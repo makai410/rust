@@ -7,14 +7,14 @@ use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{PolyTraitRef, find_attr};
-use rustc_middle::bug;
 use rustc_middle::ty::{
     self as ty, IsSuggestable, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
     TypeVisitor, Upcast,
 };
 use rustc_span::{ErrorGuaranteed, Ident, Span, kw};
+use rustc_middle::{bug, span_bug};
 use rustc_trait_selection::traits;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, trace};
 
 use crate::diagnostics;
 use crate::hir_ty_lowering::{
@@ -130,13 +130,135 @@ fn add_trait_bound<'tcx>(
     did: DefId,
     span: Span,
 ) {
-    let trait_ref = ty::TraitRef::new(tcx, did, [self_ty]);
+    let trait_ref = ty::Binder::bind_with_vars(
+        ty::TraitRef::new(tcx, sized_def_id, [self_ty]),
+        ty::List::empty(),
+    );
     // Preferable to put sizedness obligations first, since we report better errors for `Sized`
     // ambiguity.
     bounds.insert(0, (trait_ref.upcast(tcx), span));
 }
 
 impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
+    pub(crate) fn lower_where_predicates(
+        &self,
+        params: &[hir::GenericParam<'tcx>],
+        hir_predicates: &[hir::WherePredicate<'tcx>],
+        predicates: &mut FxIndexSet<(ty::Clause<'tcx>, Span)>,
+    ) {
+        let tcx = self.tcx();
+        // Add implicit predicates that should be treated as if the user has written them,
+        // including the implicit `T: Sized` for all generic parameters, and `ConstArgHasType`
+        // for const params.
+        for param in params {
+            match param.kind {
+                hir::GenericParamKind::Lifetime { .. } => (),
+                hir::GenericParamKind::Type { .. } => {
+                    // TODO:
+                    let param_ty = ty::shift_vars(self.tcx(), self.lower_ty_param(param.hir_id), 1);
+                    let mut bounds = Vec::new();
+                    // Params are implicitly sized unless a `?Sized` bound is found
+                    self.add_implicit_sizedness_bounds(
+                        &mut bounds,
+                        param_ty,
+                        &[],
+                        ImpliedBoundsContext::TyParam(param.def_id, hir_predicates),
+                        param.span,
+                    );
+                    self.add_default_traits(&mut bounds, param_ty, &[], ImpliedBoundsContext::TyParam(param.def_id, hir_predicates), param.span);
+                    trace!(?bounds);
+                    predicates.extend(bounds);
+                    trace!(?predicates);
+                }
+                hir::GenericParamKind::Const { .. } => {
+                    let param_def_id = param.def_id.to_def_id();
+                    let ct_ty = tcx.type_of(param_def_id).instantiate_identity().skip_norm_wip();
+                    let ct = self.lower_const_param(param_def_id, param.hir_id);
+                    predicates.insert((
+                        ty::ClauseKind::ConstArgHasType(ct, ct_ty).upcast(tcx),
+                        param.span,
+                    ));
+                }
+            }
+        }
+
+        // Add inline `<T: Foo>` bounds and bounds in the where clause.
+        for predicate in hir_predicates {
+            match predicate.kind {
+                hir::WherePredicateKind::BoundPredicate(bound_pred) => {
+                    let ty = self.lower_ty_maybe_return_type_notation(bound_pred.bounded_ty);
+
+                    let mut bound_assumptions = FxIndexSet::default();
+                    if self.tcx().features().non_lifetime_binders() {
+                        self.lower_where_predicates(
+                            bound_pred.bound_generic_params,
+                            bound_pred.bound_assumptions,
+                            &mut bound_assumptions,
+                        );
+                    }
+                    let bound_assumptions = self.tcx().mk_clauses_from_iter(
+                        bound_assumptions.into_iter().map(|(clause, _)| clause),
+                    );
+
+                    let bound_vars = tcx.late_bound_vars(predicate.hir_id);
+                    // Keep the type around in a dummy predicate, in case of no bounds.
+                    // That way, `where Ty:` is not a complete noop (see #53696) and `Ty`
+                    // is still checked for WF.
+                    if bound_pred.bounds.is_empty() {
+                        if let ty::Param(_) = ty.kind() {
+                            // This is a `where T:`, which can be in the HIR from the
+                            // transformation that moves `?Sized` to `T`'s declaration.
+                            // We can skip the predicate because type parameters are
+                            // trivially WF, but also we *should*, to avoid exposing
+                            // users who never wrote `where Type:,` themselves, to
+                            // compiler/tooling bugs from not handling WF predicates.
+                        } else {
+                            let span = bound_pred.bounded_ty.span;
+                            let predicate = ty::Binder::bind_with_vars(
+                                ty::ClauseKind::WellFormed(ty.into()),
+                                bound_vars,
+                            );
+                            predicates.insert((predicate.upcast(tcx), span));
+                        }
+                    }
+
+                    let mut bounds = Vec::new();
+                    self.lower_bounds(
+                        ty,
+                        bound_pred.bounds,
+                        &mut bounds,
+                        bound_vars,
+                        bound_assumptions,
+                        PredicateFilter::All,
+                    );
+                    predicates.extend(bounds);
+                }
+
+                hir::WherePredicateKind::RegionPredicate(region_pred) => {
+                    let r1 = self
+                        .lower_lifetime(region_pred.lifetime, RegionInferReason::RegionPredicate);
+                    predicates.extend(region_pred.bounds.iter().map(|bound| {
+                        let (r2, span) = match bound {
+                            hir::GenericBound::Outlives(lt) => (
+                                self.lower_lifetime(lt, RegionInferReason::RegionPredicate),
+                                lt.ident.span,
+                            ),
+                            bound => {
+                                span_bug!(
+                                    bound.span(),
+                                    "lifetime param bounds must be outlives, but found {bound:?}"
+                                )
+                            }
+                        };
+                        let pred = ty::ClauseKind::RegionOutlives(ty::OutlivesClause(r1, r2))
+                            .upcast(tcx);
+                        (pred, span)
+                    }))
+                }
+            }
+        }
+    }
+
     /// Adds sizedness bounds to a trait, trait alias, parameter, opaque type or associated type.
     ///
     /// - On parameters, opaque type and associated types, add default `Sized` bound if no explicit
@@ -313,6 +435,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         hir_bounds: I,
         bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
         bound_vars: &'tcx ty::List<ty::BoundVariableKind<'tcx>>,
+        bound_assumptions: ty::Clauses<'tcx>,
         predicate_filter: PredicateFilter,
         overlapping_assoc_constraints: OverlappingAsssocItemConstraints,
     ) where
@@ -334,9 +457,23 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
             match hir_bound {
                 hir::GenericBound::Trait(poly_trait_ref) => {
+                    let mut additional_bound_assumptions = FxIndexSet::default();
+                    if self.tcx().features().non_lifetime_binders() {
+                        self.lower_where_predicates(
+                            poly_trait_ref.bound_generic_params,
+                            poly_trait_ref.bound_assumptions,
+                            &mut additional_bound_assumptions,
+                        );
+                    }
+                    let bound_assumptions =
+                        self.tcx().mk_clauses_from_iter(bound_assumptions.into_iter().chain(
+                            additional_bound_assumptions.into_iter().map(|(clause, _)| clause),
+                        ));
+
                     let _ = self.lower_poly_trait_ref(
                         poly_trait_ref,
                         param_ty,
+                        bound_assumptions,
                         bounds,
                         predicate_filter,
                         overlapping_assoc_constraints,
@@ -352,9 +489,10 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     }
 
                     let region = self.lower_lifetime(lifetime, RegionInferReason::OutlivesBound);
-                    let bound = ty::Binder::bind_with_vars(
-                        ty::ClauseKind::TypeOutlives(ty::OutlivesClause(param_ty, region)),
+                    let bound = ty::Binder::bind_with_vars_and_clauses(
+                         ty::ClauseKind::TypeOutlives(ty::OutlivesClause(param_ty, region)),
                         bound_vars,
+                        bound_assumptions,
                     );
                     bounds.push((bound.upcast(self.tcx()), lifetime.ident.span));
                 }
@@ -600,6 +738,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                             hir_bounds,
                             bounds,
                             projection_ty.bound_vars(),
+                            projection_ty.skip_binder_with_clauses().1,
                             predicate_filter,
                             OverlappingAsssocItemConstraints::Allowed,
                         );

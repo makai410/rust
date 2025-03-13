@@ -1240,6 +1240,8 @@ pub struct WhereBoundPredicate<'hir> {
     pub origin: PredicateOrigin,
     /// Any generics from a `for` binding.
     pub bound_generic_params: &'hir [GenericParam<'hir>],
+    /// The `'a + Trait` in `for<T: 'a + Trait> ...`
+    pub bound_assumptions: &'hir [WherePredicate<'hir>],
     /// The type being bounded.
     pub bounded_ty: &'hir Ty<'hir>,
     /// Trait and lifetime bounds (e.g., `Clone + Send + 'static`).
@@ -4476,6 +4478,9 @@ pub struct PolyTraitRef<'hir> {
     /// The `'a` in `for<'a> Foo<&'a T>`.
     pub bound_generic_params: &'hir [GenericParam<'hir>],
 
+    /// The `'a + Trait` in `for<T: 'a + Trait> ...`
+    pub bound_assumptions: &'hir [WherePredicate<'hir>],
+
     /// The constness and polarity of the trait ref.
     ///
     /// The `async` modifier is lowered directly into a different trait for now.
@@ -5505,7 +5510,7 @@ mod size_asserts {
     static_assert_size!(ForeignItem<'_>, 88);
     static_assert_size!(ForeignItemKind<'_>, 56);
     static_assert_size!(GenericArg<'_>, 16);
-    static_assert_size!(GenericBound<'_>, 64);
+    static_assert_size!(GenericBound<'_>, 80);
     static_assert_size!(Generics<'_>, 56);
     static_assert_size!(Impl<'_>, 48);
     static_assert_size!(ImplItem<'_>, 88);

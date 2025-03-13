@@ -1994,6 +1994,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     bounded_ty: self.arena.alloc(bounded_ty),
                     bounds,
                     bound_generic_params: &[],
+                    bound_assumptions: &[],
                     origin,
                 })
             }
@@ -2026,7 +2027,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 bounded_ty,
                 bounds,
             }) => {
-                let rbp = if bound_generic_params.is_empty()
+                let mut rbp = if bound_generic_params.is_empty()
                     && let Some(res) =
                         self.get_partial_res(bounded_ty.id).and_then(|r| r.full_res())
                     && let Res::Def(DefKind::TyParam, def_id) = res
@@ -2040,6 +2041,21 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     bound_generic_params: self.lower_generic_params(
                         bound_generic_params,
                         hir::GenericParamSource::Binder,
+                    ),
+                    bound_assumptions: self.arena.alloc_from_iter(
+                        bound_generic_params.iter().filter_map(|param| {
+                            self.lower_generic_bound_predicate(
+                                param.ident,
+                                param.id,
+                                &param.kind,
+                                &param.bounds,
+                                param.colon_span,
+                                span,
+                                rbp.reborrow(), // FIXME(non-lifetime-binders): rethink this?
+                                ImplTraitContext::Disallowed(ImplTraitPosition::Bound),
+                                PredicateOrigin::GenericParam,
+                            )
+                        }),
                     ),
                     bounded_ty: self.lower_ty_alloc(
                         bounded_ty,
