@@ -202,8 +202,12 @@ where
             return Self::match_assumption(ecx, goal, meta_sized_clause, then);
         }
 
-        let assumption_trait_pred = ecx.instantiate_binder_with_infer(trait_clause);
+        let (assumption_trait_pred, goals) =
+            ecx.instantiate_binder_with_infer_and_goals(trait_clause);
         ecx.eq(goal.param_env, goal.predicate.trait_ref, assumption_trait_pred.trait_ref)?;
+
+        let cx = ecx.cx();
+        ecx.add_goals(GoalSource::Misc, goals.iter().map(|clause| goal.with(cx, clause)))?;
 
         then(ecx)
     }
@@ -1128,7 +1132,7 @@ where
                             ecx.enter_forall_with_assumptions(
                                 target_projection,
                                 param_env,
-                                |ecx, target_projection| {
+                                |ecx, target_projection, _| {
                                     let source_projection =
                                         ecx.instantiate_binder_with_infer(source_projection);
                                     ecx.eq(param_env, source_projection, target_projection)?;
@@ -1150,7 +1154,7 @@ where
                         ecx.enter_forall_with_assumptions(
                             target_principal,
                             param_env,
-                            |ecx, target_principal| {
+                            |ecx, target_principal, _| {
                                 let source_principal =
                                     ecx.instantiate_binder_with_infer(source_principal);
                                 ecx.eq(param_env, source_principal, target_principal)?;
@@ -1180,7 +1184,7 @@ where
                         ecx.enter_forall_with_assumptions(
                             target_projection,
                             param_env,
-                            |ecx, target_projection| {
+                            |ecx, target_projection, _| {
                                 let source_projection =
                                     ecx.instantiate_binder_with_infer(source_projection);
                                 ecx.eq(param_env, source_projection, target_projection)?;
@@ -1415,7 +1419,7 @@ where
             let goals = ecx.enter_forall_with_assumptions(
                 constituent_tys(ecx, goal.predicate.self_ty())?,
                 goal.param_env,
-                |ecx, tys| {
+                |ecx, tys, _| {
                     tys.into_iter()
                         .map(|ty| {
                             goal.with(ecx.cx(), goal.predicate.with_replaced_self_ty(ecx.cx(), ty))
