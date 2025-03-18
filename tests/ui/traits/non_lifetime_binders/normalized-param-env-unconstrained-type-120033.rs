@@ -15,8 +15,8 @@ pub struct Bar<T: ?AutoTrait> {} //~ ERROR cannot find trait `AutoTrait`
 
 pub fn f<T1, T2>()
 where
-    T1: for<T> Foo<usize, Bar = Bar<T>>, //~ ERROR missing generics for associated type `Foo::Bar`
+    T1: for<T: ?Sized> Foo<usize, Bar = Bar<T>>, //~ ERROR missing generics for associated type `Foo::Bar`
     //~| ERROR missing generics for associated type `Foo::Bar`
-    T2: for<L, T> Foo<usize, Bar<T> = T1::Bar<T>>,
+    T2: for<L: ?Sized, T> Foo<usize, Bar<T> = T1::Bar<T>>,
 {
 }
