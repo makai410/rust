@@ -363,12 +363,12 @@ impl<I: Interner> FlagComputation<I> {
                 self.add_binder_args(args);
             }
 
-            ty::FnPtr(sig_tys, _) => self.bound_computation(sig_tys, |computation, sig_tys| {
+            ty::FnPtr(sig_tys, _) => self.bound_computation(*sig_tys, |computation, sig_tys| {
                 computation.add_tys(sig_tys.inputs_and_output);
             }),
 
             ty::UnsafeBinder(bound_ty) => {
-                self.bound_computation(bound_ty.into(), |computation, ty| {
+                self.bound_computation(*bound_ty.into(), |computation, ty| {
                     computation.add_ty(ty);
                 })
             }

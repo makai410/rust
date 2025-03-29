@@ -68,6 +68,9 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     type Term = ty::Term<'tcx>;
     type BoundVarKinds = &'tcx List<ty::BoundVariableKind<'tcx>>;
 
+    type SigBinderRef = ty::SigBinderRef<'tcx>;
+    type TyBinderRef = ty::TyBinderRef<'tcx>;
+
     type PredefinedOpaques = solve::PredefinedOpaques<'tcx>;
 
     fn mk_predefined_opaques_in_body(

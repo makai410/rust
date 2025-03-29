@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::debug_assert_matches;
-use std::ops::{ControlFlow, Range};
+use std::ops::{ControlFlow, Deref, Range};
 
 use hir::def::{CtorKind, DefKind};
 use rustc_abi::{FIRST_VARIANT, FieldIdx, NumScalableVectors, ScalableElt, VariantIdx};
@@ -60,6 +60,7 @@ pub type BoundRegion<'tcx> = ir::BoundRegion<TyCtxt<'tcx>>;
 pub type BoundVariableKind<'tcx> = ir::BoundVariableKind<TyCtxt<'tcx>>;
 pub type BoundRegionKind<'tcx> = ir::BoundRegionKind<TyCtxt<'tcx>>;
 pub type BoundTyKind<'tcx> = ir::BoundTyKind<TyCtxt<'tcx>>;
+pub type FnSigTys<'tcx> = ir::FnSigTys<TyCtxt<'tcx>>;
 
 pub trait Article {
     fn article(&self) -> &'static str;
@@ -742,12 +743,12 @@ impl<'tcx> Ty<'tcx> {
     #[inline]
     pub fn new_fn_ptr(tcx: TyCtxt<'tcx>, fty: PolyFnSig<'tcx>) -> Ty<'tcx> {
         let (sig_tys, hdr) = fty.split();
-        Ty::new(tcx, FnPtr(sig_tys, hdr))
+        Ty::new(tcx, FnPtr(tcx.mk_sig_binder(sig_tys), hdr))
     }
 
     #[inline]
     pub fn new_unsafe_binder(tcx: TyCtxt<'tcx>, b: Binder<'tcx, Ty<'tcx>>) -> Ty<'tcx> {
-        Ty::new(tcx, UnsafeBinder(b.into()))
+        Ty::new(tcx, UnsafeBinder(tcx.mk_ty_binder(b)))
     }
 
     #[inline]
@@ -2214,7 +2215,31 @@ mod size_asserts {
 
     use super::*;
     // tidy-alphabetical-start
-    static_assert_size!(TyKind<'_>, 32);
-    static_assert_size!(ty::WithCachedTypeInfo<TyKind<'_>>, 40);
+    static_assert_size!(TyKind<'_>, 24);
+    static_assert_size!(ty::WithCachedTypeInfo<TyKind<'_>>, 32);
     // tidy-alphabetical-end
+}
+
+// FIXME: this is a distinct type because we need to define `Encode`/`Decode` impls.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable)]
+pub struct TyBinderRef<'tcx>(pub ty::Interned<'tcx, ty::Binder<'tcx, Ty<'tcx>>>);
+
+impl<'tcx> Deref for TyBinderRef<'tcx> {
+    type Target = ty::Binder<'tcx, Ty<'tcx>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// FIXME: this is a distinct type because we need to define `Encode`/`Decode` impls.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable)]
+pub struct SigBinderRef<'tcx>(pub ty::Interned<'tcx, ty::Binder<'tcx, FnSigTys<'tcx>>>);
+
+impl<'tcx> Deref for SigBinderRef<'tcx> {
+    type Target = ty::Binder<'tcx, FnSigTys<'tcx>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }

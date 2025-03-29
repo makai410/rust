@@ -1592,7 +1592,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ty::UnsafeBinder(binder) => self.instantiate_binder_with_fresh_vars(
                         inner_expr.span,
                         infer::BoundRegionConversionTime::HigherRankedType,
-                        binder.into(),
+                        *binder,
                     ),
                     ty::Error(e) => Ty::new_error(self.tcx, e),
                     _ => {
@@ -1629,7 +1629,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ty::UnsafeBinder(binder) => self.instantiate_binder_with_fresh_vars(
                         inner_expr.span,
                         infer::BoundRegionConversionTime::HigherRankedType,
-                        binder.into(),
+                        *binder,
                     ),
                     ty::Error(e) => Ty::new_error(self.tcx, e),
                     _ => {

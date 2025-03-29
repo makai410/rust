@@ -69,8 +69,8 @@ use crate::ty::{
     self, AdtDef, AdtDefData, AdtKind, Binder, Clause, Clauses, Const, FnSigKind, GenericArg,
     GenericArgs, GenericArgsRef, GenericParamDefKind, List, ListWithCachedTypeInfo, ParamConst,
     Pattern, PatternKind, PolyExistentialPredicate, PolyFnSig, Predicate, PredicateKind,
-    PredicatePolarity, Region, RegionKind, ReprOptions, TraitObjectVisitor, Ty, TyKind, TyVid,
-    ValTree, ValTreeKind, Visibility,
+    PredicatePolarity, Region, RegionKind, ReprOptions, SigBinderRef, TraitObjectVisitor, Ty,
+    TyBinderRef, TyKind, TyVid, ValTree, ValTreeKind, Visibility,
 };
 
 impl<'tcx> rustc_type_ir::inherent::DefId<TyCtxt<'tcx>> for DefId {
@@ -161,6 +161,8 @@ pub struct CtxtInterners<'tcx> {
     valtree: InternedSet<'tcx, ty::ValTreeKind<TyCtxt<'tcx>>>,
     patterns: InternedSet<'tcx, List<ty::Pattern<'tcx>>>,
     outlives: InternedSet<'tcx, List<ty::ArgOutlivesClause<'tcx>>>,
+    ty_binder: InternedSet<'tcx, ty::Binder<'tcx, Ty<'tcx>>>,
+    sig_binder: InternedSet<'tcx, ty::Binder<'tcx, ty::FnSigTys<'tcx>>>,
 }
 
 impl<'tcx> CtxtInterners<'tcx> {
@@ -199,6 +201,8 @@ impl<'tcx> CtxtInterners<'tcx> {
             valtree: InternedSet::with_capacity(N),
             patterns: InternedSet::with_capacity(N),
             outlives: InternedSet::with_capacity(N),
+            ty_binder: InternedSet::with_capacity(N),
+            sig_binder: InternedSet::with_capacity(N),
         }
     }
 
@@ -1733,6 +1737,8 @@ nop_lift! { predicate; Predicate<'a> => Predicate<'tcx> }
 nop_lift! { predicate; Clause<'a> => Clause<'tcx> }
 nop_lift! { layout; Layout<'a> => Layout<'tcx> }
 nop_lift! { valtree; ValTree<'a> => ValTree<'tcx> }
+nop_lift! { ty_binder; TyBinderRef<'a> => TyBinderRef<'tcx> }
+nop_lift! { sig_binder; SigBinderRef<'a> => SigBinderRef<'tcx> }
 
 impl<'a, 'tcx> Lift<TyCtxt<'tcx>> for Interned<'a, RegionKind<'a>> {
     type Lifted = Interned<'tcx, RegionKind<'tcx>>;
@@ -2010,6 +2016,8 @@ direct_interners! {
     adt_def: pub mk_adt_def_from_data(AdtDefData): AdtDef -> AdtDef<'tcx>,
     external_constraints: pub mk_external_constraints(ExternalConstraintsData<TyCtxt<'tcx>>):
         ExternalConstraints -> ExternalConstraints<'tcx>,
+    ty_binder: pub mk_ty_binder(ty::Binder<'tcx, Ty<'tcx>>): TyBinderRef -> TyBinderRef<'tcx>,
+    sig_binder: pub mk_sig_binder(ty::Binder<'tcx, ty::FnSigTys<'tcx>>): SigBinderRef -> SigBinderRef<'tcx>,
 }
 
 macro_rules! slice_interners {

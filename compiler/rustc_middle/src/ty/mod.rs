@@ -100,10 +100,10 @@ pub use self::region::{
 pub use self::sty::{
     Alias, AliasTy, AliasTyKind, Article, Binder, BoundConst, BoundRegion, BoundRegionKind,
     BoundTy, BoundTyKind, BoundVariableKind, CanonicalPolyFnSig, CoroutineArgsExt, EarlyBinder,
-    FnSig, FnSigKind, FreeAliasTy, InherentAliasTy, InlineConstArgs, InlineConstArgsParts,
-    OpaqueAliasTy, ParamConst, ParamTy, PlaceholderConst, PlaceholderRegion, PlaceholderType,
-    PolyFnSig, ProjectionAliasTy, TyKind, TypeAndMut, TypingMode, TypingModeEqWrapper,
-    Unnormalized, UpvarArgs,
+    FnSig, FnSigKind, FnSigTys, FreeAliasTy, InherentAliasTy, InlineConstArgs,
+    InlineConstArgsParts, OpaqueAliasTy, ParamConst, ParamTy, PlaceholderConst, PlaceholderRegion,
+    PlaceholderType, PolyFnSig, ProjectionAliasTy, SigBinderRef, TyBinderRef, TyKind, TypeAndMut,
+    TypingMode, TypingModeEqWrapper, Unnormalized, UpvarArgs,
 };
 pub use self::trait_def::TraitDef;
 pub use self::typeck_results::{

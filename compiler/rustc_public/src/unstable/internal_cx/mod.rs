@@ -101,4 +101,7 @@ impl<'tcx> InternalCx<'tcx> for TyCtxt<'tcx> {
     {
         TyCtxt::mk_patterns_from_iter(self, iter)
     }
+    fn mk_sig_binder(self, v: ty::Binder<'tcx, ty::FnSigTys<'tcx>>) -> ty::SigBinderRef<'tcx> {
+        TyCtxt::mk_sig_binder(self, v)
+    }
 }
