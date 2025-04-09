@@ -364,6 +364,24 @@ impl<'tcx> Context for TablesWrapper<'tcx> {
         tables.tcx.is_lang_item(def_id, LangItem::CStr)
     }
 
+    fn adt_is_phantom_data(&self, def: AdtDef) -> bool {
+        let mut tables = self.0.borrow_mut();
+        let tcx = tables.tcx;
+        def.internal(&mut *tables, tcx).is_phantom_data()
+    }
+
+    fn adt_is_unsafe_cell(&self, def: AdtDef) -> bool {
+        let mut tables = self.0.borrow_mut();
+        let tcx = tables.tcx;
+        def.internal(&mut *tables, tcx).is_unsafe_cell()
+    }
+
+    fn adt_is_manually_drop(&self, def: AdtDef) -> bool {
+        let mut tables = self.0.borrow_mut();
+        let tcx = tables.tcx;
+        def.internal(&mut *tables, tcx).is_manually_drop()
+    }
+
     fn fn_sig(&self, def: FnDef, args: &GenericArgs) -> PolyFnSig {
         let mut tables = self.0.borrow_mut();
         let tcx = tables.tcx;

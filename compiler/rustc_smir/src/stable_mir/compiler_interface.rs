@@ -106,6 +106,15 @@ pub trait Context {
     /// Returns whether this definition is a C string.
     fn adt_is_cstr(&self, def: AdtDef) -> bool;
 
+    /// Returns whether this ADT is PhantomData.
+    fn adt_is_phantom_data(&self, def: AdtDef) -> bool;
+
+    /// Returns whether this ADT is UnsafeCell.
+    fn adt_is_unsafe_cell(&self, def: AdtDef) -> bool;
+
+    /// Returns whether this ADT is ManuallyDrop.
+    fn adt_is_manually_drop(&self, def: AdtDef) -> bool;
+
     /// Retrieve the function signature for the given generic arguments.
     fn fn_sig(&self, def: FnDef, args: &GenericArgs) -> PolyFnSig;
 
