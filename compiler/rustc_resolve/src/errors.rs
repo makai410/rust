@@ -357,6 +357,8 @@ pub(crate) struct ParamInTyOfConstParam {
     #[label]
     pub(crate) span: Span,
     pub(crate) name: Symbol,
+    #[help]
+    pub help: bool,
 }
 
 #[derive(Diagnostic)]

@@ -339,6 +339,7 @@ resolve_param_in_non_trivial_anon_const_help =
 resolve_param_in_ty_of_const_param =
     the type of const parameters must not depend on other generic parameters
     .label = the type must not depend on the parameter `{$name}`
+    .help = add `#![feature(generic_const_parameter_types, adt_const_params)]` to the crate attributes to enable
 
 resolve_pattern_doesnt_bind_name = pattern doesn't bind `{$name}`
 

@@ -897,7 +897,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     .create_err(errs::ForwardDeclaredGenericInConstParamTy { param, span }),
             },
             ResolutionError::ParamInTyOfConstParam { name } => {
-                self.dcx().create_err(errs::ParamInTyOfConstParam { span, name })
+                self.dcx().create_err(errs::ParamInTyOfConstParam { span, name, help: self.tcx.sess.is_nightly_build(), })
+
             }
             ResolutionError::ParamInNonTrivialAnonConst { name, param_kind: is_type } => {
                 self.dcx().create_err(errs::ParamInNonTrivialAnonConst {

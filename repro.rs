@@ -1,0 +1,1 @@
+struct Bar<T, const N: T>(T);
