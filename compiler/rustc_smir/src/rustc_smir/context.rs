@@ -472,6 +472,23 @@ impl<'tcx> SmirCtxt<'tcx> {
         args.as_coroutine().discriminant_for_variant(coroutine, tcx, variant).stable(&mut *tables)
     }
 
+    /// The set of all discriminants for the coroutine, enumerated with their
+    /// variant indices.
+    pub fn coroutine_discriminants(
+        &self,
+        def: CoroutineDef,
+        args: &GenericArgs,
+    ) -> Vec<(VariantIdx, Discr)> {
+        let mut tables = self.0.borrow_mut();
+        let tcx = tables.tcx;
+        let coroutine = def.def_id().internal(&mut *tables, tcx);
+        let args = args.internal(&mut *tables, tcx);
+        args.as_coroutine()
+            .discriminants(coroutine, tcx)
+            .map(|(idx, discr)| (idx.stable(&mut *tables), discr.stable(&mut *tables)))
+            .collect()
+    }
+
     /// The name of a variant.
     pub fn variant_name(&self, def: VariantDef) -> Symbol {
         let mut tables = self.0.borrow_mut();

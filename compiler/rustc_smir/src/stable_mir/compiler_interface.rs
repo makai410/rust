@@ -245,6 +245,16 @@ impl<'tcx> SmirInterface<'tcx> {
         self.cx.coroutine_discr_for_variant(coroutine, args, variant)
     }
 
+    /// The set of all discriminants for the coroutine, enumerated with their
+    /// variant indices.
+    pub(crate) fn coroutine_discriminants(
+        &self,
+        def: CoroutineDef,
+        args: &GenericArgs,
+    ) -> Vec<(VariantIdx, Discr)> {
+        self.cx.coroutine_discriminants(def, args)
+    }
+
     /// The name of a variant.
     pub(crate) fn variant_name(&self, def: VariantDef) -> Symbol {
         self.cx.variant_name(def)

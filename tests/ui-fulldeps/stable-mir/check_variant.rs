@@ -23,7 +23,7 @@ use std::ops::ControlFlow;
 use stable_mir::CrateItem;
 use stable_mir::crate_def::CrateDef;
 use stable_mir::mir::{AggregateKind, Rvalue, Statement, StatementKind};
-use stable_mir::ty::{IntTy, RigidTy, Ty};
+use stable_mir::ty::{IntTy, RigidTy, Ty, TyKind};
 
 const CRATE_NAME: &str = "crate_variant_ty";
 
@@ -32,6 +32,7 @@ fn test_def_tys() -> ControlFlow<()> {
     check_adt_mono();
     check_adt_poly();
     check_adt_poly2();
+    check_coroutine_discriminants();
 
     ControlFlow::Continue(())
 }
@@ -96,6 +97,27 @@ fn check_adt_poly2() {
     );
 }
 
+fn check_coroutine_discriminants() {
+    let crate_items = stable_mir::all_local_items();
+    if let Some((def, args)) = crate_items.iter().find_map(|item| {
+        let item_ty = item.ty();
+        if let TyKind::RigidTy(RigidTy::Coroutine(def, args, ..)) = item_ty.kind() {
+            if def.0.name() == "uwu::{closure#0}".to_string() {
+                Some((def, args))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }) {
+        let discrs = def.discriminants(&args);
+        assert_eq!(5, discrs.len());
+    } else {
+        panic!("Cannot find `uwu::{{closure#0}}`. All local items are: {:#?}", crate_items);
+    }
+}
+
 fn get_fn(name: &str) -> CrateItem {
     stable_mir::all_local_items().into_iter().find(|it| it.name().eq(name)).unwrap()
 }
@@ -128,6 +150,8 @@ fn main() {
     let args = &[
         "rustc".to_string(),
         "-Cpanic=abort".to_string(),
+        "--edition".to_string(),
+        "2024".to_string(),
         "--crate-name".to_string(),
         CRATE_NAME.to_string(),
         path.to_string(),
@@ -176,6 +200,12 @@ fn generate_input(path: &str) -> std::io::Result<()> {
             black_box(Poly::<T>::A);
             black_box(Poly::B(t));
             black_box(Poly::C {{ t: t }});
+        }}
+
+        async fn uwu() -> i32 {{
+            let a = async {{ 1 }}.await;
+            let b = async {{ 2 }}.await;
+            a + b
         }}
     "#
     )?;

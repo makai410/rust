@@ -760,6 +760,10 @@ impl CoroutineDef {
     pub fn discriminant_for_variant(&self, args: &GenericArgs, idx: VariantIdx) -> Discr {
         with(|cx| cx.coroutine_discr_for_variant(*self, args, idx))
     }
+
+    pub fn discriminants(&self, args: &GenericArgs) -> Vec<(VariantIdx, Discr)> {
+        with(|cx| cx.coroutine_discriminants(*self, args))
+    }
 }
 
 crate_def! {
@@ -843,6 +847,7 @@ impl AdtDef {
     }
 }
 
+#[derive(Copy, Clone, Debug, Serialize)]
 pub struct Discr {
     pub val: u128,
     pub ty: Ty,
