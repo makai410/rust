@@ -1,0 +1,21 @@
+error[E0539]: malformed `link_ordinal` attribute input
+  --> $DIR/link-ordinal-invalid-format.rs:3:5
+   |
+LL |     #[link_ordinal("JustMonika")]
+   |     ^^^^^^^^^^^^^^^------------^^
+   |     |              |
+   |     |              expected an integer literal here
+   |     help: must be of the form: `#[link_ordinal(ordinal)]`
+
+error[E0539]: malformed `link_ordinal` attribute input
+  --> $DIR/link-ordinal-invalid-format.rs:6:5
+   |
+LL |     #[link_ordinal("JustMonika")]
+   |     ^^^^^^^^^^^^^^^------------^^
+   |     |              |
+   |     |              expected an integer literal here
+   |     help: must be of the form: `#[link_ordinal(ordinal)]`
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `rustc --explain E0539`.
