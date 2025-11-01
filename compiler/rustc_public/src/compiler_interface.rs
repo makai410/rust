@@ -1062,6 +1062,8 @@ impl<'tcx> CompilerInterface for Container<'tcx, BridgeTys> {
 // A thread local variable that stores a pointer to [`CompilerInterface`].
 scoped_tls::scoped_thread_local!(static TLV: Cell<*const ()>);
 
+// FIXME(makai410): remove this cfg when we have a stable driver.
+#[cfg(feature = "rustc_internal")]
 pub(crate) fn run<F, T>(interface: &dyn CompilerInterface, f: F) -> Result<T, Error>
 where
     F: FnOnce() -> T,
