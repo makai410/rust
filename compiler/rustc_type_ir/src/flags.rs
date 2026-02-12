@@ -362,34 +362,44 @@ impl<I: Interner> FlagComputation<I> {
         self.bound_computation(binder, |computation, atom| computation.add_predicate_atom(atom));
     }
 
-    fn add_predicate_atom(&mut self, atom: ty::PredicateKind<I>) {
-        match atom {
-            ty::PredicateKind::Clause(ty::ClauseKind::Trait(trait_pred)) => {
+    fn add_clause(&mut self, clause_kind: ty::ClauseKind<I>) {
+        match clause_kind {
+            ty::ClauseKind::Trait(trait_pred) => {
                 self.add_args(trait_pred.trait_ref.args.as_slice());
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(ty::HostEffectPredicate {
-                trait_ref,
-                constness: _,
-            })) => {
+            ty::ClauseKind::HostEffect(ty::HostEffectPredicate { trait_ref, constness: _ }) => {
                 self.add_args(trait_ref.args.as_slice());
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(ty::OutlivesPredicate(
-                a,
-                b,
-            ))) => {
+            ty::ClauseKind::RegionOutlives(ty::OutlivesPredicate(a, b)) => {
                 self.add_region(a);
                 self.add_region(b);
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(
-                ty,
-                region,
-            ))) => {
+            ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(ty, region)) => {
                 self.add_ty(ty);
                 self.add_region(region);
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(ct, ty)) => {
+            ty::ClauseKind::ConstArgHasType(ct, ty) => {
                 self.add_const(ct);
                 self.add_ty(ty);
+            }
+            ty::ClauseKind::Projection(ty::ProjectionPredicate { projection_term, term }) => {
+                self.add_alias_term(projection_term);
+                self.add_term(term);
+            }
+            ty::ClauseKind::WellFormed(term) => {
+                self.add_term(term);
+            }
+            ty::ClauseKind::ConstEvaluatable(uv) => {
+                self.add_const(uv);
+            }
+            ty::ClauseKind::UnstableFeature(_sym) => {}
+        }
+    }
+
+    fn add_predicate_atom(&mut self, atom: ty::PredicateKind<I>) {
+        match atom {
+            ty::PredicateKind::Clause(clause_kind) => {
+                self.add_clause(clause_kind);
             }
             ty::PredicateKind::Subtype(ty::SubtypePredicate { a_is_expected: _, a, b }) => {
                 self.add_ty(a);
@@ -399,20 +409,7 @@ impl<I: Interner> FlagComputation<I> {
                 self.add_ty(a);
                 self.add_ty(b);
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::Projection(ty::ProjectionPredicate {
-                projection_term,
-                term,
-            })) => {
-                self.add_alias_term(projection_term);
-                self.add_term(term);
-            }
-            ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {
-                self.add_term(term);
-            }
             ty::PredicateKind::DynCompatible(_def_id) => {}
-            ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(uv)) => {
-                self.add_const(uv);
-            }
             ty::PredicateKind::ConstEquate(expected, found) => {
                 self.add_const(expected);
                 self.add_const(found);
@@ -425,7 +422,6 @@ impl<I: Interner> FlagComputation<I> {
                 self.add_term(t1);
                 self.add_term(t2);
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_sym)) => {}
             ty::PredicateKind::Ambiguous => {}
         }
     }

@@ -506,7 +506,7 @@ pub trait Clause<I: Interner<Clause = Self>>:
     + Debug
     + Hash
     + Eq
-    + TypeFoldable<I>
+    + TypeSuperFoldable<I>
     + UpcastFrom<I, ty::Binder<I, ty::ClauseKind<I>>>
     + UpcastFrom<I, ty::TraitRef<I>>
     + UpcastFrom<I, ty::Binder<I, ty::TraitRef<I>>>

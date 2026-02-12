@@ -156,6 +156,10 @@ pub trait TypeFolder<I: Interner>: Sized {
     fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
         c.super_fold_with(self)
     }
+
+    fn fold_clause(&mut self, c: I::Clause) -> I::Clause {
+        c.super_fold_with(self)
+    }
 }
 
 /// This trait is implemented for every folding traversal. There is a fold
@@ -196,6 +200,10 @@ pub trait FallibleTypeFolder<I: Interner>: Sized {
     }
 
     fn try_fold_clauses(&mut self, c: I::Clauses) -> Result<I::Clauses, Self::Error> {
+        c.try_super_fold_with(self)
+    }
+
+    fn try_fold_clause(&mut self, c: I::Clause) -> Result<I::Clause, Self::Error> {
         c.try_super_fold_with(self)
     }
 }

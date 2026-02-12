@@ -69,11 +69,11 @@ use crate::traits;
 use crate::traits::solve::{ExternalConstraints, ExternalConstraintsData, PredefinedOpaques};
 use crate::ty::predicate::ExistentialPredicateStableCmpExt as _;
 use crate::ty::{
-    self, AdtDef, AdtDefData, AdtKind, Binder, Clause, Clauses, Const, GenericArg, GenericArgs,
-    GenericArgsRef, GenericParamDefKind, List, ListWithCachedTypeInfo, ParamConst, Pattern,
-    PatternKind, PolyExistentialPredicate, PolyFnSig, Predicate, PredicateKind, PredicatePolarity,
-    Region, RegionKind, ReprOptions, TraitObjectVisitor, Ty, TyKind, TyVid, ValTree, ValTreeKind,
-    Visibility,
+    self, AdtDef, AdtDefData, AdtKind, Binder, Clause, ClauseKind, Clauses, Const, GenericArg,
+    GenericArgs, GenericArgsRef, GenericParamDefKind, List, ListWithCachedTypeInfo, ParamConst,
+    Pattern, PatternKind, PolyExistentialPredicate, PolyFnSig, Predicate, PredicateKind,
+    PredicatePolarity, Region, RegionKind, ReprOptions, TraitObjectVisitor, Ty, TyKind, TyVid,
+    ValTree, ValTreeKind, Visibility,
 };
 
 impl<'tcx> rustc_type_ir::inherent::DefId<TyCtxt<'tcx>> for DefId {
@@ -314,6 +314,35 @@ impl<'tcx> CtxtInterners<'tcx> {
                 })
                 .0
         }
+    }
+
+    /// Interns a clause. (Use `mk_clause` instead, where possible.)
+    #[inline(never)]
+    fn intern_clause(
+        &self,
+        kind: Binder<'tcx, ClauseKind<'tcx>>,
+        sess: &Session,
+        untracked: &Untracked,
+    ) -> Clause<'tcx> {
+        let kind = kind.map_bound(|k| PredicateKind::Clause(k));
+        Clause(Interned::new_unchecked(
+            // We use the `predicate` interner here so that `Clause` and `Predicate` share
+            // the same canonical storage.
+            self.predicate
+                .intern(kind, |kind| {
+                    let flags = ty::FlagComputation::<TyCtxt<'tcx>>::for_predicate(kind);
+
+                    let stable_hash = self.stable_hash(&flags, sess, untracked, &kind);
+
+                    InternedInSet(self.arena.alloc(WithCachedTypeInfo {
+                        internee: kind,
+                        stable_hash,
+                        flags: flags.flags,
+                        outer_exclusive_binder: flags.outer_exclusive_binder,
+                    }))
+                })
+                .0,
+        ))
     }
 }
 
@@ -2122,6 +2151,25 @@ impl<'tcx> TyCtxt<'tcx> {
             // This is only used to create a stable hashing context.
             &self.untracked,
         )
+    }
+
+    #[inline]
+    pub fn mk_clause(self, binder: Binder<'tcx, ClauseKind<'tcx>>) -> Clause<'tcx> {
+        self.interners.intern_clause(
+            binder,
+            self.sess,
+            // This is only used to create a stable hashing context.
+            &self.untracked,
+        )
+    }
+
+    #[inline]
+    pub fn reuse_or_mk_clause(
+        self,
+        clause: Clause<'tcx>,
+        binder: Binder<'tcx, ClauseKind<'tcx>>,
+    ) -> Clause<'tcx> {
+        if clause.kind() != binder { self.mk_clause(binder) } else { clause }
     }
 
     #[inline]
