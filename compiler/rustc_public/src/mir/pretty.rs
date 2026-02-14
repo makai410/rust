@@ -188,6 +188,13 @@ fn pretty_terminator_head<W: Write>(writer: &mut W, terminator: &TerminatorKind)
             args_iter.try_for_each(|arg| write!(writer, ", {}", pretty_operand(arg)))?;
             write!(writer, ")")
         }
+        TailCall { func, args } => {
+            write!(writer, "{INDENT}tailcall {:?}(", pretty_operand(func))?;
+            let mut args_iter = args.iter();
+            args_iter.next().map_or(Ok(()), |arg| write!(writer, "{}", pretty_operand(arg)))?;
+            args_iter.try_for_each(|arg| write!(writer, ", {}", pretty_operand(arg)))?;
+            write!(writer, ")")
+        }
         Assert { cond, expected, msg, target: _, unwind: _ } => {
             write!(writer, "{INDENT}assert(")?;
             if !expected {
@@ -206,7 +213,12 @@ fn pretty_successor_labels(terminator: &TerminatorKind) -> Vec<String> {
     match terminator {
         Call { target: None, unwind: UnwindAction::Cleanup(_), .. }
         | InlineAsm { destination: None, .. } => vec!["unwind".into()],
-        Resume | Abort | Return | Unreachable | Call { target: None, unwind: _, .. } => vec![],
+        Resume
+        | Abort
+        | Return
+        | Unreachable
+        | Call { target: None, unwind: _, .. }
+        | TailCall { .. } => vec![],
         Goto { .. } => vec!["".to_string()],
         SwitchInt { targets, .. } => targets
             .branches()

@@ -175,6 +175,15 @@ pub enum TerminatorKind {
         target: Option<BasicBlockIdx>,
         unwind: UnwindAction,
     },
+    TailCall {
+        /// The function that’s being called.
+        func: Operand,
+        /// Arguments the function is called with.
+        /// These are owned by the callee, which is free to modify them.
+        /// This allows the memory occupied by "by-value" arguments to be
+        /// reused across function calls without duplicating the contents.
+        args: Vec<Operand>,
+    },
     Assert {
         cond: Operand,
         expected: bool,
@@ -212,11 +221,13 @@ impl TerminatorKind {
                 vec![t]
             }
 
+            // No successors
             Return
             | Resume
             | Abort
             | Unreachable
             | Call { target: None, unwind: _, .. }
+            | TailCall { .. }
             | InlineAsm { destination: None, unwind: _, .. } => {
                 vec![]
             }
@@ -231,7 +242,8 @@ impl TerminatorKind {
             | TerminatorKind::Unreachable
             | TerminatorKind::Resume
             | TerminatorKind::Abort
-            | TerminatorKind::SwitchInt { .. } => None,
+            | TerminatorKind::SwitchInt { .. }
+            | TerminatorKind::TailCall { .. } => None,
             TerminatorKind::Call { ref unwind, .. }
             | TerminatorKind::Assert { ref unwind, .. }
             | TerminatorKind::Drop { ref unwind, .. }

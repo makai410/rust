@@ -221,6 +221,12 @@ macro_rules! make_mir_visitor {
                         }
                         self.visit_place(destination, PlaceContext::MUTATING, location);
                     }
+                    TerminatorKind::TailCall { func, args, } => {
+                        self.visit_operand(func, location);
+                        for arg in args {
+                            self.visit_operand(arg, location);
+                        }
+                    },
                     TerminatorKind::InlineAsm { operands, .. } => {
                         for op in operands {
                             let InlineAsmOperand { in_value, out_place, raw_rpr: _ } = op;
