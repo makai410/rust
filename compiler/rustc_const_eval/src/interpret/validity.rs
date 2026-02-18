@@ -18,14 +18,13 @@ use rustc_abi::{
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
-use rustc_middle::bug;
+use rustc_middle::{bug, err_inval};
 use rustc_middle::mir::interpret::ValidationErrorKind::{self, *};
 use rustc_middle::mir::interpret::{
-    ExpectedKind, InterpErrorKind, InvalidMetaKind, Misalignment, PointerKind, Provenance,
-    UnsupportedOpInfo, ValidationErrorInfo, alloc_range, interp_ok,
+    ExpectedKind, InterpErrorKind, InvalidMetaKind, Misalignment, PointerKind, Provenance, ReportedErrorInfo, UnsupportedOpInfo, ValidationErrorInfo, alloc_range, interp_ok
 };
 use rustc_middle::ty::layout::{LayoutCx, TyAndLayout};
-use rustc_middle::ty::{self, Ty};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 use rustc_span::{Symbol, sym};
 use tracing::trace;
 
@@ -417,18 +416,25 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
         val: &PlaceTy<'tcx, M::Provenance>,
         expected: ExpectedKind,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::Provenance>> {
+        tracing::debug!("val: {val:#?}");
         // Not using `ecx.deref_pointer` since we want to use our `read_immediate` wrapper.
         let imm = self.read_immediate(val, expected)?;
+        tracing::debug!("im: {imm:#?}");
+
         // Reset provenance: ensure slice tail metadata does not preserve provenance,
         // and ensure all pointers do not preserve partial provenance.
         if self.reset_provenance_and_padding {
+            tracing::debug!("here 11111: {imm:#?}");
             if matches!(imm.layout.backend_repr, BackendRepr::Scalar(..)) {
+                tracing::debug!("here 22222: {imm:#?}");
                 // A thin pointer. If it has provenance, we don't have to do anything.
                 // If it does not, ensure we clear the provenance in memory.
                 if matches!(imm.to_scalar(), Scalar::Int(..)) {
+                    tracing::debug!("here 33333: {imm:#?}");
                     self.ecx.clear_provenance(val)?;
                 }
             } else {
+                tracing::debug!("here 44444: {imm:#?}");
                 // A wide pointer. This means we have to worry both about the pointer itself and the
                 // metadata. We do the lazy thing and just write back the value we got. Just
                 // clearing provenance in a targeted manner would be more efficient, but unless this
@@ -442,12 +448,24 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
         self.ecx.ref_to_mplace(&imm)
     }
 
+    // MARK
     fn check_wide_ptr_meta(
         &mut self,
         meta: MemPlaceMeta<M::Provenance>,
         pointee: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx> {
+        // Check if the pointee ty has an error, especially the region error.
+        // The later normalization will erase the lifetime infomation, in that case
+        // we'd have a good-looking ty of the kind to check the pointer.
+        // But the diverge is that the pointer kind reasoned from the typeck isn't always
+        // the same as here we erase the lifetime, if the typeck gets a region error when trying
+        // to normalize it would simply gets a {type error}, which makes the predicate evaluations
+        // always returns an `EvaluatedToOk` to cascading the error.
+        if let Some(guar) = self.ecx.tcx.dcx().has_errors() {
+            return InterpResult::from(Err(err_inval!(AlreadyReported(ReportedErrorInfo::non_const_eval_error(guar)))));
+        }
         let tail = self.ecx.tcx.struct_tail_for_codegen(pointee.ty, self.ecx.typing_env);
+        tracing::debug!("nnnn: {tail:#?}");
         match tail.kind() {
             ty::Dynamic(data, _) => {
                 let vtable = meta.unwrap_meta().to_pointer(self.ecx)?;
@@ -726,9 +744,14 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                 }
                 interp_ok(true)
             }
+            // MARK
             ty::RawPtr(..) => {
                 let place = self.deref_pointer(value, ExpectedKind::RawPtr)?;
-                if place.layout.is_unsized() {
+                tracing::debug!("place: {place:#?}");
+                let layout = place.layout;
+                tracing::debug!("layout: {layout:#?}");
+                if layout.is_unsized() {
+                    tracing::debug!("nakodesu");
                     self.check_wide_ptr_meta(place.meta(), place.layout)?;
                 }
                 interp_ok(true)

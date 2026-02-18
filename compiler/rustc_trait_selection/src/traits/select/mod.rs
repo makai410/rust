@@ -604,12 +604,30 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             None => self.check_recursion_limit(&obligation, &obligation)?,
         }
 
-        if sizedness_fast_path(self.tcx(), obligation.predicate, obligation.param_env) {
+        // let check_trait_pred_type_error = |pred: ty::Predicate<'tcx>| {
+        //     if let ty::PredicateKind::Clause(ty::ClauseKind::Trait(t)) = pred.kind().skip_binder() {
+        //         match t.self_ty().kind() {
+        //             ty::Error(_) => return true,
+        //             _ => {},
+        //         }
+        //     }
+        //     false
+        // };
+
+        // // Don't continue to evaluate if it's an error.
+        // if check_trait_pred_type_error(obligation.predicate) {
+        //     return Ok(EvaluatedToErr);
+        // }
+        
+        let result = sizedness_fast_path(self.tcx(), obligation.predicate, obligation.param_env);
+        debug!("fast path result: {result:?}");
+        if  result {
             return Ok(EvaluatedToOk);
         }
 
         ensure_sufficient_stack(|| {
             let bound_predicate = obligation.predicate.kind();
+            debug!("bound_predicate: {bound_predicate:#?}");
             match bound_predicate.skip_binder() {
                 ty::PredicateKind::Clause(ty::ClauseKind::Trait(t)) => {
                     let t = bound_predicate.rebind(t);
@@ -1008,6 +1026,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         })
     }
 
+    // SUS!!
     #[instrument(skip(self, previous_stack), level = "debug", ret)]
     fn evaluate_trait_predicate_recursively<'o>(
         &mut self,

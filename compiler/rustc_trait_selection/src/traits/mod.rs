@@ -202,7 +202,9 @@ pub fn type_known_to_meet_bound_modulo_regions<'tcx>(
     ty: Ty<'tcx>,
     def_id: DefId,
 ) -> bool {
+    debug!("gugugaga: {param_env:#?}, {ty:#?}, {def_id:#?}");
     let trait_ref = ty::TraitRef::new(infcx.tcx, def_id, [ty]);
+    debug!("traittt ref: {trait_ref:#?}");
     pred_known_to_hold_modulo_regions(infcx, param_env, trait_ref)
 }
 
@@ -219,6 +221,7 @@ fn pred_known_to_hold_modulo_regions<'tcx>(
     let obligation = Obligation::new(infcx.tcx, ObligationCause::dummy(), param_env, pred);
 
     let result = infcx.evaluate_obligation_no_overflow(&obligation);
+    debug!("eval resul::::");
     debug!(?result);
 
     if result.must_apply_modulo_regions() {

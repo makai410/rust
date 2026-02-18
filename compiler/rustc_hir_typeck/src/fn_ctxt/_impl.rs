@@ -1413,7 +1413,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// variable. This is different from `structurally_resolve_type` which errors
     /// in this case.
     #[instrument(level = "debug", skip(self, sp), ret)]
-    pub(crate) fn try_structurally_resolve_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
+    pub(crate) fn try_structurally_resolve_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> { // SUS!!!
         if self.next_trait_solver()
             && let ty::Alias(..) = ty.kind()
         {

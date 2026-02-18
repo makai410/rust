@@ -91,6 +91,7 @@ impl<'tcx> InferCtxt<'tcx> {
 
         let param_env = obligation.param_env;
 
+        tracing::debug!("dafeiji");
         if self.next_trait_solver() {
             self.probe(|snapshot| {
                 let ocx = ObligationCtxt::new(self);
@@ -111,6 +112,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 Ok(result)
             })
         } else {
+            tracing::debug!("wobudafeiji");
             let c_pred =
                 self.canonicalize_query(param_env.and(obligation.predicate), &mut _orig_values);
             self.tcx.at(obligation.cause.span).evaluate_obligation(c_pred)
@@ -130,6 +132,7 @@ impl<'tcx> InferCtxt<'tcx> {
         match self.evaluate_obligation(obligation) {
             Ok(result) => result,
             Err(OverflowError::Canonical) => {
+                tracing::debug!("errr caonical!!: {obligation:#?}");
                 let mut selcx = SelectionContext::new(self);
                 selcx.evaluate_root_obligation(obligation).unwrap_or_else(|r| match r {
                     OverflowError::Canonical => {

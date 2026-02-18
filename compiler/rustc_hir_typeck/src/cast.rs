@@ -86,6 +86,7 @@ enum PointerKind<'tcx> {
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Returns the kind of unsize information of t, or None
     /// if t is unknown.
+    // SUS!!!
     fn pointer_kind(
         &self,
         t: Ty<'tcx>,
@@ -96,12 +97,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let t = self.resolve_vars_if_possible(t);
         t.error_reported()?;
 
+        debug!("[MARKER]t: {t:#?}");
+    
         if self.type_is_sized_modulo_regions(self.param_env, t) {
+            debug!("qwq");
             return Ok(Some(PointerKind::Thin));
         }
 
         let t = self.try_structurally_resolve_type(span, t);
-
+        let t_kind = t.kind();
+        debug!("[MARKER] {t_kind:#?}");
         Ok(match *t.kind() {
             ty::Slice(_) | ty::Str => Some(PointerKind::Length),
             ty::Dynamic(tty, _) => Some(PointerKind::VTable(tty)),
@@ -1065,6 +1070,7 @@ impl<'a, 'tcx> CastCheck<'tcx> {
         Err(CastError::IllegalCast)
     }
 
+    // SUS!!!
     fn check_addr_ptr_cast(
         &self,
         fcx: &FnCtxt<'a, 'tcx>,
