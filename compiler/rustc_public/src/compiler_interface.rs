@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 
+// change from nima
 use rustc_hir::def::DefKind;
 use rustc_public_bridge::context::CompilerCtxt;
 use rustc_public_bridge::{Bridge, Tables};
