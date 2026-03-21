@@ -11,6 +11,7 @@ use rustc_public_bridge::context::CompilerCtxt;
 use rustc_public_bridge::{Bridge, Tables};
 use tracing::debug;
 
+// both inside and outside
 use crate::abi::{FnAbi, Layout, LayoutShape, ReprOptions};
 use crate::crate_def::Attribute;
 use crate::mir::alloc::{AllocId, GlobalAlloc};
