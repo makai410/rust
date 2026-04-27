@@ -522,14 +522,14 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
     #[instrument(level = "trace", skip(self), ret)]
     fn insert_constant(&mut self, value: Const<'tcx>) -> VnIndex {
-        if is_deterministic(value) {
+        if is_deterministic(value, self.tcx, self.typing_env()) {
             // The constant is deterministic, no need to disambiguate.
             let constant = Value::Constant { value, disambiguator: None };
-            self.insert(value.ty(), constant)
+            self.insert(value.ty(self.tcx, self.typing_env()), constant)
         } else {
             // Multiple mentions of this constant will yield different values,
             // so assign a different `disambiguator` to ensure they do not get the same `VnIndex`.
-            self.insert_unique(value.ty(), |disambiguator| Value::Constant {
+            self.insert_unique(value.ty(self.tcx, self.typing_env()), |disambiguator| Value::Constant {
                 value,
                 disambiguator: Some(disambiguator),
             })
@@ -557,14 +557,14 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
     fn insert_bool(&mut self, flag: bool) -> VnIndex {
         // Booleans are deterministic.
         let value = Const::from_bool(self.tcx, flag);
-        debug_assert!(is_deterministic(value));
+        debug_assert!(is_deterministic(value, self.tcx, self.typing_env()));
         self.insert(self.tcx.types.bool, Value::Constant { value, disambiguator: None })
     }
 
     fn insert_scalar(&mut self, ty: Ty<'tcx>, scalar: Scalar) -> VnIndex {
         // Scalars are deterministic.
         let value = Const::from_scalar(self.tcx, scalar, ty);
-        debug_assert!(is_deterministic(value));
+        debug_assert!(is_deterministic(value, self.tcx, self.typing_env()));
         self.insert(ty, Value::Constant { value, disambiguator: None })
     }
 
@@ -1106,7 +1106,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 bug!("forbidden in runtime MIR: {rvalue:?}")
             }
         };
-        let ty = rvalue.ty(self.local_decls, self.tcx);
+        let ty = rvalue.ty(self.local_decls, self.tcx, self.typing_env());
         Some(self.insert(ty, value))
     }
 
@@ -1183,7 +1183,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         location: Location,
     ) -> Option<VnIndex> {
         let tcx = self.tcx;
-        let ty = rvalue.ty(self.local_decls, tcx);
+        let ty = rvalue.ty(self.local_decls, tcx, self.typing_env());
 
         let Rvalue::Aggregate(box ref kind, ref mut field_ops) = *rvalue else { bug!() };
 
@@ -1207,7 +1207,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
         let fields = self.arena.alloc_from_iter(field_ops.iter_mut().map(|op| {
             self.simplify_operand(op, location)
-                .unwrap_or_else(|| self.new_opaque(op.ty(self.local_decls, self.tcx)))
+                .unwrap_or_else(|| self.new_opaque(op.ty(self.local_decls, self.tcx, self.typing_env())))
         }));
 
         let variant_index = match *kind {
@@ -1311,7 +1311,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                         && let Some(to) = self.ty(arg_index).builtin_deref(true)
                         && let ty::Slice(..) = to.kind() =>
                     {
-                        return Some(self.insert_constant(Const::Ty(self.tcx.types.usize, *len)));
+                        return Some(self.insert_constant(Const::Ty(*len)));
                     }
 
                     // `&mut *p`, `&raw *p`, etc don't change metadata.
@@ -1351,7 +1351,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             ) if let ty::Slice(..) = arg_ty.builtin_deref(true).unwrap().kind()
                 && let ty::Array(_, len) = self.ty(inner).builtin_deref(true).unwrap().kind() =>
             {
-                return Some(self.insert_constant(Const::Ty(self.tcx.types.usize, *len)));
+                return Some(self.insert_constant(Const::Ty(*len)));
             }
             _ => Value::UnaryOp(op, arg_index),
         };
@@ -1775,9 +1775,9 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 /// This returns `false` for constants that synthesize new `AllocId` when they are instantiated.
 /// It is `true` for anything else, since a given `AllocId` *does* have a unique runtime value
 /// within the scope of a single MIR body.
-fn is_deterministic(c: Const<'_>) -> bool {
+fn is_deterministic<'tcx>(c: Const<'tcx>, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> bool {
     // Primitive types cannot contain provenance and always have the same value.
-    if c.ty().is_primitive() {
+    if c.ty(tcx, typing_env).is_primitive() {
         return true;
     }
 
@@ -2035,7 +2035,7 @@ impl<'tcx> MutVisitor<'tcx> for VnState<'_, '_, 'tcx> {
 
         if let Some(local) = lhs.as_local()
             && self.ssa.is_ssa(local)
-            && let rvalue_ty = rvalue.ty(self.local_decls, self.tcx)
+            && let rvalue_ty = rvalue.ty(self.local_decls, self.tcx, self.typing_env())
             // FIXME(#112651) `rvalue` may have a subtype to `local`. We can only mark
             // `local` as reusable if we have an exact type match.
             && self.local_decls[local].ty == rvalue_ty

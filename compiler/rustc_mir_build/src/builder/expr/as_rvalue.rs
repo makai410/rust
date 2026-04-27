@@ -443,6 +443,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         lhs: Operand<'tcx>,
         rhs: Operand<'tcx>,
     ) -> BlockAnd<Rvalue<'tcx>> {
+        let typing_env = ty::TypingEnv::fully_monomorphized();
         let source_info = self.source_info(span);
         let bool_ty = self.tcx.types.bool;
         let rvalue = match op {
@@ -479,7 +480,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // so this cast can never make us miss an overflow.
                 let (lhs_size, _) = ty.int_size_and_signed(self.tcx);
                 assert!(lhs_size.bits() <= 128);
-                let rhs_ty = rhs.ty(&self.local_decls, self.tcx);
+                let rhs_ty = rhs.ty(&self.local_decls, self.tcx, typing_env);
                 let (rhs_size, _) = rhs_ty.int_size_and_signed(self.tcx);
 
                 let (unsigned_rhs, unsigned_ty) = match rhs_ty.kind() {

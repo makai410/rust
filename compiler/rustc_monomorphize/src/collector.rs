@@ -738,7 +738,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
                 ref operand,
                 target_ty,
             ) => {
-                let source_ty = operand.ty(self.body, self.tcx);
+                let source_ty = operand.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                 // *Before* monomorphizing, record that we already handled this mention.
                 self.used_mentioned_items
                     .insert(MentionedItem::UnsizeCast { source_ty, target_ty });
@@ -764,7 +764,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
                 ref operand,
                 _,
             ) => {
-                let fn_ty = operand.ty(self.body, self.tcx);
+                let fn_ty = operand.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                 // *Before* monomorphizing, record that we already handled this mention.
                 self.used_mentioned_items.insert(MentionedItem::Fn(fn_ty));
                 let fn_ty = self.monomorphize(fn_ty);
@@ -775,7 +775,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
                 ref operand,
                 _,
             ) => {
-                let source_ty = operand.ty(self.body, self.tcx);
+                let source_ty = operand.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                 // *Before* monomorphizing, record that we already handled this mention.
                 self.used_mentioned_items.insert(MentionedItem::Closure(source_ty));
                 let source_ty = self.monomorphize(source_ty);
@@ -805,7 +805,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
 
     /// This does not walk the MIR of the constant as that is not needed for codegen, all we need is
     /// to ensure that the constant evaluates successfully and walk the result.
-    #[instrument(skip(self), level = "debug")]
+    // #[instrument(skip(self), level = "debug")]
     fn visit_const_operand(&mut self, constant: &mir::ConstOperand<'tcx>, _location: Location) {
         // No `super_constant` as we don't care about `visit_ty`/`visit_ty_const`.
         let Some(val) = self.eval_constant(constant) else { return };
@@ -815,6 +815,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
     fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
         debug!("visiting terminator {:?} @ {:?}", terminator, location);
         let source = self.body.source_info(location).span;
+        let typing_env = ty::TypingEnv::fully_monomorphized();
 
         let tcx = self.tcx;
         let push_mono_lang_item = |this: &mut Self, lang_item: LangItem| {
@@ -827,7 +828,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
         match terminator.kind {
             mir::TerminatorKind::Call { ref func, .. }
             | mir::TerminatorKind::TailCall { ref func, .. } => {
-                let callee_ty = func.ty(self.body, tcx);
+                let callee_ty = func.ty(self.body, tcx, self.body.typing_env(tcx));
                 // *Before* monomorphizing, record that we already handled this mention.
                 self.used_mentioned_items.insert(MentionedItem::Fn(callee_ty));
                 let callee_ty = self.monomorphize(callee_ty);
@@ -872,7 +873,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirUsedCollector<'a, 'tcx> {
                 for op in operands {
                     match *op {
                         mir::InlineAsmOperand::SymFn { ref value } => {
-                            let fn_ty = value.const_.ty();
+                            let fn_ty = value.const_.ty(self.tcx, typing_env);
                             // *Before* monomorphizing, record that we already handled this mention.
                             self.used_mentioned_items.insert(MentionedItem::Fn(fn_ty));
                             let fn_ty = self.monomorphize(fn_ty);
@@ -1676,7 +1677,7 @@ impl<'v> RootCollector<'_, 'v> {
 
     /// If `def_id` represents a root, pushes it onto the list of
     /// outputs. (Note that all roots must be monomorphic.)
-    #[instrument(skip(self), level = "debug")]
+    // #[instrument(skip(self), level = "debug")]
     fn push_if_root(&mut self, def_id: LocalDefId) {
         if self.is_root(def_id) {
             debug!("found root");

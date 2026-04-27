@@ -241,7 +241,7 @@ fn check_callees_abi<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, body: &m
         match terminator.kind {
             mir::TerminatorKind::Call { ref func, ref fn_span, .. }
             | mir::TerminatorKind::TailCall { ref func, ref fn_span, .. } => {
-                let callee_ty = func.ty(body, tcx);
+                let callee_ty = func.ty(body, tcx, body.typing_env(tcx));
                 let callee_ty = instance.instantiate_mir_and_normalize_erasing_regions(
                     tcx,
                     ty::TypingEnv::fully_monomorphized(),

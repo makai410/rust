@@ -844,10 +844,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         &self,
         constant: ConstOperand<'tcx>,
     ) -> Result<(ty::ValTree<'tcx>, Ty<'tcx>), interpret::ErrorHandled> {
-        assert!(!constant.const_.ty().has_param());
+        assert!(!constant.const_.ty(self.tcx, self.typing_env()).has_param());
         let (uv, ty) = match constant.const_ {
             mir::Const::Unevaluated(uv, ty) => (uv.shrink(), ty),
-            mir::Const::Ty(_, c) => match c.kind() {
+            mir::Const::Ty(c) => match c.kind() {
                 // A constant that came from a const generic but was then used as an argument to
                 // old-style simd_shuffle (passing as argument instead of as a generic param).
                 ty::ConstKind::Value(cv) => return Ok((cv.valtree, cv.ty)),
@@ -899,7 +899,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     span: self.thir[value].span,
                     user_ty: None,
                     const_: Const::Ty(
-                        self.thir[value].ty,
                         ty::Const::new_value(
                             self.tcx,
                             ValTree::from_branches(

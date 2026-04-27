@@ -351,7 +351,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
             let r = r.clone()?;
             // We need the type of the LHS. We cannot use `place_layout` as that is the type
             // of the result, which for checked binops is not the same!
-            let left_ty = left.ty(self.local_decls(), self.tcx);
+            let left_ty = left.ty(self.local_decls(), self.tcx, self.typing_env);
             let left_size = self.ecx.layout_of(left_ty).ok()?.size;
             let right_size = r.layout.size;
             let r_bits = r.to_scalar().to_bits(right_size).discard_err();
@@ -454,7 +454,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
         if rvalue.has_param() {
             return None;
         }
-        if !rvalue.ty(self.local_decls(), self.tcx).is_sized(self.tcx, self.typing_env) {
+        if !rvalue.ty(self.local_decls(), self.tcx, self.typing_env).is_sized(self.tcx, self.typing_env) {
             // the interpreter doesn't support unsized locals (only unsized arguments),
             // but rustc does (in a kinda broken way), so we have to skip them here
             return None;

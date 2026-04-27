@@ -1772,7 +1772,7 @@ fn suggest_ampmut<'tcx>(
                 && let TerminatorKind::Call {
                     func: Operand::Constant(box const_operand), args, ..
                 } = &call.kind
-                && let ty::FnDef(method_def_id, method_args) = *const_operand.ty().kind()
+                && let ty::FnDef(method_def_id, method_args) = *const_operand.ty(infcx.tcx, infcx.typing_env(infcx.param_env)).kind()
                 && let Some(trait_) = tcx.trait_of_assoc(method_def_id)
                 && tcx.is_lang_item(trait_, hir::LangItem::Index)
             {

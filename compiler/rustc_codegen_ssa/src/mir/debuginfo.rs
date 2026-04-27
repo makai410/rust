@@ -578,7 +578,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     mir::VarDebugInfoContents::Place(place) => {
                         self.monomorphized_place_ty(place.as_ref())
                     }
-                    mir::VarDebugInfoContents::Const(c) => self.monomorphize(c.ty()),
+                    mir::VarDebugInfoContents::Const(c) => self.monomorphize(c.ty(bx.tcx(), bx.typing_env())),
                 }
             };
 

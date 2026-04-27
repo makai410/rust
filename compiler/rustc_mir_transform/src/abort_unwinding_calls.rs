@@ -60,6 +60,7 @@ impl<'tcx> crate::MirPass<'tcx> for AbortUnwindingCalls {
         };
         let body_can_unwind = layout::fn_can_unwind(tcx, Some(def_id), body_abi);
 
+        let typing_env = body.typing_env(tcx);
         // Look in this function body for any basic blocks which are terminated
         // with a function call, and whose function we're calling may unwind.
         // This will filter to functions with `extern "C-unwind"` ABIs, for
@@ -88,7 +89,7 @@ impl<'tcx> crate::MirPass<'tcx> for AbortUnwindingCalls {
 
             let call_can_unwind = match &terminator.kind {
                 TerminatorKind::Call { func, .. } => {
-                    let ty = func.ty(&body.local_decls, tcx);
+                    let ty = func.ty(&body.local_decls, tcx, typing_env);
                     let sig = ty.fn_sig(tcx);
                     let fn_def_id = match ty.kind() {
                         ty::FnPtr(..) => None,

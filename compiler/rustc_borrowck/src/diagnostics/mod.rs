@@ -264,7 +264,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             args,
             ..
         } = &terminator.kind
-            && let ty::FnDef(id, _) = *const_.ty().kind()
+            && let ty::FnDef(id, _) = *const_.ty(self.infcx.tcx, self.infcx.typing_env(self.infcx.param_env)).kind()
         {
             debug!("add_moved_or_invoked_closure_note: id={:?}", id);
             if self.infcx.tcx.is_lang_item(self.infcx.tcx.parent(id), LangItem::FnOnce) {
@@ -584,7 +584,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                     }) = &bbd.terminator
                     {
                         if let Some(source) =
-                            BorrowedContentSource::from_call(func.ty(self.body, tcx), tcx)
+                            BorrowedContentSource::from_call(func.ty(self.body, tcx, self.body.typing_env(tcx)), tcx)
                         {
                             return source;
                         }

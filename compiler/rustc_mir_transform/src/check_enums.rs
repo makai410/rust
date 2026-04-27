@@ -180,7 +180,7 @@ impl<'a, 'tcx> Visitor<'tcx> for EnumFinder<'a, 'tcx> {
             };
             let Ok(op_layout) = self
                 .tcx
-                .layout_of(self.typing_env.as_query_input(op.ty(self.local_decls, self.tcx)))
+                .layout_of(self.typing_env.as_query_input(op.ty(self.local_decls, self.tcx, self.typing_env)))
             else {
                 return;
             };

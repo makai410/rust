@@ -34,7 +34,7 @@ fn check_inline_always_target_features<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx
         let terminator = bb.terminator();
         match &terminator.kind {
             TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => {
-                let fn_ty = func.ty(body, tcx);
+                let fn_ty = func.ty(body, tcx, body.typing_env(tcx));
                 let ty::FnDef(callee_def_id, _) = *fn_ty.kind() else {
                     continue;
                 };

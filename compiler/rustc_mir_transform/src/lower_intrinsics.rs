@@ -12,11 +12,12 @@ pub(super) struct LowerIntrinsics;
 impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let local_decls = &body.local_decls;
+        let typing_env = body.typing_env(tcx);
         for block in body.basic_blocks.as_mut() {
             let terminator = block.terminator.as_mut().unwrap();
             if let TerminatorKind::Call { func, args, destination, target, .. } =
                 &mut terminator.kind
-                && let ty::FnDef(def_id, generic_args) = *func.ty(local_decls, tcx).kind()
+                && let ty::FnDef(def_id, generic_args) = *func.ty(local_decls, tcx, typing_env).kind()
                 && let Some(intrinsic) = tcx.intrinsic(def_id)
             {
                 match intrinsic.name {

@@ -118,7 +118,7 @@ impl<'tcx, 'a> SimplifyMatch<'tcx, 'a> {
     ) -> Option<StatementKind<'tcx>> {
         // FIXME: extend to any case.
         let (first_case, first_const, mut others) = split_first_case(consts, otherwise);
-        if !first_const.ty().is_bool() {
+        if !first_const.ty(self.tcx, self.typing_env).is_bool() {
             return None;
         }
         let first_bool = first_const.const_.try_eval_bool(self.tcx, self.typing_env)?;
@@ -188,7 +188,7 @@ impl<'tcx, 'a> SimplifyMatch<'tcx, 'a> {
         consts: &[(u128, &ConstOperand<'tcx>)],
     ) -> Option<StatementKind<'tcx>> {
         let (_, first_const) = consts[0];
-        if !first_const.ty().is_integral() {
+        if !first_const.ty(self.tcx, self.typing_env).is_integral() {
             return None;
         }
         let discr_layout =
@@ -198,13 +198,13 @@ impl<'tcx, 'a> SimplifyMatch<'tcx, 'a> {
             else {
                 return false;
             };
-            can_cast(self.tcx, case, discr_layout, const_.ty(), scalar_int)
+            can_cast(self.tcx, case, discr_layout, const_.ty(self.tcx, self.typing_env), scalar_int)
         }) {
             let operand = Operand::Copy(Place::from(self.discr_local()));
-            let rval = if first_const.ty() == self.discr_ty {
+            let rval = if first_const.ty(self.tcx, self.typing_env) == self.discr_ty {
                 Rvalue::Use(operand)
             } else {
-                Rvalue::Cast(CastKind::IntToInt, operand, first_const.ty())
+                Rvalue::Cast(CastKind::IntToInt, operand, first_const.ty(self.tcx, self.typing_env))
             };
             Some(StatementKind::Assign(Box::new((dest, rval))))
         } else {
@@ -380,7 +380,7 @@ fn simplify_match<'tcx>(
         switch_bb,
         discr,
         discr_local: None,
-        discr_ty: discr.ty(body.local_decls(), tcx),
+        discr_ty: discr.ty(body.local_decls(), tcx, body.typing_env(tcx)),
     };
     let reachable_cases: Vec<_> =
         targets.iter().filter(|&(_, bb)| !body.basic_blocks[bb].is_empty_unreachable()).collect();

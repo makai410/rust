@@ -225,7 +225,7 @@ where
     F: FnMut(Local) -> bool,
 {
     match rvalue {
-        Rvalue::ThreadLocalRef(_) => Q::in_any_value_of_ty(cx, rvalue.ty(cx.body, cx.tcx)),
+        Rvalue::ThreadLocalRef(_) => Q::in_any_value_of_ty(cx, rvalue.ty(cx.body, cx.tcx, cx.body.typing_env(cx.tcx))),
 
         Rvalue::Discriminant(place) => in_place::<Q, _>(cx, in_local, place.as_ref()),
 
@@ -265,7 +265,7 @@ where
                 // we fall back to checking the qualif for *any* value
                 // of the ADT.
                 if def.is_union() || !Q::is_structural_in_adt_value(cx, def) {
-                    return Q::in_any_value_of_ty(cx, rvalue.ty(cx.body, cx.tcx));
+                    return Q::in_any_value_of_ty(cx, rvalue.ty(cx.body, cx.tcx, cx.body.typing_env(cx.tcx)));
                 }
             }
 
@@ -339,7 +339,7 @@ where
 
     // Check the qualifs of the value of `const` items.
     let uneval = match constant.const_ {
-        Const::Ty(_, ct) => match ct.kind() {
+        Const::Ty(ct) => match ct.kind() {
             ty::ConstKind::Param(_) | ty::ConstKind::Error(_) => None,
             // Unevaluated consts in MIR bodies don't have associated MIR (e.g. `type const`).
             ty::ConstKind::Unevaluated(_) => None,
@@ -376,5 +376,5 @@ where
     }
 
     // Otherwise use the qualifs of the type.
-    Q::in_any_value_of_ty(cx, constant.const_.ty())
+    Q::in_any_value_of_ty(cx, constant.const_.ty(cx.tcx, cx.typing_env))
 }

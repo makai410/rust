@@ -16,7 +16,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         constant: &mir::ConstOperand<'tcx>,
     ) -> OperandRef<'tcx, Bx::Value> {
         let val = self.eval_mir_constant(constant);
-        let ty = self.monomorphize(constant.ty());
+        let ty = self.monomorphize(constant.ty(bx.tcx(), bx.typing_env()));
         OperandRef::from_const(bx, val, ty)
     }
 
@@ -40,7 +40,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     ) -> Result<Result<ty::ValTree<'tcx>, Ty<'tcx>>, ErrorHandled> {
         let uv = match self.monomorphize(constant.const_) {
             mir::Const::Unevaluated(uv, _) => uv.shrink(),
-            mir::Const::Ty(_, c) => match c.kind() {
+            mir::Const::Ty(c) => match c.kind() {
                 // A constant that came from a const generic but was then used as an argument to
                 // old-style simd_shuffle (passing as argument instead of as a generic param).
                 ty::ConstKind::Value(cv) => return Ok(Ok(cv.valtree)),
@@ -66,7 +66,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         bx: &Bx,
         constant: &mir::ConstOperand<'tcx>,
     ) -> (Bx::Value, Ty<'tcx>) {
-        let ty = self.monomorphize(constant.ty());
+        let ty = self.monomorphize(constant.ty(bx.tcx(), bx.typing_env()));
         assert!(ty.is_simd());
         let field_ty = ty.simd_size_and_type(bx.tcx()).1;
 

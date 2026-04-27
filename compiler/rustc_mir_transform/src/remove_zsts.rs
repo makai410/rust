@@ -111,7 +111,7 @@ impl<'tcx> MutVisitor<'tcx> for Replacer<'_, 'tcx> {
         if let Operand::Constant(_) = operand {
             return;
         }
-        let op_ty = operand.ty(self.local_decls, self.tcx);
+        let op_ty = operand.ty(self.local_decls, self.tcx, self.typing_env);
         if self.known_to_be_zst(op_ty) {
             *operand = Operand::Constant(Box::new(self.make_zst(op_ty)))
         }

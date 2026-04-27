@@ -646,7 +646,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             Rvalue::Cast(_, _, _) => {}
 
             Rvalue::UnaryOp(op, operand) => {
-                let ty = operand.ty(self.body, self.tcx);
+                let ty = operand.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                 match op {
                     UnOp::Not | UnOp::Neg => {
                         if is_int_bool_float_or_char(ty) {
@@ -666,8 +666,8 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             }
 
             Rvalue::BinaryOp(op, box (lhs, rhs)) => {
-                let lhs_ty = lhs.ty(self.body, self.tcx);
-                let rhs_ty = rhs.ty(self.body, self.tcx);
+                let lhs_ty = lhs.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
+                let rhs_ty = rhs.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
 
                 if is_int_bool_float_or_char(lhs_ty) && is_int_bool_float_or_char(rhs_ty) {
                     // Int, bool, float, and char operations are fine.
@@ -751,7 +751,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
                 let ConstCx { tcx, body, .. } = *self.ccx;
 
-                let fn_ty = func.ty(body, tcx);
+                let fn_ty = func.ty(body, tcx, self.body.typing_env(self.tcx));
 
                 let (callee, fn_args) = match *fn_ty.kind() {
                     ty::FnDef(def_id, fn_args) => (def_id, fn_args),
@@ -825,7 +825,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
                 // const-eval of the `begin_panic` fn assumes the argument is `&str`
                 if tcx.is_lang_item(callee, LangItem::BeginPanic) {
-                    match args[0].node.ty(&self.ccx.body.local_decls, tcx).kind() {
+                    match args[0].node.ty(&self.ccx.body.local_decls, tcx, self.ccx.body.typing_env(tcx)).kind() {
                         ty::Ref(_, ty, _) if ty.is_str() => {}
                         _ => self.check_op(ops::PanicNonStr),
                     }
@@ -836,7 +836,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 // const-eval of `panic_display` assumes the argument is `&&str`
                 if tcx.is_lang_item(callee, LangItem::PanicDisplay) {
                     if let ty::Ref(_, ty, _) =
-                        args[0].node.ty(&self.ccx.body.local_decls, tcx).kind()
+                        args[0].node.ty(&self.ccx.body.local_decls, tcx, self.ccx.body.typing_env(tcx)).kind()
                         && let ty::Ref(_, ty, _) = ty.kind()
                         && ty.is_str()
                     {

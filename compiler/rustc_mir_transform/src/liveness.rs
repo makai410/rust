@@ -870,6 +870,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
     /// Report fully unused locals, and forget the corresponding assignments.
     fn report_fully_unused(&mut self) {
         let tcx = self.tcx;
+        let typing_env = self.typing_env;
 
         // Give a diagnostic when any of the string constants look like a naked format string that
         // would interpolate our dead local.
@@ -877,13 +878,15 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
         let mut maybe_suggest_literal_matching_name = |name: Symbol| {
             // Visiting MIR to enumerate string constants can be expensive, so cache the result.
             let string_constants_in_body = string_constants_in_body.get_or_insert_with(|| {
-                struct LiteralFinder {
+                struct LiteralFinder<'tcx> {
+                    tcx: TyCtxt<'tcx>,
+                    typing_env: ty::TypingEnv<'tcx>,
                     found: Vec<(Span, String)>,
                 }
 
-                impl<'tcx> Visitor<'tcx> for LiteralFinder {
+                impl<'tcx> Visitor<'tcx> for LiteralFinder<'tcx> {
                     fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, _: Location) {
-                        if let ty::Ref(_, ref_ty, _) = constant.ty().kind()
+                        if let ty::Ref(_, ref_ty, _) = constant.ty(self.tcx, self.typing_env).kind()
                             && ref_ty.kind() == &ty::Str
                         {
                             let rendered_constant = constant.const_.to_string();
@@ -892,7 +895,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                     }
                 }
 
-                let mut finder = LiteralFinder { found: vec![] };
+                let mut finder = LiteralFinder { tcx, typing_env, found: vec![] };
                 finder.visit_body(self.body);
                 finder.found
             });

@@ -231,7 +231,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         cleanup_kinds,
         landing_pads: IndexVec::from_elem(None, &mir.basic_blocks),
         funclets: IndexVec::from_fn_n(|_| None, mir.basic_blocks.len()),
-        cold_blocks: find_cold_blocks(tcx, mir),
+        cold_blocks: find_cold_blocks::<Bx>(cx, tcx, mir),
         locals: locals::Locals::empty(),
         debug_context,
         per_local_var_debug_info: None,
@@ -347,7 +347,7 @@ fn optimize_use_clone<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
             // These types are easily available from locals, so check that before
             // doing DefId lookups to figure out what we're actually calling.
-            let arg_ty = arg.node.ty(&mir.local_decls, tcx);
+            let arg_ty = arg.node.ty(&mir.local_decls, tcx, cx.typing_env());
 
             let ty::Ref(_region, inner_ty, mir::Mutability::Not) = *arg_ty.kind() else { continue };
 
@@ -560,7 +560,8 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     args
 }
 
-fn find_cold_blocks<'tcx>(
+fn find_cold_blocks<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+    cx: &'a Bx::CodegenCx,
     tcx: TyCtxt<'tcx>,
     mir: &mir::Body<'tcx>,
 ) -> IndexVec<mir::BasicBlock, bool> {
@@ -577,7 +578,7 @@ fn find_cold_blocks<'tcx>(
             // If a BB ends with a call to a cold function, mark it as cold.
             mir::TerminatorKind::Call { ref func, .. }
             | mir::TerminatorKind::TailCall { ref func, .. }
-                if let ty::FnDef(def_id, ..) = *func.ty(local_decls, tcx).kind()
+                if let ty::FnDef(def_id, ..) = *func.ty(local_decls, tcx, cx.typing_env()).kind()
                     && let attrs = tcx.codegen_fn_attrs(def_id)
                     && attrs.flags.contains(CodegenFnAttrFlags::COLD) =>
             {

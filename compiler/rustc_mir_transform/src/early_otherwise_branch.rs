@@ -118,7 +118,7 @@ impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
             };
             // Always correct since we can only switch on `Copy` types
             let parent_op = parent_op.to_copy();
-            let parent_ty = parent_op.ty(body.local_decls(), tcx);
+            let parent_ty = parent_op.ty(body.local_decls(), tcx, body.typing_env(tcx));
             let statements_before = bbs[parent].statements.len();
             let parent_end = Location { block: parent, statement_index: statements_before };
 
@@ -225,7 +225,7 @@ fn evaluate_candidate<'tcx>(
     else {
         return None;
     };
-    let parent_ty = parent_discr.ty(body.local_decls(), tcx);
+    let parent_ty = parent_discr.ty(body.local_decls(), tcx, body.typing_env(tcx));
     let (_, child) = targets.iter().next()?;
 
     let Terminator {
@@ -235,7 +235,7 @@ fn evaluate_candidate<'tcx>(
     else {
         return None;
     };
-    let child_ty = child_discr.ty(body.local_decls(), tcx);
+    let child_ty = child_discr.ty(body.local_decls(), tcx, body.typing_env(tcx));
     if child_ty != parent_ty {
         return None;
     }

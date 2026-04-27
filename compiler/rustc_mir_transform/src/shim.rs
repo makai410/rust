@@ -298,6 +298,7 @@ fn local_decls_for_sig<'tcx>(
 
 fn dropee_emit_retag<'tcx>(
     tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     body: &mut Body<'tcx>,
     mut dropee_ptr: Place<'tcx>,
     span: Span,
@@ -317,7 +318,7 @@ fn dropee_emit_retag<'tcx>(
             BorrowKind::Mut { kind: MutBorrowKind::Default },
             tcx.mk_place_deref(dropee_ptr),
         );
-        let ref_ty = reborrow.ty(body.local_decls(), tcx);
+        let ref_ty = reborrow.ty(body.local_decls(), tcx, typing_env);
         dropee_ptr = body.local_decls.push(LocalDecl::new(ref_ty, span)).into();
         let new_statements = [
             StatementKind::Assign(Box::new((dropee_ptr, reborrow))),
@@ -358,9 +359,10 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
     let mut body =
         new_body(source, blocks, local_decls_for_sig(&sig, span), sig.inputs().len(), span);
 
+    let typing_env = ty::TypingEnv::post_analysis(tcx, def_id);
     // The first argument (index 0), but add 1 for the return value.
     let dropee_ptr = Place::from(Local::new(1 + 0));
-    let dropee_ptr = dropee_emit_retag(tcx, &mut body, dropee_ptr, span);
+    let dropee_ptr = dropee_emit_retag(tcx, typing_env, &mut body, dropee_ptr, span);
 
     if ty.is_some() {
         let patch = {

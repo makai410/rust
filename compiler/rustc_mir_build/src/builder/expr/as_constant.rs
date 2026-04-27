@@ -7,7 +7,7 @@ use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::{
-    self, CanonicalUserType, CanonicalUserTypeAnnotation, LitToConstInput, Ty, TyCtxt,
+    self, CanonicalUserType, CanonicalUserTypeAnnotation, LitToConstInput, TyCtxt,
     TypeVisitableExt as _, UserTypeAnnotationIndex,
 };
 use rustc_middle::{bug, mir, span_bug};
@@ -75,7 +75,7 @@ pub(crate) fn as_constant_inner<'tcx>(
                 let uneval = ty::UnevaluatedConst::new(def_id, args);
                 let ct = ty::Const::new_unevaluated(tcx, uneval);
 
-                let const_ = Const::Ty(ty, ct);
+                let const_ = Const::Ty(ct);
                 return ConstOperand { span, user_ty, const_ };
             }
 
@@ -86,7 +86,7 @@ pub(crate) fn as_constant_inner<'tcx>(
         }
         ExprKind::ConstParam { param, def_id: _ } => {
             let const_param = ty::Const::new_param(tcx, param);
-            let const_ = Const::Ty(expr.ty, const_param);
+            let const_ = Const::Ty(const_param);
 
             ConstOperand { user_ty: None, span, const_ }
         }
@@ -113,7 +113,7 @@ fn lit_to_mir_constant<'tcx>(tcx: TyCtxt<'tcx>, lit_input: LitToConstInput<'tcx>
     let ty = ty.expect("type of literal must be known at this point");
 
     if let Err(guar) = ty.error_reported() {
-        return Const::Ty(Ty::new_error(tcx, guar), ty::Const::new_error(tcx, guar));
+        return Const::Ty(ty::Const::new_error(tcx, guar));
     }
 
     let lit_ty = match *ty.kind() {
@@ -170,7 +170,7 @@ fn lit_to_mir_constant<'tcx>(tcx: TyCtxt<'tcx>, lit_input: LitToConstInput<'tcx>
         (ast::LitKind::Bool(b), ty::Bool) => ConstValue::Scalar(Scalar::from_bool(b)),
         (ast::LitKind::Char(c), ty::Char) => ConstValue::Scalar(Scalar::from_char(c)),
         (ast::LitKind::Err(guar), _) => {
-            return Const::Ty(Ty::new_error(tcx, guar), ty::Const::new_error(tcx, guar));
+            return Const::Ty(ty::Const::new_error(tcx, guar));
         }
         _ => bug!("invalid lit/ty combination in `lit_to_mir_constant`: {lit:?}: {ty:?}"),
     };

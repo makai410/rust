@@ -17,11 +17,7 @@ use crate::mir::mono::{Instance, InstanceDef, StaticDef};
 use crate::mir::{BinOp, Body, Place, UnOp};
 use crate::target::{MachineInfo, MachineSize};
 use crate::ty::{
-    AdtDef, AdtKind, Allocation, Asyncness, ClosureDef, ClosureKind, Constness, CoroutineDef,
-    Discr, FieldDef, FnDef, ForeignDef, ForeignItemKind, ForeignModule, ForeignModuleDef,
-    GenericArgs, GenericPredicates, Generics, ImplDef, ImplTrait, IntrinsicDef, LineInfo, MirConst,
-    PolyFnSig, RigidTy, Span, TraitDecl, TraitDef, TraitRef, Ty, TyConst, TyConstId, TyKind,
-    UintTy, VariantDef, VariantIdx, VtblEntry,
+    AdtDef, AdtKind, Allocation, Asyncness, ClosureDef, ClosureKind, Constness, CoroutineDef, Discr, FieldDef, FnDef, ForeignDef, ForeignItemKind, ForeignModule, ForeignModuleDef, GenericArgs, GenericPredicates, Generics, ImplDef, ImplTrait, IntrinsicDef, LineInfo, MirConst, MirConstId, PolyFnSig, RigidTy, Span, TraitDecl, TraitDef, TraitRef, Ty, TyConst, TyConstId, TyKind, UintTy, VariantDef, VariantIdx, VtblEntry
 };
 use crate::unstable::{RustcInternal, Stable, new_item_kind};
 use crate::{
@@ -873,6 +869,12 @@ impl<'tcx> CompilerInterface<'tcx> {
         let mut tables = self.tables.borrow_mut();
         let cx = &*self.cx.borrow();
         cx.vtable_entry(trait_ref.internal(&mut *tables, cx.tcx), idx).stable(&mut *tables, cx)
+    }
+
+    pub(crate) fn mir_const_ty(&self, mir_id: MirConstId) -> Ty {
+        let mut tables = self.tables.borrow_mut();
+        let cx = &*self.cx.borrow();
+        cx.mir_const_ty(tables.mir_consts[mir_id]).stable(&mut *tables, cx)
     }
 }
 

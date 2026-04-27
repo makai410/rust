@@ -159,16 +159,14 @@ pub struct TyConstId(usize, ThreadLocalIndex);
 pub struct MirConst {
     /// The constant kind.
     pub(crate) kind: ConstantKind,
-    /// The constant type.
-    pub(crate) ty: Ty,
     /// Used for internal tracking of the internal constant.
     pub id: MirConstId,
 }
 
 impl MirConst {
     /// Build a constant. Note that this should only be used by the compiler.
-    pub fn new(kind: ConstantKind, ty: Ty, id: MirConstId) -> MirConst {
-        MirConst { kind, ty, id }
+    pub fn new(kind: ConstantKind, id: MirConstId) -> MirConst {
+        MirConst { kind, id }
     }
 
     /// Retrieve the constant kind.
@@ -178,7 +176,7 @@ impl MirConst {
 
     /// Get the constant type.
     pub fn ty(&self) -> Ty {
-        self.ty
+        with(|cx| cx.mir_const_ty(self.id))
     }
 
     /// Try to evaluate to a target `usize`.

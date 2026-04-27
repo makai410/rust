@@ -75,7 +75,7 @@ fn inline_to_global_operand<'a, 'tcx, Cx: LayoutOf<'tcx, LayoutOfResult = TyAndL
             let mono_type = instance.instantiate_mir_and_normalize_erasing_regions(
                 cx.tcx(),
                 cx.typing_env(),
-                ty::EarlyBinder::bind(value.ty()),
+                ty::EarlyBinder::bind(value.ty(cx.tcx(), cx.typing_env())),
             );
 
             let string = common::asm_const_to_str(
@@ -91,7 +91,7 @@ fn inline_to_global_operand<'a, 'tcx, Cx: LayoutOf<'tcx, LayoutOfResult = TyAndL
             let mono_type = instance.instantiate_mir_and_normalize_erasing_regions(
                 cx.tcx(),
                 cx.typing_env(),
-                ty::EarlyBinder::bind(value.ty()),
+                ty::EarlyBinder::bind(value.ty(cx.tcx(), cx.typing_env())),
             );
 
             let instance = match mono_type.kind() {

@@ -622,7 +622,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 debug!(?place_ty);
                 let place_ty = self.normalize(place_ty, location);
                 debug!("place_ty normalized: {:?}", place_ty);
-                let rv_ty = rv.ty(self.body, tcx);
+                let rv_ty = rv.ty(self.body, tcx, self.body.typing_env(tcx));
                 debug!(?rv_ty);
                 let rv_ty = self.normalize(rv_ty, location);
                 debug!("normalized rv_ty: {:?}", rv_ty);
@@ -730,7 +730,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             }
 
             TerminatorKind::SwitchInt { discr, .. } => {
-                let switch_ty = discr.ty(self.body, tcx);
+                let switch_ty = discr.ty(self.body, tcx, self.body.typing_env(tcx));
                 if !switch_ty.is_integral() && !switch_ty.is_char() && !switch_ty.is_bool() {
                     span_mirbug!(self, term, "bad SwitchInt discr ty {:?}", switch_ty);
                 }
@@ -748,7 +748,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     _ => unreachable!(),
                 };
 
-                let func_ty = func.ty(self.body, tcx);
+                let func_ty = func.ty(self.body, tcx, self.body.typing_env(tcx));
                 debug!("func_ty.kind: {:?}", func_ty.kind());
 
                 let sig = match func_ty.kind() {
@@ -835,16 +835,16 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 self.check_call_inputs(term, func, &sig, args, term_location, call_source);
             }
             TerminatorKind::Assert { cond, msg, .. } => {
-                let cond_ty = cond.ty(self.body, tcx);
+                let cond_ty = cond.ty(self.body, tcx, self.body.typing_env(tcx));
                 if cond_ty != tcx.types.bool {
                     span_mirbug!(self, term, "bad Assert ({:?}, not bool", cond_ty);
                 }
 
                 if let AssertKind::BoundsCheck { len, index } = &**msg {
-                    if len.ty(self.body, tcx) != tcx.types.usize {
+                    if len.ty(self.body, tcx, self.body.typing_env(tcx)) != tcx.types.usize {
                         span_mirbug!(self, len, "bounds-check length non-usize {:?}", len)
                     }
-                    if index.ty(self.body, tcx) != tcx.types.usize {
+                    if index.ty(self.body, tcx, self.body.typing_env(tcx)) != tcx.types.usize {
                         span_mirbug!(self, index, "bounds-check index non-usize {:?}", index)
                     }
                 }
@@ -853,7 +853,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 match self.body.yield_ty() {
                     None => span_mirbug!(self, term, "yield in non-coroutine"),
                     Some(ty) => {
-                        let value_ty = value.ty(self.body, tcx);
+                        let value_ty = value.ty(self.body, tcx, self.body.typing_env(tcx));
                         if let Err(terr) = self.sub_types(
                             value_ty,
                             ty,
@@ -958,7 +958,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
         }
     }
 
-    #[instrument(skip(self), level = "debug")]
+    // #[instrument(skip(self), level = "debug")]
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
         self.super_rvalue(rvalue, location);
         let tcx = self.tcx();
@@ -967,7 +967,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             Rvalue::Aggregate(ak, ops) => self.check_aggregate_rvalue(rvalue, ak, ops, location),
 
             Rvalue::Repeat(operand, len) => {
-                let array_ty = rvalue.ty(self.body.local_decls(), tcx);
+                let array_ty = rvalue.ty(self.body.local_decls(), tcx, self.body.typing_env(tcx));
                 self.prove_predicate(
                     ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(array_ty.into())),
                     Locations::Single(location),
@@ -1010,7 +1010,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         coercion_source,
                     ) => {
                         let is_implicit_coercion = coercion_source == CoercionSource::Implicit;
-                        let src_ty = op.ty(self.body, tcx);
+                        let src_ty = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let mut src_sig = src_ty.fn_sig(tcx);
                         if let ty::FnDef(def_id, _) = *src_ty.kind()
                             && let ty::FnPtr(_, target_hdr) = *ty.kind()
@@ -1132,7 +1132,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         PointerCoercion::ClosureFnPointer(safety),
                         coercion_source,
                     ) => {
-                        let sig = match op.ty(self.body, tcx).kind() {
+                        let sig = match op.ty(self.body, tcx, self.body.typing_env(tcx)).kind() {
                             ty::Closure(_, args) => args.as_closure().sig(),
                             _ => bug!(),
                         };
@@ -1165,7 +1165,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         PointerCoercion::UnsafeFnPointer,
                         coercion_source,
                     ) => {
-                        let fn_sig = op.ty(self.body, tcx).fn_sig(tcx);
+                        let fn_sig = op.ty(self.body, tcx, self.body.typing_env(tcx)).fn_sig(tcx);
 
                         // The type that we see in the fcx is like
                         // `foo::<'a, 'b>`, where `foo` is the path to a
@@ -1203,7 +1203,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         let trait_ref = ty::TraitRef::new(
                             tcx,
                             tcx.require_lang_item(LangItem::CoerceUnsized, span),
-                            [op.ty(self.body, tcx), ty],
+                            [op.ty(self.body, tcx, self.body.typing_env(tcx)), ty],
                         );
 
                         let is_implicit_coercion = coercion_source == CoercionSource::Implicit;
@@ -1226,7 +1226,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         coercion_source,
                     ) => {
                         let ty::RawPtr(ty_from, hir::Mutability::Mut) =
-                            op.ty(self.body, tcx).kind()
+                            op.ty(self.body, tcx, self.body.typing_env(tcx)).kind()
                         else {
                             span_mirbug!(self, rvalue, "unexpected base type for cast {:?}", ty,);
                             return;
@@ -1258,7 +1258,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     }
 
                     CastKind::PointerCoercion(PointerCoercion::ArrayToPointer, coercion_source) => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
 
                         let opt_ty_elem_mut = match ty_from.kind() {
                             ty::RawPtr(array_ty, array_mut) => match array_ty.kind() {
@@ -1325,7 +1325,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     }
 
                     CastKind::PointerExposeProvenance => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let cast_ty_from = CastTy::from_ty(ty_from);
                         let cast_ty_to = CastTy::from_ty(*ty);
                         match (cast_ty_from, cast_ty_to) {
@@ -1343,7 +1343,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     }
 
                     CastKind::PointerWithExposedProvenance => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let cast_ty_from = CastTy::from_ty(ty_from);
                         let cast_ty_to = CastTy::from_ty(*ty);
                         match (cast_ty_from, cast_ty_to) {
@@ -1360,7 +1360,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         }
                     }
                     CastKind::IntToInt => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let cast_ty_from = CastTy::from_ty(ty_from);
                         let cast_ty_to = CastTy::from_ty(*ty);
                         match (cast_ty_from, cast_ty_to) {
@@ -1377,7 +1377,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         }
                     }
                     CastKind::IntToFloat => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let cast_ty_from = CastTy::from_ty(ty_from);
                         let cast_ty_to = CastTy::from_ty(*ty);
                         match (cast_ty_from, cast_ty_to) {
@@ -1394,7 +1394,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         }
                     }
                     CastKind::FloatToInt => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let cast_ty_from = CastTy::from_ty(ty_from);
                         let cast_ty_to = CastTy::from_ty(*ty);
                         match (cast_ty_from, cast_ty_to) {
@@ -1411,7 +1411,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         }
                     }
                     CastKind::FloatToFloat => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let cast_ty_from = CastTy::from_ty(ty_from);
                         let cast_ty_to = CastTy::from_ty(*ty);
                         match (cast_ty_from, cast_ty_to) {
@@ -1428,7 +1428,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         }
                     }
                     CastKind::FnPtrToPtr => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let cast_ty_from = CastTy::from_ty(ty_from);
                         let cast_ty_to = CastTy::from_ty(*ty);
                         match (cast_ty_from, cast_ty_to) {
@@ -1445,7 +1445,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         }
                     }
                     CastKind::PtrToPtr => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         let Some(CastTy::Ptr(src)) = CastTy::from_ty(ty_from) else {
                             unreachable!();
                         };
@@ -1561,7 +1561,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         }
                     }
                     CastKind::Transmute => {
-                        let ty_from = op.ty(self.body, tcx);
+                        let ty_from = op.ty(self.body, tcx, self.body.typing_env(tcx));
                         match ty_from.kind() {
                             ty::Pat(base, _) if base == ty => {}
                             _ => span_mirbug!(
@@ -1585,11 +1585,11 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
                 box (left, right),
             ) => {
-                let ty_left = left.ty(self.body, tcx);
+                let ty_left = left.ty(self.body, tcx, self.body.typing_env(tcx));
                 match ty_left.kind() {
                     // Types with regions are comparable if they have a common super-type.
                     ty::RawPtr(_, _) | ty::FnPtr(..) => {
-                        let ty_right = right.ty(self.body, tcx);
+                        let ty_right = right.ty(self.body, tcx, self.body.typing_env(tcx));
                         let common_ty =
                             self.infcx.next_ty_var(self.body.source_info(location).span);
                         self.sub_types(
@@ -1620,7 +1620,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     // For types with no regions we can just check that the
                     // both operands have the same type.
                     ty::Int(_) | ty::Uint(_) | ty::Bool | ty::Char | ty::Float(_)
-                        if ty_left == right.ty(self.body, tcx) => {}
+                        if ty_left == right.ty(self.body, tcx, self.body.typing_env(tcx)) => {}
                     // Other types are compared by trait methods, not by
                     // `Rvalue::BinaryOp`.
                     _ => span_mirbug!(
@@ -1628,13 +1628,13 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         rvalue,
                         "unexpected comparison types {:?} and {:?}",
                         ty_left,
-                        right.ty(self.body, tcx)
+                        right.ty(self.body, tcx, self.body.typing_env(tcx))
                     ),
                 }
             }
 
             Rvalue::WrapUnsafeBinder(op, ty) => {
-                let operand_ty = op.ty(self.body, self.tcx());
+                let operand_ty = op.ty(self.body, self.tcx(), self.body.typing_env(tcx));
                 let ty::UnsafeBinder(binder_ty) = *ty.kind() else {
                     unreachable!();
                 };
@@ -1662,12 +1662,12 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
+    // #[instrument(level = "debug", skip(self))]
     fn visit_operand(&mut self, op: &Operand<'tcx>, location: Location) {
         self.super_operand(op, location);
         if let Operand::Constant(constant) = op {
             let maybe_uneval = match constant.const_ {
-                Const::Val(..) | Const::Ty(_, _) => None,
+                Const::Val(..) | Const::Ty(_) => None,
                 Const::Unevaluated(uv, _) => Some(uv),
             };
 
@@ -1689,10 +1689,10 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
+    // #[instrument(level = "debug", skip(self))]
     fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, location: Location) {
         self.super_const_operand(constant, location);
-        let ty = constant.const_.ty();
+        let ty = constant.const_.ty(self.tcx(), self.infcx.typing_env(self.infcx.param_env));
 
         self.infcx.tcx.for_each_free_region(&ty, |live_region| {
             let live_region_vid = self.universal_regions.to_region_vid(live_region);
@@ -1702,7 +1702,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
         let locations = location.to_locations();
         if let Some(annotation_index) = constant.user_ty {
             if let Err(terr) = self.relate_type_and_user_type(
-                constant.const_.ty(),
+                constant.const_.ty(self.tcx(), self.infcx.typing_env(self.infcx.param_env)),
                 ty::Invariant,
                 &UserTypeProjection { base: annotation_index, projs: vec![] },
                 locations,
@@ -1714,14 +1714,14 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     constant,
                     "bad constant user type {:?} vs {:?}: {:?}",
                     annotation,
-                    constant.const_.ty(),
+                    constant.const_.ty(self.tcx(), self.infcx.typing_env(self.infcx.param_env)),
                     terr,
                 );
             }
         } else {
             let tcx = self.tcx();
             let maybe_uneval = match constant.const_ {
-                Const::Ty(_, ct) => match ct.kind() {
+                Const::Ty(ct) => match ct.kind() {
                     ty::ConstKind::Unevaluated(uv) => {
                         Some(UnevaluatedConst { def: uv.def, args: uv.args, promoted: None })
                     }
@@ -1750,7 +1750,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     };
                 } else {
                     self.ascribe_user_type(
-                        constant.const_.ty(),
+                        constant.const_.ty(self.tcx(), self.infcx.typing_env(self.infcx.param_env)),
                         ty::UserType::new(ty::UserTypeKind::TypeOf(
                             uv.def,
                             UserArgs { args: uv.args, user_self_ty: None },
@@ -1762,20 +1762,20 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 let unnormalized_ty =
                     tcx.type_of(static_def_id).instantiate_identity().skip_norm_wip();
                 let normalized_ty = self.normalize(unnormalized_ty, locations);
-                let literal_ty = constant.const_.ty().builtin_deref(true).unwrap();
+                let literal_ty = constant.const_.ty(self.tcx(), self.infcx.typing_env(self.infcx.param_env)).builtin_deref(true).unwrap();
 
                 if let Err(terr) =
                     self.eq_types(literal_ty, normalized_ty, locations, ConstraintCategory::Boring)
                 {
                     span_mirbug!(self, constant, "bad static type {:?} ({:?})", constant, terr);
                 }
-            } else if let Const::Ty(_, ct) = constant.const_
+            } else if let Const::Ty(ct) = constant.const_
                 && let ty::ConstKind::Param(p) = ct.kind()
             {
                 let body_def_id = self.universal_regions.defining_ty.def_id();
                 let const_param = tcx.generics_of(body_def_id).const_param(p, tcx);
                 self.ascribe_user_type(
-                    constant.const_.ty(),
+                    constant.const_.ty(self.tcx(), self.infcx.typing_env(self.infcx.param_env)),
                     ty::UserType::new(ty::UserTypeKind::TypeOf(
                         const_param.def_id,
                         UserArgs {
@@ -1787,7 +1787,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 );
             }
 
-            if let ty::FnDef(def_id, args) = *constant.const_.ty().kind() {
+            if let ty::FnDef(def_id, args) = *constant.const_.ty(self.tcx(), self.infcx.typing_env(self.infcx.param_env)).kind() {
                 let instantiated_predicates = tcx.predicates_of(def_id).instantiate(tcx, args);
                 self.normalize_and_prove_instantiated_predicates(
                     def_id,
@@ -1962,7 +1962,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         }
     }
 
-    #[instrument(level = "debug", skip(self, term, func, term_location, call_source))]
+    // #[instrument(level = "debug", skip(self, term, func, term_location, call_source))]
     fn check_call_inputs(
         &mut self,
         term: &Terminator<'tcx>,
@@ -1977,7 +1977,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             span_mirbug!(self, term, "call to {:?} with wrong # of args", sig);
         }
 
-        let func_ty = func.ty(self.body, self.infcx.tcx);
+        let func_ty = func.ty(self.body, self.infcx.tcx, self.body.typing_env(self.infcx.tcx));
         if let ty::FnDef(def_id, _) = *func_ty.kind() {
             // Some of the SIMD intrinsics are special: they need a particular argument to be a
             // constant. (Eventually this should use const-generics, but those are not up for the
@@ -2001,7 +2001,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         debug!(?func_ty);
 
         for (n, (fn_arg, op_arg)) in iter::zip(sig.inputs(), args).enumerate() {
-            let op_arg_ty = op_arg.node.ty(self.body, self.tcx());
+            let op_arg_ty = op_arg.node.ty(self.body, self.tcx(), self.body.typing_env(self.tcx()));
 
             let op_arg_ty = self.normalize(op_arg_ty, term_location);
             let category = if call_source.from_hir_call() {
@@ -2273,7 +2273,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                     continue;
                 }
             };
-            let operand_ty = operand.ty(self.body, tcx);
+            let operand_ty = operand.ty(self.body, tcx, self.body.typing_env(tcx));
             let operand_ty = self.normalize(operand_ty, location);
 
             if let Err(terr) = self.sub_types(

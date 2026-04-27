@@ -625,7 +625,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 err.emit_note(*self.tcx);
                 err
             })?;
-        self.const_val_to_op(const_val, val.ty(), layout)
+        self.const_val_to_op(const_val, val.ty(*self.tcx, self.typing_env), layout)
     }
 
     #[must_use]

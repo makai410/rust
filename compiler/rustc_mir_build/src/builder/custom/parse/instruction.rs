@@ -261,7 +261,7 @@ impl<'a, 'tcx> ParseCtxt<'a, 'tcx> {
             ),
             ExprKind::Cast { source } => {
                 let source = self.parse_operand(*source)?;
-                let source_ty = source.ty(self.body.local_decls(), self.tcx);
+                let source_ty = source.ty(self.body.local_decls(), self.tcx, self.typing_env);
                 let cast_kind = mir_cast_kind(source_ty, expr.ty);
                 Ok(Rvalue::Cast(cast_kind, source, expr.ty))
             },

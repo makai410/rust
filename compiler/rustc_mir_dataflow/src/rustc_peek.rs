@@ -23,20 +23,20 @@ pub fn sanity_check<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
             let flow_inits = MaybeInitializedPlaces::new(tcx, body, &move_data)
                 .iterate_to_fixpoint(tcx, body, None)
                 .into_results_cursor(body);
-            sanity_check_via_rustc_peek(tcx, flow_inits);
+            sanity_check_via_rustc_peek(tcx, body.typing_env(tcx),flow_inits);
         }
 
         if kind.contains(&RustcMirKind::PeekMaybeUninit) {
             let flow_uninits = MaybeUninitializedPlaces::new(tcx, body, &move_data)
                 .iterate_to_fixpoint(tcx, body, None)
                 .into_results_cursor(body);
-            sanity_check_via_rustc_peek(tcx, flow_uninits);
+            sanity_check_via_rustc_peek(tcx, body.typing_env(tcx), flow_uninits);
         }
 
         if kind.contains(&RustcMirKind::PeekLiveness) {
             let flow_liveness =
                 MaybeLiveLocals.iterate_to_fixpoint(tcx, body, None).into_results_cursor(body);
-            sanity_check_via_rustc_peek(tcx, flow_liveness);
+            sanity_check_via_rustc_peek(tcx, body.typing_env(tcx), flow_liveness);
         }
 
         if kind.contains(&RustcMirKind::StopAfterDataflow) {
@@ -63,7 +63,7 @@ pub fn sanity_check<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
 /// (If there are any calls to `rustc_peek` that do not match the
 /// expression form above, then that emits an error as well, but those
 /// errors are not intended to be used for unit tests.)
-fn sanity_check_via_rustc_peek<'tcx, A>(tcx: TyCtxt<'tcx>, mut cursor: ResultsCursor<'_, 'tcx, A>)
+fn sanity_check_via_rustc_peek<'tcx, A>(tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>, mut cursor: ResultsCursor<'_, 'tcx, A>)
 where
     A: RustcPeekAt<'tcx>,
 {
@@ -71,7 +71,7 @@ where
     debug!("sanity_check_via_rustc_peek def_id: {:?}", def_id);
 
     let peek_calls = cursor.body().basic_blocks.iter_enumerated().filter_map(|(bb, block_data)| {
-        PeekCall::from_terminator(tcx, block_data.terminator()).map(|call| (bb, block_data, call))
+        PeekCall::from_terminator(tcx, typing_env, block_data.terminator()).map(|call| (bb, block_data, call))
     });
 
     for (bb, block_data, call) in peek_calls {
@@ -154,6 +154,7 @@ struct PeekCall {
 impl PeekCall {
     fn from_terminator<'tcx>(
         tcx: TyCtxt<'tcx>,
+        typing_env: ty::TypingEnv<'tcx>,
         terminator: &mir::Terminator<'tcx>,
     ) -> Option<Self> {
         use mir::Operand;
@@ -161,7 +162,7 @@ impl PeekCall {
         let span = terminator.source_info.span;
         if let mir::TerminatorKind::Call { func: Operand::Constant(func), args, .. } =
             &terminator.kind
-            && let ty::FnDef(def_id, fn_args) = *func.const_.ty().kind()
+            && let ty::FnDef(def_id, fn_args) = *func.const_.ty(tcx, typing_env).kind()
         {
             if tcx.intrinsic(def_id)?.name != sym::rustc_peek {
                 return None;

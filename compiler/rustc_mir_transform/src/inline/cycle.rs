@@ -206,13 +206,13 @@ pub(crate) fn mir_inliner_callees<'tcx>(
     for bb_data in body.basic_blocks.iter() {
         let terminator = bb_data.terminator();
         if let TerminatorKind::Call { func, args: call_args, .. } = &terminator.kind {
-            let ty = func.ty(&body.local_decls, tcx);
+            let ty = func.ty(&body.local_decls, tcx, body.typing_env(tcx));
             let ty::FnDef(def_id, generic_args) = ty.kind() else {
                 continue;
             };
             let call = if tcx.is_intrinsic(*def_id, sym::const_eval_select) {
                 let func = &call_args[2].node;
-                let ty = func.ty(&body.local_decls, tcx);
+                let ty = func.ty(&body.local_decls, tcx, body.typing_env(tcx));
                 let ty::FnDef(def_id, generic_args) = ty.kind() else {
                     continue;
                 };

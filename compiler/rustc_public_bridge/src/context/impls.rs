@@ -9,7 +9,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::{Attribute, LangItem};
 use rustc_middle::mir::interpret::{AllocId, ConstAllocation, ErrorHandled, GlobalAlloc, Scalar};
 use rustc_middle::mir::{BinOp, Body, Const as MirConst, ConstValue, UnOp};
-use rustc_middle::ty::layout::{FnAbiOf, LayoutOf};
+use rustc_middle::ty::layout::{FnAbiOf, HasTypingEnv, LayoutOf};
 use rustc_middle::ty::print::{
     with_forced_trimmed_paths, with_no_trimmed_paths, with_resolve_crate_name,
 };
@@ -468,7 +468,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
             )));
         }
 
-        Ok(MirConst::Ty(ty_internal, self.const_zero_sized(ty_internal)))
+        Ok(MirConst::Ty(self.const_zero_sized(ty_internal)))
     }
 
     pub fn const_zero_sized(&self, ty_internal: Ty<'tcx>) -> ty::Const<'tcx> {
@@ -778,5 +778,9 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
     /// Returns `None` if the index is out of bounds.
     pub fn vtable_entry(&self, trait_ref: TraitRef<'tcx>, idx: usize) -> Option<VtblEntry<'tcx>> {
         self.vtable_entries(trait_ref).get(idx).copied()
+    }
+
+    pub fn mir_const_ty(&self, cnst: MirConst<'tcx>) -> Ty<'tcx> {
+        cnst.ty(self.tcx, self.typing_env())
     }
 }

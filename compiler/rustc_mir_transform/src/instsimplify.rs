@@ -134,16 +134,16 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
         };
     }
 
-    fn try_eval_bool(&self, a: &Operand<'_>) -> Option<bool> {
+    fn try_eval_bool(&self, a: &Operand<'tcx>) -> Option<bool> {
         let a = a.constant()?;
-        if a.const_.ty().is_bool() { a.const_.try_to_bool() } else { None }
+        if a.const_.ty(self.tcx, self.typing_env).is_bool() { a.const_.try_to_bool() } else { None }
     }
 
     /// Transform `&(*a)` ==> `a`.
     fn simplify_ref_deref(&self, rvalue: &mut Rvalue<'tcx>) {
         if let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = rvalue
             && let Some((base, ProjectionElem::Deref)) = place.as_ref().last_projection()
-            && rvalue.ty(self.local_decls, self.tcx) == base.ty(self.local_decls, self.tcx).ty
+            && rvalue.ty(self.local_decls, self.tcx, self.typing_env) == base.ty(self.local_decls, self.tcx).ty
         {
             *rvalue = Rvalue::Use(Operand::Copy(Place {
                 local: base.local,
@@ -155,7 +155,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
     /// Transform `Aggregate(RawPtr, [p, ()])` ==> `Cast(PtrToPtr, p)`.
     fn simplify_ptr_aggregate(&self, rvalue: &mut Rvalue<'tcx>) {
         if let Rvalue::Aggregate(box AggregateKind::RawPtr(pointee_ty, mutability), fields) = rvalue
-            && let meta_ty = fields.raw[1].ty(self.local_decls, self.tcx)
+            && let meta_ty = fields.raw[1].ty(self.local_decls, self.tcx, self.typing_env)
             && meta_ty.is_unit()
         {
             // The mutable borrows we're holding prevent printing `rvalue` here
@@ -170,7 +170,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
     fn simplify_cast(&self, rvalue: &mut Rvalue<'tcx>) {
         let Rvalue::Cast(kind, operand, cast_ty) = rvalue else { return };
 
-        let operand_ty = operand.ty(self.local_decls, self.tcx);
+        let operand_ty = operand.ty(self.local_decls, self.tcx, self.typing_env);
         if operand_ty == *cast_ty {
             *rvalue = Rvalue::Use(operand.clone());
         } else if *kind == CastKind::Transmute
@@ -194,7 +194,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
             && let Some(1) = count.try_to_target_usize(self.tcx)
         {
             *rvalue = Rvalue::Aggregate(
-                Box::new(AggregateKind::Array(operand.ty(self.local_decls, self.tcx))),
+                Box::new(AggregateKind::Array(operand.ty(self.local_decls, self.tcx, self.typing_env))),
                 [operand.clone()].into(),
             );
         }
@@ -220,7 +220,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
 
         // These types are easily available from locals, so check that before
         // doing DefId lookups to figure out what we're actually calling.
-        let arg_ty = arg.node.ty(self.local_decls, self.tcx);
+        let arg_ty = arg.node.ty(self.local_decls, self.tcx, self.typing_env);
 
         let ty::Ref(_region, inner_ty, Mutability::Not) = *arg_ty.kind() else { return };
 
@@ -328,7 +328,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
         else {
             return;
         };
-        let func_ty = func.ty(self.local_decls, self.tcx);
+        let func_ty = func.ty(self.local_decls, self.tcx, self.typing_env);
         let Some((intrinsic_name, args)) = resolve_rust_intrinsic(self.tcx, func_ty) else {
             return;
         };

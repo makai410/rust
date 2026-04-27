@@ -1101,7 +1101,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         let extra_args = &args[sig.inputs().skip_binder().len()..];
         let extra_args = bx.tcx().mk_type_list_from_iter(extra_args.iter().map(|op_arg| {
-            let op_ty = op_arg.node.ty(self.mir, bx.tcx());
+            let op_ty = op_arg.node.ty(self.mir, bx.tcx(), bx.typing_env());
             self.monomorphize(op_ty)
         }));
 
@@ -1398,13 +1398,13 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         bx.tcx(),
                         span,
                         const_value,
-                        bx.layout_of(value.ty()),
+                        bx.layout_of(value.ty(bx.tcx(), bx.typing_env())),
                     );
                     InlineAsmOperandRef::Const { string }
                 }
                 mir::InlineAsmOperand::SymFn { ref value } => {
                     let const_ = self.monomorphize(value.const_);
-                    if let ty::FnDef(def_id, args) = *const_.ty().kind() {
+                    if let ty::FnDef(def_id, args) = *const_.ty(bx.tcx(), bx.typing_env()).kind() {
                         let instance = ty::Instance::resolve_for_fn_ptr(
                             bx.tcx(),
                             bx.typing_env(),

@@ -495,7 +495,7 @@ impl<'a, 'tcx> TOFinder<'a, 'tcx> {
         }
     }
 
-    #[instrument(level = "trace", skip(self, state))]
+    // #[instrument(level = "trace", skip(self, state))]
     fn process_assign(
         &mut self,
         lhs_place: &Place<'tcx>,
@@ -534,7 +534,7 @@ impl<'a, 'tcx> TOFinder<'a, 'tcx> {
                     _ => lhs,
                 };
                 for (field_index, operand) in operands.iter_enumerated() {
-                    let operand_ty = operand.ty(self.body, self.tcx);
+                    let operand_ty = operand.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                     let field = self.map.register_place_index(
                         operand_ty,
                         lhs,
@@ -574,7 +574,7 @@ impl<'a, 'tcx> TOFinder<'a, 'tcx> {
                     BinOp::Ne => ScalarInt::FALSE,
                     _ => return,
                 };
-                if value.const_.ty().is_floating_point() {
+                if value.const_.ty(self.tcx, self.typing_env).is_floating_point() {
                     // Floating point equality does not follow bit-patterns.
                     // -0.0 and NaN both have special rules for equality,
                     // and therefore we cannot use integer comparisons for them.

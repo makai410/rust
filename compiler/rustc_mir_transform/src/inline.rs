@@ -554,7 +554,7 @@ fn resolve_callsite<'tcx, I: Inliner<'tcx>>(
 
     // FIXME(explicit_tail_calls): figure out if we can inline tail calls
     if let TerminatorKind::Call { ref func, fn_span, .. } = terminator.kind {
-        let func_ty = func.ty(caller_body, tcx);
+        let func_ty = func.ty(caller_body, tcx, inliner.typing_env());
         if let ty::FnDef(def_id, args) = *func_ty.kind() {
             if !inliner.should_inline_for_callee(def_id) {
                 debug!("not enabled");
@@ -617,7 +617,7 @@ fn try_inlining<'tcx, I: Inliner<'tcx>>(
     let TerminatorKind::Call { args, destination, .. } = &terminator.kind else { bug!() };
     let destination_ty = destination.ty(&caller_body.local_decls, tcx).ty;
     for arg in args {
-        if !arg.node.ty(&caller_body.local_decls, tcx).is_sized(tcx, inliner.typing_env()) {
+        if !arg.node.ty(&caller_body.local_decls, tcx, inliner.typing_env()).is_sized(tcx, inliner.typing_env()) {
             // We do not allow inlining functions with unsized params. Inlining these functions
             // could create unsized locals, which are unsound and being phased out.
             return Err("call has unsized argument");
@@ -659,9 +659,9 @@ fn try_inlining<'tcx, I: Inliner<'tcx>>(
             _ => bug!("Expected `rust-call` to have 1 or 2 args"),
         };
 
-        let self_arg_ty = self_arg.map(|self_arg| self_arg.node.ty(&caller_body.local_decls, tcx));
+        let self_arg_ty = self_arg.map(|self_arg| self_arg.node.ty(&caller_body.local_decls, tcx, inliner.typing_env()));
 
-        let arg_tuple_ty = arg_tuple.node.ty(&caller_body.local_decls, tcx);
+        let arg_tuple_ty = arg_tuple.node.ty(&caller_body.local_decls, tcx, inliner.typing_env());
         let arg_tys = if callee_body.spread_arg.is_some() {
             std::slice::from_ref(&arg_tuple_ty)
         } else {
@@ -684,7 +684,7 @@ fn try_inlining<'tcx, I: Inliner<'tcx>>(
     } else {
         for (arg, input) in args.iter().zip(callee_body.args_iter()) {
             let input_type = callee_body.local_decls[input].ty;
-            let arg_ty = arg.node.ty(&caller_body.local_decls, tcx);
+            let arg_ty = arg.node.ty(&caller_body.local_decls, tcx, inliner.typing_env());
             if !util::sub_types(tcx, inliner.typing_env(), input_type, arg_ty) {
                 trace!(?arg_ty, ?input_type);
                 debug!("failed to normalize argument type");
@@ -903,7 +903,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
             BorrowKind::Mut { kind: MutBorrowKind::Default },
             destination,
         );
-        let dest_ty = dest.ty(caller_body, tcx);
+        let dest_ty = dest.ty(caller_body, tcx, inliner.typing_env());
         let temp = Place::from(new_call_temp(caller_body, callsite, dest_ty, return_block));
         caller_body[callsite.block].statements.push(Statement::new(
             callsite.source_info,
@@ -1025,7 +1025,7 @@ fn inline_call<'tcx, I: Inliner<'tcx>>(
     // the actually used items. By doing this we can entirely avoid visiting the callee!
     // We need to reconstruct the `required_item` for the callee so that we can find and
     // remove it.
-    let callee_item = MentionedItem::Fn(func.ty(caller_body, tcx));
+    let callee_item = MentionedItem::Fn(func.ty(caller_body, tcx, inliner.typing_env()));
     let caller_mentioned_items = caller_body.mentioned_items.as_mut().unwrap();
     if let Some(idx) = caller_mentioned_items.iter().position(|item| item.node == callee_item) {
         // We found the callee, so remove it and add its items instead.
@@ -1134,7 +1134,7 @@ fn create_temp_if_necessary<'tcx, I: Inliner<'tcx>>(
 
     // Otherwise, create a temporary for the argument.
     trace!("creating temp for argument {:?}", arg);
-    let arg_ty = arg.ty(caller_body, inliner.tcx());
+    let arg_ty = arg.ty(caller_body, inliner.tcx(), inliner.typing_env());
     let local = new_call_temp(caller_body, callsite, arg_ty, return_block);
     caller_body[callsite.block].statements.push(Statement::new(
         callsite.source_info,

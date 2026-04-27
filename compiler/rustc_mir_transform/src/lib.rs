@@ -242,6 +242,7 @@ fn remap_mir_for_const_eval_select<'tcx>(
     mut body: Body<'tcx>,
     context: hir::Constness,
 ) -> Body<'tcx> {
+    let typing_env = body.typing_env(tcx);
     for bb in body.basic_blocks.as_mut().iter_mut() {
         let terminator = bb.terminator.as_mut().expect("invalid terminator");
         match terminator.kind {
@@ -253,13 +254,13 @@ fn remap_mir_for_const_eval_select<'tcx>(
                 unwind,
                 fn_span,
                 ..
-            } if let ty::FnDef(def_id, _) = *const_.ty().kind()
+            } if let ty::FnDef(def_id, _) = *const_.ty(tcx, typing_env).kind()
                 && tcx.is_intrinsic(def_id, sym::const_eval_select) =>
             {
                 let Ok([tupled_args, called_in_const, called_at_rt]) = take_array(args) else {
                     unreachable!()
                 };
-                let ty = tupled_args.node.ty(&body.local_decls, tcx);
+                let ty = tupled_args.node.ty(&body.local_decls, tcx, typing_env);
                 let fields = ty.tuple_fields();
                 let num_args = fields.len();
                 let func =

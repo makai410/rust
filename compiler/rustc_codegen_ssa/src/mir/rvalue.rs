@@ -616,7 +616,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             }
 
             mir::Rvalue::Discriminant(ref place) => {
-                let discr_ty = rvalue.ty(self.mir, bx.tcx());
+                let discr_ty = rvalue.ty(self.mir, bx.tcx(), bx.typing_env());
                 let discr_ty = self.monomorphize(discr_ty);
                 let operand = self.codegen_consume(bx, place.as_ref());
                 let discr = operand.codegen_get_discr(self, bx, discr_ty);
@@ -682,7 +682,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     _ => (FIRST_VARIANT, None),
                 };
 
-                let ty = rvalue.ty(self.mir, self.cx.tcx());
+                let ty = rvalue.ty(self.mir, self.cx.tcx(), self.cx.typing_env());
                 let ty = self.monomorphize(ty);
                 let layout = self.cx.layout_of(ty);
 

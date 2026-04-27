@@ -1,5 +1,5 @@
 use rustc_middle::mir::visit::MutVisitor;
-use rustc_middle::mir::*;
+use rustc_middle::{mir::*, ty};
 use rustc_middle::ty::TyCtxt;
 
 use crate::patch::MirPatch;
@@ -29,7 +29,7 @@ impl<'a, 'tcx> MutVisitor<'tcx> for SubTypeChecker<'a, 'tcx> {
             return;
         }
         let mut place_ty = place.ty(self.local_decls, self.tcx).ty;
-        let mut rval_ty = rvalue.ty(self.local_decls, self.tcx);
+        let mut rval_ty = rvalue.ty(self.local_decls, self.tcx, ty::TypingEnv::fully_monomorphized());
         // Not erasing this causes `Free Regions` errors in validator,
         // when rval is `ReStatic`.
         rval_ty = self.tcx.erase_and_anonymize_regions(rval_ty);

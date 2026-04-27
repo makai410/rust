@@ -141,7 +141,7 @@ impl<'tcx> TerminatorClassifier<'tcx> for CallRecursion<'tcx> {
         let caller = body.source.def_id();
         let typing_env = body.typing_env(tcx);
 
-        let func_ty = func.ty(body, tcx);
+        let func_ty = func.ty(body, tcx, typing_env);
         if let ty::FnDef(callee, args) = *func_ty.kind() {
             let Ok(normalized_args) =
                 tcx.try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(args))

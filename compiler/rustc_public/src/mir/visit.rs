@@ -312,8 +312,7 @@ macro_rules! make_mir_visitor {
             }
 
             fn super_mir_const(&mut self, constant: &$($mutability)? MirConst, location: Location) {
-                let MirConst { kind: _, ty, id: _ } = constant;
-                self.visit_ty(ty, location);
+                self.visit_ty(&$($mutability)? constant.ty(), location);
             }
 
             fn super_ty_const(&mut self, constant: &$($mutability)? TyConst) {

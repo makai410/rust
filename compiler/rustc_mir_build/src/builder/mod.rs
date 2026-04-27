@@ -877,16 +877,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
 
         /// Starting at a target unreachable block, find some user code to lint as unreachable
-        fn find_unreachable_code_from(
+        fn find_unreachable_code_from<'tcx>(
+            tcx: TyCtxt<'tcx>,
+            typing_env: ty::TypingEnv<'tcx>,
             bb: BasicBlock,
-            bbs: &IndexVec<BasicBlock, BasicBlockData<'_>>,
+            bbs: &IndexVec<BasicBlock, BasicBlockData<'tcx>>,
         ) -> Option<(SourceInfo, &'static str)> {
             let bb = &bbs[bb];
             for stmt in &bb.statements {
                 match &stmt.kind {
                     // Ignore the implicit `()` return place assignment for unit functions/blocks
                     StatementKind::Assign(box (_, Rvalue::Use(Operand::Constant(const_))))
-                        if const_.ty().is_unit() =>
+                        if const_.ty(tcx, typing_env).is_unit() =>
                     {
                         continue;
                     }
@@ -912,7 +914,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
 
             let Some((target_loc, descr)) =
-                find_unreachable_code_from(target_bb, &self.cfg.basic_blocks)
+                find_unreachable_code_from(self.tcx, self.typing_env(), target_bb, &self.cfg.basic_blocks)
             else {
                 continue;
             };

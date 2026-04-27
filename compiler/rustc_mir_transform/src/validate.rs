@@ -441,7 +441,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                     }
                 }
 
-                if let ty::FnDef(did, ..) = *func.ty(&self.body.local_decls, self.tcx).kind()
+                if let ty::FnDef(did, ..) = *func.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx)).kind()
                     && self.body.phase >= MirPhase::Runtime(RuntimePhase::Optimized)
                     && matches!(self.tcx.codegen_fn_attrs(did).inline, InlineAttr::Force { .. })
                 {
@@ -1029,7 +1029,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 AggregateKind::Tuple => {}
                 AggregateKind::Array(dest) => {
                     for src in fields {
-                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest) {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx, self.body.typing_env(self.tcx)), dest) {
                             self.fail(location, "array field has the wrong type");
                         }
                     }
@@ -1045,7 +1045,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         ),
                     );
                     if let [field] = fields.raw.as_slice() {
-                        let src_ty = field.ty(self.body, self.tcx);
+                        let src_ty = field.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                         if !self.mir_assign_valid_types(src_ty, dest_ty) {
                             self.fail(location, "union field has the wrong type");
                         }
@@ -1069,7 +1069,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                             self.typing_env,
                             Unnormalized::new_wip(dest.ty(self.tcx, args)),
                         );
-                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest_ty) {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx, self.body.typing_env(self.tcx)), dest_ty) {
                             self.fail(location, "adt field has the wrong type");
                         }
                     }
@@ -1080,7 +1080,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         self.fail(location, "closure has the wrong number of initialized fields");
                     }
                     for (src, dest) in std::iter::zip(fields, upvars) {
-                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest) {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx, self.body.typing_env(self.tcx)), dest) {
                             self.fail(location, "closure field has the wrong type");
                         }
                     }
@@ -1091,7 +1091,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         self.fail(location, "coroutine has the wrong number of initialized fields");
                     }
                     for (src, dest) in std::iter::zip(fields, upvars) {
-                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest) {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx, self.body.typing_env(self.tcx)), dest) {
                             self.fail(location, "coroutine field has the wrong type");
                         }
                     }
@@ -1105,7 +1105,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         );
                     }
                     for (src, dest) in std::iter::zip(fields, upvars) {
-                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx), dest) {
+                        if !self.mir_assign_valid_types(src.ty(self.body, self.tcx, self.body.typing_env(self.tcx)), dest) {
                             self.fail(location, "coroutine-closure field has the wrong type");
                         }
                     }
@@ -1119,8 +1119,8 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     }
 
                     if let [data_ptr, metadata] = fields.raw.as_slice() {
-                        let data_ptr_ty = data_ptr.ty(self.body, self.tcx);
-                        let metadata_ty = metadata.ty(self.body, self.tcx);
+                        let data_ptr_ty = data_ptr.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
+                        let metadata_ty = metadata.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                         if let ty::RawPtr(in_pointee, in_mut) = data_ptr_ty.kind() {
                             if *in_mut != mutability {
                                 self.fail(location, "input and output mutability must match");
@@ -1163,8 +1163,8 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             Rvalue::Ref(..) => {}
             Rvalue::BinaryOp(op, vals) => {
                 use BinOp::*;
-                let a = vals.0.ty(&self.body.local_decls, self.tcx);
-                let b = vals.1.ty(&self.body.local_decls, self.tcx);
+                let a = vals.0.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
+                let b = vals.1.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
                 if crate::util::binop_right_homogeneous(*op) {
                     if let Eq | Lt | Le | Ne | Ge | Gt = op {
                         // The function pointer types can have lifetimes
@@ -1244,7 +1244,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             Rvalue::UnaryOp(op, operand) => {
-                let a = operand.ty(&self.body.local_decls, self.tcx);
+                let a = operand.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
                 match op {
                     UnOp::Neg => {
                         check_kinds!(a, "Cannot negate type {:?}", ty::Int(..) | ty::Float(..))
@@ -1266,7 +1266,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             Rvalue::Cast(kind, operand, target_type) => {
-                let op_ty = operand.ty(self.body, self.tcx);
+                let op_ty = operand.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                 match kind {
                     // FIXME: Add Checks for these
                     CastKind::PointerWithExposedProvenance | CastKind::PointerExposeProvenance => {}
@@ -1446,7 +1446,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             | Rvalue::Discriminant(_) => {}
 
             Rvalue::WrapUnsafeBinder(op, ty) => {
-                let unwrapped_ty = op.ty(self.body, self.tcx);
+                let unwrapped_ty = op.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                 let ty::UnsafeBinder(binder_ty) = *ty.kind() else {
                     self.fail(
                         location,
@@ -1471,7 +1471,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             StatementKind::Assign(box (dest, rvalue)) => {
                 // LHS and RHS of the assignment must have the same type.
                 let left_ty = dest.ty(&self.body.local_decls, self.tcx).ty;
-                let right_ty = rvalue.ty(&self.body.local_decls, self.tcx);
+                let right_ty = rvalue.ty(&self.body.local_decls, self.tcx, self.typing_env);
 
                 if !self.mir_assign_valid_types(right_ty, left_ty) {
                     self.fail(
@@ -1510,7 +1510,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(op)) => {
-                let ty = op.ty(&self.body.local_decls, self.tcx);
+                let ty = op.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
                 if !ty.is_bool() {
                     self.fail(
                         location,
@@ -1521,7 +1521,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(
                 CopyNonOverlapping { src, dst, count },
             )) => {
-                let src_ty = src.ty(&self.body.local_decls, self.tcx);
+                let src_ty = src.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
                 let op_src_ty = if let Some(src_deref) = src_ty.builtin_deref(true) {
                     src_deref
                 } else {
@@ -1531,7 +1531,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     );
                     return;
                 };
-                let dst_ty = dst.ty(&self.body.local_decls, self.tcx);
+                let dst_ty = dst.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
                 let op_dst_ty = if let Some(dst_deref) = dst_ty.builtin_deref(true) {
                     dst_deref
                 } else {
@@ -1547,7 +1547,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     self.fail(location, format!("bad arg ({op_src_ty} != {op_dst_ty})"));
                 }
 
-                let op_cnt_ty = count.ty(&self.body.local_decls, self.tcx);
+                let op_cnt_ty = count.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
                 if op_cnt_ty != self.tcx.types.usize {
                     self.fail(location, format!("bad arg ({op_cnt_ty} != usize)"))
                 }
@@ -1594,7 +1594,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
     fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         match &terminator.kind {
             TerminatorKind::SwitchInt { targets, discr } => {
-                let switch_ty = discr.ty(&self.body.local_decls, self.tcx);
+                let switch_ty = discr.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
 
                 let target_width = self.tcx.sess.target.pointer_width;
 
@@ -1616,7 +1616,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => {
-                let func_ty = func.ty(&self.body.local_decls, self.tcx);
+                let func_ty = func.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
                 match func_ty.kind() {
                     ty::FnPtr(..) | ty::FnDef(..) => {}
                     _ => self.fail(
@@ -1634,7 +1634,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             TerminatorKind::Assert { cond, .. } => {
-                let cond_ty = cond.ty(&self.body.local_decls, self.tcx);
+                let cond_ty = cond.ty(&self.body.local_decls, self.tcx, self.body.typing_env(self.tcx));
                 if cond_ty != self.tcx.types.bool {
                     self.fail(
                         location,

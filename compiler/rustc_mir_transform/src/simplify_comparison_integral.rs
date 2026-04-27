@@ -6,7 +6,7 @@ use rustc_middle::mir::{
     BasicBlock, BinOp, Body, Operand, Place, Rvalue, Statement, StatementKind, SwitchTargets,
     TerminatorKind,
 };
-use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_middle::ty::{Ty, TyCtxt, TypingEnv};
 use tracing::trace;
 
 use crate::ssa::SsaLocals;
@@ -38,7 +38,7 @@ impl<'tcx> crate::MirPass<'tcx> for SimplifyComparisonIntegral {
         let typing_env = body.typing_env(tcx);
         let ssa = SsaLocals::new(tcx, body, typing_env);
         let helper = OptimizationFinder { body };
-        let opts = helper.find_optimizations(&ssa);
+        let opts = helper.find_optimizations(tcx, &ssa);
         let mut storage_deads_to_insert = vec![];
         let mut storage_deads_to_remove: Vec<(usize, BasicBlock)> = vec![];
         for opt in opts {
@@ -157,7 +157,7 @@ struct OptimizationFinder<'a, 'tcx> {
 }
 
 impl<'tcx> OptimizationFinder<'_, 'tcx> {
-    fn find_optimizations(&self, ssa: &SsaLocals) -> Vec<OptimizationInfo<'tcx>> {
+    fn find_optimizations(&self, tcx: TyCtxt<'tcx>, ssa: &SsaLocals) -> Vec<OptimizationInfo<'tcx>> {
         self.body
             .basic_blocks
             .iter_enumerated()
@@ -182,7 +182,7 @@ impl<'tcx> OptimizationFinder<'_, 'tcx> {
                                     box (left, right),
                                 ) => {
                                     let (branch_value_scalar, branch_value_ty, to_switch_on) =
-                                        find_branch_value_info(left, right, ssa)?;
+                                        find_branch_value_info(tcx, self.body.typing_env(tcx), left, right, ssa)?;
 
                                     Some(OptimizationInfo {
                                         bin_op_stmt_idx: stmt_idx,
@@ -207,6 +207,8 @@ impl<'tcx> OptimizationFinder<'_, 'tcx> {
 }
 
 fn find_branch_value_info<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: TypingEnv<'tcx>,
     left: &Operand<'tcx>,
     right: &Operand<'tcx>,
     ssa: &SsaLocals,
@@ -221,7 +223,7 @@ fn find_branch_value_info<'tcx>(
             if !ssa.is_ssa(to_switch_on.local) || !to_switch_on.is_stable_offset() {
                 return None;
             }
-            let branch_value_ty = branch_value.const_.ty();
+            let branch_value_ty = branch_value.const_.ty(tcx, typing_env);
             // we only want to apply this optimization if we are matching on integrals (and chars),
             // as it is not possible to switch on floats
             if !branch_value_ty.is_integral() && !branch_value_ty.is_char() {

@@ -694,17 +694,33 @@ impl<'tcx> Operand<'tcx> {
     /// While this is unlikely in general, it's the normal case of what you'll
     /// find as the `func` in a [`TerminatorKind::Call`].
     pub fn const_fn_def(&self) -> Option<(DefId, GenericArgsRef<'tcx>)> {
-        let const_ty = self.constant()?.const_.ty();
-        if let ty::FnDef(def_id, args) = *const_ty.kind() { Some((def_id, args)) } else { None }
+        match self {
+            Operand::Constant(box constant) => {
+                let ty = match &constant.const_ {
+                    Const::Ty(ct) => match ct.kind() {
+                        ty::ConstKind::Value(cv) => cv.ty,
+                        _ => return None,
+                    },
+                    Const::Val(_, ty) | Const::Unevaluated(_, ty) => *ty,
+                };
+
+                if let ty::FnDef(def_id, args) = *ty.kind() {
+                    Some((def_id, args))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
-    pub fn ty<D>(&self, local_decls: &D, tcx: TyCtxt<'tcx>) -> Ty<'tcx>
+    pub fn ty<D>(&self, local_decls: &D, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Ty<'tcx>
     where
         D: ?Sized + HasLocalDecls<'tcx>,
     {
         match self {
             &Operand::Copy(ref l) | &Operand::Move(ref l) => l.ty(local_decls, tcx).ty,
-            Operand::Constant(c) => c.const_.ty(),
+            Operand::Constant(c) => c.const_.ty(tcx, typing_env),
             Operand::RuntimeChecks(_) => tcx.types.bool,
         }
     }
@@ -739,8 +755,8 @@ impl<'tcx> ConstOperand<'tcx> {
     }
 
     #[inline]
-    pub fn ty(&self) -> Ty<'tcx> {
-        self.const_.ty()
+    pub fn ty(&self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Ty<'tcx> {
+        self.const_.ty(tcx, typing_env)
     }
 }
 
@@ -785,14 +801,14 @@ impl<'tcx> Rvalue<'tcx> {
         }
     }
 
-    pub fn ty<D>(&self, local_decls: &D, tcx: TyCtxt<'tcx>) -> Ty<'tcx>
+    pub fn ty<D>(&self, local_decls: &D, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Ty<'tcx>
     where
         D: ?Sized + HasLocalDecls<'tcx>,
     {
         match *self {
-            Rvalue::Use(ref operand) => operand.ty(local_decls, tcx),
+            Rvalue::Use(ref operand) => operand.ty(local_decls, tcx, typing_env),
             Rvalue::Repeat(ref operand, count) => {
-                Ty::new_array_with_const_len(tcx, operand.ty(local_decls, tcx), count)
+                Ty::new_array_with_const_len(tcx, operand.ty(local_decls, tcx, typing_env), count)
             }
             Rvalue::ThreadLocalRef(did) => tcx.thread_local_ptr_ty(did),
             Rvalue::Ref(reg, bk, ref place) => {
@@ -805,19 +821,19 @@ impl<'tcx> Rvalue<'tcx> {
             }
             Rvalue::Cast(.., ty) => ty,
             Rvalue::BinaryOp(op, box (ref lhs, ref rhs)) => {
-                let lhs_ty = lhs.ty(local_decls, tcx);
-                let rhs_ty = rhs.ty(local_decls, tcx);
+                let lhs_ty = lhs.ty(local_decls, tcx, typing_env);
+                let rhs_ty = rhs.ty(local_decls, tcx, typing_env);
                 op.ty(tcx, lhs_ty, rhs_ty)
             }
             Rvalue::UnaryOp(op, ref operand) => {
-                let arg_ty = operand.ty(local_decls, tcx);
+                let arg_ty = operand.ty(local_decls, tcx, typing_env);
                 op.ty(tcx, arg_ty)
             }
             Rvalue::Discriminant(ref place) => place.ty(local_decls, tcx).ty.discriminant_ty(tcx),
             Rvalue::Aggregate(ref ak, ref ops) => match **ak {
                 AggregateKind::Array(ty) => Ty::new_array(tcx, ty, ops.len() as u64),
                 AggregateKind::Tuple => {
-                    Ty::new_tup_from_iter(tcx, ops.iter().map(|op| op.ty(local_decls, tcx)))
+                    Ty::new_tup_from_iter(tcx, ops.iter().map(|op| op.ty(local_decls, tcx, typing_env)))
                 }
                 AggregateKind::Adt(did, _, args, _, _) => {
                     tcx.type_of(did).instantiate(tcx, args).skip_norm_wip()

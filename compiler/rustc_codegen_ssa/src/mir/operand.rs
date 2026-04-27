@@ -1065,7 +1065,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             }
 
             mir::Operand::Constant(ref constant) => {
-                let constant_ty = self.monomorphize(constant.ty());
+                let constant_ty = self.monomorphize(constant.ty(bx.tcx(), bx.typing_env()));
                 // Most SIMD vector constants should be passed as immediates.
                 // (In particular, some intrinsics really rely on this.)
                 if constant_ty.is_simd() {

@@ -35,7 +35,7 @@ impl<'tcx> MirVisitor<'tcx> for MoveCheckVisitor<'tcx> {
         match terminator.kind {
             mir::TerminatorKind::Call { ref func, ref args, ref fn_span, .. }
             | mir::TerminatorKind::TailCall { ref func, ref args, ref fn_span } => {
-                let callee_ty = func.ty(self.body, self.tcx);
+                let callee_ty = func.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
                 let callee_ty = self.monomorphize(callee_ty);
                 self.check_fn_args_move_size(callee_ty, args, *fn_span, location);
             }
@@ -124,7 +124,7 @@ impl<'tcx> MoveCheckVisitor<'tcx> {
         limit: Limit,
         operand: &mir::Operand<'tcx>,
     ) -> Option<Size> {
-        let ty = operand.ty(self.body, self.tcx);
+        let ty = operand.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
         let ty = self.monomorphize(ty);
         let Ok(layout) =
             self.tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty))

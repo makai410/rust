@@ -458,7 +458,7 @@ impl<'tcx> Validator<'_, 'tcx> {
 
             Rvalue::BinaryOp(op, box (lhs, rhs)) => {
                 let op = *op;
-                let lhs_ty = lhs.ty(self.body, self.tcx);
+                let lhs_ty = lhs.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
 
                 if let ty::RawPtr(_, _) | ty::FnPtr(..) = lhs_ty.kind() {
                     // Raw and fn pointer operations are not allowed inside consts and thus not
@@ -639,7 +639,7 @@ impl<'tcx> Validator<'_, 'tcx> {
 
         // Functions marked `#[rustc_promotable]` are explicitly allowed to be promoted, so we can
         // accept them at this point.
-        let fn_ty = callee.ty(self.body, self.tcx);
+        let fn_ty = callee.ty(self.body, self.tcx, self.body.typing_env(self.tcx));
         if let ty::FnDef(def_id, _) = *fn_ty.kind() {
             if self.tcx.is_promotable_const_fn(def_id) {
                 return Ok(());

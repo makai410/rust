@@ -752,6 +752,7 @@ impl<'a, 'tcx> MirWriter<'a, 'tcx> {
 
             write_extra(
                 self.tcx,
+                body.typing_env(self.tcx),
                 w,
                 &|visitor| visitor.visit_statement(statement, current_location),
                 self.options,
@@ -789,6 +790,7 @@ impl<'a, 'tcx> MirWriter<'a, 'tcx> {
 
             write_extra(
                 self.tcx,
+                body.typing_env(self.tcx),
                 w,
                 &|visitor| visitor.visit_terminator(data.terminator(), current_location),
                 self.options,
@@ -1274,9 +1276,19 @@ impl<'tcx> Debug for ConstOperand<'tcx> {
 
 impl<'tcx> Display for ConstOperand<'tcx> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
-        match self.ty().kind() {
-            ty::FnDef(..) => {}
-            _ => write!(fmt, "const ")?,
+        let is_fn_def = match &self.const_ {
+            Const::Ty(ct) => {
+                match ct.kind() {
+                    ty::ConstKind::Value(cv) => matches!(cv.ty.kind(), ty::FnDef(..)),
+                    _ => false,
+                }
+            }
+            Const::Val(_, ty) | Const::Unevaluated(_, ty) => {
+                matches!(ty.kind(), ty::FnDef(..))
+            }
+        };
+        if !is_fn_def {
+            write!(fmt, "const ")?;
         }
         Display::fmt(&self.const_, fmt)
     }
@@ -1372,12 +1384,13 @@ fn post_fmt_projection(projection: &[PlaceElem<'_>], fmt: &mut Formatter<'_>) ->
 /// a statement.
 fn write_extra<'tcx>(
     tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     write: &mut dyn io::Write,
     visit_op: &dyn Fn(&mut ExtraComments<'tcx>),
     options: PrettyPrintMirOptions,
 ) -> io::Result<()> {
     if options.include_extra_comments {
-        let mut extra_comments = ExtraComments { tcx, comments: vec![] };
+        let mut extra_comments = ExtraComments { tcx, typing_env, comments: vec![] };
         visit_op(&mut extra_comments);
         for comment in extra_comments.comments {
             writeln!(write, "{:A$} // {}", "", comment, A = ALIGN)?;
@@ -1388,6 +1401,7 @@ fn write_extra<'tcx>(
 
 struct ExtraComments<'tcx> {
     tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     comments: Vec<String>,
 }
 
@@ -1414,7 +1428,7 @@ fn use_verbose(ty: Ty<'_>, fn_def: bool) -> bool {
 impl<'tcx> Visitor<'tcx> for ExtraComments<'tcx> {
     fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, _location: Location) {
         let ConstOperand { span, user_ty, const_ } = constant;
-        if use_verbose(const_.ty(), true) {
+        if use_verbose(const_.ty(self.tcx, self.typing_env), true) {
             self.push("mir::ConstOperand");
             self.push(&format!(
                 "+ span: {}",
@@ -1438,7 +1452,7 @@ impl<'tcx> Visitor<'tcx> for ExtraComments<'tcx> {
             };
 
             let val = match const_ {
-                Const::Ty(_, ct) => match ct.kind() {
+                Const::Ty(ct) => match ct.kind() {
                     ty::ConstKind::Param(p) => format!("ty::Param({p})"),
                     ty::ConstKind::Unevaluated(uv) => {
                         format!("ty::Unevaluated({}, {:?})", self.tcx.def_path_str(uv.def), uv.args,)
@@ -1468,7 +1482,7 @@ impl<'tcx> Visitor<'tcx> for ExtraComments<'tcx> {
             // This reflects what `Const` looked liked before `val` was renamed
             // as `kind`. We print it like this to avoid having to update
             // expected output in a lot of tests.
-            self.push(&format!("+ const_: Const {{ ty: {}, val: {} }}", const_.ty(), val));
+            self.push(&format!("+ const_: Const {{ ty: {}, val: {} }}", const_.ty(self.tcx, self.typing_env), val));
         }
     }
 
@@ -1538,7 +1552,7 @@ pub fn write_allocations<'tcx>(
     impl<'tcx> Visitor<'tcx> for CollectAllocIds {
         fn visit_const_operand(&mut self, c: &ConstOperand<'tcx>, _: Location) {
             match c.const_ {
-                Const::Ty(_, _) | Const::Unevaluated(..) => {}
+                Const::Ty(_) | Const::Unevaluated(..) => {}
                 Const::Val(val, _) => {
                     if let Some(id) = alloc_id_from_const_val(val) {
                         self.0.insert(id);

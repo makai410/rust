@@ -386,10 +386,10 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
                 state.assign(target.as_ref(), pointer, &self.map);
 
                 if let Some(target_len) = self.map.find_len(target.as_ref())
-                    && let operand_ty = operand.ty(self.local_decls, self.tcx)
+                    && let operand_ty = operand.ty(self.local_decls, self.tcx, self.typing_env)
                     && let Some(operand_ty) = operand_ty.builtin_deref(true)
                     && let ty::Array(_, len) = operand_ty.kind()
-                    && let Some(len) = Const::Ty(self.tcx.types.usize, *len)
+                    && let Some(len) = Const::Ty(*len)
                         .try_eval_scalar_int(self.tcx, self.typing_env)
                 {
                     state.insert_value_idx(target_len, FlatSet::Elem(len.into()), &self.map);
@@ -565,7 +565,7 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
     /// The caller must have flooded `place`.
     ///
     /// Perform: `place = operand.projection`.
-    #[instrument(level = "trace", skip(self, state))]
+    // #[instrument(level = "trace", skip(self, state))]
     fn assign_constant(
         &self,
         state: &mut State<FlatSet<Scalar>>,
@@ -702,7 +702,7 @@ impl<'a, 'tcx> ConstAnalysis<'a, 'tcx> {
         match value {
             FlatSet::Top => FlatSet::Top,
             FlatSet::Elem(scalar) => {
-                let ty = op.ty(self.local_decls, self.tcx);
+                let ty = op.ty(self.local_decls, self.tcx, self.typing_env);
                 self.tcx
                     .layout_of(self.typing_env.as_query_input(ty))
                     .map_or(FlatSet::Top, |layout| {

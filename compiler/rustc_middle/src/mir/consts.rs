@@ -217,7 +217,7 @@ pub enum Const<'tcx> {
     /// anything like that.
     ///
     /// FIXME(BoxyUwU): We should remove this `Ty` and look up the type for params via `ParamEnv`
-    Ty(Ty<'tcx>, ty::Const<'tcx>),
+    Ty(ty::Const<'tcx>),
 
     /// An unevaluated mir constant which is not part of the type system.
     ///
@@ -250,15 +250,47 @@ impl<'tcx> Const<'tcx> {
     }
 
     #[inline(always)]
-    pub fn ty(&self) -> Ty<'tcx> {
+    pub fn ty(&self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> Ty<'tcx> {
         match self {
-            Const::Ty(ty, ct) => {
+            Const::Ty(ct) => {
                 match ct.kind() {
                     // Dont use the outer ty as on invalid code we can wind up with them not being the same.
                     // this then results in allowing const eval to add `1_i64 + 1_usize` in cases where the mir
                     // was originally `({N: usize} + 1_usize)` under `generic_const_exprs`.
                     ty::ConstKind::Value(cv) => cv.ty,
-                    _ => *ty,
+                    ty::ConstKind::Param(param) => param.find_const_ty_from_env(typing_env.param_env),
+                    ty::ConstKind::Unevaluated(uneval) => {
+                        let unnormalized_ty = tcx.type_of(uneval.def).instantiate(tcx, uneval.args);
+                        tcx.normalize_erasing_regions(typing_env, unnormalized_ty)
+                    },
+                    ty::ConstKind::Error(e) => Ty::new_error(tcx, e),
+                    // 4. Expr types (used in `generic_const_exprs`) have to be evaluated 
+                    // recursively depending on their operator.
+                    ty::ConstKind::Expr(expr) => {
+                        // Expr doesn't store a `ty` field, so we must derive it
+                        match expr.kind {
+                            ty::ExprKind::Binop(op) => {
+                                let (lhs_ty, rhs_ty, _, _) = expr.binop_args();
+                                op.ty(tcx, lhs_ty, rhs_ty)
+                            }
+                            
+                            // ty::ExprKind::Unop(_) => expr.unop_args().0,
+                            // ty::ExprKind::FunctionCall => expr.call_args().0,
+                            // ty::ExprKind::Cast => expr.cast_args().0,
+                            // handle other variants depending on compiler version...
+                            ty::ExprKind::UnOp(_) => expr.unop_args().0,
+                            ty::ExprKind::FunctionCall => expr.call_args().0,
+                            ty::ExprKind::Cast(_) => expr.cast_args().0,
+                        }
+                    }
+
+                    // 5. These variants should theoretically never exist in fully built MIR.
+                    // You can safely bug!/unreachable! them.
+                    ty::ConstKind::Infer(_) |
+                    ty::ConstKind::Bound(_, _) |
+                    ty::ConstKind::Placeholder(_) => {
+                        bug!("unexpected ConstKind in MIR: {:?}", ct)
+                    }
                 }
             }
             Const::Val(_, ty) | Const::Unevaluated(_, ty) => *ty,
@@ -270,7 +302,7 @@ impl<'tcx> Const<'tcx> {
     #[inline]
     pub fn is_required_const(&self) -> bool {
         match self {
-            Const::Ty(_, c) => match c.kind() {
+            Const::Ty(c) => match c.kind() {
                 ty::ConstKind::Value(_) => false, // already a value, cannot error
                 _ => true,
             },
@@ -282,7 +314,7 @@ impl<'tcx> Const<'tcx> {
     #[inline]
     pub fn try_to_scalar(self) -> Option<Scalar> {
         match self {
-            Const::Ty(_, c) => c.try_to_scalar(),
+            Const::Ty(c) => c.try_to_scalar(),
             Const::Val(val, _) => val.try_to_scalar(),
             Const::Unevaluated(..) => None,
         }
@@ -293,7 +325,7 @@ impl<'tcx> Const<'tcx> {
         // This is equivalent to `self.try_to_scalar()?.try_to_int().ok()`, but measurably faster.
         match self {
             Const::Val(ConstValue::Scalar(Scalar::Int(x)), _) => Some(x),
-            Const::Ty(_, c) => c.try_to_leaf(),
+            Const::Ty(c) => c.try_to_leaf(),
             _ => None,
         }
     }
@@ -316,7 +348,7 @@ impl<'tcx> Const<'tcx> {
         span: Span,
     ) -> Result<ConstValue, ErrorHandled> {
         match self {
-            Const::Ty(_, c) => {
+            Const::Ty(c) => {
                 if c.has_non_region_param() {
                     return Err(ErrorHandled::TooGeneric(span));
                 }
@@ -346,7 +378,7 @@ impl<'tcx> Const<'tcx> {
         tcx: TyCtxt<'tcx>,
         typing_env: ty::TypingEnv<'tcx>,
     ) -> Option<Scalar> {
-        if let Const::Ty(_, c) = self {
+        if let Const::Ty(c) = self {
             // We don't evaluate anything for type system constants as normalizing
             // the MIR will handle this for us
             c.try_to_scalar()
@@ -372,7 +404,7 @@ impl<'tcx> Const<'tcx> {
     ) -> Option<u128> {
         let int = self.try_eval_scalar_int(tcx, typing_env)?;
         let size = tcx
-            .layout_of(typing_env.with_post_analysis_normalized(tcx).as_query_input(self.ty()))
+            .layout_of(typing_env.with_post_analysis_normalized(tcx).as_query_input(self.ty(tcx, typing_env)))
             .ok()?
             .size;
         Some(int.to_bits(size))
@@ -382,7 +414,7 @@ impl<'tcx> Const<'tcx> {
     #[inline]
     pub fn eval_bits(self, tcx: TyCtxt<'tcx>, typing_env: ty::TypingEnv<'tcx>) -> u128 {
         self.try_eval_bits(tcx, typing_env)
-            .unwrap_or_else(|| bug!("expected bits of {:#?}, got {:#?}", self.ty(), self))
+            .unwrap_or_else(|| bug!("expected bits of {:#?}, got {:#?}", self.ty(tcx, typing_env), self))
     }
 
     #[inline]
@@ -413,7 +445,7 @@ impl<'tcx> Const<'tcx> {
 
     #[inline]
     pub fn from_ty_value(tcx: TyCtxt<'tcx>, val: ty::Value<'tcx>) -> Self {
-        Self::Ty(val.ty, ty::Const::new_value(tcx, val.valtree, val.ty))
+        Self::Ty(ty::Const::new_value(tcx, val.valtree, val.ty))
     }
 
     pub fn from_bits(
@@ -488,7 +520,7 @@ impl<'tcx> UnevaluatedConst<'tcx> {
 impl<'tcx> Display for Const<'tcx> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
         match *self {
-            Const::Ty(_, c) => pretty_print_const(c, fmt, true),
+            Const::Ty(c) => pretty_print_const(c, fmt, true),
             Const::Val(val, ty) => pretty_print_const_value(val, ty, fmt),
             // FIXME(valtrees): Correctly print mir constants.
             Const::Unevaluated(c, _ty) => {
