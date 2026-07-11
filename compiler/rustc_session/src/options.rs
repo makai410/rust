@@ -2263,6 +2263,7 @@ options! {
     // - src/doc/unstable-book/src/compiler-flags
 
     // tidy-alphabetical-start
+    aaa_threshold: usize = (0, parse_number, [TRACKED], "gugugaga"),
     allow_features: Option<Vec<String>> = (None, parse_opt_comma_list, [TRACKED],
         "only allow the listed language features to be enabled in code (comma separated)"),
     // the real parser is at the `setter_for` macro, to allow `-Z` and `-C` options to

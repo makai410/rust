@@ -273,7 +273,7 @@ fn show_fieldless_enum_concat_str(
     fmt: Box<ast::Expr>,
 ) -> Option<(ThinVec<ast::Stmt>, Box<ast::Expr>)> {
     let variant_count = def.variants.len();
-    if variant_count < 39 {
+    if variant_count < cx.sess.opts.unstable_opts.aaa_threshold {
         return None;
     }
 
