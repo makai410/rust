@@ -1020,7 +1020,7 @@ impl ::core::cmp::PartialOrd for Enum0 {
     #[inline]
     fn partial_cmp(&self, other: &Enum0)
         -> ::core::option::Option<::core::cmp::Ordering> {
-        match *self {}
+        ::core::option::Option::Some(::core::cmp::Ord::cmp(self, other))
     }
 }
 #[automatically_derived]
