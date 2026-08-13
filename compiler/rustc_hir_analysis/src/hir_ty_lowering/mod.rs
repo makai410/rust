@@ -66,7 +66,7 @@ pub(crate) enum ImpliedBoundsContext<'tcx> {
     /// a default `MetaSized` supertrait
     TraitDef(LocalDefId),
     /// An implied bound is added to a type parameter
-    TyParam(LocalDefId, &[hir::WherePredicate<'tcx>]),
+    TyParam(LocalDefId, &'tcx [hir::WherePredicate<'tcx>]),
     /// An implied bound being added in any other context
     AssociatedTypeOrImplTrait,
 }
@@ -333,7 +333,7 @@ pub(crate) enum GenericArgPosition {
     Value(IsMethodCall),
 }
 
-/// Whether to allow duplicate associated iten constraints in a trait ref, e.g.
+/// Whether to allow duplicate associated item constraints in a trait ref, e.g.
 /// `Trait<Assoc = Ty, Assoc = Ty>`. This is forbidden in `dyn Trait<...>`
 /// but allowed everywhere else.
 #[derive(Clone, Copy, Debug, PartialEq)]

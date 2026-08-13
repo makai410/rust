@@ -1688,7 +1688,7 @@ impl<'tcx> Ty<'tcx> {
                 Some(args.as_coroutine().variant_range(*def_id, tcx))
             }
             TyKind::UnsafeBinder(bound_ty) => {
-                tcx.instantiate_bound_regions_with_erased((*bound_ty).into()).variant_range(tcx)
+                tcx.instantiate_bound_regions_with_erased(**bound_ty).variant_range(tcx)
             }
             _ => None,
         }
@@ -1712,7 +1712,7 @@ impl<'tcx> Ty<'tcx> {
                 Some(args.as_coroutine().discriminant_for_variant(*def_id, tcx, variant_index))
             }
             TyKind::UnsafeBinder(bound_ty) => tcx
-                .instantiate_bound_regions_with_erased((*bound_ty).into())
+                .instantiate_bound_regions_with_erased(**bound_ty)
                 .discriminant_for_variant(tcx, variant_index),
             _ => None,
         }
@@ -1738,7 +1738,7 @@ impl<'tcx> Ty<'tcx> {
 
             ty::Pat(ty, _) => ty.discriminant_ty(tcx),
             ty::UnsafeBinder(bound_ty) => {
-                tcx.instantiate_bound_regions_with_erased((*bound_ty).into()).discriminant_ty(tcx)
+                tcx.instantiate_bound_regions_with_erased(**bound_ty).discriminant_ty(tcx)
             }
 
             ty::Bool
@@ -2215,13 +2215,13 @@ mod size_asserts {
 
     use super::*;
     // tidy-alphabetical-start
-    static_assert_size!(TyKind<'_>, 24);
-    static_assert_size!(ty::WithCachedTypeInfo<TyKind<'_>>, 32);
+    static_assert_size!(TyKind<'_>, 40);
+    static_assert_size!(ty::WithCachedTypeInfo<TyKind<'_>>, 48);
     // tidy-alphabetical-end
 }
 
 // FIXME: this is a distinct type because we need to define `Encode`/`Decode` impls.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, StableHash)]
 pub struct TyBinderRef<'tcx>(pub ty::Interned<'tcx, ty::Binder<'tcx, Ty<'tcx>>>);
 
 impl<'tcx> Deref for TyBinderRef<'tcx> {
@@ -2233,7 +2233,7 @@ impl<'tcx> Deref for TyBinderRef<'tcx> {
 }
 
 // FIXME: this is a distinct type because we need to define `Encode`/`Decode` impls.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, StableHash)]
 pub struct SigBinderRef<'tcx>(pub ty::Interned<'tcx, ty::Binder<'tcx, FnSigTys<'tcx>>>);
 
 impl<'tcx> Deref for SigBinderRef<'tcx> {

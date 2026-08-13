@@ -60,6 +60,7 @@ pub trait InternalCx<'tcx>: Copy + Clone {
     where
         I: Iterator<Item = T>,
         T: ty::CollectAndApply<ty::Pattern<'tcx>, &'tcx List<ty::Pattern<'tcx>>>;
+    fn mk_sig_binder(self, v: ty::Binder<'tcx, ty::FnSigTys<'tcx>>) -> ty::SigBinderRef<'tcx>;
 }
 
 /// Trait used to convert between an internal MIR type to a rustc_public's IR type.

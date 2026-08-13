@@ -1,0 +1,4 @@
+Building stage1 compiler artifacts (stage0 -> stage1, x86_64-unknown-linux-gnu)
+Creating a sysroot for stage1 compiler (use `rustup toolchain link 'name' build/host/stage1`)
+Building stage1 lld-wrapper (stage0 -> stage1, x86_64-unknown-linux-gnu)
+Building stage1 library artifacts{alloc, compiler_builtins, core, panic_abort, panic_unwind, proc_macro, rustc-std-workspace-core, std, std_detect, sysroot, test, unwind} (stage1 -> stage1, x86_64-unknown-linux-gnu)

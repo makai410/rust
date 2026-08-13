@@ -11,8 +11,8 @@ use rustc_middle::ty::{
     self as ty, IsSuggestable, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
     TypeVisitor, Upcast,
 };
-use rustc_span::{ErrorGuaranteed, Ident, Span, kw};
 use rustc_middle::{bug, span_bug};
+use rustc_span::{ErrorGuaranteed, Ident, Span, kw};
 use rustc_trait_selection::traits;
 use tracing::{debug, instrument, trace};
 
@@ -130,10 +130,8 @@ fn add_trait_bound<'tcx>(
     did: DefId,
     span: Span,
 ) {
-    let trait_ref = ty::Binder::bind_with_vars(
-        ty::TraitRef::new(tcx, sized_def_id, [self_ty]),
-        ty::List::empty(),
-    );
+    let trait_ref =
+        ty::Binder::bind_with_vars(ty::TraitRef::new(tcx, did, [self_ty]), ty::List::empty());
     // Preferable to put sizedness obligations first, since we report better errors for `Sized`
     // ambiguity.
     bounds.insert(0, (trait_ref.upcast(tcx), span));
@@ -143,7 +141,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     pub(crate) fn lower_where_predicates(
         &self,
         params: &[hir::GenericParam<'tcx>],
-        hir_predicates: &[hir::WherePredicate<'tcx>],
+        hir_predicates: &'tcx [hir::WherePredicate<'tcx>],
         predicates: &mut FxIndexSet<(ty::Clause<'tcx>, Span)>,
     ) {
         let tcx = self.tcx();
@@ -167,7 +165,13 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                         ImpliedBoundsContext::TyParam(param.def_id, hir_predicates),
                         param.span,
                     );
-                    self.add_default_traits(&mut bounds, param_ty, &[], ImpliedBoundsContext::TyParam(param.def_id, hir_predicates), param.span);
+                    self.add_default_traits(
+                        &mut bounds,
+                        param_ty,
+                        &[],
+                        ImpliedBoundsContext::TyParam(param.def_id, hir_predicates),
+                        param.span,
+                    );
                     trace!(?bounds);
                     predicates.extend(bounds);
                     trace!(?predicates);
@@ -244,6 +248,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                         bound_vars,
                         bound_assumptions,
                         PredicateFilter::All,
+                        OverlappingAsssocItemConstraints::Allowed,
                     );
                     predicates.extend(bounds);
                 }
@@ -264,8 +269,8 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                                 )
                             }
                         };
-                        let pred = ty::ClauseKind::RegionOutlives(ty::OutlivesClause(r1, r2))
-                            .upcast(tcx);
+                        let pred =
+                            ty::ClauseKind::RegionOutlives(ty::OutlivesClause(r1, r2)).upcast(tcx);
                         (pred, span)
                     }))
                 }
@@ -504,7 +509,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
                     let region = self.lower_lifetime(lifetime, RegionInferReason::OutlivesBound);
                     let bound = ty::Binder::bind_with_vars_and_clauses(
-                         ty::ClauseKind::TypeOutlives(ty::OutlivesClause(param_ty, region)),
+                        ty::ClauseKind::TypeOutlives(ty::OutlivesClause(param_ty, region)),
                         bound_vars,
                         bound_assumptions,
                     );

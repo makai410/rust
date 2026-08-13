@@ -806,6 +806,11 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for ty::TyBinderRef<'tcx> {
         let folded = (*self).try_fold_with(folder)?;
         Ok(if *self == folded { self } else { folder.cx().mk_ty_binder(folded) })
     }
+
+    fn fold_with<F: TypeFolder<TyCtxt<'tcx>>>(self, folder: &mut F) -> Self {
+        let folded = (*self).fold_with(folder);
+        if *self == folded { self } else { folder.cx().mk_ty_binder(folded) }
+    }
 }
 
 impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for ty::SigBinderRef<'tcx> {
@@ -821,5 +826,10 @@ impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for ty::SigBinderRef<'tcx> {
     ) -> Result<Self, F::Error> {
         let folded = (*self).try_fold_with(folder)?;
         Ok(if *self == folded { self } else { folder.cx().mk_sig_binder(folded) })
+    }
+
+    fn fold_with<F: TypeFolder<TyCtxt<'tcx>>>(self, folder: &mut F) -> Self {
+        let folded = (*self).fold_with(folder);
+        if *self == folded { self } else { folder.cx().mk_sig_binder(folded) }
     }
 }

@@ -12,7 +12,7 @@ use rustc_middle::ty::{
 };
 use rustc_middle::{bug, span_bug};
 use rustc_span::{DUMMY_SP, Ident, Span};
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument};
 
 use super::item_bounds::explicit_item_bounds_with_filter;
 use crate::collect::ItemCtxt;
@@ -20,7 +20,6 @@ use crate::constrained_generic_params as cgp;
 use crate::delegation::inherit_clauses_for_delegation_item;
 use crate::hir_ty_lowering::{
     HirTyLowerer, ImpliedBoundsContext, OverlappingAsssocItemConstraints, PredicateFilter,
-    RegionInferReason,
 };
 
 /// Returns a list of all type clauses (explicit and implicit) for the definition with
@@ -1046,7 +1045,7 @@ pub(super) fn const_conditions<'tcx>(
                     );
                 }
                 let bound_assumptions =
-                    icx.tcx().mk_clauses_from_iter(bound_assumptions.into_iter().map(|(c,)| c));
+                    icx.tcx().mk_clauses_from_iter(bound_assumptions.into_iter().map(|(c, _)| c));
 
                 let bound_vars = tcx.late_bound_vars(pred.hir_id);
                 icx.lowerer().lower_bounds(

@@ -39,6 +39,7 @@ use snapshot::undo_log::InferCtxtUndoLogs;
 use tracing::{debug, instrument};
 use type_variable::TypeVariableOrigin;
 
+use crate::infer::RegionVariableOrigin::BoundRegion;
 use crate::infer::snapshot::undo_log::UndoLog;
 use crate::infer::type_variable::{FloatVariableOrigin, TypeVariableValue};
 use crate::infer::unify_key::{ConstVariableOrigin, ConstVariableValue, ConstVidKey};
@@ -1502,14 +1503,14 @@ impl<'tcx> InferCtxt<'tcx> {
         }
 
         impl<'tcx> BoundVarReplacerDelegate<'tcx> for ToFreshVars<'tcx> {
-            fn replace_region(&mut self, br: ty::BoundRegion) -> ty::Region<'tcx> {
+            fn replace_region(&mut self, br: ty::BoundRegion<'tcx>) -> ty::Region<'tcx> {
                 self.args[br.var.index()].expect_region()
             }
-            fn replace_ty(&mut self, bt: ty::BoundTy) -> Ty<'tcx> {
+            fn replace_ty(&mut self, bt: ty::BoundTy<'tcx>) -> Ty<'tcx> {
                 self.args[bt.var.index()].expect_ty()
             }
-            fn replace_const(&mut self, bv: ty::BoundVar) -> ty::Const<'tcx> {
-                self.args[bv.index()].expect_const()
+            fn replace_const(&mut self, bv: ty::BoundConst<'tcx>) -> ty::Const<'tcx> {
+                self.args[bv.var.index()].expect_const()
             }
         }
         let delegate = ToFreshVars { args };

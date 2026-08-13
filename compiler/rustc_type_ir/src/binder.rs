@@ -306,7 +306,7 @@ impl<I: Interner> TypeVisitor<I> for ValidateBoundVars<I> {
 
     fn visit_const(&mut self, c: I::Const) -> Self::Result {
         if c.outer_exclusive_binder() < self.binder_index {
-            return ControlFlow::Break(());
+            return;
         }
         match c.kind() {
             ty::ConstKind::Bound(debruijn, bound_const)

@@ -2414,7 +2414,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     &param.kind,
                     &param.bounds,
                     param.colon_span,
-                    span,
+                    *span,
                     rbp.reborrow(),
                     ImplTraitContext::Disallowed(ImplTraitPosition::Bound),
                     PredicateOrigin::GenericParam,
