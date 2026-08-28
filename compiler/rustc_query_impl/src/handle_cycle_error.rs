@@ -9,49 +9,27 @@ use rustc_errors::{Applicability, Diag, MultiSpan, pluralize, struct_span_code_e
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_middle::bug;
-use rustc_middle::queries::{QueryVTables, TaggedQueryKey};
-use rustc_middle::query::Cycle;
-use rustc_middle::query::erase::erase_val;
-use rustc_middle::ty::layout::LayoutError;
+use rustc_middle::queries::TaggedQueryKey;
+use rustc_middle::query::QueryCycle;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::def_id::{DefId, LocalDefId};
-use rustc_span::{ErrorGuaranteed, Span};
+use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span};
 
-use crate::job::create_cycle_error;
-
-pub(crate) fn specialize_query_vtables<'tcx>(vtables: &mut QueryVTables<'tcx>) {
-    vtables.fn_sig.handle_cycle_error_fn = |tcx, key, _, err| {
-        let guar = err.delay_as_bug();
-        erase_val(fn_sig(tcx, key, guar))
-    };
-
-    vtables.check_representability.handle_cycle_error_fn =
-        |tcx, _, cycle, _err| check_representability(tcx, cycle);
-
-    vtables.check_representability_adt_ty.handle_cycle_error_fn =
-        |tcx, _, cycle, _err| check_representability(tcx, cycle);
-
-    vtables.variances_of.handle_cycle_error_fn = |tcx, key, _, err| {
-        let _guar = err.delay_as_bug();
-        erase_val(variances_of(tcx, key))
-    };
-
-    vtables.layout_of.handle_cycle_error_fn = |tcx, _, cycle, err| {
-        let _guar = err.delay_as_bug();
-        erase_val(Err(layout_of(tcx, cycle)))
-    }
-}
-
+// Default cycle handler used for all queries that don't use the `handle_cycle_error` query
+// modifier.
 pub(crate) fn default(err: Diag<'_>) -> ! {
     let guar = err.emit();
     guar.raise_fatal()
 }
 
-fn fn_sig<'tcx>(
+pub(crate) fn fn_sig<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
-    guar: ErrorGuaranteed,
+    _: QueryCycle<'tcx>,
+    err: Diag<'_>,
 ) -> ty::EarlyBinder<'tcx, ty::PolyFnSig<'tcx>> {
+    let guar = err.delay_as_bug();
+
     let err = Ty::new_error(tcx, guar);
 
     let arity = if let Some(node) = tcx.hir_get_if_local(def_id)
@@ -63,16 +41,31 @@ fn fn_sig<'tcx>(
         unreachable!()
     };
 
-    ty::EarlyBinder::bind(ty::Binder::dummy(tcx.mk_fn_sig(
-        std::iter::repeat_n(err, arity),
-        err,
-        false,
-        rustc_hir::Safety::Safe,
-        rustc_abi::ExternAbi::Rust,
-    )))
+    ty::EarlyBinder::bind(
+        tcx,
+        ty::Binder::dummy(tcx.mk_fn_sig_safe_rust_abi(std::iter::repeat_n(err, arity), err)),
+    )
 }
 
-fn check_representability<'tcx>(tcx: TyCtxt<'tcx>, cycle: Cycle<'tcx>) -> ! {
+pub(crate) fn check_representability<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    _key: LocalDefId,
+    cycle: QueryCycle<'tcx>,
+    _err: Diag<'_>,
+) {
+    check_representability_inner(tcx, cycle);
+}
+
+pub(crate) fn check_representability_adt_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    _key: Ty<'tcx>,
+    cycle: QueryCycle<'tcx>,
+    _err: Diag<'_>,
+) {
+    check_representability_inner(tcx, cycle);
+}
+
+fn check_representability_inner<'tcx>(tcx: TyCtxt<'tcx>, cycle: QueryCycle<'tcx>) -> ! {
     let mut item_and_field_ids = Vec::new();
     let mut representable_ids = FxHashSet::default();
     for frame in &cycle.frames {
@@ -103,8 +96,14 @@ fn check_representability<'tcx>(tcx: TyCtxt<'tcx>, cycle: Cycle<'tcx>) -> ! {
     guar.raise_fatal()
 }
 
-fn variances_of<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> &'tcx [ty::Variance] {
-    let n = tcx.generics_of(def_id).own_params.len();
+pub(crate) fn variances_of<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    _cycle: QueryCycle<'tcx>,
+    err: Diag<'_>,
+) -> &'tcx [ty::Variance] {
+    let _guar = err.delay_as_bug();
+    let n = tcx.generics_of(def_id).count();
     tcx.arena.alloc_from_iter(iter::repeat_n(ty::Bivariant, n))
 }
 
@@ -127,7 +126,13 @@ fn search_for_cycle_permutation<Q, T>(
     otherwise()
 }
 
-fn layout_of<'tcx>(tcx: TyCtxt<'tcx>, cycle: Cycle<'tcx>) -> &'tcx ty::layout::LayoutError<'tcx> {
+pub(crate) fn layout_of<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    _key: ty::PseudoCanonicalInput<'tcx, Ty<'tcx>>,
+    cycle: QueryCycle<'tcx>,
+    err: Diag<'_>,
+) -> Result<ty::layout::TyAndLayout<'tcx>, &'tcx ty::layout::LayoutError<'tcx>> {
+    let _guar = err.delay_as_bug();
     let diag = search_for_cycle_permutation(
         &cycle.frames,
         |frames| {
@@ -200,11 +205,10 @@ fn layout_of<'tcx>(tcx: TyCtxt<'tcx>, cycle: Cycle<'tcx>) -> &'tcx ty::layout::L
                 ControlFlow::Continue(())
             }
         },
-        || create_cycle_error(tcx, &cycle),
+        || create_cycle_error(tcx, &cycle, false),
     );
 
-    let guar = diag.emit();
-    tcx.arena.alloc(LayoutError::Cycle(guar))
+    diag.emit().raise_fatal()
 }
 
 // item_and_field_ids should form a cycle where each field contains the
@@ -335,5 +339,93 @@ fn find_item_ty_spans(
             tys.iter().for_each(|ty| find_item_ty_spans(tcx, ty, needle, spans, seen_representable))
         }
         _ => {}
+    }
+}
+
+#[inline(never)]
+#[cold]
+pub(crate) fn create_cycle_error<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    QueryCycle { usage, frames }: &QueryCycle<'tcx>,
+    nested: bool,
+) -> Diag<'tcx> {
+    assert!(!frames.is_empty());
+
+    let span = frames[0].tagged_key.catch_default_span(tcx, frames[1 % frames.len()].span);
+
+    let mut cycle_stack = Vec::new();
+
+    use crate::diagnostics::StackCount;
+    let stack_bottom = frames[0].tagged_key.catch_description(tcx);
+    let stack_count = if frames.len() == 1 {
+        StackCount::Single { stack_bottom: stack_bottom.clone() }
+    } else {
+        StackCount::Multiple { stack_bottom: stack_bottom.clone() }
+    };
+
+    let mut prev = span;
+    for i in 1..frames.len() {
+        let frame = &frames[i];
+        let span = frame.tagged_key.catch_default_span(tcx, frames[(i + 1) % frames.len()].span);
+        cycle_stack.push(crate::diagnostics::CycleStack {
+            span: if span == prev { DUMMY_SP } else { span },
+            desc: frame.tagged_key.catch_description(tcx),
+        });
+        prev = span;
+    }
+
+    let cycle_usage = usage.as_ref().map(|usage| {
+        let cycle_span = usage.tagged_key.catch_default_span(tcx, usage.span);
+        crate::diagnostics::CycleUsage {
+            span: if cycle_span != span { cycle_span } else { DUMMY_SP },
+            usage: usage.tagged_key.catch_description(tcx),
+        }
+    });
+
+    let is_all_def_kind = |def_kind| {
+        // Trivial type alias and trait alias cycles consists of `type_of` and
+        // `explicit_implied_clauses_of` queries, so we just check just these here.
+        frames.iter().all(|frame| match frame.tagged_key {
+            TaggedQueryKey::type_of(def_id)
+            | TaggedQueryKey::explicit_implied_clauses_of(def_id)
+                if tcx.def_kind(def_id) == def_kind =>
+            {
+                true
+            }
+            _ => false,
+        })
+    };
+
+    let alias = if !nested {
+        if is_all_def_kind(DefKind::TyAlias) {
+            Some(crate::diagnostics::Alias::Ty)
+        } else if is_all_def_kind(DefKind::TraitAlias) {
+            Some(crate::diagnostics::Alias::Trait)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if nested {
+        tcx.sess.dcx().create_err(crate::diagnostics::NestedCycle {
+            span,
+            cycle_stack,
+            stack_bottom: crate::diagnostics::NestedCycleBottom { stack_bottom },
+            cycle_usage,
+            stack_count,
+            note_span: (),
+        })
+    } else {
+        tcx.sess.dcx().create_err(crate::diagnostics::Cycle {
+            span,
+            cycle_stack,
+            stack_bottom,
+            alias,
+            cycle_usage,
+            stack_count,
+            note_span: (),
+        })
     }
 }

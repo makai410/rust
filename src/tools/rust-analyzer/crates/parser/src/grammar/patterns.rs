@@ -12,6 +12,7 @@ pub(super) const PATTERN_FIRST: TokenSet =
         T![_],
         T![-],
         T![.],
+        T![!],
     ]));
 
 const PAT_TOP_FIRST: TokenSet = PATTERN_FIRST.union(TokenSet::new(&[T![|]]));
@@ -175,9 +176,11 @@ fn pattern_single_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
                 //      ^
                 // `0 .. if`
                 //       ^
+                // `0 .. | _`
+                //       ^
                 if matches!(
                     p.current(),
-                    T![=] | T![,] | T![:] | T![')'] | T!['}'] | T![']'] | T![if] | EOF
+                    T![=] | T![,] | T![:] | T![')'] | T!['}'] | T![']'] | T![if] | T![|] | EOF
                 ) {
                     // test half_open_range_pat
                     // fn f() {
@@ -188,6 +191,8 @@ fn pattern_single_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
                     //         0 .. if true => (),
                     //         _ => (),
                     //     }
+                    //
+                    //     let &(0.. | _) = &0_i32;
                     // }
                 } else {
                     atom_pat(p, recovery_set);
@@ -196,6 +201,23 @@ fn pattern_single_r(p: &mut Parser<'_>, recovery_set: TokenSet) {
                 return;
             }
         }
+    }
+}
+
+fn builtin_pat(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+    let m = p.start();
+    p.bump_remap(T![builtin]);
+    p.bump(T![#]);
+    if p.eat_contextual_kw(T![deref]) {
+        // test deref_pat
+        // fn foo() { let builtin # deref(_) = 1; }
+        p.expect(T!['(']);
+        pattern(p);
+        p.expect(T![')']);
+        Some(m.complete(p, DEREF_PAT))
+    } else {
+        m.abandon(p);
+        None
     }
 }
 
@@ -214,6 +236,10 @@ const PAT_RECOVERY_SET: TokenSet = TokenSet::new(&[
 ]);
 
 fn atom_pat(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMarker> {
+    if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
+        return builtin_pat(p);
+    }
+
     let m = match p.current() {
         T![box] => box_pat(p),
         T![ref] | T![mut] => ident_pat(p, true),
@@ -235,6 +261,7 @@ fn atom_pat(p: &mut Parser<'_>, recovery_set: TokenSet) -> Option<CompletedMarke
         T![&] => ref_pat(p),
         T!['('] => tuple_pat(p),
         T!['['] => slice_pat(p),
+        T![!] => not_null_pat(p),
 
         _ => {
             p.err_recover("expected pattern", recovery_set);
@@ -412,6 +439,18 @@ fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
     p.eat(T![mut]);
     pattern_single(p);
     m.complete(p, REF_PAT)
+}
+
+// test not_null_pat
+// fn main() {
+//     let (!a | !&0) = ();
+// }
+fn not_null_pat(p: &mut Parser<'_>) -> CompletedMarker {
+    assert!(p.at(T![!]));
+    let m = p.start();
+    p.bump(T![!]);
+    pattern_single(p);
+    m.complete(p, NOT_NULL)
 }
 
 // test tuple_pat

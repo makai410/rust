@@ -197,6 +197,20 @@ fn generate_launcher<'ll>(cx: &CodegenCx<'ll, '_>) -> (&'ll llvm::Value, &'ll ll
     (tgt_decl, tgt_fn_ty)
 }
 
+/// Declares the `omp_get_num_devices` runtime function and returns the
+/// declaration together with its type.
+pub(crate) fn declare_omp_get_num_devices<'ll>(
+    cx: &CodegenCx<'ll, '_>,
+) -> (&'ll llvm::Value, &'ll llvm::Type) {
+    let ti32 = cx.type_i32();
+    let tgt_fn_ty = cx.type_func(&[], ti32);
+    let name = "omp_get_num_devices";
+    let tgt_decl = declare_offload_fn(&cx, name, tgt_fn_ty);
+    let nounwind = llvm::AttributeKind::NoUnwind.create_attr(cx.llcx);
+    attributes::apply_to_llfn(tgt_decl, Function, &[nounwind]);
+    (tgt_decl, tgt_fn_ty)
+}
+
 // What is our @1 here? A magic global, used in our data_{begin/update/end}_mapper:
 // @0 = private unnamed_addr constant [23 x i8] c";unknown;unknown;0;0;;\00", align 1
 // @1 = private unnamed_addr constant %struct.ident_t { i32 0, i32 2, i32 0, i32 22, ptr @0 }, align 8
@@ -296,7 +310,7 @@ struct KernelArgsTy {
 
 impl KernelArgsTy {
     const OFFLOAD_VERSION: u64 = 3;
-    const FLAGS: u64 = 0;
+    const FLAGS: u64 = 1 << 6; // Enable StrictBlocksAndThreads
     const TRIPCOUNT: u64 = 0;
     fn new_decl<'ll>(cx: &CodegenCx<'ll, '_>) -> &'ll Type {
         let kernel_arguments_ty = cx.type_named_struct("struct.__tgt_kernel_arguments");
@@ -319,25 +333,26 @@ impl KernelArgsTy {
         geps: [&'ll Value; 3],
         workgroup_dims: &'ll Value,
         thread_dims: &'ll Value,
-    ) -> [(Align, &'ll Value); 13] {
+        dyn_cache: &'ll Value,
+    ) -> [(Align, &'ll str, &'ll Value); 13] {
         let four = Align::from_bytes(4).expect("4 Byte alignment should work");
         let eight = Align::EIGHT;
 
         [
-            (four, cx.get_const_i32(KernelArgsTy::OFFLOAD_VERSION)),
-            (four, cx.get_const_i32(num_args)),
-            (eight, geps[0]),
-            (eight, geps[1]),
-            (eight, geps[2]),
-            (eight, memtransfer_types),
+            (four, "Version", cx.get_const_i32(KernelArgsTy::OFFLOAD_VERSION)),
+            (four, "NumArgs", cx.get_const_i32(num_args)),
+            (eight, "ArgBasePtrs", geps[0]),
+            (eight, "ArgPtrs", geps[1]),
+            (eight, "ArgSizes", geps[2]),
+            (eight, "ArgTypes", memtransfer_types),
             // The next two are debug infos. FIXME(offload): set them
-            (eight, cx.const_null(cx.type_ptr())), // dbg
-            (eight, cx.const_null(cx.type_ptr())), // dbg
-            (eight, cx.get_const_i64(KernelArgsTy::TRIPCOUNT)),
-            (eight, cx.get_const_i64(KernelArgsTy::FLAGS)),
-            (four, workgroup_dims),
-            (four, thread_dims),
-            (four, cx.get_const_i32(0)),
+            (eight, "ArgNames", cx.const_null(cx.type_ptr())), // dbg
+            (eight, "ArgMappers", cx.const_null(cx.type_ptr())), // dbg
+            (eight, "Tripcount", cx.get_const_i64(KernelArgsTy::TRIPCOUNT)),
+            (eight, "Flags", cx.get_const_i64(KernelArgsTy::FLAGS)),
+            (four, "NumTeams", workgroup_dims),
+            (four, "ThreadLimit", thread_dims),
+            (four, "DynCGroupMem", dyn_cache),
         ]
     }
 }
@@ -448,14 +463,19 @@ pub(crate) fn gen_define_handling<'ll>(
         transfer.iter().map(|m| m.intersection(valid_begin_mappings).bits()).collect();
     let transfer_from: Vec<u64> =
         transfer.iter().map(|m| m.intersection(MappingFlags::FROM).bits()).collect();
+    let valid_kernel_mappings = MappingFlags::LITERAL | MappingFlags::IMPLICIT;
     // FIXME(offload): add `OMP_MAP_TARGET_PARAM = 0x20` only if necessary
-    let transfer_kernel = vec![MappingFlags::TARGET_PARAM.bits(); transfer_to.len()];
+    let transfer_kernel: Vec<u64> = transfer
+        .iter()
+        .map(|m| (m.intersection(valid_kernel_mappings) | MappingFlags::TARGET_PARAM).bits())
+        .collect();
 
     let actual_sizes = sizes
         .iter()
         .map(|s| match s {
             OffloadSize::Static(sz) => *sz,
-            OffloadSize::Dynamic => 0,
+            // NOTE(Sa4dUs): set `.offload_sizes` entry to 0 for sizes that we determine at runtime, just like clang
+            _ => 0,
         })
         .collect::<Vec<_>>();
     let offload_sizes =
@@ -542,12 +562,20 @@ pub(crate) fn scalar_width<'ll>(cx: &'ll SimpleCx<'_>, ty: &'ll Type) -> u64 {
 }
 
 fn get_runtime_size<'ll, 'tcx>(
-    _cx: &CodegenCx<'ll, 'tcx>,
-    _val: &'ll Value,
-    _meta: &OffloadMetadata,
+    builder: &mut Builder<'_, 'll, 'tcx>,
+    args: &[&'ll Value],
+    index: usize,
+    meta: &OffloadMetadata,
 ) -> &'ll Value {
-    // FIXME(Sa4dUs): handle dynamic-size data (e.g. slices)
-    bug!("offload does not support dynamic sizes yet");
+    match meta.payload_size {
+        OffloadSize::Slice { element_size } => {
+            let length_idx = index + 1;
+            let length = args[length_idx];
+            let length_i64 = builder.intcast(length, builder.cx.type_i64(), false);
+            builder.mul(length_i64, builder.cx.get_const_i64(element_size))
+        }
+        _ => bug!("unexpected offload size {:?}", meta.payload_size),
+    }
 }
 
 // For each kernel *call*, we now use some of our previous declared globals to move data to and from
@@ -576,6 +604,8 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
     metadata: &[OffloadMetadata],
     offload_globals: &OffloadGlobals<'ll>,
     offload_dims: &OffloadKernelDims<'ll>,
+    dyn_cache: &'ll Value,
+    device_id: &'ll Value,
 ) {
     let cx = builder.cx;
     let OffloadKernelGlobals {
@@ -588,7 +618,7 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
     let OffloadKernelDims { num_workgroups, threads_per_block, workgroup_dims, thread_dims } =
         offload_dims;
 
-    let has_dynamic = metadata.iter().any(|m| matches!(m.payload_size, OffloadSize::Dynamic));
+    let has_dynamic = metadata.iter().any(|m| !matches!(m.payload_size, OffloadSize::Static(_)));
 
     let tgt_decl = offload_globals.launcher_fn;
     let tgt_target_kernel_ty = offload_globals.launcher_ty;
@@ -683,9 +713,9 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
         let gep2 = builder.inbounds_gep(ty, a2, &[i32_0, idx]);
         builder.store(geps[i as usize], gep2, Align::EIGHT);
 
-        if matches!(metadata[i as usize].payload_size, OffloadSize::Dynamic) {
+        if !matches!(metadata[i as usize].payload_size, OffloadSize::Static(_)) {
             let gep3 = builder.inbounds_gep(ty2, a4, &[i32_0, idx]);
-            let size_val = get_runtime_size(cx, args[i as usize], &metadata[i as usize]);
+            let size_val = get_runtime_size(builder, args, i as usize, &metadata[i as usize]);
             builder.store(size_val, gep3, Align::EIGHT);
         }
     }
@@ -740,25 +770,28 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
         num_args,
         s_ident_t,
     );
-    let values =
-        KernelArgsTy::new(&cx, num_args, memtransfer_kernel, geps, workgroup_dims, thread_dims);
+    let values = KernelArgsTy::new(
+        &cx,
+        num_args,
+        memtransfer_kernel,
+        geps,
+        workgroup_dims,
+        thread_dims,
+        dyn_cache,
+    );
 
     // Step 3)
     // Here we fill the KernelArgsTy, see the documentation above
     for (i, value) in values.iter().enumerate() {
         let ptr = builder.inbounds_gep(tgt_kernel_decl, a5, &[i32_0, cx.get_const_i32(i as u64)]);
-        builder.store(value.1, ptr, value.0);
+        let name = std::ffi::CString::new(value.1).unwrap();
+        llvm::set_value_name(ptr, &name.as_bytes());
+
+        builder.store(value.2, ptr, value.0);
     }
 
-    let args = vec![
-        s_ident_t,
-        // FIXME(offload) give users a way to select which GPU to use.
-        cx.get_const_i64(u64::MAX), // MAX == -1.
-        num_workgroups,
-        threads_per_block,
-        region_id,
-        a5,
-    ];
+    let device_id = builder.sext(device_id, cx.type_i64());
+    let args = vec![s_ident_t, device_id, num_workgroups, threads_per_block, region_id, a5];
     builder.call(tgt_target_kernel_ty, None, None, tgt_decl, &args, None, None);
     // %41 = call i32 @__tgt_target_kernel(ptr @1, i64 -1, i32 2097152, i32 256, ptr @.kernel_1.region_id, ptr %kernel_args)
 

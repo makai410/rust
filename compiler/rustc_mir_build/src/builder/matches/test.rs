@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_hir::{LangItem, RangeEnd};
+use rustc_hir::RangeEnd;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::bug;
 use rustc_middle::mir::*;
 use rustc_middle::ty::util::IntTypeExt;
@@ -44,10 +45,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 TestKind::ScalarEq { value }
             }
 
-            TestableCase::Range(ref range) => {
-                assert_eq!(range.ty, match_pair.pattern_ty);
-                TestKind::Range(Arc::clone(range))
-            }
+            TestableCase::Range(ref range) => TestKind::Range(Arc::clone(range)),
 
             TestableCase::Slice { len, op } => TestKind::SliceLen { len, op },
 
@@ -281,7 +279,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
                 // actual = len(place)
                 let length_op = self.len_of_slice_or_array(block, place, test.span, source_info);
-                self.cfg.push_assign(block, source_info, actual, Rvalue::Use(length_op));
+                self.cfg.push_assign(
+                    block,
+                    source_info,
+                    actual,
+                    Rvalue::Use(length_op, WithRetag::Yes),
+                );
 
                 // expected = <N>
                 let expected = self.push_usize(block, source_info, len);
@@ -346,7 +349,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let source_info = self.source_info(span);
         let re_erased = self.tcx.lifetimes.re_erased;
         let trait_item = self.tcx.require_lang_item(trait_item, span);
-        let method = trait_method(self.tcx, trait_item, method, [ty]);
+        let method = trait_method(self.tcx, trait_item, method, &[ty.into()]);
         let ref_src = self.temp(Ty::new_ref(self.tcx, re_erased, ty, mutability), span);
         // `let ref_src = &src_place;`
         // or `let ref_src = &mut src_place;`
@@ -419,7 +422,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) {
         let str_ty = self.tcx.types.str_;
         let eq_def_id = self.tcx.require_lang_item(LangItem::PartialEq, source_info.span);
-        let method = trait_method(self.tcx, eq_def_id, sym::eq, [str_ty, str_ty]);
+        let method = trait_method(self.tcx, eq_def_id, sym::eq, &[str_ty.into(), str_ty.into()]);
 
         let bool_ty = self.tcx.types.bool;
         let eq_result = self.temp(bool_ty, source_info.span);
@@ -466,7 +469,7 @@ fn trait_method<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_def_id: DefId,
     method_name: Symbol,
-    args: impl IntoIterator<Item: Into<GenericArg<'tcx>>>,
+    args: &[GenericArg<'tcx>],
 ) -> Const<'tcx> {
     // The unhygienic comparison here is acceptable because this is only
     // used on known traits.
@@ -476,7 +479,5 @@ fn trait_method<'tcx>(
         .find(|item| item.is_fn())
         .expect("trait method not found");
 
-    let method_ty = Ty::new_fn_def(tcx, item.def_id, args);
-
-    Const::zero_sized(method_ty)
+    Const::zero_sized(tcx.type_of(item.def_id).instantiate(tcx, args).skip_norm_wip())
 }

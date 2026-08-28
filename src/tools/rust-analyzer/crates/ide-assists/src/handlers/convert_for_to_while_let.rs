@@ -2,7 +2,7 @@ use hir::{Name, sym};
 use ide_db::{famous_defs::FamousDefs, syntax_helpers::suggest_name};
 use syntax::{
     AstNode,
-    ast::{self, HasAttrs, HasLoopBody, edit::IndentLevel, syntax_factory::SyntaxFactory},
+    ast::{self, HasAttrs, HasLoopBody, edit::IndentLevel},
     syntax_editor::Position,
 };
 
@@ -24,15 +24,15 @@ use crate::{AssistContext, AssistId, Assists};
 // ```
 // fn main() {
 //     let x = vec![1, 2, 3];
-//     let mut tmp = x.into_iter();
-//     while let Some(v) = tmp.next() {
+//     let mut iter = x.into_iter();
+//     while let Some(v) = iter.next() {
 //         let y = v * 2;
 //     };
 // }
 // ```
 pub(crate) fn convert_for_loop_to_while_let(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let for_loop = ctx.find_node_at_offset::<ast::ForExpr>()?;
     let iterable = for_loop.iterable()?;
@@ -48,8 +48,8 @@ pub(crate) fn convert_for_loop_to_while_let(
         "Replace this for loop with `while let`",
         for_loop.syntax().text_range(),
         |builder| {
-            let make = SyntaxFactory::with_mappings();
-            let mut editor = builder.make_editor(for_loop.syntax());
+            let editor = builder.make_editor(for_loop.syntax());
+            let make = editor.make();
 
             let (iterable, method) = if impls_core_iter(&ctx.sema, &iterable) {
                 (iterable, None)
@@ -71,7 +71,7 @@ pub(crate) fn convert_for_loop_to_while_let(
             let mut new_name = suggest_name::NameGenerator::new_from_scope_locals(
                 ctx.sema.scope(for_loop.syntax()),
             );
-            let tmp_var = new_name.suggest_name("tmp");
+            let tmp_var = new_name.suggest_name("iter");
 
             let mut_expr = make.let_stmt(
                 make.ident_pat(false, true, make.name(&tmp_var)).into(),
@@ -81,16 +81,11 @@ pub(crate) fn convert_for_loop_to_while_let(
             let indent = IndentLevel::from_node(for_loop.syntax());
 
             if let Some(label) = for_loop.label() {
-                let label = label.syntax().clone_for_update();
+                let label = label.syntax();
                 editor.insert(Position::before(for_loop.syntax()), make.whitespace(" "));
                 editor.insert(Position::before(for_loop.syntax()), label);
             }
-            crate::utils::insert_attributes(
-                for_loop.syntax(),
-                &mut editor,
-                for_loop.attrs().map(|it| it.clone_for_update()),
-                &make,
-            );
+            crate::utils::insert_attributes(for_loop.syntax(), &editor, for_loop.attrs());
 
             editor.insert(
                 Position::before(for_loop.syntax()),
@@ -110,7 +105,6 @@ pub(crate) fn convert_for_loop_to_while_let(
 
             editor.replace(for_loop.syntax(), while_loop.syntax());
 
-            editor.add_mappings(make.finish_with_mappings());
             builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
@@ -188,8 +182,8 @@ fn main() {
             r"
 fn main() {
     let mut x = vec![1, 2, 3];
-    let mut tmp = x.into_iter();
-    while let Some(v) = tmp.next() {
+    let mut iter = x.into_iter();
+    while let Some(v) = iter.next() {
         v *= 2;
     };
 }",
@@ -211,8 +205,8 @@ fn main() {
             r"
 fn main() {
     let mut x = vec![1, 2, 3];
-    let mut tmp = x.into_iter();
-    'a: while let Some(v) = tmp.next() {
+    let mut iter = x.into_iter();
+    'a: while let Some(v) = iter.next() {
         v *= 2;
         break 'a;
     };
@@ -236,10 +230,10 @@ fn main() {
             r"
 fn main() {
     let mut x = vec![1, 2, 3];
-    let mut tmp = x.into_iter();
+    let mut iter = x.into_iter();
     #[allow(unused)]
     #[deny(unsafe_code)]
-    while let Some(v) = tmp.next() {
+    while let Some(v) = iter.next() {
         v *= 2;
     };
 }",
@@ -275,8 +269,8 @@ impl<T> core::iter::Iterator for core::ops::Range<T> {
 }
 
 fn main() {
-    let mut tmp = 0..92;
-    while let Some(x) = tmp.next() {
+    let mut iter = 0..92;
+    while let Some(x) = iter.next() {
         print!("{}", x);
     }
 }"#,
@@ -330,8 +324,8 @@ impl S {
 
 fn main() {
     let x = S;
-    let mut tmp = x.iter();
-    while let Some(v) = tmp.next() {
+    let mut iter = x.iter();
+    while let Some(v) = iter.next() {
         let a = v * 2;
     }
 }
@@ -356,8 +350,8 @@ fn main() {
 struct NoIterMethod;
 fn main() {
     let x = NoIterMethod;
-    let mut tmp = (&x).into_iter();
-    while let Some(v) = tmp.next() {
+    let mut iter = (&x).into_iter();
+    while let Some(v) = iter.next() {
         let a = v * 2;
     }
 }
@@ -382,8 +376,8 @@ fn main() {
 struct NoIterMethod;
 fn main() {
     let x = NoIterMethod;
-    let mut tmp = (&mut x).into_iter();
-    while let Some(v) = tmp.next() {
+    let mut iter = (&mut x).into_iter();
+    while let Some(v) = iter.next() {
         let a = v * 2;
     }
 }
@@ -423,8 +417,8 @@ impl S {
 
 fn main() {
     let x = S;
-    let mut tmp = x.iter_mut();
-    while let Some(v) = tmp.next() {
+    let mut iter = x.iter_mut();
+    while let Some(v) = iter.next() {
         let a = v * 2;
     }
 }
@@ -448,8 +442,8 @@ fn main() {
 fn main() {
     let mut x = vec![1, 2, 3];
     let y = &mut x;
-    let mut tmp = y.into_iter();
-    while let Some(v) = tmp.next() {
+    let mut iter = y.into_iter();
+    while let Some(v) = iter.next() {
         *v *= 2;
     }
 }",
@@ -471,8 +465,8 @@ fn main() {
 "#,
             r#"
 fn main() {
-    let mut tmp = core::iter::repeat(92).take(1);
-    while let Some(a) = tmp.next() {
+    let mut iter = core::iter::repeat(92).take(1);
+    while let Some(a) = iter.next() {
         println!("{}", a);
     }
 }

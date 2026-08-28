@@ -1,7 +1,6 @@
 use crate::io;
-use crate::sys::io::RawOsError;
 
-pub fn errno() -> RawOsError {
+pub fn errno() -> io::RawOsError {
     // Not used in Motor OS because it is ambiguous: Motor OS
     // is micro-kernel-based, and I/O happens via a shared-memory
     // ring buffer, so an I/O operation that on a unix is a syscall
@@ -51,13 +50,14 @@ pub fn decode_error_kind(code: io::RawOsError) -> io::ErrorKind {
         moto_rt::Error::BadHandle => io::ErrorKind::InvalidInput,
         moto_rt::Error::FileTooLarge => io::ErrorKind::FileTooLarge,
         moto_rt::Error::NotConnected => io::ErrorKind::NotConnected,
+        moto_rt::Error::ConnectionReset => io::ErrorKind::ConnectionReset,
         moto_rt::Error::StorageFull => io::ErrorKind::StorageFull,
         moto_rt::Error::InvalidData => io::ErrorKind::InvalidData,
         _ => io::ErrorKind::Uncategorized,
     }
 }
 
-pub fn error_string(errno: RawOsError) -> String {
+pub fn error_string(errno: io::RawOsError) -> String {
     let error: moto_rt::Error = match errno {
         x if x < 0 => moto_rt::Error::Unknown,
         x if x > u16::MAX.into() => moto_rt::Error::Unknown,

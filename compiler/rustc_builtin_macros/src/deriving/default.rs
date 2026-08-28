@@ -9,7 +9,7 @@ use thin_vec::{ThinVec, thin_vec};
 
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
-use crate::errors;
+use crate::diagnostics;
 
 pub(crate) fn expand_deriving_default(
     cx: &ExtCtxt<'_>,
@@ -26,17 +26,17 @@ pub(crate) fn expand_deriving_default(
         path: Path::new(vec![kw::Default, sym::Default]),
         skip_path_as_bound: has_a_default_variant(item),
         needs_copy_as_bound_if_packed: false,
-        additional_bounds: Vec::new(),
+        additional_bounds: SmallVec::new(),
         supports_unions: false,
-        methods: vec![MethodDef {
+        methods: smallvec![MethodDef {
             name: kw::Default,
             generics: Bounds::empty(),
             explicit_self: false,
-            nonself_args: Vec::new(),
+            nonself_args: SmallVec::new(),
             ret_ty: Self_,
             attributes: thin_vec![cx.attr_word(sym::inline, span)],
             fieldless_variants_strategy: FieldlessVariantsStrategy::Default,
-            combine_substructure: combine_substructure(Box::new(|cx, trait_span, substr| {
+            combine_substructure: combine_substructure(|cx, trait_span, substr| {
                 match substr.fields {
                     StaticStruct(_, fields) => {
                         default_struct_substructure(cx, trait_span, substr, fields)
@@ -46,11 +46,10 @@ pub(crate) fn expand_deriving_default(
                     }
                     _ => cx.dcx().span_bug(trait_span, "method in `derive(Default)`"),
                 }
-            })),
+            }),
         }],
-        associated_types: Vec::new(),
+        associated_types: SmallVec::new(),
         is_const,
-        is_staged_api_crate: cx.ecfg.features.staged_api(),
         safety: Safety::Default,
         document: true,
     };
@@ -123,7 +122,7 @@ fn default_enum_substructure(
                             cx.field_imm(
                                 field.span,
                                 field.ident.unwrap(),
-                                match &field.default {
+                                match field.default_value() {
                                     // We use `Default::default()`.
                                     None => default_call(cx, field.span),
                                     // We use the field default const expression.
@@ -177,10 +176,13 @@ fn extract_default_variant<'a>(
                 .filter(|variant| !attr::contains_name(&variant.attrs, sym::non_exhaustive));
 
             let suggs = possible_defaults
-                .map(|v| errors::NoDefaultVariantSugg { span: v.span.shrink_to_lo() })
+                .map(|v| diagnostics::NoDefaultVariantSugg { span: v.span.shrink_to_lo() })
                 .collect();
-            let guar =
-                cx.dcx().emit_err(errors::NoDefaultVariant { span: trait_span, item_span, suggs });
+            let guar = cx.dcx().emit_err(diagnostics::NoDefaultVariant {
+                span: trait_span,
+                item_span,
+                suggs,
+            });
 
             return Err(guar);
         }
@@ -196,11 +198,13 @@ fn extract_default_variant<'a>(
                                 .filter_map(|attr| (attr.span != keep).then_some(attr.span))
                         })
                         .collect();
-                    (!spans.is_empty())
-                        .then_some(errors::MultipleDefaultsSugg { spans, ident: variant.ident })
+                    (!spans.is_empty()).then_some(diagnostics::MultipleDefaultsSugg {
+                        spans,
+                        ident: variant.ident,
+                    })
                 })
                 .collect();
-            let guar = cx.dcx().emit_err(errors::MultipleDefaults {
+            let guar = cx.dcx().emit_err(diagnostics::MultipleDefaults {
                 span: trait_span,
                 first: first.span,
                 additional: rest.iter().map(|v| v.span).collect(),
@@ -212,7 +216,7 @@ fn extract_default_variant<'a>(
 
     if cx.ecfg.features.default_field_values()
         && let VariantData::Struct { fields, .. } = &variant.data
-        && fields.iter().all(|f| f.default.is_some())
+        && fields.iter().all(|f| f.default_value().is_some())
         // Disallow `#[default] Variant {}`
         && !fields.is_empty()
     {
@@ -223,12 +227,13 @@ fn extract_default_variant<'a>(
         } else {
             ""
         };
-        let guar = cx.dcx().emit_err(errors::NonUnitDefault { span: variant.ident.span, post });
+        let guar =
+            cx.dcx().emit_err(diagnostics::NonUnitDefault { span: variant.ident.span, post });
         return Err(guar);
     }
 
     if let Some(non_exhaustive_attr) = attr::find_by_name(&variant.attrs, sym::non_exhaustive) {
-        let guar = cx.dcx().emit_err(errors::NonExhaustiveDefault {
+        let guar = cx.dcx().emit_err(diagnostics::NonExhaustiveDefault {
             span: variant.ident.span,
             non_exhaustive: non_exhaustive_attr.span,
         });
@@ -252,10 +257,10 @@ fn validate_default_attribute(
             "this method must only be called with a variant that has a `#[default]` attribute",
         ),
         [first, rest @ ..] => {
-            let sugg = errors::MultipleDefaultAttrsSugg {
+            let sugg = diagnostics::MultipleDefaultAttrsSugg {
                 spans: rest.iter().map(|attr| attr.span).collect(),
             };
-            let guar = cx.dcx().emit_err(errors::MultipleDefaultAttrs {
+            let guar = cx.dcx().emit_err(diagnostics::MultipleDefaultAttrs {
                 span: default_variant.ident.span,
                 first: first.span,
                 first_rest: rest[0].span,
@@ -268,7 +273,7 @@ fn validate_default_attribute(
         }
     };
     if !attr.is_word() {
-        let guar = cx.dcx().emit_err(errors::DefaultHasArg { span: attr.span });
+        let guar = cx.dcx().emit_err(diagnostics::DefaultHasArg { span: attr.span });
 
         return Err(guar);
     }
@@ -287,7 +292,7 @@ impl<'a, 'b> rustc_ast::visit::Visitor<'a> for DetectNonVariantDefaultAttr<'a, '
             } else {
                 ""
             };
-            self.cx.dcx().emit_err(errors::NonUnitDefault { span: attr.span, post });
+            self.cx.dcx().emit_err(diagnostics::NonUnitDefault { span: attr.span, post });
         }
 
         rustc_ast::visit::walk_attribute(self, attr);

@@ -1,6 +1,6 @@
 // Tests for repeating attribute warnings.
 //@ aux-build:lint_unused_extern_crate.rs
-//@ compile-flags:--test
+//@ compile-flags:--test -W repeated-reprs
 // Not tested due to extra requirements:
 // - panic_handler: needs extra setup
 // - target_feature: platform-specific
@@ -61,10 +61,10 @@ pub mod from_path;
 fn t1() {}
 
 #[must_use]
-#[must_use = "some message"]  //~ ERROR unused attribute
-//~^ WARN this was previously accepted
-// No warnings for #[repr], would require more logic.
-#[repr(C)]
+#[must_use = "some message"]
+//~^ ERROR unused attribute
+//~| WARN this was previously accepted
+#[repr(C)] //~ WARN `#[repr(..)]` attribute is specified more than once [repeated_reprs]
 #[repr(C)]
 #[non_exhaustive]
 #[non_exhaustive] //~ ERROR unused attribute
@@ -96,7 +96,7 @@ extern "C" {
 }
 
 #[export_name = "exported_symbol_name"]
-#[export_name = "exported_symbol_name2"]  //~ ERROR unused attribute
+#[export_name = "exported_symbol_name2"] //~ ERROR unused attribute
 //~^ WARN this was previously accepted
 pub fn export_test() {}
 
@@ -108,8 +108,8 @@ pub fn no_mangle_test() {}
 #[used] //~ ERROR unused attribute
 static FOO: u32 = 0;
 
-#[link_section = ".text"]
-#[link_section = ".bss"]
+#[link_section = "__TEXT,__text"]
+#[link_section = "__DATA,__mod_init_func"]
 //~^ ERROR unused attribute
 //~| WARN this was previously accepted
 pub extern "C" fn example() {}

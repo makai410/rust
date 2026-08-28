@@ -94,7 +94,6 @@
 //! constructors of a type. For example, all the following is ok:
 //!
 //! ```rust,ignore(example)
-//! # #![feature(never_type)]
 //! # #![feature(exhaustive_patterns)]
 //! fn foo(x: Option<!>) {
 //!   match x {
@@ -114,8 +113,8 @@
 //! Moreover, take the following:
 //!
 //! ```rust
-//! # #![feature(never_type)]
 //! # #![feature(exhaustive_patterns)]
+#![cfg_attr(feature = "rustc", cfg_attr(bootstrap, doc = "#![feature(never_type)]"))]
 //! # let x = None::<!>;
 //! match x {
 //!   None => {}
@@ -493,6 +492,15 @@ impl Slice {
     /// See `Constructor::is_covered_by`
     fn is_covered_by(self, other: Self) -> bool {
         other.kind.covers_length(self.arity())
+    }
+
+    // Getters. They are used by rust-analyzer.
+    pub fn array_len(self) -> Option<usize> {
+        self.array_len
+    }
+
+    pub fn kind(self) -> SliceKind {
+        self.kind
     }
 
     /// This computes constructor splitting for variable-length slices, as explained at the top of

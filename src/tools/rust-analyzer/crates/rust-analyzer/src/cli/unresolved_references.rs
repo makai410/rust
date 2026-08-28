@@ -1,7 +1,7 @@
 //! Reports references in code that the IDE layer cannot resolve.
 use hir::{AnyDiagnostic, Crate, Module, Semantics, db::HirDatabase, sym};
 use ide::{AnalysisHost, RootDatabase, TextRange};
-use ide_db::{FxHashSet, LineIndexDatabase as _, base_db::SourceDatabase, defs::NameRefClass};
+use ide_db::{FxHashSet, base_db::SourceDatabase, defs::NameRefClass, line_index};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use parser::SyntaxKind;
 use syntax::{AstNode, WalkEvent, ast};
@@ -11,13 +11,10 @@ use crate::cli::flags;
 
 impl flags::UnresolvedReferences {
     pub fn run(self) -> anyhow::Result<()> {
-        const STACK_SIZE: usize = 1024 * 1024 * 8;
-
         let handle = stdx::thread::Builder::new(
             stdx::thread::ThreadIntent::LatencySensitive,
             "BIG_STACK_THREAD",
         )
-        .stack_size(STACK_SIZE)
         .spawn(|| self.run_())
         .unwrap();
 
@@ -75,7 +72,7 @@ impl flags::UnresolvedReferences {
                 let file_path = vfs.file_path(file_id);
                 eprintln!("processing crate: {crate_name}, module: {file_path}",);
 
-                let line_index = db.line_index(file_id);
+                let line_index = line_index(db, file_id);
                 let file_text = db.file_text(file_id);
 
                 for range in find_unresolved_references(db, &sema, file_id, &module) {

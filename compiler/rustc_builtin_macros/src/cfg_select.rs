@@ -6,7 +6,7 @@ use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacResult, MacroExp
 use rustc_span::{Ident, Span, sym};
 use smallvec::SmallVec;
 
-use crate::errors::CfgSelectNoMatches;
+use crate::diagnostics::CfgSelectNoMatches;
 
 /// This intermediate structure is used to emit parse errors for the branches that are not chosen.
 /// The `MacResult` instance below parses all branches, emitting any errors it encounters, but only
@@ -74,7 +74,7 @@ pub(super) fn expand_cfg_select<'cx>(
         ) {
             Ok(mut branches) => {
                 if let Some((selected_tts, selected_span)) = branches.pop_first_match(|cfg| {
-                    matches!(attr::eval_config_entry(&ecx.sess, cfg), EvalConfigResult::True)
+                    matches!(attr::eval_config_entry(ecx.sess, cfg), EvalConfigResult::True)
                 }) {
                     let mac = CfgSelectResult {
                         ecx,

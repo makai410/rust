@@ -16,7 +16,6 @@ use crate::traits::{ObligationCause, ObligationCtxt};
 
 pub mod ascribe_user_type;
 pub mod custom;
-pub mod implied_outlives_bounds;
 pub mod normalize;
 pub mod outlives;
 pub mod prove_predicate;
@@ -110,7 +109,9 @@ pub trait QueryTypeOp<'tcx>: fmt::Debug + Copy + TypeFoldable<TyCtxt<'tcx>> + 't
         ),
         NoSolution,
     > {
-        if let Some(result) = QueryTypeOp::try_fast_path(infcx.tcx, &query_key) {
+        if !infcx.disable_trait_solver_fast_paths()
+            && let Some(result) = QueryTypeOp::try_fast_path(infcx.tcx, &query_key)
+        {
             return Ok((result, None, PredicateObligations::new(), Certainty::Proven));
         }
 
@@ -145,24 +146,6 @@ where
         root_def_id: LocalDefId,
         span: Span,
     ) -> Result<TypeOpOutput<'tcx, Self>, ErrorGuaranteed> {
-        // In the new trait solver, query type ops are performed locally. This
-        // is because query type ops currently use the old canonicalizer, and
-        // that doesn't preserve things like opaques which have been registered
-        // during MIR typeck. Even after the old canonicalizer is gone, it's
-        // probably worthwhile just keeping this run-locally logic, since we
-        // probably don't gain much from caching here given the new solver does
-        // caching internally.
-        if infcx.next_trait_solver() {
-            return Ok(scrape_region_constraints(
-                infcx,
-                root_def_id,
-                "query type op",
-                span,
-                |ocx| QueryTypeOp::perform_locally_with_next_solver(ocx, self, span),
-            )?
-            .0);
-        }
-
         let mut error_info = None;
         let mut region_constraints = QueryRegionConstraints::default();
 
@@ -180,8 +163,8 @@ where
                 Ok(output)
             })?;
         output.error_info = error_info;
-        if let Some(QueryRegionConstraints { outlives, assumptions }) = output.constraints {
-            region_constraints.outlives.extend(outlives.iter().cloned());
+        if let Some(QueryRegionConstraints { constraints, assumptions }) = output.constraints {
+            region_constraints.constraints.extend(constraints.iter().cloned());
             region_constraints.assumptions.extend(assumptions.iter().cloned());
         }
         output.constraints = if region_constraints.is_empty() {

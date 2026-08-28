@@ -2,6 +2,9 @@ use std::hint::black_box;
 use std::num::FpCategory as Fp;
 use std::ops::{Add, Div, Mul, Rem, Sub};
 
+/// i586 has issues with floating point precision.
+const I586: bool = cfg!(target_arch = "x86") && cfg!(not(target_feature = "sse2"));
+
 pub(crate) trait TestableFloat: Sized {
     const BITS: u32;
     /// Unsigned int with the same size, for converting to/from bits.
@@ -55,23 +58,31 @@ pub(crate) trait TestableFloat: Sized {
     const RAW_MINUS_14_DOT_25: Self;
     /// The result of 12.3.mul_add(4.5, 6.7)
     const MUL_ADD_RESULT: Self;
+    /// The result of 48.34375.mul_add(0.000013887882, 0.12438965), which checks that f16::mul_add
+    /// is correctly rounded. A naive implementation via f32::mul_add has insufficient precision.
+    const F16_NO_DOUBLE_ROUNDING_MUL_ADD_RESULT: Self;
     /// The result of (-12.3).mul_add(-4.5, -6.7)
     const NEG_MUL_ADD_RESULT: Self;
     /// Reciprocal of the maximum val
     const MAX_RECIP: Self;
+    const ASINH_ACOSH_MAX: Self;
 }
 
 impl TestableFloat for f16 {
     const BITS: u32 = 16;
     type Int = u16;
     type SInt = i16;
-    const APPROX: Self = 1e-3;
-    const POWF_APPROX: Self = 5e-1;
+    /// Miri adds some extra errors to float functions; make sure the tests still pass.
+    /// These values are purely used as a canary to test against and are thus not a stable guarantee Rust provides.
+    /// They serve as a way to get an idea of the real precision of floating point operations on different platforms.
+    const APPROX: Self = if cfg!(miri) { 1e-2 } else { 1e-3 };
+    const POWF_APPROX: Self = if cfg!(miri) { 1e-0 } else { 5e-1 };
     const _180_TO_RADIANS_APPROX: Self = 1e-2;
     const PI_TO_DEGREES_APPROX: Self = 0.125;
-    const EXP_APPROX: Self = 1e-2;
+    const EXP_APPROX: Self = if cfg!(miri) { 5e-1 } else { 1e-2 }; // for values on the order of 150, 4 ULP are more than 0.1...
+    const POWI_APPROX: Self = if cfg!(miri) { 1e-1 } else { Self::APPROX };
     const LN_APPROX: Self = 1e-2;
-    const LOG_APPROX: Self = 1e-2;
+    const LOG_APPROX: Self = if cfg!(miri) { 1e-1 } else { 1e-2 };
     const LOG2_APPROX: Self = 1e-2;
     const LOG10_APPROX: Self = 1e-2;
     const ASINH_APPROX: Self = 1e-2;
@@ -101,8 +112,10 @@ impl TestableFloat for f16 {
     const RAW_1337: Self = Self::from_bits(0x6539);
     const RAW_MINUS_14_DOT_25: Self = Self::from_bits(0xcb20);
     const MUL_ADD_RESULT: Self = 62.031;
+    const F16_NO_DOUBLE_ROUNDING_MUL_ADD_RESULT: Self = 0.1251;
     const NEG_MUL_ADD_RESULT: Self = 48.625;
     const MAX_RECIP: Self = 1.526624e-5;
+    const ASINH_ACOSH_MAX: Self = 11.781;
 }
 
 impl TestableFloat for f32 {
@@ -120,8 +133,20 @@ impl TestableFloat for f32 {
     const LOG_APPROX: Self = if cfg!(miri) { 1e-3 } else { Self::APPROX };
     const LOG2_APPROX: Self = if cfg!(miri) { 1e-3 } else { Self::APPROX };
     const LOG10_APPROX: Self = if cfg!(miri) { 1e-3 } else { Self::APPROX };
-    const ASINH_APPROX: Self = if cfg!(miri) { 1e-3 } else { Self::APPROX };
-    const ACOSH_APPROX: Self = if cfg!(miri) { 1e-3 } else { Self::APPROX };
+    const ASINH_APPROX: Self = if cfg!(miri) {
+        1e-3
+    } else if I586 {
+        1e-5
+    } else {
+        Self::APPROX
+    };
+    const ACOSH_APPROX: Self = if cfg!(miri) {
+        1e-3
+    } else if I586 {
+        1e-5
+    } else {
+        Self::APPROX
+    };
     const ATANH_APPROX: Self = if cfg!(miri) { 1e-3 } else { Self::APPROX };
     const GAMMA_APPROX: Self = if cfg!(miri) { 1e-3 } else { Self::APPROX };
     const GAMMA_APPROX_LOOSE: Self = if cfg!(miri) { 1e-2 } else { 1e-4 };
@@ -147,8 +172,10 @@ impl TestableFloat for f32 {
     const RAW_1337: Self = Self::from_bits(0x44a72000);
     const RAW_MINUS_14_DOT_25: Self = Self::from_bits(0xc1640000);
     const MUL_ADD_RESULT: Self = 62.05;
+    const F16_NO_DOUBLE_ROUNDING_MUL_ADD_RESULT: Self = 0.12506104;
     const NEG_MUL_ADD_RESULT: Self = 48.65;
     const MAX_RECIP: Self = 2.938736e-39;
+    const ASINH_ACOSH_MAX: Self = 89.4159851;
 }
 
 impl TestableFloat for f64 {
@@ -178,8 +205,10 @@ impl TestableFloat for f64 {
     const RAW_1337: Self = Self::from_bits(0x4094e40000000000);
     const RAW_MINUS_14_DOT_25: Self = Self::from_bits(0xc02c800000000000);
     const MUL_ADD_RESULT: Self = 62.050000000000004;
+    const F16_NO_DOUBLE_ROUNDING_MUL_ADD_RESULT: Self = 0.1250610422954375;
     const NEG_MUL_ADD_RESULT: Self = 48.650000000000006;
     const MAX_RECIP: Self = 5.562684646268003e-309;
+    const ASINH_ACOSH_MAX: Self = 710.47586007394398;
 }
 
 impl TestableFloat for f128 {
@@ -219,8 +248,10 @@ impl TestableFloat for f128 {
     const RAW_1337: Self = Self::from_bits(0x40094e40000000000000000000000000);
     const RAW_MINUS_14_DOT_25: Self = Self::from_bits(0xc002c800000000000000000000000000);
     const MUL_ADD_RESULT: Self = 62.0500000000000000000000000000000037;
+    const F16_NO_DOUBLE_ROUNDING_MUL_ADD_RESULT: Self = 0.1250610422954375;
     const NEG_MUL_ADD_RESULT: Self = 48.6500000000000000000000000000000049;
     const MAX_RECIP: Self = 8.40525785778023376565669454330438228902076605e-4933;
+    const ASINH_ACOSH_MAX: Self = 11357.216553474703894801348310092223;
 }
 
 /// Determine the tolerance for values of the argument type.
@@ -420,8 +451,8 @@ pub(crate) use float_test;
 float_test! {
     name: num,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let two: Float = 2.0;
@@ -438,6 +469,7 @@ float_test! {
 float_test! {
     name: num_rem,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -451,8 +483,8 @@ float_test! {
 float_test! {
     name: nan,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -471,8 +503,8 @@ float_test! {
 float_test! {
     name: infinity,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let inf: Float = Float::INFINITY;
@@ -489,8 +521,8 @@ float_test! {
 float_test! {
     name: neg_infinity,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let neg_inf: Float = Float::NEG_INFINITY;
@@ -507,8 +539,8 @@ float_test! {
 float_test! {
     name: zero,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert_biteq!(0.0, Float::ZERO);
@@ -525,8 +557,8 @@ float_test! {
 float_test! {
     name: neg_zero,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let neg_zero: Float = -0.0;
@@ -545,8 +577,8 @@ float_test! {
 float_test! {
     name: one,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert_biteq!(1.0, Float::ONE);
@@ -563,8 +595,8 @@ float_test! {
 float_test! {
     name: is_nan,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -584,8 +616,8 @@ float_test! {
 float_test! {
     name: is_infinite,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -605,8 +637,8 @@ float_test! {
 float_test! {
     name: is_finite,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -626,8 +658,8 @@ float_test! {
 float_test! {
     name: is_normal,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -648,7 +680,7 @@ float_test! {
 float_test! {
     name: classify,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
+        f16: #[cfg(target_has_reliable_f16)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -669,6 +701,7 @@ float_test! {
 float_test! {
     name: min,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -710,6 +743,7 @@ float_test! {
 float_test! {
     name: max,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -752,6 +786,7 @@ float_test! {
 float_test! {
     name: minimum,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -783,6 +818,7 @@ float_test! {
 float_test! {
     name: maximum,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -815,6 +851,7 @@ float_test! {
 float_test! {
     name: midpoint,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -867,9 +904,9 @@ float_test! {
     name: midpoint_large_magnitude,
     attrs: {
         const: #[cfg(false)],
-        // FIXME(f16_f128): `powi` does not work in Miri for these types
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        // Needs powi
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         // test if large differences in magnitude are still correctly computed.
@@ -898,6 +935,7 @@ float_test! {
 float_test! {
     name: abs,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -916,6 +954,7 @@ float_test! {
 float_test! {
     name: copysign,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -931,6 +970,7 @@ float_test! {
     name: rem_euclid,
     attrs: {
         const: #[cfg(false)],
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -948,6 +988,7 @@ float_test! {
     name: div_euclid,
     attrs: {
         const: #[cfg(false)],
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -963,6 +1004,7 @@ float_test! {
 float_test! {
     name: floor,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -992,6 +1034,7 @@ float_test! {
 float_test! {
     name: ceil,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1021,6 +1064,7 @@ float_test! {
 float_test! {
     name: round,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1051,6 +1095,7 @@ float_test! {
 float_test! {
     name: round_ties_even,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1081,6 +1126,7 @@ float_test! {
 float_test! {
     name: trunc,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1110,6 +1156,7 @@ float_test! {
 float_test! {
     name: fract,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1141,6 +1188,7 @@ float_test! {
 float_test! {
     name: signum,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1159,8 +1207,8 @@ float_test! {
 float_test! {
     name: is_sign_positive,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert!(Float::INFINITY.is_sign_positive());
@@ -1178,8 +1226,8 @@ float_test! {
 float_test! {
     name: is_sign_negative,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert!(!Float::INFINITY.is_sign_negative());
@@ -1197,8 +1245,8 @@ float_test! {
 float_test! {
     name: next_up,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert_biteq!(Float::NEG_INFINITY.next_up(), Float::MIN);
@@ -1228,8 +1276,8 @@ float_test! {
 float_test! {
     name: next_down,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert_biteq!(Float::NEG_INFINITY.next_down(), Float::NEG_INFINITY);
@@ -1261,6 +1309,7 @@ float_test! {
     name: sqrt_domain,
     attrs: {
         const: #[cfg(false)],
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1279,10 +1328,10 @@ float_test! {
     name: clamp_min_greater_than_max,
     attrs: {
         const: #[cfg(false)],
-        f16: #[should_panic, cfg(any(miri, target_has_reliable_f16))],
+        f16: #[should_panic, cfg(target_has_reliable_f16)],
         f32: #[should_panic],
         f64: #[should_panic],
-        f128: #[should_panic, cfg(any(miri, target_has_reliable_f128))],
+        f128: #[should_panic, cfg(target_has_reliable_f128)],
     },
     test {
         let _ = Float::ONE.clamp(3.0, 1.0);
@@ -1293,10 +1342,10 @@ float_test! {
     name: clamp_min_is_nan,
     attrs: {
         const: #[cfg(false)],
-        f16: #[should_panic, cfg(any(miri, target_has_reliable_f16))],
+        f16: #[should_panic, cfg(target_has_reliable_f16)],
         f32: #[should_panic],
         f64: #[should_panic],
-        f128: #[should_panic, cfg(any(miri, target_has_reliable_f128))],
+        f128: #[should_panic, cfg(target_has_reliable_f128)],
     },
     test {
         let _ = Float::ONE.clamp(Float::NAN, 1.0);
@@ -1307,10 +1356,10 @@ float_test! {
     name: clamp_max_is_nan,
     attrs: {
         const: #[cfg(false)],
-        f16: #[should_panic, cfg(any(miri, target_has_reliable_f16))],
+        f16: #[should_panic, cfg(target_has_reliable_f16)],
         f32: #[should_panic],
         f64: #[should_panic],
-        f128: #[should_panic, cfg(any(miri, target_has_reliable_f128))],
+        f128: #[should_panic, cfg(target_has_reliable_f128)],
     },
     test {
         let _ = Float::ONE.clamp(3.0, Float::NAN);
@@ -1320,6 +1369,7 @@ float_test! {
 float_test! {
     name: total_cmp,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1425,6 +1475,7 @@ float_test! {
     name: total_cmp_s_nan,
     attrs: {
         const: #[cfg(false)],
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1481,6 +1532,7 @@ float_test! {
 float_test! {
     name: recip,
     attrs: {
+        // Miri only uses softfloats here, so that always works
         f16: #[cfg(any(miri, target_has_reliable_f16_math))],
         f128: #[cfg(any(miri, target_has_reliable_f128_math))],
     },
@@ -1504,9 +1556,8 @@ float_test! {
     name: powi,
     attrs: {
         const: #[cfg(false)],
-        // FIXME(f16_f128): `powi` does not work in Miri for these types
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -1526,8 +1577,8 @@ float_test! {
     name: powf,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -1549,8 +1600,8 @@ float_test! {
     name: exp,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         assert_biteq!(1.0, flt(0.0).exp());
@@ -1570,8 +1621,8 @@ float_test! {
     name: exp2,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         assert_approx_eq!(32.0, flt(5.0).exp2(), Float::EXP_APPROX);
@@ -1590,8 +1641,8 @@ float_test! {
     name: ln,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -1612,8 +1663,8 @@ float_test! {
     name: log,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -1637,8 +1688,8 @@ float_test! {
     name: log2,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -1660,8 +1711,8 @@ float_test! {
     name: log10,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         let nan: Float = Float::NAN;
@@ -1684,8 +1735,8 @@ float_test! {
     name: asinh,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         assert_biteq!(flt(0.0).asinh(), 0.0);
@@ -1705,6 +1756,9 @@ float_test! {
 
         assert_approx_eq!(flt(-200.0).asinh(), -5.991470797049389, Float::ASINH_APPROX);
 
+        // issue 153878: large values were rounding to infinity
+        assert_approx_eq!(Float::MAX.asinh(), Float::ASINH_ACOSH_MAX, Float::ASINH_APPROX);
+
         #[allow(overflowing_literals)]
         if Float::MAX > flt(66000.0) {
              // regression test for the catastrophic cancellation fixed in 72486
@@ -1717,8 +1771,8 @@ float_test! {
     name: acosh,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         assert_biteq!(flt(1.0).acosh(), 0.0);
@@ -1733,6 +1787,9 @@ float_test! {
         assert_approx_eq!(flt(2.0).acosh(), 1.31695789692481670862504634730796844, Float::ACOSH_APPROX);
         assert_approx_eq!(flt(3.0).acosh(), 1.76274717403908605046521864995958461, Float::ACOSH_APPROX);
 
+        // issue 153878: large values were rounding to infinity
+        assert_approx_eq!(Float::MAX.acosh(), Float::ASINH_ACOSH_MAX, Float::ACOSH_APPROX);
+
         #[allow(overflowing_literals)]
         if Float::MAX > flt(66000.0) {
             // test for low accuracy from issue 104548
@@ -1745,8 +1802,8 @@ float_test! {
     name: atanh,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         assert_biteq!(flt(0.0).atanh(), 0.0);
@@ -1771,8 +1828,8 @@ float_test! {
     name: gamma,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         assert_approx_eq!(flt(1.0).gamma(), 1.0, Float::GAMMA_APPROX);
@@ -1806,8 +1863,8 @@ float_test! {
     name: ln_gamma,
     attrs: {
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         assert_approx_eq!(flt(1.0).ln_gamma().0, 0.0, Float::LNGAMMA_APPROX);
@@ -1824,8 +1881,8 @@ float_test! {
 float_test! {
     name: to_degrees,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let pi: Float = consts::PI;
@@ -1845,8 +1902,8 @@ float_test! {
 float_test! {
     name: to_radians,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let pi: Float = consts::PI;
@@ -1866,8 +1923,8 @@ float_test! {
 float_test! {
     name: to_algebraic,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let a: Float = flt(123.0);
@@ -1890,8 +1947,8 @@ float_test! {
 float_test! {
     name: to_bits_conv,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert_biteq!(flt(1.0), Float::RAW_1);
@@ -1917,17 +1974,18 @@ float_test! {
 float_test! {
     name: mul_add,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
+        f16: #[cfg(target_has_reliable_f16)],
         // FIXME(#140515): mingw has an incorrect fma https://sourceforge.net/p/mingw-w64/bugs/848/
         f32: #[cfg_attr(all(target_os = "windows", target_env = "gnu", not(target_abi = "llvm")), ignore)],
         f64: #[cfg_attr(all(target_os = "windows", target_env = "gnu", not(target_abi = "llvm")), ignore)],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         let nan: Float = Float::NAN;
         let inf: Float = Float::INFINITY;
         let neg_inf: Float = Float::NEG_INFINITY;
         assert_biteq!(flt(12.3).mul_add(flt(4.5), flt(6.7)), Float::MUL_ADD_RESULT);
+        assert_biteq!(flt( 48.34375).mul_add(flt(0.000013887882), flt(0.12438965)), Float::F16_NO_DOUBLE_ROUNDING_MUL_ADD_RESULT);
         assert_biteq!((flt(-12.3)).mul_add(flt(-4.5), flt(-6.7)), Float::NEG_MUL_ADD_RESULT);
         assert_biteq!(flt(0.0).mul_add(8.9, 1.2), 1.2);
         assert_biteq!(flt(3.4).mul_add(-0.0, 5.6), 5.6);
@@ -1942,8 +2000,8 @@ float_test! {
 float_test! {
     name: from,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert_biteq!(Float::from(false), Float::ZERO);
@@ -1964,7 +2022,7 @@ float_test! {
     attrs: {
         f16: #[cfg(false)],
         const f16: #[cfg(false)],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert_biteq!(Float::from(u16::MIN), Float::ZERO);
@@ -1983,7 +2041,7 @@ float_test! {
         const f16: #[cfg(false)],
         f32: #[cfg(false)],
         const f32: #[cfg(false)],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         assert_biteq!(Float::from(u32::MIN), Float::ZERO);
@@ -1999,8 +2057,8 @@ float_test! {
 float_test! {
     name: max_exact_integer_constant,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         // The maximum integer that converts to a unique floating point
@@ -2041,8 +2099,8 @@ float_test! {
 float_test! {
     name: min_exact_integer_constant,
     attrs: {
-        f16: #[cfg(any(miri, target_has_reliable_f16))],
-        f128: #[cfg(any(miri, target_has_reliable_f128))],
+        f16: #[cfg(target_has_reliable_f16)],
+        f128: #[cfg(target_has_reliable_f128)],
     },
     test {
         // The minimum integer that converts to a unique floating point
@@ -2089,7 +2147,7 @@ float_test! {
 //         f16: #[cfg(false)],
 //         f32: #[cfg(false)],
 //         f64: #[cfg(false)],
-//         f128: #[cfg(any(miri, target_has_reliable_f128))],
+//         f128: #[cfg(target_has_reliable_f128)],
 //     },
 //     test {
 //         assert_biteq!(Float::from(u64::MIN), Float::ZERO);
@@ -2106,8 +2164,8 @@ float_test! {
     attrs: {
         // FIXME(f16_f128): add math tests when available
         const: #[cfg(false)],
-        f16: #[cfg(all(not(miri), target_has_reliable_f16_math))],
-        f128: #[cfg(all(not(miri), target_has_reliable_f128_math))],
+        f16: #[cfg(target_has_reliable_f16_math)],
+        f128: #[cfg(target_has_reliable_f128_math)],
     },
     test {
         let pi: Float = consts::PI;

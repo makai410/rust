@@ -64,6 +64,7 @@ already_send!(
         [std::io::Error][std::fs::File][std::panic::Location<'_>][rustc_arena::DroplessArena]
         [jobserver_crate::Client][jobserver_crate::HelperThread][crate::memmap::Mmap]
         [crate::profiling::SelfProfiler][crate::owned_slice::OwnedSlice]
+        [rustc_serialize::opaque::FileEncoder<'_>]
 );
 
 #[cfg(target_has_atomic = "64")]
@@ -84,7 +85,7 @@ impl_dyn_send!(
     [std::sync::LazyLock<T, F> where T: DynSend, F: DynSend]
     [std::collections::HashSet<K, S> where K: DynSend, S: DynSend]
     [std::collections::HashMap<K, V, S> where K: DynSend, V: DynSend, S: DynSend]
-    [std::collections::BTreeMap<K, V, A> where K: DynSend, V: DynSend, A: std::alloc::Allocator + Clone + DynSend]
+    [std::collections::BTreeMap<K, V, A> where K: DynSend, V: DynSend, A: std::alloc::AllocatorClone + DynSend]
     [Vec<T, A> where T: DynSend, A: std::alloc::Allocator + DynSend]
     [Box<T, A> where T: ?Sized + DynSend, A: std::alloc::Allocator + DynSend]
     [crate::sync::RwLock<T> where T: DynSend]
@@ -167,7 +168,7 @@ impl_dyn_sync!(
     [std::sync::LazyLock<T, F> where T: DynSend + DynSync, F: DynSend]
     [std::collections::HashSet<K, S> where K: DynSync, S: DynSync]
     [std::collections::HashMap<K, V, S> where K: DynSync, V: DynSync, S: DynSync]
-    [std::collections::BTreeMap<K, V, A> where K: DynSync, V: DynSync, A: std::alloc::Allocator + Clone + DynSync]
+    [std::collections::BTreeMap<K, V, A> where K: DynSync, V: DynSync, A: std::alloc::AllocatorClone + DynSync]
     [Vec<T, A> where T: DynSync, A: std::alloc::Allocator + DynSync]
     [Box<T, A> where T: ?Sized + DynSync, A: std::alloc::Allocator + DynSync]
     [crate::sync::RwLock<T> where T: DynSend + DynSync]

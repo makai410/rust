@@ -25,18 +25,19 @@ use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_hir::{Attribute, CRATE_HIR_ID};
 use rustc_interface::interface;
+use rustc_lint as lint;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config::{self, CrateType, ErrorOutputType, Input};
-use rustc_session::lint;
+use rustc_session::config::{self, ErrorOutputType, Input};
 use rustc_span::edition::Edition;
 use rustc_span::{FileName, RemapPathScopeComponents, Span};
+use rustc_structures::CrateType;
 use rustc_target::spec::{Target, TargetTuple};
 use tempfile::{Builder as TempFileBuilder, TempDir};
 use tracing::{debug, info};
 
 use self::rust::HirCollector;
 use crate::config::{MergeDoctests, Options as RustdocOptions, OutputFormat};
-use crate::html::markdown::{ErrorCodes, Ignore, LangString, MdRelLine};
+use crate::html::markdown::{CodeLineMapping, ErrorCodes, Ignore, LangString, MdRelLine};
 use crate::lint::init_lints;
 
 /// Type used to display times (compilation and total) information for merged doctests.
@@ -171,6 +172,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         target_triple: options.target.clone(),
         crate_name: options.crate_name.clone(),
         remap_path_prefix: options.remap_path_prefix.clone(),
+        remap_path_scope: options.remap_path_scope.clone(),
         unstable_opts: options.unstable_opts.clone(),
         error_format: options.error_format.clone(),
         target_modifiers: options.target_modifiers.clone(),
@@ -216,34 +218,37 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
     let result = interface::run_compiler(config, |compiler| {
         let krate = rustc_interface::passes::parse(&compiler.sess);
 
-        let collector = rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-            let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
-            let opts = scrape_test_config(tcx, crate_name, args_path);
+        let (collector, _incr_comp_session) =
+            rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+                let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
+                let opts = scrape_test_config(tcx, crate_name, args_path);
 
-            let hir_collector = HirCollector::new(
-                ErrorCodes::from(compiler.sess.opts.unstable_features.is_nightly_build()),
-                tcx,
-            );
-            let tests = hir_collector.collect_crate();
-            if extract_doctests {
-                let mut collector = extracted::ExtractedDocTests::new();
-                tests.into_iter().for_each(|t| collector.add_test(t, &opts, &options));
+                let hir_collector = HirCollector::new(
+                    ErrorCodes::from(compiler.sess.opts.unstable_features.is_nightly_build()),
+                    tcx,
+                );
+                let tests = hir_collector.collect_crate();
+                if extract_doctests {
+                    let mut collector = extracted::ExtractedDocTests::new();
+                    tests.into_iter().for_each(|t| collector.add_test(t, &opts, &options));
 
-                let stdout = std::io::stdout();
-                let mut stdout = stdout.lock();
-                if let Err(error) = serde_json::ser::to_writer(&mut stdout, &collector) {
-                    eprintln!();
-                    Err(format!("Failed to generate JSON output for doctests: {error:?}"))
+                    let stdout = std::io::stdout();
+                    let mut stdout = stdout.lock();
+                    if let Err(error) = serde_json::ser::to_writer(&mut stdout, &collector) {
+                        eprintln!();
+                        Err(format!("Failed to generate JSON output for doctests: {error:?}"))
+                    } else {
+                        Ok(None)
+                    }
                 } else {
-                    Ok(None)
-                }
-            } else {
-                let mut collector = CreateRunnableDocTests::new(options, opts);
-                tests.into_iter().for_each(|t| collector.add_test(t, Some(compiler.sess.dcx())));
+                    let mut collector = CreateRunnableDocTests::new(options, opts);
+                    tests
+                        .into_iter()
+                        .for_each(|t| collector.add_test(t, Some(compiler.sess.dcx())));
 
-                Ok(Some(collector))
-            }
-        });
+                    Ok(Some(collector))
+                }
+            });
         compiler.sess.dcx().abort_if_errors();
 
         collector
@@ -939,6 +944,7 @@ pub(crate) struct ScrapedDocTest {
     text: String,
     name: String,
     span: Span,
+    code_mappings: Vec<CodeLineMapping>,
     global_crate_attrs: Vec<String>,
 }
 
@@ -950,6 +956,7 @@ impl ScrapedDocTest {
         langstr: LangString,
         text: String,
         span: Span,
+        code_mappings: Vec<CodeLineMapping>,
         global_crate_attrs: Vec<String>,
     ) -> Self {
         let mut item_path = logical_path.join("::");
@@ -962,7 +969,7 @@ impl ScrapedDocTest {
             filename.display(RemapPathScopeComponents::DOCUMENTATION)
         );
 
-        Self { filename, line, langstr, text, name, span, global_crate_attrs }
+        Self { filename, line, langstr, text, name, span, code_mappings, global_crate_attrs }
     }
     fn edition(&self, opts: &RustdocOptions) -> Edition {
         self.langstr.edition.unwrap_or(opts.edition)
@@ -983,7 +990,13 @@ impl ScrapedDocTest {
 }
 
 pub(crate) trait DocTestVisitor {
-    fn visit_test(&mut self, test: String, config: LangString, rel_line: MdRelLine);
+    fn visit_test(
+        &mut self,
+        test: String,
+        config: LangString,
+        rel_line: MdRelLine,
+        code_mappings: Vec<CodeLineMapping>,
+    );
     fn visit_header(&mut self, _name: &str, _level: u32) {}
 }
 
@@ -1054,6 +1067,7 @@ impl CreateRunnableDocTests {
             .test_id(test_id)
             .lang_str(&scraped_test.langstr)
             .span(scraped_test.span)
+            .code_mappings(&scraped_test.code_mappings)
             .build(dcx);
         let is_standalone = !doctest.can_be_merged
             || self.rustdoc_options.no_capture
@@ -1227,7 +1241,13 @@ fn doctest_run_fn(
 
 #[cfg(test)] // used in tests
 impl DocTestVisitor for Vec<usize> {
-    fn visit_test(&mut self, _test: String, _config: LangString, rel_line: MdRelLine) {
+    fn visit_test(
+        &mut self,
+        _test: String,
+        _config: LangString,
+        rel_line: MdRelLine,
+        _code_mappings: Vec<CodeLineMapping>,
+    ) {
         self.push(1 + rel_line.offset());
     }
 }

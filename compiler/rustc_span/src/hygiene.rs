@@ -30,20 +30,22 @@ use std::{fmt, iter, mem};
 
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{
+    StableHash, StableHashCtxt, StableHasher, ToStableHashKey,
+};
 use rustc_data_structures::sync::Lock;
 use rustc_data_structures::unhash::UnhashMap;
 use rustc_hashes::Hash64;
 use rustc_index::IndexVec;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use tracing::{debug, trace};
 
-use crate::def_id::{CRATE_DEF_ID, CrateNum, DefId, LOCAL_CRATE, StableCrateId};
+use crate::def_id::{CRATE_DEF_ID, CrateNum, DefId, LOCAL_CRATE, ModId, StableCrateId};
 use crate::edition::Edition;
 use crate::source_map::SourceMap;
 use crate::symbol::{Symbol, kw, sym};
-use crate::{DUMMY_SP, HashStableContext, Span, SpanDecoder, SpanEncoder, with_session_globals};
+use crate::{DUMMY_SP, Span, SpanDecoder, SpanEncoder, with_session_globals};
 
 /// A `SyntaxContext` represents a chain of pairs `(ExpnId, Transparency)` named "marks".
 ///
@@ -127,7 +129,7 @@ impl !Ord for LocalExpnId {}
 impl !PartialOrd for LocalExpnId {}
 
 /// A unique hash value associated to an expansion.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Encodable, Decodable, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Encodable, Decodable, StableHash)]
 pub struct ExpnHash(Fingerprint);
 
 impl ExpnHash {
@@ -161,7 +163,7 @@ impl ExpnHash {
 /// A property of a macro expansion that determines how identifiers
 /// produced by that expansion are resolved.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Hash, Debug, Encodable, Decodable)]
-#[derive(HashStable_Generic)]
+#[derive(StableHash)]
 pub enum Transparency {
     /// Identifier produced by a transparent expansion is always resolved at call-site.
     /// Call-site spans in procedural macros, hygiene opt-out in `macro` should use this.
@@ -207,9 +209,9 @@ impl LocalExpnId {
         })
     }
 
-    pub fn fresh(mut expn_data: ExpnData, ctx: impl HashStableContext) -> LocalExpnId {
+    pub fn fresh(mut expn_data: ExpnData, hcx: impl StableHashCtxt) -> LocalExpnId {
         debug_assert_eq!(expn_data.parent.krate, LOCAL_CRATE);
-        let expn_hash = update_disambiguator(&mut expn_data, ctx);
+        let expn_hash = update_disambiguator(&mut expn_data, hcx);
         HygieneData::with(|data| {
             let expn_id = data.local_expn_data.push(Some(expn_data));
             let _eid = data.local_expn_hashes.push(expn_hash);
@@ -231,9 +233,9 @@ impl LocalExpnId {
     }
 
     #[inline]
-    pub fn set_expn_data(self, mut expn_data: ExpnData, ctx: impl HashStableContext) {
+    pub fn set_expn_data(self, mut expn_data: ExpnData, hcx: impl StableHashCtxt) {
         debug_assert_eq!(expn_data.parent.krate, LOCAL_CRATE);
-        let expn_hash = update_disambiguator(&mut expn_data, ctx);
+        let expn_hash = update_disambiguator(&mut expn_data, hcx);
         HygieneData::with(|data| {
             let old_expn_data = &mut data.local_expn_data[self];
             assert!(old_expn_data.is_none(), "expansion data is reset for an expansion ID");
@@ -308,6 +310,11 @@ impl ExpnId {
     /// `expn_id.is_descendant_of(ctxt.outer_expn())`.
     #[inline]
     pub fn outer_expn_is_descendant_of(self, ctxt: SyntaxContext) -> bool {
+        // fast path to avoid locking: everything is a descendant of the root context's
+        // outer expansion
+        if ctxt.is_root() {
+            return true;
+        }
         HygieneData::with(|data| data.is_descendant_of(self, data.outer_expn(ctxt)))
     }
 
@@ -365,6 +372,8 @@ impl HygieneData {
             None,
         );
 
+        // Index 0 is the root context, and nothing but its `dollar_crate_name` is ever
+        // mutated afterwards. The lock-free root paths on `SyntaxContext` rely on that.
         let root_ctxt_data = SyntaxContextData::root();
         HygieneData {
             local_expn_data: IndexVec::from_elem_n(Some(root_data), 1),
@@ -874,11 +883,19 @@ impl SyntaxContext {
 
     #[inline]
     pub fn normalize_to_macros_2_0(self) -> SyntaxContext {
+        // fast path to avoid locking: the root context normalizes to itself
+        if self.is_root() {
+            return self;
+        }
         HygieneData::with(|data| data.normalize_to_macros_2_0(self))
     }
 
     #[inline]
     pub fn normalize_to_macro_rules(self) -> SyntaxContext {
+        // fast path to avoid locking: the root context normalizes to itself
+        if self.is_root() {
+            return self;
+        }
         HygieneData::with(|data| data.normalize_to_macro_rules(self))
     }
 
@@ -916,6 +933,10 @@ impl SyntaxContext {
     /// This is used to test whether a lint should not even begin to figure out whether it should
     /// be reported on the current node.
     pub fn in_external_macro(self, sm: &SourceMap) -> bool {
+        // fast path to avoid locking/expn-data read: the root context is not in a macro
+        if self.is_root() {
+            return false;
+        }
         let expn_data = self.outer_expn_data();
         match expn_data.kind {
             ExpnKind::Root
@@ -950,20 +971,20 @@ impl Span {
         allow_internal_unstable: Option<Arc<[Symbol]>>,
         reason: DesugaringKind,
         edition: Edition,
-        ctx: impl HashStableContext,
+        hcx: impl StableHashCtxt,
     ) -> Span {
         let expn_data = ExpnData {
             allow_internal_unstable,
             ..ExpnData::default(ExpnKind::Desugaring(reason), self, edition, None, None)
         };
-        let expn_id = LocalExpnId::fresh(expn_data, ctx);
+        let expn_id = LocalExpnId::fresh(expn_data, hcx);
         self.apply_mark(expn_id.to_expn_id(), Transparency::Transparent)
     }
 }
 
 /// A subset of properties from both macro definition and macro call available through global data.
 /// Avoid using this if you have access to the original definition or call structures.
-#[derive(Clone, Debug, Encodable, Decodable, HashStable_Generic)]
+#[derive(Clone, Debug, Encodable, Decodable, StableHash)]
 pub struct ExpnData {
     // --- The part unique to each expansion.
     pub kind: ExpnKind,
@@ -983,9 +1004,9 @@ pub struct ExpnData {
     pub call_site: Span,
     /// Used to force two `ExpnData`s to have different `Fingerprint`s.
     /// Due to macro expansion, it's possible to end up with two `ExpnId`s
-    /// that have identical `ExpnData`s. This violates the contract of `HashStable`
+    /// that have identical `ExpnData`s. This violates the contract of `StableHash`
     /// - the two `ExpnId`s are not equal, but their `Fingerprint`s are equal
-    /// (since the numerical `ExpnId` value is not considered by the `HashStable`
+    /// (since the numerical `ExpnId` value is not considered by the `StableHash`
     /// implementation).
     ///
     /// The `disambiguator` field is set by `update_disambiguator` when two distinct
@@ -1010,7 +1031,7 @@ pub struct ExpnData {
     /// if this `ExpnData` corresponds to a macro invocation
     pub macro_def_id: Option<DefId>,
     /// The normal module (`mod`) in which the expanded macro was defined.
-    pub parent_module: Option<DefId>,
+    pub parent_module: Option<ModId>,
     /// Suppresses the `unsafe_code` lint for code produced by this macro.
     pub(crate) allow_internal_unsafe: bool,
     /// Enables the macro helper hack (`ident!(...)` -> `$crate::ident!(...)`) for this macro.
@@ -1018,8 +1039,9 @@ pub struct ExpnData {
     /// Should debuginfo for the macro be collapsed to the outermost expansion site (in other
     /// words, was the macro definition annotated with `#[collapse_debuginfo]`)?
     pub(crate) collapse_debuginfo: bool,
-    /// When true, we do not display the note telling people to use the `-Zmacro-backtrace` flag.
-    pub hide_backtrace: bool,
+    /// When true, we prevent diagnostics pointing into this macro, if it is one, and we do not
+    /// display the note telling people to use the `-Zmacro-backtrace` flag.
+    pub diagnostic_opaque: bool,
 }
 
 impl !PartialEq for ExpnData {}
@@ -1034,11 +1056,11 @@ impl ExpnData {
         allow_internal_unstable: Option<Arc<[Symbol]>>,
         edition: Edition,
         macro_def_id: Option<DefId>,
-        parent_module: Option<DefId>,
+        parent_module: Option<ModId>,
         allow_internal_unsafe: bool,
         local_inner_macros: bool,
         collapse_debuginfo: bool,
-        hide_backtrace: bool,
+        diagnostic_opaque: bool,
     ) -> ExpnData {
         ExpnData {
             kind,
@@ -1053,7 +1075,7 @@ impl ExpnData {
             allow_internal_unsafe,
             local_inner_macros,
             collapse_debuginfo,
-            hide_backtrace,
+            diagnostic_opaque,
         }
     }
 
@@ -1063,7 +1085,7 @@ impl ExpnData {
         call_site: Span,
         edition: Edition,
         macro_def_id: Option<DefId>,
-        parent_module: Option<DefId>,
+        parent_module: Option<ModId>,
     ) -> ExpnData {
         ExpnData {
             kind,
@@ -1078,7 +1100,7 @@ impl ExpnData {
             allow_internal_unsafe: false,
             local_inner_macros: false,
             collapse_debuginfo: false,
-            hide_backtrace: false,
+            diagnostic_opaque: false,
         }
     }
 
@@ -1088,7 +1110,7 @@ impl ExpnData {
         edition: Edition,
         allow_internal_unstable: Arc<[Symbol]>,
         macro_def_id: Option<DefId>,
-        parent_module: Option<DefId>,
+        parent_module: Option<ModId>,
     ) -> ExpnData {
         ExpnData {
             allow_internal_unstable: Some(allow_internal_unstable),
@@ -1102,15 +1124,15 @@ impl ExpnData {
     }
 
     #[inline]
-    fn hash_expn(&self, ctx: &mut impl HashStableContext) -> Hash64 {
+    fn hash_expn(&self, hcx: &mut impl StableHashCtxt) -> Hash64 {
         let mut hasher = StableHasher::new();
-        self.hash_stable(ctx, &mut hasher);
+        self.stable_hash(hcx, &mut hasher);
         hasher.finish()
     }
 }
 
 /// Expansion kind.
-#[derive(Clone, Debug, PartialEq, Encodable, Decodable, HashStable_Generic)]
+#[derive(Clone, Debug, PartialEq, Encodable, Decodable, StableHash)]
 pub enum ExpnKind {
     /// No expansion, aka root expansion. Only `ExpnId::root()` has this kind.
     Root,
@@ -1139,7 +1161,7 @@ impl ExpnKind {
 
 /// The kind of macro invocation or definition.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encodable, Decodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+#[derive(StableHash)]
 pub enum MacroKind {
     /// A bang macro `foo!()`.
     Bang,
@@ -1174,7 +1196,7 @@ impl MacroKind {
 }
 
 /// The kind of AST transform.
-#[derive(Clone, Copy, Debug, PartialEq, Encodable, Decodable, HashStable_Generic)]
+#[derive(Clone, Copy, Debug, PartialEq, Encodable, Decodable, StableHash)]
 pub enum AstPass {
     StdImports,
     TestHarness,
@@ -1192,7 +1214,7 @@ impl AstPass {
 }
 
 /// The kind of compiler desugaring.
-#[derive(Clone, Copy, PartialEq, Debug, Encodable, Decodable, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Debug, Encodable, Decodable, StableHash)]
 pub enum DesugaringKind {
     QuestionMark,
     TryBlock,
@@ -1482,11 +1504,11 @@ pub fn raw_encode_syntax_context(
 /// `set_expn_data`). It is *not* called for foreign `ExpnId`s deserialized
 /// from another crate's metadata - since `ExpnHash` includes the stable crate id,
 /// collisions are only possible between `ExpnId`s within the same crate.
-fn update_disambiguator(expn_data: &mut ExpnData, mut ctx: impl HashStableContext) -> ExpnHash {
+fn update_disambiguator(expn_data: &mut ExpnData, mut hcx: impl StableHashCtxt) -> ExpnHash {
     // This disambiguator should not have been set yet.
     assert_eq!(expn_data.disambiguator, 0, "Already set disambiguator for ExpnData: {expn_data:?}");
-    ctx.assert_default_hashing_controls("ExpnData (disambiguator)");
-    let mut expn_hash = expn_data.hash_expn(&mut ctx);
+    hcx.assert_default_stable_hash_controls("ExpnData (disambiguator)");
+    let mut expn_hash = expn_data.hash_expn(&mut hcx);
 
     let disambiguator = HygieneData::with(|data| {
         // If this is the first ExpnData with a given hash, then keep our
@@ -1501,7 +1523,7 @@ fn update_disambiguator(expn_data: &mut ExpnData, mut ctx: impl HashStableContex
         debug!("Set disambiguator for expn_data={:?} expn_hash={:?}", expn_data, expn_hash);
 
         expn_data.disambiguator = disambiguator;
-        expn_hash = expn_data.hash_expn(&mut ctx);
+        expn_hash = expn_data.hash_expn(&mut hcx);
 
         // Verify that the new disambiguator makes the hash unique
         #[cfg(debug_assertions)]
@@ -1514,28 +1536,28 @@ fn update_disambiguator(expn_data: &mut ExpnData, mut ctx: impl HashStableContex
         });
     }
 
-    ExpnHash::new(ctx.def_path_hash(LOCAL_CRATE.as_def_id()).stable_crate_id(), expn_hash)
+    ExpnHash::new(LOCAL_CRATE.as_def_id().to_stable_hash_key(&mut hcx).stable_crate_id(), expn_hash)
 }
 
-impl<CTX: HashStableContext> HashStable<CTX> for SyntaxContext {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
+impl StableHash for SyntaxContext {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         const TAG_EXPANSION: u8 = 0;
         const TAG_NO_EXPANSION: u8 = 1;
 
         if self.is_root() {
-            TAG_NO_EXPANSION.hash_stable(ctx, hasher);
+            TAG_NO_EXPANSION.stable_hash(hcx, hasher);
         } else {
-            TAG_EXPANSION.hash_stable(ctx, hasher);
+            TAG_EXPANSION.stable_hash(hcx, hasher);
             let (expn_id, transparency) = self.outer_mark();
-            expn_id.hash_stable(ctx, hasher);
-            transparency.hash_stable(ctx, hasher);
+            expn_id.stable_hash(hcx, hasher);
+            transparency.stable_hash(hcx, hasher);
         }
     }
 }
 
-impl<CTX: HashStableContext> HashStable<CTX> for ExpnId {
-    fn hash_stable(&self, ctx: &mut CTX, hasher: &mut StableHasher) {
-        ctx.assert_default_hashing_controls("ExpnId");
+impl StableHash for ExpnId {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        hcx.assert_default_stable_hash_controls("ExpnId");
         let hash = if *self == ExpnId::root() {
             // Avoid fetching TLS storage for a trivial often-used value.
             Fingerprint::ZERO
@@ -1543,12 +1565,12 @@ impl<CTX: HashStableContext> HashStable<CTX> for ExpnId {
             self.expn_hash().0
         };
 
-        hash.hash_stable(ctx, hasher);
+        hash.stable_hash(hcx, hasher);
     }
 }
 
-impl<CTX: HashStableContext> HashStable<CTX> for LocalExpnId {
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
-        self.to_expn_id().hash_stable(hcx, hasher);
+impl StableHash for LocalExpnId {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        self.to_expn_id().stable_hash(hcx, hasher);
     }
 }

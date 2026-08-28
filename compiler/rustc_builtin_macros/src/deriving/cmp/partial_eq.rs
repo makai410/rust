@@ -4,8 +4,8 @@ use rustc_span::{Span, sym};
 use thin_vec::thin_vec;
 
 use crate::deriving::generic::ty::*;
-use crate::deriving::generic::*;
-use crate::deriving::{path_local, path_std};
+use crate::deriving::generic::{self, *};
+use crate::deriving::path_std;
 
 /// Expands a `#[derive(PartialEq)]` attribute into an implementation for the
 /// target item.
@@ -22,14 +22,16 @@ pub(crate) fn expand_deriving_partial_eq(
         path: path_std!(marker::StructuralPartialEq),
         skip_path_as_bound: true, // crucial!
         needs_copy_as_bound_if_packed: false,
-        additional_bounds: Vec::new(),
+        // The `StructuralPartialEq` impl must have the *same* bounds as the `PartialEq` impl,
+        // or it will apply in situations where it should not, such as in the bug
+        // <https://github.com/rust-lang/rust/issues/147714>.
+        additional_bounds: smallvec![ty::Ty::Path(path_std!(cmp::PartialEq))],
         // We really don't support unions, but that's already checked by the impl generated below;
         // a second check here would lead to redundant error messages.
         supports_unions: true,
-        methods: Vec::new(),
-        associated_types: Vec::new(),
+        methods: SmallVec::new(),
+        associated_types: SmallVec::new(),
         is_const: false,
-        is_staged_api_crate: cx.ecfg.features.staged_api(),
         safety: Safety::Default,
         document: true,
     };
@@ -37,17 +39,17 @@ pub(crate) fn expand_deriving_partial_eq(
 
     // No need to generate `ne`, the default suffices, and not generating it is
     // faster.
-    let methods = vec![MethodDef {
+    let methods = smallvec![MethodDef {
         name: sym::eq,
         generics: Bounds::empty(),
         explicit_self: true,
-        nonself_args: vec![(self_ref(), sym::other)],
-        ret_ty: Path(path_local!(bool)),
+        nonself_args: smallvec![(self_ref(), sym::other)],
+        ret_ty: Path(generic::ty::Path::new_local(sym::bool)),
         attributes: thin_vec![cx.attr_word(sym::inline, span)],
         fieldless_variants_strategy: FieldlessVariantsStrategy::Unify,
-        combine_substructure: combine_substructure(Box::new(|a, b, c| {
+        combine_substructure: combine_substructure(|a, b, c| {
             BlockOrExpr::new_expr(get_substructure_equality_expr(a, b, c))
-        })),
+        }),
     }];
 
     let trait_def = TraitDef {
@@ -55,12 +57,11 @@ pub(crate) fn expand_deriving_partial_eq(
         path: path_std!(cmp::PartialEq),
         skip_path_as_bound: false,
         needs_copy_as_bound_if_packed: true,
-        additional_bounds: Vec::new(),
+        additional_bounds: SmallVec::new(),
         supports_unions: false,
         methods,
-        associated_types: Vec::new(),
+        associated_types: SmallVec::new(),
         is_const,
-        is_staged_api_crate: cx.ecfg.features.staged_api(),
         safety: Safety::Default,
         document: true,
     };
@@ -129,23 +130,23 @@ fn get_substructure_equality_expr(
         EnumMatching(.., fields) | Struct(.., fields) => {
             let combine = move |acc, field| {
                 let rhs = get_field_equality_expr(cx, field);
-                if let Some(lhs) = acc {
+                match acc {
                     // Combine the previous comparison with the current field
                     // using logical AND.
-                    return Some(cx.expr_binary(field.span, BinOpKind::And, lhs, rhs));
+                    Some(lhs) => Some(cx.expr_binary(field.span, BinOpKind::And, lhs, rhs)),
+                    // Start the chain with the first field's comparison.
+                    None => Some(rhs),
                 }
-                // Start the chain with the first field's comparison.
-                Some(rhs)
             };
 
             // First compare scalar fields, then compound fields, combining all
             // with logical AND.
-            return fields
+            fields
                 .iter()
                 .filter(|field| !field.maybe_scalar)
                 .fold(fields.iter().filter(|field| field.maybe_scalar).fold(None, combine), combine)
                 // If there are no fields, treat as always equal.
-                .unwrap_or_else(|| cx.expr_bool(span, true));
+                .unwrap_or_else(|| cx.expr_bool(span, true))
         }
         EnumDiscr(disc, match_expr) => {
             let lhs = get_field_equality_expr(cx, disc);
@@ -154,7 +155,7 @@ fn get_substructure_equality_expr(
             };
             // Compare the discriminant first (cheaper), then the rest of the
             // fields.
-            return cx.expr_binary(disc.span, BinOpKind::And, lhs, match_expr.clone());
+            cx.expr_binary(disc.span, BinOpKind::And, lhs, match_expr.clone())
         }
         StaticEnum(..) => cx.dcx().span_bug(
             span,
@@ -203,7 +204,7 @@ fn get_field_equality_expr(cx: &ExtCtxt<'_>, field: &FieldInfo) -> Box<Expr> {
 /// references are preserved.
 fn peel_refs(mut expr: &Box<Expr>) -> Box<Expr> {
     while let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, inner) = &expr.kind {
-        expr = &inner;
+        expr = inner;
     }
     expr.clone()
 }

@@ -3,7 +3,7 @@ use std::fmt;
 use rustc_abi::ExternAbi;
 use rustc_feature::Features;
 use rustc_session::Session;
-use rustc_session::parse::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::symbol::sym;
 use rustc_span::{Span, Symbol};
 
@@ -70,6 +70,7 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
         ExternAbi::Rust
         | ExternAbi::C { .. }
         | ExternAbi::Cdecl { .. }
+        | ExternAbi::Custom
         | ExternAbi::Stdcall { .. }
         | ExternAbi::Fastcall { .. }
         | ExternAbi::Thiscall { .. }
@@ -100,6 +101,9 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
             feature: sym::rust_preserve_none_cc,
             explain: GateReason::Experimental,
         }),
+        ExternAbi::RustTail => {
+            Err(UnstableAbi { abi, feature: sym::rust_tail_cc, explain: GateReason::Experimental })
+        }
         ExternAbi::RustInvalid => {
             Err(UnstableAbi { abi, feature: sym::rustc_attrs, explain: GateReason::ImplDetail })
         }
@@ -141,8 +145,8 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
             feature: sym::cmse_nonsecure_entry,
             explain: GateReason::Experimental,
         }),
-        ExternAbi::Custom => {
-            Err(UnstableAbi { abi, feature: sym::abi_custom, explain: GateReason::Experimental })
+        ExternAbi::Swift => {
+            Err(UnstableAbi { abi, feature: sym::abi_swift, explain: GateReason::Experimental })
         }
     }
 }

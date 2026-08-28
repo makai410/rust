@@ -275,8 +275,9 @@ This looks something like:
 rustc_queries! {
     /// Records the type of every item.
     query type_of(key: DefId) -> Ty<'tcx> {
-        cache_on_disk_if { key.is_local() }
         desc { |tcx| "computing the type of `{}`", tcx.def_path_str(key) }
+        cache_on_disk
+        separate_provide_extern
     }
     ...
 }
@@ -312,7 +313,7 @@ Let's go over these elements one by one:
   query is processed (mostly with respect to [incremental compilation][incrcomp]).
 
 [QueryKey]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/query/keys/trait.QueryKey.html
-[incrcomp]: queries/incremental-compilation-in-detail.html#query-modifiers
+[incrcomp]: queries/incremental-compilation-in-detail.md#query-modifiers
 
 So, to add a query:
 

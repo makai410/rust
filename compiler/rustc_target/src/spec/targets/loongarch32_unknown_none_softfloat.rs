@@ -8,7 +8,7 @@ pub(crate) fn target() -> Target {
         llvm_target: "loongarch32-unknown-none".into(),
         metadata: TargetMetadata {
             description: Some("Freestanding/bare-metal LoongArch32 softfloat".into()),
-            tier: Some(3),
+            tier: Some(2),
             host_tools: Some(false),
             std: Some(false),
         },
@@ -23,6 +23,7 @@ pub(crate) fn target() -> Target {
             linker: Some("rust-lld".into()),
             llvm_abiname: LlvmAbi::Ilp32s,
             max_atomic_width: Some(32),
+            mcount: "_mcount".into(),
             relocation_model: RelocModel::Static,
             panic_strategy: PanicStrategy::Abort,
             ..Default::default()

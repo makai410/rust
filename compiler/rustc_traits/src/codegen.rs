@@ -27,7 +27,7 @@ pub(crate) fn codegen_select_candidate<'tcx>(
 ) -> Result<&'tcx ImplSource<'tcx, ()>, CodegenObligationError> {
     let PseudoCanonicalInput { typing_env, value: trait_ref } = key;
     // We expect the input to be fully normalized.
-    debug_assert_eq!(trait_ref, tcx.normalize_erasing_regions(typing_env, trait_ref));
+    tcx.debug_assert_fully_normalized(typing_env, trait_ref);
 
     // Do the initial selection for the obligation. This yields the
     // shallow result we are looking for -- that is, what specific impl.
@@ -60,7 +60,7 @@ pub(crate) fn codegen_select_candidate<'tcx>(
     // contains unbound type parameters. It could be a slight
     // optimization to stop iterating early.
     let errors = ocx.evaluate_obligations_error_on_ambiguity();
-    if !errors.is_empty() {
+    if !errors.no_errors() {
         // `rustc_monomorphize::collector` assumes there are no type errors.
         // Cycle errors are the only post-monomorphization errors possible; emit them now so
         // `rustc_ty_utils::resolve_associated_item` doesn't return `None` post-monomorphization.

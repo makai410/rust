@@ -13,9 +13,10 @@ use std::mem::MaybeUninit;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{DynSend, DynSync};
+use rustc_span::def_id::ModId;
 use rustc_span::{ErrorGuaranteed, Spanned};
 
-use crate::mir::mono::{MonoItem, NormalizationErrorInMono};
+use crate::mono::{MonoItem, NormalizationErrorInMono};
 use crate::ty::{self, Ty, TyCtxt};
 use crate::{mir, thir, traits};
 
@@ -109,8 +110,6 @@ pub fn restore_val<T: Erasable>(erased_value: Erased<T>) -> T {
     unsafe { transmute_unchecked::<MaybeUninit<T::Storage>, T>(data) }
 }
 
-// FIXME(#151565): Using `T: ?Sized` here should let us remove the separate
-// impls for fat reference types.
 impl<T> Erasable for &'_ T {
     type Storage = [u8; size_of::<&'_ ()>()];
 }
@@ -119,12 +118,14 @@ impl<T> Erasable for &'_ [T] {
     type Storage = [u8; size_of::<&'_ [()]>()];
 }
 
-impl<T> Erasable for &'_ ty::List<T> {
-    type Storage = [u8; size_of::<&'_ ty::List<()>>()];
-}
-
-impl<T> Erasable for &'_ ty::ListWithCachedTypeInfo<T> {
-    type Storage = [u8; size_of::<&'_ ty::ListWithCachedTypeInfo<()>>()];
+// Note: this impl does not overlap with the impl for `&'_ T` above because `RawList` is unsized
+// and does not satisfy the implicit `T: Sized` bound.
+//
+// Furthermore, even if that implicit bound was removed (by adding `T: ?Sized`) this impl still
+// wouldn't overlap because `?Sized` is equivalent to `MetaSized` and `RawList` does not satisfy
+// `MetaSized` because it contains an extern type.
+impl<H, T> Erasable for &'_ ty::RawList<H, T> {
+    type Storage = [u8; size_of::<&'_ ty::RawList<(), ()>>()];
 }
 
 impl<T> Erasable for Result<&'_ T, traits::query::NoSolution> {
@@ -147,6 +148,14 @@ impl<T0, T1> Erasable for (&'_ T0, &'_ T1) {
     type Storage = [u8; size_of::<(&'_ (), &'_ ())>()];
 }
 
+impl<T0, T1, T2> Erasable for (&'_ T0, &'_ T1, &'_ T2) {
+    type Storage = [u8; size_of::<(&'_ (), &'_ (), &'_ ())>()];
+}
+
+impl<T0, T1> Erasable for (&'_ [T0], &'_ [T1]) {
+    type Storage = [u8; size_of::<(&'_ [()], &'_ [()])>()];
+}
+
 macro_rules! impl_erasable_for_types_with_no_type_params {
     ($($ty:ty),+ $(,)?) => {
         $(
@@ -163,7 +172,7 @@ impl_erasable_for_types_with_no_type_params! {
     // tidy-alphabetical-start
     (&'_ ty::CrateInherentImpls, Result<(), ErrorGuaranteed>),
     (),
-    (traits::solve::QueryResult<'_>, &'_ traits::solve::inspect::Probe<TyCtxt<'_>>),
+    (traits::solve::QueryResult<'_>, &'_ traits::solve::inspect::Probe<TyCtxt<'_>>, ty::RequiredDepth),
     Option<&'_ OsStr>,
     Option<&'_ [rustc_hir::PreciseCapturingArgKind<rustc_span::Symbol, rustc_span::Symbol>]>,
     Option<(mir::ConstValue, Ty<'_>)>,
@@ -206,6 +215,7 @@ impl_erasable_for_types_with_no_type_params! {
     Result<ty::GenericArg<'_>, traits::query::NoSolution>,
     Ty<'_>,
     bool,
+    rustc_crate_store::CrateDepKind,
     rustc_data_structures::svh::Svh,
     rustc_hir::Constness,
     rustc_hir::Defaultness,
@@ -214,6 +224,7 @@ impl_erasable_for_types_with_no_type_params! {
     rustc_hir::OpaqueTyOrigin<rustc_hir::def_id::DefId>,
     rustc_hir::def::DefKind,
     rustc_hir::def_id::DefId,
+    rustc_middle::hir::ProjectedMaybeOwner<'_>,
     rustc_middle::middle::codegen_fn_attrs::SanitizerFnAttrs,
     rustc_middle::middle::resolve_bound_vars::ObjectLifetimeDefault,
     rustc_middle::mir::ConstQualifs,
@@ -221,7 +232,7 @@ impl_erasable_for_types_with_no_type_params! {
     rustc_middle::mir::interpret::AllocId,
     rustc_middle::mir::interpret::EvalStaticInitializerRawResult<'_>,
     rustc_middle::mir::interpret::EvalToValTreeResult<'_>,
-    rustc_middle::mir::mono::MonoItemPartitions<'_>,
+    rustc_middle::mono::MonoItemPartitions<'_>,
     rustc_middle::traits::query::MethodAutoderefStepsResult<'_>,
     rustc_middle::ty::AdtDef<'_>,
     rustc_middle::ty::AnonConstKind,
@@ -232,17 +243,16 @@ impl_erasable_for_types_with_no_type_params! {
     rustc_middle::ty::ClosureTypeInfo<'_>,
     rustc_middle::ty::Const<'_>,
     rustc_middle::ty::ConstConditions<'_>,
-    rustc_middle::ty::GenericPredicates<'_>,
+    rustc_middle::ty::GenericClauses<'_>,
     rustc_middle::ty::ImplTraitHeader<'_>,
     rustc_middle::ty::ParamEnv<'_>,
     rustc_middle::ty::SymbolName<'_>,
     rustc_middle::ty::TypingEnv<'_>,
-    rustc_middle::ty::Visibility<rustc_span::def_id::DefId>,
+    rustc_middle::ty::Visibility<ModId>,
     rustc_middle::ty::inhabitedness::InhabitedPredicate<'_>,
     rustc_session::Limits,
     rustc_session::config::OptLevel,
     rustc_session::config::SymbolManglingVersion,
-    rustc_session::cstore::CrateDepKind,
     rustc_span::ExpnId,
     rustc_span::Span,
     rustc_span::Symbol,

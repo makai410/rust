@@ -1,20 +1,19 @@
 #![feature(
     exit_status_error,
     new_range,
-    new_range_api,
     os_str_slice,
     os_string_truncate,
     pattern,
     rustc_private
 )]
 #![warn(
+    rust_2018_idioms,
     trivial_casts,
     trivial_numeric_casts,
-    rust_2018_idioms,
     unused_lifetimes,
     unused_qualifications
 )]
-#![allow(clippy::missing_panics_doc)]
+#![expect(clippy::missing_panics_doc)]
 
 extern crate rustc_arena;
 extern crate rustc_data_structures;
