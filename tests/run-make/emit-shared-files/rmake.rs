@@ -12,14 +12,14 @@ use run_make_support::{has_extension, has_prefix, path, rustdoc, shallow_find_fi
 fn main() {
     rustdoc()
         .arg("-Zunstable-options")
-        .arg("--emit=invocation-specific")
+        .arg("--emit=html-non-static-files")
         .out_dir("invocation-only")
         .arg("--resource-suffix=-xxx")
         .args(&["--theme", "y.css"])
         .args(&["--extend-css", "z.css"])
         .input("x.rs")
         .run();
-    assert!(path("invocation-only/search-index-xxx.js").exists());
+    assert!(path("invocation-only/search.index/root-xxx.js").exists());
     assert!(path("invocation-only/crates-xxx.js").exists());
     assert!(path("invocation-only/settings.html").exists());
     assert!(path("invocation-only/x/all.html").exists());
@@ -34,7 +34,7 @@ fn main() {
 
     rustdoc()
         .arg("-Zunstable-options")
-        .arg("--emit=toolchain-shared-resources")
+        .arg("--emit=html-static-files")
         .out_dir("toolchain-only")
         .arg("--resource-suffix=-xxx")
         .args(&["--extend-css", "z.css"])
@@ -68,7 +68,7 @@ fn main() {
 
     rustdoc()
         .arg("-Zunstable-options")
-        .arg("--emit=toolchain-shared-resources,unversioned-shared-resources")
+        .arg("--emit=html-static-files")
         .out_dir("all-shared")
         .arg("--resource-suffix=-xxx")
         .args(&["--extend-css", "z.css"])

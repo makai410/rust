@@ -8,10 +8,10 @@ define-function: (
     [x, i_x],
     block {
         // Checking they have the same y position.
-        compare-elements-position: (
+        compare-elements-position-near: (
             "//*[@id='method.create_an_iterator_from_read']//a[normalize-space()='NotableStructWithLongName']",
             "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
-            ["y"],
+            {"y": 1},
         )
         // Checking they don't have the same x position.
         compare-elements-position-false: (
@@ -39,6 +39,10 @@ define-function: (
         assert-count: ("//*[@class='tooltip popover']", 0)
         click: "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']"
         assert-count: ("//*[@class='tooltip popover']", 1)
+        wait-for-position: (
+            "//*[@class='tooltip popover']",
+            {"x": |popover_x|}
+        )
         compare-elements-position-near: (
             "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
             "//*[@class='tooltip popover']",
@@ -48,10 +52,6 @@ define-function: (
             "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']",
             "//*[@class='tooltip popover']",
             ["x"]
-        )
-        assert-position: (
-            "//*[@class='tooltip popover']",
-            {"x": |popover_x|}
         )
         click: "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']"
         move-cursor-to: "//h1"
@@ -82,24 +82,15 @@ call-function: ("check-notable-tooltip-position", {
     "i_x": 528,
 })
 
-// Checking on mobile now.
-set-window-size: (650, 600)
-wait-for-size: ("body", {"width": 650})
-call-function: ("check-notable-tooltip-position-complete", {
-    "x": 26,
-    "i_x": 305,
-    "popover_x": 0,
-})
+go-to: "file://" + |DOC_PATH| + "/test_docs/struct.NotableStructWithLongName.html"
+// This is needed to ensure that the text color is computed.
+show-text: true
 
 // Now check the colors.
 define-function: (
     "check-colors",
     [theme, header_color, content_color, type_color, trait_color, link_color],
     block {
-        go-to: "file://" + |DOC_PATH| + "/test_docs/struct.NotableStructWithLongName.html"
-        // This is needed to ensure that the text color is computed.
-        show-text: true
-
         call-function: ("switch-theme", {"theme": |theme|})
 
         assert-css: (
@@ -176,6 +167,15 @@ call-function: (
     },
 )
 
+// Checking on mobile now.
+set-window-size: (650, 600)
+wait-for-size: ("body", {"width": 650})
+call-function: ("check-notable-tooltip-position-complete", {
+    "x": 26,
+    "i_x": 305,
+    "popover_x": 0,
+})
+
 reload:
 
 // Check that pressing escape works
@@ -189,7 +189,7 @@ assert: "#method\.create_an_iterator_from_read .tooltip:focus"
 // Check that clicking outside works.
 click: "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']"
 assert-count: ("//*[@class='tooltip popover']", 1)
-click: ".search-input"
+click: ".main-heading h1"
 assert-count: ("//*[@class='tooltip popover']", 0)
 assert-false: "#method\.create_an_iterator_from_read .tooltip:focus"
 
@@ -219,14 +219,14 @@ define-function: (
         store-window-property: {"scrollY": scroll}
         click: "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']"
         wait-for: "//*[@class='tooltip popover']"
-        click: "#settings-menu a"
+        click: ".main-heading h1"
     }
 )
 
 // Now we check that the focus isn't given back to the wrong item when opening
 // another popover.
 call-function: ("setup-popup", {})
-click: ".search-input"
+click: ".main-heading h1"
 // We ensure we didn't come back to the previous focused item.
 assert-window-property-false: {"scrollY": |scroll|}
 
@@ -250,8 +250,7 @@ set-window-size: (1100, 600)
 reload:
 assert-count: ("//*[@class='tooltip popover']", 0)
 click: "//*[@id='method.create_an_iterator_from_read']//*[@class='tooltip']"
-assert-count: ("//*[@class='tooltip popover']", 1)
-click: "#settings-menu a"
-wait-for: "#settings"
-assert-count: ("//*[@class='tooltip popover']", 0)
+wait-for-count: ("//*[@class='tooltip popover']", 1)
+call-function: ("open-settings-menu", {})
+wait-for-count: ("//*[@class='tooltip popover']", 0)
 assert-false: "#method\.create_an_iterator_from_read .tooltip:focus"

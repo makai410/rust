@@ -6,42 +6,45 @@ use std::os::raw::{c_char, c_int};
 
 use cranelift_jit::{JITBuilder, JITModule};
 use rustc_codegen_ssa::CrateInfo;
+use rustc_codegen_ssa::base::{allocator_kind_for_codegen, allocator_shim_contents};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::mir::mono::MonoItem;
+use rustc_middle::mono::MonoItem;
 use rustc_session::Session;
+use rustc_session::config::OutputFilenames;
 use rustc_span::sym;
 
-use crate::CodegenCx;
 use crate::debuginfo::TypeDebugContext;
 use crate::prelude::*;
 use crate::unwind_module::UnwindModule;
 
-fn create_jit_module(tcx: TyCtxt<'_>) -> (UnwindModule<JITModule>, CodegenCx) {
-    let crate_info = CrateInfo::new(tcx, "dummy_target_cpu".to_string());
-
+fn create_jit_module(
+    tcx: TyCtxt<'_>,
+    crate_info: &CrateInfo,
+) -> (UnwindModule<JITModule>, Option<DebugContext>) {
     let isa = crate::build_isa(tcx.sess, true);
     let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     crate::compiler_builtins::register_functions_for_jit(&mut jit_builder);
-    jit_builder.symbol_lookup_fn(dep_symbol_lookup_fn(tcx.sess, crate_info));
+    jit_builder.symbol_lookup_fn(dep_symbol_lookup_fn(tcx.sess, crate_info.clone()));
     let mut jit_module = UnwindModule::new(JITModule::new(jit_builder), false);
 
-    let cx = crate::CodegenCx::new(tcx, jit_module.isa(), false, sym::dummy_cgu_name);
+    let cx = DebugContext::new(tcx, jit_module.isa(), false, "dummy_cgu_name");
 
-    crate::allocator::codegen(tcx, &mut jit_module);
+    if let Some(kind) = allocator_kind_for_codegen(tcx) {
+        crate::allocator::codegen(tcx, &mut jit_module, &allocator_shim_contents(tcx, kind));
+    }
 
     (jit_module, cx)
 }
 
-pub(crate) fn run_jit(tcx: TyCtxt<'_>, jit_args: Vec<String>) -> ! {
-    if !tcx.sess.opts.output_types.should_codegen() {
-        tcx.dcx().fatal("JIT mode doesn't work with `cargo check`");
-    }
-
-    if !tcx.crate_types().contains(&rustc_session::config::CrateType::Executable) {
+pub(crate) fn run_jit(tcx: TyCtxt<'_>, target_cpu: String, jit_args: Vec<String>) -> ! {
+    if !tcx.crate_types().contains(&rustc_structures::CrateType::Executable) {
         tcx.dcx().fatal("can't jit non-executable crate");
     }
 
-    let (mut jit_module, mut cx) = create_jit_module(tcx);
+    let output_filenames = tcx.output_filenames(());
+    let crate_info = CrateInfo::new(tcx, target_cpu);
+    let should_write_ir = crate::pretty_clif::should_write_ir(tcx.sess);
+    let (mut jit_module, mut debug_context) = create_jit_module(tcx, &crate_info);
     let mut cached_context = Context::new();
 
     let cgus = tcx.collect_and_partition_mono_items(()).codegen_units;
@@ -60,7 +63,9 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, jit_args: Vec<String>) -> ! {
                 MonoItem::Fn(inst) => {
                     codegen_and_compile_fn(
                         tcx,
-                        &mut cx,
+                        &output_filenames,
+                        should_write_ir,
+                        debug_context.as_mut(),
                         &mut cached_context,
                         &mut jit_module,
                         inst,
@@ -76,10 +81,6 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, jit_args: Vec<String>) -> ! {
             }
         }
     });
-
-    if !cx.global_asm.is_empty() {
-        tcx.dcx().fatal("Inline asm is not supported in JIT mode");
-    }
 
     crate::main_shim::maybe_create_entry_wrapper(tcx, &mut jit_module, true, true);
 
@@ -122,12 +123,14 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, jit_args: Vec<String>) -> ! {
 
 fn codegen_and_compile_fn<'tcx>(
     tcx: TyCtxt<'tcx>,
-    cx: &mut crate::CodegenCx,
+    output_filenames: &OutputFilenames,
+    should_write_ir: bool,
+    mut debug_context: Option<&mut DebugContext>,
     cached_context: &mut Context,
     module: &mut dyn Module,
     instance: Instance<'tcx>,
 ) {
-    if tcx.codegen_fn_attrs(instance.def_id()).flags.contains(CodegenFnAttrFlags::NAKED) {
+    if tcx.codegen_instance_attrs(instance.def).flags.contains(CodegenFnAttrFlags::NAKED) {
         tcx.dcx()
             .span_fatal(tcx.def_span(instance.def_id()), "Naked asm is not supported in JIT mode");
     }
@@ -143,13 +146,29 @@ fn codegen_and_compile_fn<'tcx>(
         let cached_func = std::mem::replace(&mut cached_context.func, Function::new());
         let codegened_func = crate::base::codegen_fn(
             tcx,
-            cx,
+            sym::dummy_cgu_name,
+            debug_context.as_deref_mut(),
             &mut TypeDebugContext::default(),
             cached_func,
             module,
             instance,
         );
-        crate::base::compile_fn(cx, &tcx.prof, cached_context, module, codegened_func);
+
+        let mut global_asm = String::new();
+        crate::base::compile_fn(
+            &tcx.prof,
+            tcx.dcx(),
+            output_filenames,
+            should_write_ir,
+            cached_context,
+            module,
+            debug_context.as_deref_mut(),
+            &mut global_asm,
+            codegened_func,
+        );
+        if !global_asm.is_empty() {
+            tcx.dcx().fatal("Inline asm is not supported in JIT mode");
+        }
     });
 }
 
@@ -161,7 +180,7 @@ fn dep_symbol_lookup_fn(
 
     let mut dylib_paths = Vec::new();
 
-    let data = &crate_info.dependency_formats[&rustc_session::config::CrateType::Executable];
+    let data = &crate_info.dependency_formats[&rustc_structures::CrateType::Executable];
     // `used_crates` is in reverse postorder in terms of dependencies. Reverse the order here to
     // get a postorder which ensures that all dependencies of a dylib are loaded before the dylib
     // itself. This helps the dynamic linker to find dylibs not in the regular dynamic library
@@ -177,7 +196,7 @@ fn dep_symbol_lookup_fn(
                 diag.emit();
             }
             Linkage::Dynamic => {
-                dylib_paths.push(src.dylib.as_ref().unwrap().0.clone());
+                dylib_paths.push(src.dylib.as_ref().unwrap().clone());
             }
         }
     }

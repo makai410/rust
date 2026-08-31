@@ -1,10 +1,11 @@
 use core::iter::{FusedIterator, TrustedLen};
-use core::mem::MaybeUninit;
+use core::mem::{DropGuard, MaybeUninit};
 use core::num::NonZero;
 use core::ops::Try;
 use core::{array, fmt, ptr};
 
 use super::VecDeque;
+use super::index::WrappedIndex;
 use crate::alloc::{Allocator, Global};
 
 /// An owning iterator over the elements of a `VecDeque`.
@@ -77,28 +78,20 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
         F: FnMut(B, Self::Item) -> R,
         R: Try<Output = B>,
     {
-        struct Guard<'a, T, A: Allocator> {
-            deque: &'a mut VecDeque<T, A>,
-            // `consumed <= deque.len` always holds.
-            consumed: usize,
-        }
+        // `consumed <= deque.len` always holds.
+        let mut guard = DropGuard::new((&mut self.inner, 0), |(deque, consumed)| {
+            deque.len -= consumed;
+            deque.head = deque.to_wrapped_index(consumed);
+        });
 
-        impl<'a, T, A: Allocator> Drop for Guard<'a, T, A> {
-            fn drop(&mut self) {
-                self.deque.len -= self.consumed;
-                self.deque.head = self.deque.to_physical_idx(self.consumed);
-            }
-        }
-
-        let mut guard = Guard { deque: &mut self.inner, consumed: 0 };
-
-        let (head, tail) = guard.deque.as_slices();
+        let (deque, consumed) = &mut *guard;
+        let (head, tail) = deque.as_slices();
 
         init = head
             .iter()
             .map(|elem| {
-                guard.consumed += 1;
-                // SAFETY: Because we incremented `guard.consumed`, the
+                *consumed += 1;
+                // SAFETY: Because we incremented `consumed`, the
                 // deque effectively forgot the element, so we can take
                 // ownership
                 unsafe { ptr::read(elem) }
@@ -107,7 +100,7 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
 
         tail.iter()
             .map(|elem| {
-                guard.consumed += 1;
+                *consumed += 1;
                 // SAFETY: Same as above.
                 unsafe { ptr::read(elem) }
             })
@@ -140,7 +133,7 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
             // SAFETY: By manually adjusting the head and length of the deque, we effectively
             // make it forget the first `N` elements, so taking ownership of them is safe.
             unsafe { ptr::copy_nonoverlapping(head.as_ptr(), raw_arr_ptr, N) };
-            self.inner.head = self.inner.to_physical_idx(N);
+            self.inner.head = self.inner.to_wrapped_index(N);
             self.inner.len -= N;
             // SAFETY: We initialized the entire array with items from `head`
             return Ok(unsafe { raw_arr.transpose().assume_init() });
@@ -155,7 +148,7 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
             unsafe {
                 ptr::copy_nonoverlapping(tail.as_ptr(), raw_arr_ptr.add(head.len()), remaining)
             };
-            self.inner.head = self.inner.to_physical_idx(N);
+            self.inner.head = self.inner.to_wrapped_index(N);
             self.inner.len -= N;
             // SAFETY: We initialized the entire array with items from `head` and `tail`
             Ok(unsafe { raw_arr.transpose().assume_init() })
@@ -166,7 +159,7 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
             };
             let init = head.len() + tail.len();
             // We completely drained all the deques elements.
-            self.inner.head = 0;
+            self.inner.head = WrappedIndex::zero();
             self.inner.len = 0;
             // SAFETY: We copied all elements from both slices to the beginning of the array, so
             // the given range is initialized.
@@ -200,26 +193,18 @@ impl<T, A: Allocator> DoubleEndedIterator for IntoIter<T, A> {
         F: FnMut(B, Self::Item) -> R,
         R: Try<Output = B>,
     {
-        struct Guard<'a, T, A: Allocator> {
-            deque: &'a mut VecDeque<T, A>,
-            // `consumed <= deque.len` always holds.
-            consumed: usize,
-        }
+        // `consumed <= deque.len` always holds.
+        let mut guard = DropGuard::new((&mut self.inner, 0), |(deque, consumed)| {
+            deque.len -= consumed;
+        });
 
-        impl<'a, T, A: Allocator> Drop for Guard<'a, T, A> {
-            fn drop(&mut self) {
-                self.deque.len -= self.consumed;
-            }
-        }
-
-        let mut guard = Guard { deque: &mut self.inner, consumed: 0 };
-
-        let (head, tail) = guard.deque.as_slices();
+        let (deque, consumed) = &mut *guard;
+        let (head, tail) = deque.as_slices();
 
         init = tail
             .iter()
             .map(|elem| {
-                guard.consumed += 1;
+                *consumed += 1;
                 // SAFETY: See `try_fold`'s safety comment.
                 unsafe { ptr::read(elem) }
             })
@@ -227,7 +212,7 @@ impl<T, A: Allocator> DoubleEndedIterator for IntoIter<T, A> {
 
         head.iter()
             .map(|elem| {
-                guard.consumed += 1;
+                *consumed += 1;
                 // SAFETY: Same as above.
                 unsafe { ptr::read(elem) }
             })

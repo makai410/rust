@@ -1,19 +1,23 @@
 use std::marker::PhantomData;
+use std::ops::ControlFlow;
 
 use rustc_data_structures::obligation_forest::{
     Error, ForestObligation, ObligationForest, ObligationProcessor, Outcome, ProcessResult,
 };
+use rustc_hir::def_id::LocalDefId;
 use rustc_infer::infer::DefineOpaqueTypes;
 use rustc_infer::traits::{
     FromSolverError, PolyTraitObligation, PredicateObligations, ProjectionCacheKey, SelectionError,
-    TraitEngine,
+    TraitEngine, TraitErrors,
 };
 use rustc_middle::bug;
 use rustc_middle::ty::abstract_const::NotConstEvaluatable;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{
-    self, Binder, Const, GenericArgsRef, TypeVisitableExt, TypingMode, may_use_unstable_feature,
+    self, Binder, Const, DelayedSet, GenericArgsRef, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt, TypeVisitor, TypingMode, may_use_unstable_feature,
 };
+use rustc_next_trait_solver::solve::TyOrConstInferVar;
 use thin_vec::{ThinVec, thin_vec};
 use tracing::{debug, debug_span, instrument};
 
@@ -25,7 +29,7 @@ use super::{
     ScrubbedTraitError, const_evaluatable, wf,
 };
 use crate::error_reporting::InferCtxtErrorExt;
-use crate::infer::{InferCtxt, TyOrConstInferVar};
+use crate::infer::InferCtxt;
 use crate::traits::normalize::normalize_with_depth_to;
 use crate::traits::project::{PolyProjectionObligation, ProjectionCacheKeyExt as _};
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
@@ -48,11 +52,11 @@ impl<'tcx> ForestObligation for PendingPredicateObligation<'tcx> {
 /// consists of a list of obligations that must be (eventually)
 /// satisfied. The job is to track which are satisfied, which yielded
 /// errors, and which are still pending. At any point, users can call
-/// `select_where_possible`, and the fulfillment context will try to do
+/// `try_evaluate_obligations`, and the fulfillment context will try to do
 /// selection, retaining only those obligations that remain
 /// ambiguous. This may be helpful in pushing type inference
 /// along. Once all type inference constraints have been generated, the
-/// method `select_all_or_error` can be used to report any remaining
+/// method `evaluate_obligations_error_on_ambiguity` can be used to report any remaining
 /// ambiguous cases as errors.
 pub struct FulfillmentContext<'tcx, E: 'tcx> {
     /// A list of all obligations that have been registered with this
@@ -101,7 +105,7 @@ where
     }
 
     /// Attempts to select obligations using `selcx`.
-    fn select(&mut self, selcx: SelectionContext<'_, 'tcx>) -> Vec<E> {
+    fn select(&mut self, selcx: SelectionContext<'_, 'tcx>) -> TraitErrors<E> {
         let span = debug_span!("select", obligation_forest_size = ?self.predicates.len());
         let _enter = span.enter();
         let infcx = selcx.infcx;
@@ -113,11 +117,9 @@ where
         // FIXME: if we kept the original cache key, we could mark projection
         // obligations as complete for the projection cache here.
 
-        let errors: Vec<E> = outcome
-            .errors
-            .into_iter()
-            .map(|err| E::from_solver_error(infcx, OldSolverError(err)))
-            .collect();
+        let errors = TraitErrors::from_iter(
+            outcome.errors.into_iter().map(|err| E::from_solver_error(infcx, OldSolverError(err))),
+        );
 
         debug!(
             "select({} predicates remaining, {} errors) done",
@@ -151,15 +153,16 @@ where
             .register_obligation(PendingPredicateObligation { obligation, stalled_on: vec![] });
     }
 
-    fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<E> {
-        self.predicates
-            .to_errors(FulfillmentErrorCode::Ambiguity { overflow: None })
-            .into_iter()
-            .map(|err| E::from_solver_error(infcx, OldSolverError(err)))
-            .collect()
+    fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> TraitErrors<E> {
+        TraitErrors::from_iter(
+            self.predicates
+                .to_errors(FulfillmentErrorCode::Ambiguity { overflow: None })
+                .into_iter()
+                .map(|err| E::from_solver_error(infcx, OldSolverError(err))),
+        )
     }
 
-    fn select_where_possible(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<E> {
+    fn try_evaluate_obligations(&mut self, infcx: &InferCtxt<'tcx>) -> TraitErrors<E> {
         let selcx = SelectionContext::new(infcx);
         self.select(selcx)
     }
@@ -168,8 +171,27 @@ where
         &mut self,
         infcx: &InferCtxt<'tcx>,
     ) -> PredicateObligations<'tcx> {
-        let mut processor =
-            DrainProcessor { removed_predicates: PredicateObligations::new(), infcx };
+        let stalled_coroutines = match infcx.typing_mode_raw().assert_not_erased() {
+            TypingMode::Typeck { defining_opaque_types_and_generators } => {
+                defining_opaque_types_and_generators
+            }
+            TypingMode::Coherence
+            | TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: _ }
+            | TypingMode::PostBorrowck { defined_opaque_types: _ }
+            | TypingMode::Reflection
+            | TypingMode::PostAnalysis
+            | TypingMode::Codegen => return Default::default(),
+        };
+
+        if stalled_coroutines.is_empty() {
+            return Default::default();
+        }
+
+        let mut processor = DrainProcessor {
+            infcx,
+            removed_predicates: PredicateObligations::new(),
+            stalled_coroutines,
+        };
         let outcome: Outcome<_, _> = self.predicates.process_obligations(&mut processor);
         assert!(outcome.errors.is_empty());
         return processor.removed_predicates;
@@ -177,6 +199,7 @@ where
         struct DrainProcessor<'a, 'tcx> {
             infcx: &'a InferCtxt<'tcx>,
             removed_predicates: PredicateObligations<'tcx>,
+            stalled_coroutines: &'tcx ty::List<LocalDefId>,
         }
 
         impl<'tcx> ObligationProcessor for DrainProcessor<'_, 'tcx> {
@@ -185,10 +208,40 @@ where
             type OUT = Outcome<Self::Obligation, Self::Error>;
 
             fn needs_process_obligation(&self, pending_obligation: &Self::Obligation) -> bool {
-                pending_obligation
-                    .stalled_on
-                    .iter()
-                    .any(|&var| self.infcx.ty_or_const_infer_var_changed(var))
+                struct StalledOnCoroutines<'tcx> {
+                    pub stalled_coroutines: &'tcx ty::List<LocalDefId>,
+                    pub cache: DelayedSet<Ty<'tcx>>,
+                }
+
+                impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for StalledOnCoroutines<'tcx> {
+                    type Result = ControlFlow<()>;
+
+                    fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
+                        if !self.cache.insert(ty) {
+                            return ControlFlow::Continue(());
+                        }
+
+                        if let ty::Coroutine(def_id, _) = ty.kind()
+                            && def_id
+                                .as_local()
+                                .is_some_and(|def_id| self.stalled_coroutines.contains(&def_id))
+                        {
+                            ControlFlow::Break(())
+                        } else if ty.has_coroutines() {
+                            ty.super_visit_with(self)
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    }
+                }
+
+                self.infcx
+                    .resolve_vars_if_possible(pending_obligation.obligation.predicate)
+                    .visit_with(&mut StalledOnCoroutines {
+                        stalled_coroutines: self.stalled_coroutines,
+                        cache: Default::default(),
+                    })
+                    .is_break()
             }
 
             fn process_obligation(
@@ -274,6 +327,10 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
     /// compile-time benchmarks are very sensitive to even small changes.
     #[inline(always)]
     fn needs_process_obligation(&self, pending_obligation: &Self::Obligation) -> bool {
+        if self.selcx.infcx.disable_trait_solver_fast_paths() {
+            return true;
+        }
+
         // If we were stalled on some unresolved variables, first check whether
         // any of them have been resolved; if not, don't bother doing more work
         // yet.
@@ -323,7 +380,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
         &mut self,
         pending_obligation: &mut PendingPredicateObligation<'tcx>,
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
-        pending_obligation.stalled_on.truncate(0);
+        pending_obligation.stalled_on.clear();
 
         let obligation = &mut pending_obligation.obligation;
 
@@ -337,7 +394,9 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
 
         let infcx = self.selcx.infcx;
 
-        if sizedness_fast_path(infcx.tcx, obligation.predicate) {
+        if !infcx.disable_trait_solver_fast_paths()
+            && sizedness_fast_path(infcx.tcx, obligation.predicate, obligation.param_env)
+        {
             return ProcessResult::Changed(thin_vec![]);
         }
 
@@ -348,7 +407,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 obligation.param_env,
                 obligation.cause.clone(),
                 obligation.recursion_depth + 1,
-                obligation.predicate,
+                ty::Unnormalized::new_wip(obligation.predicate),
                 &mut obligations,
             );
             if predicate != obligation.predicate {
@@ -403,11 +462,8 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 ty::PredicateKind::NormalizesTo(..) => {
                     bug!("NormalizesTo is only used by the new solver")
                 }
-                ty::PredicateKind::AliasRelate(..) => {
-                    bug!("AliasRelate is only used by the new solver")
-                }
                 ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_)) => {
-                   unreachable!("unexpected higher ranked `UnstableFeature` goal")
+                    unreachable!("unexpected higher ranked `UnstableFeature` goal")
                 }
             },
             Some(pred) => match pred {
@@ -433,13 +489,17 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
 
                 ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(data)) => {
                     if infcx.considering_regions {
-                        infcx.register_region_outlives_constraint(data, &obligation.cause);
+                        infcx.register_region_outlives_constraint(
+                            data,
+                            ty::VisibleForLeakCheck::Yes,
+                            &obligation.cause,
+                        );
                     }
 
                     ProcessResult::Changed(Default::default())
                 }
 
-                ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(
+                ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(ty::OutlivesClause(
                     t_a,
                     r_b,
                 ))) => {
@@ -473,9 +533,6 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 ty::PredicateKind::NormalizesTo(..) => {
                     bug!("NormalizesTo is only used by the new solver")
                 }
-                ty::PredicateKind::AliasRelate(..) => {
-                    bug!("AliasRelate is only used by the new solver")
-                }
                 // Compute `ConstArgHasType` above the overflow check below.
                 // This is because this is not ever a useful obligation to report
                 // as the cause of an overflow.
@@ -497,8 +554,8 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                             return ProcessResult::Changed(PendingPredicateObligations::new());
                         }
                         ty::ConstKind::Value(cv) => cv.ty,
-                        ty::ConstKind::Unevaluated(uv) => {
-                            infcx.tcx.type_of(uv.def).instantiate(infcx.tcx, uv.args)
+                        ty::ConstKind::Alias(_, alias_const) => {
+                            alias_const.type_of(infcx.tcx).skip_norm_wip()
                         }
                         // FIXME(generic_const_exprs): we should construct an alias like
                         // `<lhs_ty as Add<rhs_ty>>::Output` when this is an `Expr` representing
@@ -555,14 +612,15 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                     match wf::obligations(
                         self.selcx.infcx,
                         obligation.param_env,
-                        obligation.cause.body_id,
+                        obligation.cause.body_def_id,
                         obligation.recursion_depth + 1,
                         term,
                         obligation.cause.span,
                     ) {
                         None => {
-                            pending_obligation.stalled_on =
-                                vec![TyOrConstInferVar::maybe_from_term(term).unwrap()];
+                            pending_obligation.stalled_on = vec![
+                                TyOrConstInferVar::maybe_from_term::<TyCtxt<'tcx>>(term).unwrap(),
+                            ];
                             ProcessResult::Unchanged
                         }
                         Some(os) => ProcessResult::Changed(mk_pending(obligation, os)),
@@ -617,19 +675,19 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                     }
                 }
 
-                ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(uv)) => {
+                ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(alias_const)) => {
                     match const_evaluatable::is_const_evaluatable(
                         self.selcx.infcx,
-                        uv,
+                        alias_const,
                         obligation.param_env,
                         obligation.cause.span,
                     ) {
                         Ok(()) => ProcessResult::Changed(Default::default()),
                         Err(NotConstEvaluatable::MentionsInfer) => {
                             pending_obligation.stalled_on.clear();
-                            pending_obligation.stalled_on.extend(
-                                uv.walk().filter_map(TyOrConstInferVar::maybe_from_generic_arg),
-                            );
+                            pending_obligation.stalled_on.extend(alias_const.walk().filter_map(
+                                TyOrConstInferVar::maybe_from_generic_arg::<TyCtxt<'tcx>>,
+                            ));
                             ProcessResult::Unchanged
                         }
                         Err(
@@ -656,10 +714,14 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                         let c2 = tcx.expand_abstract_consts(c2);
                         debug!("equating consts:\nc1= {:?}\nc2= {:?}", c1, c2);
 
-                        use rustc_hir::def::DefKind;
                         match (c1.kind(), c2.kind()) {
-                            (ty::ConstKind::Unevaluated(a), ty::ConstKind::Unevaluated(b))
-                                if a.def == b.def && tcx.def_kind(a.def) == DefKind::AssocConst =>
+                            (ty::ConstKind::Alias(_, a), ty::ConstKind::Alias(_, b))
+                                if a.kind == b.kind
+                                    && matches!(
+                                        a.kind,
+                                        ty::AliasConstKind::Projection { .. }
+                                            | ty::AliasConstKind::Inherent { .. }
+                                    ) =>
                             {
                                 if let Ok(new_obligations) = infcx
                                     .at(&obligation.cause, obligation.param_env)
@@ -677,8 +739,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                                     ));
                                 }
                             }
-                            (_, ty::ConstKind::Unevaluated(_))
-                            | (ty::ConstKind::Unevaluated(_), _) => (),
+                            (_, ty::ConstKind::Alias(_, _)) | (ty::ConstKind::Alias(_, _), _) => (),
                             (_, _) => {
                                 if let Ok(new_obligations) = infcx
                                     .at(&obligation.cause, obligation.param_env)
@@ -698,20 +759,18 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                     let stalled_on = &mut pending_obligation.stalled_on;
 
                     let mut evaluate = |c: Const<'tcx>| {
-                        if let ty::ConstKind::Unevaluated(unevaluated) = c.kind() {
+                        if let ty::ConstKind::Alias(_, alias_const) = c.kind() {
                             match super::try_evaluate_const(
                                 self.selcx.infcx,
                                 c,
                                 obligation.param_env,
+                                |ty| Ok::<_, !>(ty.skip_norm_wip()),
                             ) {
                                 Ok(val) => Ok(val),
                                 e @ Err(EvaluateConstErr::HasGenericsOrInfers) => {
-                                    stalled_on.extend(
-                                        unevaluated
-                                            .args
-                                            .iter()
-                                            .filter_map(TyOrConstInferVar::maybe_from_generic_arg),
-                                    );
+                                    stalled_on.extend(alias_const.args.iter().filter_map(
+                                        TyOrConstInferVar::maybe_from_generic_arg::<TyCtxt<'tcx>>,
+                                    ));
                                     e
                                 }
                                 e @ Err(
@@ -811,8 +870,7 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
         stalled_on: &mut Vec<TyOrConstInferVar>,
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
         let infcx = self.selcx.infcx;
-        if obligation.predicate.is_global() && !matches!(infcx.typing_mode(), TypingMode::Coherence)
-        {
+        if obligation.predicate.is_global() && !self.selcx.typing_mode().is_coherence() {
             // no type variables present, can use evaluation for better caching.
             // FIXME: consider caching errors too.
             if infcx.predicate_must_hold_considering_regions(obligation) {
@@ -866,8 +924,7 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
         let tcx = self.selcx.tcx();
         let infcx = self.selcx.infcx;
-        if obligation.predicate.is_global() && !matches!(infcx.typing_mode(), TypingMode::Coherence)
-        {
+        if obligation.predicate.is_global() && !self.selcx.typing_mode().is_coherence() {
             // no type variables present, can use evaluation for better caching.
             // FIXME: consider caching errors too.
             if infcx.predicate_must_hold_considering_regions(obligation) {
@@ -891,7 +948,35 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
         }
 
         match project::poly_project_and_unify_term(&mut self.selcx, &project_obligation) {
-            ProjectAndUnifyResult::Holds(os) => ProcessResult::Changed(mk_pending(obligation, os)),
+            ProjectAndUnifyResult::Holds(os) if os.is_empty() => {
+                ProcessResult::Changed(mk_pending(obligation, os))
+            }
+            ProjectAndUnifyResult::Holds(os) => {
+                let input_projection_term = infcx
+                    .resolve_vars_if_possible(project_obligation.predicate)
+                    .map_bound(|p| p.projection_term);
+                let all_same_projection_term = os.iter().all(|o| {
+                    let Some(proj_clause) = o.predicate.as_projection_clause() else {
+                        return false;
+                    };
+                    infcx.resolve_vars_if_possible(proj_clause).map_bound(|p| p.projection_term)
+                        == input_projection_term
+                });
+                if all_same_projection_term {
+                    // Every nested obligation has the same projection term as the obligation
+                    // we are processing, so registering would make fulfillment process the same
+                    // obligation forever. This happens when unifying the projection with the
+                    // predicate's term spawns a delayed copy of the predicate itself, see
+                    // `InferCtxt::instantiate_var`. E.g. in Issue #159750, processing
+                    // `<_ as Queryable>::Output == ?0` returns `Holds` with the single nested
+                    // obligation `<_ as Queryable>::Output == ?1` where `?1` is merely unioned
+                    // with `?0`.
+                    // Since at this point the code will not compile, error immediately.
+                    ProcessResult::Error(FulfillmentErrorCode::Ambiguity { overflow: None })
+                } else {
+                    ProcessResult::Changed(mk_pending(obligation, os))
+                }
+            }
             ProjectAndUnifyResult::FailedNormalization => {
                 stalled_on.clear();
                 stalled_on.extend(args_infer_vars(
@@ -957,7 +1042,7 @@ fn args_infer_vars<'tcx>(
             }
             walker.visited.into_iter()
         })
-        .filter_map(TyOrConstInferVar::maybe_from_generic_arg)
+        .filter_map(TyOrConstInferVar::maybe_from_generic_arg::<TyCtxt<'tcx>>)
 }
 
 #[derive(Debug)]
@@ -981,6 +1066,7 @@ impl<'tcx> FromSolverError<'tcx, OldSolverError<'tcx>> for ScrubbedTraitError<'t
         match error.0.error {
             FulfillmentErrorCode::Select(_)
             | FulfillmentErrorCode::Project(_)
+            | FulfillmentErrorCode::Outlives
             | FulfillmentErrorCode::Subtype(_, _)
             | FulfillmentErrorCode::ConstEquate(_, _) => ScrubbedTraitError::TrueError,
             FulfillmentErrorCode::Ambiguity { overflow: _ } => ScrubbedTraitError::Ambiguity,

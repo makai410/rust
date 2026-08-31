@@ -2,34 +2,34 @@ use std::fmt;
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
-use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
+use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisitable_Generic};
 
-use crate::{self as ty, Interner};
+use crate::{self as ty, Interner, Region};
 
 /// A clause is something that can appear in where bounds or be inferred
 /// by implied bounds.
-#[derive_where(Clone, Copy, Hash, PartialEq, Eq; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive_where(Clone, Copy, Hash, PartialEq; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub enum ClauseKind<I: Interner> {
     /// Corresponds to `where Foo: Bar<A, B, C>`. `Foo` here would be
     /// the `Self` type of the trait reference and `A`, `B`, and `C`
     /// would be the type parameters.
-    Trait(ty::TraitPredicate<I>),
+    Trait(ty::TraitClause<I>),
 
     /// `where 'a: 'r`
-    RegionOutlives(ty::OutlivesPredicate<I, I::Region>),
+    RegionOutlives(ty::OutlivesClause<I, Region<I>>),
 
     /// `where T: 'r`
-    TypeOutlives(ty::OutlivesPredicate<I, I::Ty>),
+    TypeOutlives(ty::OutlivesClause<I, I::Ty>),
 
     /// `where <T as TraitRef>::Name == X`, approximately.
-    /// See the `ProjectionPredicate` struct for details.
-    Projection(ty::ProjectionPredicate<I>),
+    /// See the `ProjectionClause` struct for details.
+    Projection(ty::ProjectionClause<I>),
 
     /// Ensures that a const generic argument to a parameter `const N: u8`
     /// is of type `u8`.
@@ -41,11 +41,11 @@ pub enum ClauseKind<I: Interner> {
     /// Constant initializer must evaluate successfully.
     ConstEvaluatable(I::Const),
 
-    /// Enforces the constness of the predicate we're calling. Like a projection
+    /// Enforces the constness of the clause we're calling. Like a projection
     /// goal from a where clause, it's always going to be paired with a
     /// corresponding trait clause; this just enforces the *constness* of that
     /// implementation.
-    HostEffect(ty::HostEffectPredicate<I>),
+    HostEffect(ty::HostEffectClause<I>),
 
     /// Support marking impl as unstable.
     UnstableFeature(
@@ -55,18 +55,20 @@ pub enum ClauseKind<I: Interner> {
     ),
 }
 
-#[derive_where(Clone, Copy, Hash, PartialEq, Eq; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+impl<I: Interner> Eq for ClauseKind<I> {}
+
+#[derive_where(Clone, Copy, Hash, PartialEq; I: Interner)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub enum PredicateKind<I: Interner> {
     /// Prove a clause
     Clause(ClauseKind<I>),
 
     /// Trait must be dyn-compatible.
-    DynCompatible(I::DefId),
+    DynCompatible(I::TraitId),
 
     /// `T1 <: T2`
     ///
@@ -101,32 +103,9 @@ pub enum PredicateKind<I: Interner> {
     /// It is likely more useful to think of this as a function `normalizes_to(alias)`,
     /// whose return value is written into `term`.
     NormalizesTo(ty::NormalizesTo<I>),
-
-    /// Separate from `ClauseKind::Projection` which is used for normalization in new solver.
-    /// This predicate requires two terms to be equal to eachother.
-    ///
-    /// Only used for new solver.
-    AliasRelate(I::Term, I::Term, AliasRelationDirection),
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Copy)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(HashStable_NoContext, Encodable_NoContext, Decodable_NoContext)
-)]
-pub enum AliasRelationDirection {
-    Equate,
-    Subtype,
-}
-
-impl std::fmt::Display for AliasRelationDirection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AliasRelationDirection::Equate => write!(f, "=="),
-            AliasRelationDirection::Subtype => write!(f, "<:"),
-        }
-    }
-}
+impl<I: Interner> Eq for PredicateKind<I> {}
 
 impl<I: Interner> fmt::Debug for ClauseKind<I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -160,9 +139,6 @@ impl<I: Interner> fmt::Debug for PredicateKind<I> {
             PredicateKind::ConstEquate(c1, c2) => write!(f, "ConstEquate({c1:?}, {c2:?})"),
             PredicateKind::Ambiguous => write!(f, "Ambiguous"),
             PredicateKind::NormalizesTo(p) => p.fmt(f),
-            PredicateKind::AliasRelate(t1, t2, dir) => {
-                write!(f, "AliasRelate({t1:?}, {dir:?}, {t2:?})")
-            }
         }
     }
 }

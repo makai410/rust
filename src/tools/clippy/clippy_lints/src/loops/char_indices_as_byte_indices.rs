@@ -1,11 +1,12 @@
 use std::ops::ControlFlow;
 
 use clippy_utils::diagnostics::span_lint_hir_and_then;
-use clippy_utils::ty::is_type_lang_item;
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::visitors::for_each_expr;
-use clippy_utils::{eq_expr_value, higher, path_to_local_id, sym};
+use clippy_utils::{eq_expr_value, higher, sym};
 use rustc_errors::{Applicability, MultiSpan};
-use rustc_hir::{Expr, ExprKind, LangItem, Node, Pat, PatKind};
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::{Expr, ExprKind, Node, Pat, PatKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::Ty;
 use rustc_span::{Span, Symbol};
@@ -48,17 +49,17 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, pat: &Pat<'_>, iterable: &Expr
             && let PatKind::Binding(_, binding_id, ..) = pat.kind
         {
             // Destructured iterator element `(idx, _)`, look for uses of the binding
-            for_each_expr(cx, body, |expr| {
-                if path_to_local_id(expr, binding_id) {
+            for_each_expr(cx.tcx, body, |expr| {
+                if expr.res_local_id() == Some(binding_id) {
                     check_index_usage(cx, expr, pat, enumerate_span, chars_span, chars_recv);
                 }
                 CONTINUE
             });
         } else if let PatKind::Binding(_, binding_id, ..) = pat.kind {
             // Bound as a tuple, look for `tup.0`
-            for_each_expr(cx, body, |expr| {
+            for_each_expr(cx.tcx, body, |expr| {
                 if let ExprKind::Field(e, field) = expr.kind
-                    && path_to_local_id(e, binding_id)
+                    && e.res_local_id() == Some(binding_id)
                     && field.name == sym::integer(0)
                 {
                     check_index_usage(cx, expr, pat, enumerate_span, chars_span, chars_recv);
@@ -81,7 +82,7 @@ fn check_index_usage<'tcx>(
         return;
     };
 
-    let is_string_like = |ty: Ty<'_>| ty.is_str() || is_type_lang_item(cx, ty, LangItem::String);
+    let is_string_like = |ty: Ty<'_>| ty.is_str() || ty.is_lang_item(cx, LangItem::String);
     let message = match parent_expr.kind {
         ExprKind::MethodCall(segment, recv, ..)
             // We currently only lint `str` methods (which `String` can deref to), so a `.is_str()` check is sufficient here
@@ -89,13 +90,13 @@ fn check_index_usage<'tcx>(
             // `Index` directly and no deref to `str` would happen in that case).
             if cx.typeck_results().expr_ty_adjusted(recv).peel_refs().is_str()
                 && BYTE_INDEX_METHODS.contains(&segment.ident.name)
-                && eq_expr_value(cx, chars_recv, recv) =>
+                && eq_expr_value(cx, expr.span.ctxt(), chars_recv, recv) =>
         {
             "passing a character position to a method that expects a byte index"
         },
         ExprKind::Index(target, ..)
             if is_string_like(cx.typeck_results().expr_ty_adjusted(target).peel_refs())
-                && eq_expr_value(cx, chars_recv, target) =>
+                && eq_expr_value(cx, expr.span.ctxt(), chars_recv, target) =>
         {
             "indexing into a string with a character position where a byte index is expected"
         },
@@ -131,7 +132,7 @@ fn check_index_usage<'tcx>(
 fn index_consumed_at<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> Option<&'tcx Expr<'tcx>> {
     for (_, node) in cx.tcx.hir_parent_iter(expr.hir_id) {
         match node {
-            Node::Expr(expr) if higher::Range::hir(expr).is_some() => {},
+            Node::Expr(expr) if higher::Range::hir(cx, expr).is_some() => {},
             Node::ExprField(_) => {},
             Node::Expr(expr) => return Some(expr),
             _ => break,

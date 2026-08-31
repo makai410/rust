@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::time::Duration;
 
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_span::edition::Edition;
@@ -67,6 +68,10 @@ impl DocTestRunner {
         self.nb_tests += 1;
     }
 
+    /// Returns a tuple containing the `Duration` of the compilation and the `Result` of the test.
+    ///
+    /// If compilation failed, it will return `Err`, otherwise it will return `Ok` containing if
+    /// the test ran successfully.
     pub(crate) fn run_merged_tests(
         &mut self,
         test_options: IndividualTestOptions,
@@ -74,8 +79,8 @@ impl DocTestRunner {
         opts: &GlobalTestOptions,
         test_args: &[String],
         rustdoc_options: &RustdocOptions,
-    ) -> Result<bool, ()> {
-        let mut code = "\
+    ) -> (Duration, Result<bool, ()>) {
+        let mut runner_code = "\
 #![allow(unused_extern_crates)]
 #![allow(internal_features)]
 #![feature(test)]
@@ -103,15 +108,15 @@ impl DocTestRunner {
             code_prefix.push_str(&format!("#![{attr}]\n"));
         }
 
-        code.push_str("extern crate test;\n");
-        writeln!(code, "extern crate doctest_bundle_{edition} as doctest_bundle;").unwrap();
+        runner_code.push_str("extern crate test;\n");
+        writeln!(runner_code, "extern crate doctest_bundle_{edition} as doctest_bundle;").unwrap();
 
         let test_args = test_args.iter().fold(String::new(), |mut x, arg| {
             write!(x, "{arg:?}.to_string(),").unwrap();
             x
         });
         write!(
-            code,
+            runner_code,
             "\
 {output}
 
@@ -202,11 +207,11 @@ std::process::Termination::report(test::test_main(test_args, tests, None))
             line: 0,
             edition,
             no_run: false,
-            merged_test_code: Some(code),
+            merged_test_runner_code: Some(runner_code),
         };
-        let ret =
+        let (duration, ret) =
             run_test(runnable_test, rustdoc_options, self.supports_color, |_: UnusedExterns| {});
-        if let Err(TestFailure::CompileError) = ret { Err(()) } else { Ok(ret.is_ok()) }
+        (duration, if let Err(TestFailure::CompileError) = ret { Err(()) } else { Ok(ret.is_ok()) })
     }
 }
 
@@ -225,7 +230,7 @@ fn generate_mergeable_doctest(
         // We generate nothing else.
         writeln!(output, "pub mod {test_id} {{}}\n").unwrap();
     } else {
-        writeln!(output, "pub mod {test_id} {{\n{}{}", doctest.crates, doctest.maybe_crate_attrs)
+        writeln!(output, "pub mod {test_id} {{\n{}{}", doctest.crates, doctest.module_attrs)
             .unwrap();
         if doctest.has_main_fn {
             output.push_str(&doctest.everything_else);

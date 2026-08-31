@@ -1,5 +1,10 @@
 // Test that we don't ICE when computing the drop types for
 
+//@ ignore-compare-mode-polonius (explicit revisions)
+//@ revisions: nll polonius
+//@ [nll] compile-flags: -Zpolonius=off
+//@ [polonius] compile-flags: -Zpolonius=next
+
 trait Decode<'a> {
     type Decoder;
 }

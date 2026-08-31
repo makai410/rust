@@ -34,6 +34,8 @@ where
     Builder::new(intent, name).spawn(f).expect("failed to spawn thread")
 }
 
+pub const DEFAULT_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 pub struct Builder {
     intent: ThreadIntent,
     inner: jod_thread::Builder,
@@ -43,7 +45,11 @@ pub struct Builder {
 impl Builder {
     #[must_use]
     pub fn new(intent: ThreadIntent, name: impl Into<String>) -> Self {
-        Self { intent, inner: jod_thread::Builder::new().name(name.into()), allow_leak: false }
+        Self {
+            intent,
+            inner: jod_thread::Builder::new().name(name.into()).stack_size(DEFAULT_STACK_SIZE),
+            allow_leak: false,
+        }
     }
 
     #[must_use]
@@ -101,7 +107,6 @@ impl<T> Drop for JoinHandle<T> {
     }
 }
 
-#[expect(clippy::min_ident_chars, reason = "trait impl")]
 impl<T> fmt::Debug for JoinHandle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("JoinHandle { .. }")

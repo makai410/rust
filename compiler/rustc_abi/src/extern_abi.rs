@@ -3,9 +3,11 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 #[cfg(feature = "nightly")]
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher, StableOrd};
 #[cfg(feature = "nightly")]
 use rustc_macros::{Decodable, Encodable};
+#[cfg(feature = "nightly")]
+use rustc_span::Symbol;
 
 use crate::AbiFromStrErr;
 
@@ -40,9 +42,20 @@ pub enum ExternAbi {
     /// in a platform-agnostic way.
     RustInvalid,
 
-    /// Unstable impl detail that directly uses Rust types to describe the ABI to LLVM.
-    /// Even normally-compatible Rust types can become ABI-incompatible with this ABI!
-    Unadjusted,
+    /// Preserves no registers.
+    ///
+    /// Note, that this ABI is not stable in the registers it uses, is intended as an optimization
+    /// and may fall-back to a more conservative calling convention if the backend does not support
+    /// forcing callers to save all registers.
+    RustPreserveNone,
+
+    /// Ensures that calls in tail position can always be optimized into a jump.
+    ///
+    /// This ABI is not stable, and relies on LLVM implementation details.
+    RustTail,
+
+    /// Unstable ABI used to call LLVM intrinsics.
+    LlvmIntrinsic,
 
     /// An ABI that rustc does not know how to call or define. Functions with this ABI can
     /// only be created using `#[naked]` functions or `extern "custom"` blocks, and can only
@@ -52,6 +65,10 @@ pub enum ExternAbi {
     /// UEFI ABI, usually an alias of C, but sometimes an arch-specific alias
     /// and only valid on platforms that have a UEFI standard
     EfiApi,
+
+    /// Swift's calling convention, used to interoperate with Swift code without
+    /// going through C as an intermediary.
+    Swift,
 
     /* arm */
     /// Arm Architecture Procedure Call Standard, sometimes `ExternAbi::C` is an alias for this
@@ -65,7 +82,6 @@ pub enum ExternAbi {
 
     /* gpu */
     /// An entry-point function called by the GPU's host
-    // FIXME: should not be callable from Rust on GPU targets, is for host's use only
     GpuKernel,
     /// An entry-point function called by the GPU's host
     // FIXME: why do we have two of these?
@@ -123,6 +139,29 @@ macro_rules! abi_impls {
                     $($e_name::$variant $( { unwind: $uw } )* => $tok,)*
                 }
             }
+            // FIXME(FnSigKind): when PartialEq is stably const, use it instead
+            const fn internal_const_eq(&self, other: &Self) -> bool {
+                match (self, other) {
+                    $( ( $e_name::$variant $( { unwind: $uw } )* , $e_name::$variant $( { unwind: $uw } )* ) => true,)*
+                    _ => false,
+                }
+            }
+            // ALL_VARIANTS.iter().position(|v| v == self), but const
+            pub const fn as_packed(&self) -> u8 {
+                let mut index = 0;
+                while index < $e_name::ALL_VARIANTS.len() {
+                    if self.internal_const_eq(&$e_name::ALL_VARIANTS[index]) {
+                        return index as u8;
+                    }
+                    index += 1;
+                }
+                panic!("unreachable: invalid ExternAbi variant");
+            }
+            pub const fn from_packed(index: u8) -> Self {
+                let index = index as usize;
+                assert!(index < $e_name::ALL_VARIANTS.len(), "invalid ExternAbi index");
+                $e_name::ALL_VARIANTS[index]
+            }
         }
 
         impl ::core::str::FromStr for $e_name {
@@ -142,6 +181,7 @@ abi_impls! {
             C { unwind: false } =><= "C",
             C { unwind: true } =><= "C-unwind",
             Rust =><= "Rust",
+            Swift =><= "Swift",
             Aapcs { unwind: false } =><= "aapcs",
             Aapcs { unwind: true } =><= "aapcs-unwind",
             AvrInterrupt =><= "avr-interrupt",
@@ -155,6 +195,7 @@ abi_impls! {
             Fastcall { unwind: false } =><= "fastcall",
             Fastcall { unwind: true } =><= "fastcall-unwind",
             GpuKernel =><= "gpu-kernel",
+            LlvmIntrinsic =><= "llvm-intrinsic",
             Msp430Interrupt =><= "msp430-interrupt",
             PtxKernel =><= "ptx-kernel",
             RiscvInterruptM =><= "riscv-interrupt-m",
@@ -162,15 +203,16 @@ abi_impls! {
             RustCall =><= "rust-call",
             RustCold =><= "rust-cold",
             RustInvalid =><= "rust-invalid",
+            RustPreserveNone =><= "rust-preserve-none",
             Stdcall { unwind: false } =><= "stdcall",
             Stdcall { unwind: true } =><= "stdcall-unwind",
             System { unwind: false } =><= "system",
             System { unwind: true } =><= "system-unwind",
             SysV64 { unwind: false } =><= "sysv64",
             SysV64 { unwind: true } =><= "sysv64-unwind",
+            RustTail =><= "tail",
             Thiscall { unwind: false } =><= "thiscall",
             Thiscall { unwind: true } =><= "thiscall-unwind",
-            Unadjusted =><= "unadjusted",
             Vectorcall { unwind: false } =><= "vectorcall",
             Vectorcall { unwind: true } =><= "vectorcall-unwind",
             Win64 { unwind: false } =><= "win64",
@@ -208,9 +250,9 @@ impl Hash for ExternAbi {
 }
 
 #[cfg(feature = "nightly")]
-impl<C> HashStable<C> for ExternAbi {
+impl StableHash for ExternAbi {
     #[inline]
-    fn hash_stable(&self, _: &mut C, hasher: &mut StableHasher) {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, _: &mut Hcx, hasher: &mut StableHasher) {
         Hash::hash(self, hasher);
     }
 }
@@ -223,6 +265,17 @@ impl StableOrd for ExternAbi {
     const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
+#[cfg(feature = "nightly")]
+rustc_error_messages::into_diag_arg_using_display!(ExternAbi);
+
+#[cfg(feature = "nightly")]
+#[derive(Debug)]
+pub enum CVariadicStatus {
+    NotSupported,
+    Stable,
+    Unstable { feature: Symbol },
+}
+
 impl ExternAbi {
     /// An ABI "like Rust"
     ///
@@ -232,26 +285,88 @@ impl ExternAbi {
     /// - are subject to change between compiler versions
     pub fn is_rustic_abi(self) -> bool {
         use ExternAbi::*;
-        matches!(self, Rust | RustCall | RustCold)
+        matches!(self, Rust | RustCall | RustCold | RustPreserveNone | RustTail)
     }
 
-    pub fn supports_varargs(self) -> bool {
+    /// Returns whether the ABI supports C variadics. This only controls whether we allow *imports*
+    /// of such functions via `extern` blocks and definition via naked functions; there's a
+    /// separate check during AST construction guarding *definitions* of variadic functions.
+    #[cfg(feature = "nightly")]
+    pub fn supports_c_variadic(self) -> CVariadicStatus {
         // * C and Cdecl obviously support varargs.
         // * C can be based on Aapcs, SysV64 or Win64, so they must support varargs.
         // * EfiApi is based on Win64 or C, so it also supports it.
+        // * System automatically falls back to C when used with variadics, therefore supports it.
         //
         // * Stdcall does not, because it would be impossible for the callee to clean
         //   up the arguments. (callee doesn't know how many arguments are there)
         // * Same for Fastcall, Vectorcall and Thiscall.
         // * Other calling conventions are related to hardware or the compiler itself.
+        //
+        // All of the supported ones must have a test in `tests/codegen/cffi/c-variadic-ffi.rs`.
         match self {
             Self::C { .. }
             | Self::Cdecl { .. }
             | Self::Aapcs { .. }
             | Self::Win64 { .. }
             | Self::SysV64 { .. }
-            | Self::EfiApi => true,
-            _ => false,
+            | Self::EfiApi
+            | Self::System { .. } => CVariadicStatus::Stable,
+            _ => CVariadicStatus::NotSupported,
+        }
+    }
+
+    /// Returns whether the ABI supports guaranteed tail calls.
+    #[cfg(feature = "nightly")]
+    pub fn supports_guaranteed_tail_call(self) -> bool {
+        match self {
+            Self::CmseNonSecureCall | Self::CmseNonSecureEntry => {
+                // See https://godbolt.org/z/9jhdeqErv. The CMSE calling conventions clear registers
+                // before returning, and hence cannot guarantee a tail call.
+                false
+            }
+            Self::AvrInterrupt
+            | Self::AvrNonBlockingInterrupt
+            | Self::Msp430Interrupt
+            | Self::RiscvInterruptM
+            | Self::RiscvInterruptS
+            | Self::X86Interrupt => {
+                // See https://godbolt.org/z/Edfjnxxcq. Interrupts cannot be called directly.
+                false
+            }
+            Self::GpuKernel | Self::PtxKernel => {
+                // See https://godbolt.org/z/jq5TE5jK1.
+                false
+            }
+            Self::Custom => {
+                // This ABI does not support calls at all (except via assembly).
+                false
+            }
+            Self::RustCall => {
+                // Argument untupling requires additional support for tail calls to be possible,
+                // see <https://github.com/rust-lang/rust/pull/158248>. There is no real uses of
+                // tail calling `extern "rust-call"` functions
+                false
+            }
+
+            Self::C { .. }
+            | Self::System { .. }
+            | Self::Rust
+            | Self::RustCold
+            | Self::RustInvalid
+            | Self::LlvmIntrinsic
+            | Self::EfiApi
+            | Self::Aapcs { .. }
+            | Self::Cdecl { .. }
+            | Self::Stdcall { .. }
+            | Self::Fastcall { .. }
+            | Self::Thiscall { .. }
+            | Self::Vectorcall { .. }
+            | Self::SysV64 { .. }
+            | Self::Win64 { .. }
+            | Self::RustPreserveNone
+            | Self::RustTail
+            | Self::Swift => true,
         }
     }
 }

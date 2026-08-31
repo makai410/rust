@@ -9,21 +9,22 @@ use std::cell::Cell;
 use std::vec;
 
 use rustc_abi::ExternAbi;
+use rustc_ast as ast;
 use rustc_ast::util::parser::{self, ExprPrecedence, Fixity};
 use rustc_ast::{DUMMY_NODE_ID, DelimArgs};
 use rustc_ast_pretty::pp::Breaks::{Consistent, Inconsistent};
 use rustc_ast_pretty::pp::{self, BoxMarker, Breaks};
 use rustc_ast_pretty::pprust::state::MacHeader;
 use rustc_ast_pretty::pprust::{Comments, PrintState};
-use rustc_attr_data_structures::{AttributeKind, PrintAttribute};
+use rustc_hir as hir;
+use rustc_hir::attrs::{AttributeKind, PrintAttribute};
 use rustc_hir::{
-    BindingMode, ByRef, ConstArgKind, GenericArg, GenericBound, GenericParam, GenericParamKind,
-    HirId, ImplicitSelfKind, LifetimeParamKind, Node, PatKind, PreciseCapturingArg, RangeEnd, Term,
-    TyPatKind,
+    BindingMode, ByRef, ConstArg, ConstArgExprField, ConstArgKind, GenericArg, GenericBound,
+    GenericParam, GenericParamKind, HirId, ImplicitSelfKind, LifetimeParamKind, Node, PatKind,
+    PreciseCapturingArg, RangeEnd, Term, TyFieldPath, TyPatKind,
 };
 use rustc_span::source_map::SourceMap;
-use rustc_span::{FileName, Ident, Span, Symbol, kw, sym};
-use {rustc_ast as ast, rustc_hir as hir};
+use rustc_span::{DUMMY_SP, FileName, Ident, Span, Spanned, Symbol, kw, sym};
 
 pub fn id_to_string(cx: &dyn rustc_hir::intravisit::HirTyCtxt<'_>, hir_id: HirId) -> String {
     to_string(&cx, |s| s.print_node(cx.hir_node(hir_id)))
@@ -136,9 +137,12 @@ impl<'a> State<'a> {
                 .path
                 .segments
                 .iter()
-                .map(|i| ast::PathSegment { ident: *i, args: None, id: DUMMY_NODE_ID })
+                .map(|i| ast::PathSegment {
+                    ident: Ident { name: *i, span: DUMMY_SP },
+                    args: None,
+                    id: DUMMY_NODE_ID,
+                })
                 .collect(),
-            tokens: None,
         };
 
         match &item.args {
@@ -180,6 +184,8 @@ impl<'a> State<'a> {
             Node::ConstArg(a) => self.print_const_arg(a),
             Node::Expr(a) => self.print_expr(a),
             Node::ExprField(a) => self.print_expr_field(a),
+            // FIXME(mgca): proper printing for struct exprs
+            Node::ConstArgExprField(_) => self.word("/* STRUCT EXPR */"),
             Node::Stmt(a) => self.print_stmt(a),
             Node::PathSegment(a) => self.print_path_segment(a),
             Node::Ty(a) => self.print_type(a),
@@ -210,6 +216,8 @@ impl<'a> State<'a> {
             Node::LetStmt(a) => self.print_local_decl(a),
             Node::Crate(..) => panic!("cannot print Crate"),
             Node::WherePredicate(pred) => self.print_where_predicate(pred),
+            Node::TestBinderForall(_) => panic!("cannot print Node::TestBinderForall"),
+            Node::TestBinderExists(_) => panic!("cannot print Node::TestBinderExists"),
             Node::Synthetic => unreachable!(),
             Node::Err(_) => self.word("/*ERROR*/"),
         }
@@ -445,11 +453,6 @@ impl<'a> State<'a> {
                 self.print_const_arg(length);
                 self.word("]");
             }
-            hir::TyKind::Typeof(ref e) => {
-                self.word("typeof(");
-                self.print_anon_const(e);
-                self.word(")");
-            }
             hir::TyKind::Err(_) => {
                 self.popen();
                 self.word("/*ERROR*/");
@@ -462,6 +465,28 @@ impl<'a> State<'a> {
                 self.print_type(ty);
                 self.word(" is ");
                 self.print_ty_pat(pat);
+            }
+            hir::TyKind::FieldOf(ty, TyFieldPath { variant, field }) => {
+                self.word("field_of!(");
+                self.print_type(ty);
+                self.word(", ");
+                if let Some(variant) = *variant {
+                    self.print_ident(variant);
+                    self.word(".");
+                }
+                self.print_ident(*field);
+                self.word(")");
+            }
+            hir::TyKind::View(ty, fields) => {
+                self.word("view_type!(");
+                self.print_type(ty);
+                self.word(".{");
+                if !fields.is_empty() {
+                    self.space();
+                    self.commasep(Breaks::Inconsistent, fields, |s, f| s.print_ident(*f));
+                    self.space();
+                }
+                self.word("})");
             }
         }
         self.end(ib)
@@ -523,17 +548,17 @@ impl<'a> State<'a> {
         ident: Ident,
         generics: &hir::Generics<'_>,
         ty: &hir::Ty<'_>,
-        default: Option<hir::BodyId>,
+        default: Option<hir::ConstItemRhs<'_>>,
     ) {
         self.word_space("const");
         self.print_ident(ident);
         self.print_generic_params(generics.params);
         self.word_space(":");
         self.print_type(ty);
-        if let Some(expr) = default {
+        if let Some(ct_rhs) = default {
             self.space();
             self.word_space("=");
-            self.ann.nested(self, Nested::Body(expr));
+            self.print_const_item_rhs(ct_rhs);
         }
         self.print_where_clause(generics);
         self.word(";")
@@ -616,7 +641,7 @@ impl<'a> State<'a> {
                 self.word(";");
                 self.end(cb);
             }
-            hir::ItemKind::Const(ident, generics, ty, expr) => {
+            hir::ItemKind::Const(ident, generics, ty, rhs) => {
                 let (cb, ib) = self.head("const");
                 self.print_ident(ident);
                 self.print_generic_params(generics.params);
@@ -626,7 +651,7 @@ impl<'a> State<'a> {
                 self.end(ib);
 
                 self.word_space("=");
-                self.ann.nested(self, Nested::Body(expr));
+                self.print_const_item_rhs(rhs);
                 self.print_where_clause(generics);
                 self.word(";");
                 self.end(cb);
@@ -690,39 +715,48 @@ impl<'a> State<'a> {
                 let (cb, ib) = self.head("union");
                 self.print_struct(ident.name, generics, struct_def, item.span, true, cb, ib);
             }
-            hir::ItemKind::Impl(&hir::Impl {
-                constness,
-                safety,
-                polarity,
-                defaultness,
-                defaultness_span: _,
-                generics,
-                ref of_trait,
-                self_ty,
-                items,
-            }) => {
+            hir::ItemKind::Impl(hir::Impl { generics, of_trait, self_ty, items, constness }) => {
                 let (cb, ib) = self.head("");
-                self.print_defaultness(defaultness);
-                self.print_safety(safety);
-                self.word_nbsp("impl");
 
-                if let hir::Constness::Const = constness {
-                    self.word_nbsp("const");
-                }
+                let impl_generics = |this: &mut Self| {
+                    this.word_nbsp("impl");
+                    if !generics.params.is_empty() {
+                        this.print_generic_params(generics.params);
+                        this.space();
+                    }
+                };
 
-                if !generics.params.is_empty() {
-                    self.print_generic_params(generics.params);
-                    self.space();
-                }
+                match of_trait {
+                    None => {
+                        if let hir::Constness::Const { always: false } = constness {
+                            self.word_nbsp("const");
+                        }
+                        impl_generics(self)
+                    }
+                    Some(&hir::TraitImplHeader {
+                        safety,
+                        polarity,
+                        defaultness,
+                        defaultness_span: _,
+                        ref trait_ref,
+                    }) => {
+                        self.print_defaultness(defaultness);
+                        self.print_safety(safety);
 
-                if let hir::ImplPolarity::Negative(_) = polarity {
-                    self.word("!");
-                }
+                        impl_generics(self);
 
-                if let Some(t) = of_trait {
-                    self.print_trait_ref(t);
-                    self.space();
-                    self.word_space("for");
+                        if let hir::Constness::Const { always: false } = constness {
+                            self.word_nbsp("const");
+                        }
+
+                        if let hir::ImplPolarity::Negative(_) = polarity {
+                            self.word("!");
+                        }
+
+                        self.print_trait_ref(trait_ref);
+                        self.space();
+                        self.word_space("for");
+                    }
                 }
 
                 self.print_type(self_ty);
@@ -735,16 +769,18 @@ impl<'a> State<'a> {
                 }
                 self.bclose(item.span, cb);
             }
-            hir::ItemKind::Trait(
+            hir::ItemKind::Trait {
+                impl_restriction,
                 constness,
                 is_auto,
                 safety,
                 ident,
                 generics,
                 bounds,
-                trait_items,
-            ) => {
+                items: trait_items,
+            } => {
                 let (cb, ib) = self.head("");
+                self.print_impl_restriction(impl_restriction);
                 self.print_constness(constness);
                 self.print_is_auto(is_auto);
                 self.print_safety(safety);
@@ -760,8 +796,10 @@ impl<'a> State<'a> {
                 }
                 self.bclose(item.span, cb);
             }
-            hir::ItemKind::TraitAlias(ident, generics, bounds) => {
-                let (cb, ib) = self.head("trait");
+            hir::ItemKind::TraitAlias(constness, ident, generics, bounds) => {
+                let (cb, ib) = self.head("");
+                self.print_constness(constness);
+                self.word_nbsp("trait");
                 self.print_ident(ident);
                 self.print_generic_params(generics.params);
                 self.nbsp();
@@ -770,6 +808,9 @@ impl<'a> State<'a> {
                 self.word(";");
                 self.end(ib);
                 self.end(cb);
+            }
+            rustc_hir::ItemKind::TestBinderConstraints { .. } => {
+                self.word("test_binder_constraints!(/* pretty-printing not supported */)");
             }
         }
         self.ann.post(self, AnnNode::Item(item))
@@ -865,6 +906,7 @@ impl<'a> State<'a> {
                     self.commasep(Inconsistent, struct_def.fields(), |s, field| {
                         s.maybe_print_comment(field.span.lo());
                         s.print_attrs(s.attrs(field.hir_id));
+                        s.print_mut_restriction(field.mut_restriction);
                         s.print_type(field.ty);
                     });
                     self.pclose();
@@ -886,6 +928,7 @@ impl<'a> State<'a> {
                     self.hardbreak_if_not_bol();
                     self.maybe_print_comment(field.span.lo());
                     self.print_attrs(self.attrs(field.hir_id));
+                    self.print_mut_restriction(field.mut_restriction);
                     self.print_ident(field.ident);
                     self.word_nbsp(":");
                     self.print_type(field.ty);
@@ -1120,12 +1163,65 @@ impl<'a> State<'a> {
         self.ann.nested(self, Nested::Body(constant.body))
     }
 
+    fn print_const_item_rhs(&mut self, ct_rhs: hir::ConstItemRhs<'_>) {
+        match ct_rhs {
+            hir::ConstItemRhs::Body(body_id) => self.ann.nested(self, Nested::Body(body_id)),
+            hir::ConstItemRhs::TypeConst(const_arg) => self.print_const_arg(const_arg),
+        }
+    }
+
     fn print_const_arg(&mut self, const_arg: &hir::ConstArg<'_>) {
         match &const_arg.kind {
+            ConstArgKind::Tup(exprs) => {
+                self.popen();
+                self.commasep_cmnt(
+                    Inconsistent,
+                    exprs,
+                    |s, arg| s.print_const_arg(arg),
+                    |arg| arg.span,
+                );
+                self.pclose();
+            }
+            ConstArgKind::Struct(qpath, fields) => self.print_const_struct(qpath, fields),
+            ConstArgKind::TupleCall(qpath, args) => self.print_const_ctor(qpath, args),
+            ConstArgKind::Array(..) => self.word("/* ARRAY EXPR */"),
             ConstArgKind::Path(qpath) => self.print_qpath(qpath, true),
             ConstArgKind::Anon(anon) => self.print_anon_const(anon),
+            ConstArgKind::Error(_) => self.word("/*ERROR*/"),
             ConstArgKind::Infer(..) => self.word("_"),
+            ConstArgKind::Literal { lit, negated } => {
+                if *negated {
+                    self.word("-");
+                }
+                let span = const_arg.span;
+                self.print_literal(&Spanned { span, node: *lit })
+            }
         }
+    }
+
+    fn print_const_struct(&mut self, qpath: &hir::QPath<'_>, fields: &&[&ConstArgExprField<'_>]) {
+        self.print_qpath(qpath, true);
+        self.word(" ");
+        self.word("{");
+        if !fields.is_empty() {
+            self.nbsp();
+        }
+        self.commasep(Inconsistent, *fields, |s, field| {
+            s.word(field.field.as_str().to_string());
+            s.word(":");
+            s.nbsp();
+            s.print_const_arg(field.expr);
+        });
+        self.word("}");
+    }
+
+    fn print_const_ctor(&mut self, qpath: &hir::QPath<'_>, args: &&[&ConstArg<'_, ()>]) {
+        self.print_qpath(qpath, true);
+        self.word("(");
+        self.commasep(Inconsistent, *args, |s, arg| {
+            s.print_const_arg(arg);
+        });
+        self.word(")");
     }
 
     fn print_call_post(&mut self, args: &[hir::Expr<'_>]) {
@@ -1238,6 +1334,7 @@ impl<'a> State<'a> {
                 self.end(ib);
             }
             hir::StructTailExpr::None => {}
+            hir::StructTailExpr::NoneWithError(_) => {}
         }
         self.space();
         self.word("}");
@@ -1565,6 +1662,7 @@ impl<'a> State<'a> {
                 fn_arg_span: _,
                 kind: _,
                 def_id: _,
+                explicit_captures: _,
             }) => {
                 self.print_closure_binder(binder, bound_generic_params);
                 self.print_constness(constness);
@@ -1648,7 +1746,7 @@ impl<'a> State<'a> {
                 self.print_expr_cond_paren(result, self.precedence(result) < ExprPrecedence::Jump);
             }
             hir::ExprKind::InlineAsm(asm) => {
-                self.word("asm!");
+                self.word(format!("{}!", asm.asm_macro.macro_name()));
                 self.print_inline_asm(asm);
             }
             hir::ExprKind::OffsetOf(container, fields) => {
@@ -1769,11 +1867,6 @@ impl<'a> State<'a> {
                 self.print_ident(item_segment.ident);
                 self.print_generic_args(item_segment.args(), colons_before_params)
             }
-            hir::QPath::LangItem(lang_item, span) => {
-                self.word("#[lang = \"");
-                self.print_ident(Ident::new(lang_item.name(), span));
-                self.word("\"]");
-            }
         }
     }
 
@@ -1867,7 +1960,6 @@ impl<'a> State<'a> {
                 }
                 self.print_literal(lit);
             }
-            hir::PatExprKind::ConstBlock(c) => self.print_inline_const(c),
             hir::PatExprKind::Path(qpath) => self.print_qpath(qpath, true),
         }
     }
@@ -1882,6 +1974,10 @@ impl<'a> State<'a> {
                 self.print_const_arg(begin);
                 self.word("..=");
                 self.print_const_arg(end);
+            }
+            TyPatKind::NotNull => {
+                self.word_space("not");
+                self.word("null");
             }
             TyPatKind::Or(patterns) => {
                 self.popen();
@@ -1919,10 +2015,15 @@ impl<'a> State<'a> {
                 if mutbl.is_mut() {
                     self.word_nbsp("mut");
                 }
-                if let ByRef::Yes(rmutbl) = by_ref {
+                if let ByRef::Yes(pinnedness, rmutbl) = by_ref {
                     self.word_nbsp("ref");
+                    if pinnedness.is_pinned() {
+                        self.word_nbsp("pin");
+                    }
                     if rmutbl.is_mut() {
                         self.word_nbsp("mut");
+                    } else if pinnedness.is_pinned() {
+                        self.word_nbsp("const");
                     }
                 }
                 self.print_ident(ident);
@@ -1953,12 +2054,12 @@ impl<'a> State<'a> {
                 self.print_qpath(qpath, true);
                 self.nbsp();
                 self.word("{");
-                let empty = fields.is_empty() && !etc;
+                let empty = fields.is_empty() && etc.is_none();
                 if !empty {
                     self.space();
                 }
                 self.commasep_cmnt(Consistent, fields, |s, f| s.print_patfield(f), |f| f.pat.span);
-                if etc {
+                if etc.is_some() {
                     if !fields.is_empty() {
                         self.word_space(",");
                     }
@@ -1992,26 +2093,21 @@ impl<'a> State<'a> {
                 }
                 self.pclose();
             }
-            PatKind::Box(inner) => {
-                let is_range_inner = matches!(inner.kind, PatKind::Range(..));
-                self.word("box ");
-                if is_range_inner {
-                    self.popen();
-                }
-                self.print_pat(inner);
-                if is_range_inner {
-                    self.pclose();
-                }
-            }
             PatKind::Deref(inner) => {
                 self.word("deref!");
                 self.popen();
                 self.print_pat(inner);
                 self.pclose();
             }
-            PatKind::Ref(inner, mutbl) => {
+            PatKind::Ref(inner, pinned, mutbl) => {
                 let is_range_inner = matches!(inner.kind, PatKind::Range(..));
                 self.word("&");
+                if pinned.is_pinned() {
+                    self.word("pin ");
+                    if mutbl.is_not() {
+                        self.word("const ");
+                    }
+                }
                 self.word(mutbl.prefix_str());
                 if is_range_inner {
                     self.popen();
@@ -2175,8 +2271,11 @@ impl<'a> State<'a> {
         assert!(arg_idents.is_empty() || body_id.is_none());
         let mut i = 0;
         let mut print_arg = |s: &mut Self, ty: Option<&hir::Ty<'_>>| {
-            if i == 0 && decl.implicit_self.has_implicit_self() {
-                s.print_implicit_self(&decl.implicit_self);
+            if Some(i) == decl.splatted().map(usize::from) {
+                s.word("#[rustc_splat]");
+            }
+            if i == 0 && decl.implicit_self().has_implicit_self() {
+                s.print_implicit_self(&decl.implicit_self());
             } else {
                 if let Some(arg_ident) = arg_idents.get(i) {
                     if let Some(arg_ident) = arg_ident {
@@ -2200,7 +2299,7 @@ impl<'a> State<'a> {
             print_arg(s, Some(ty));
             s.end(ib);
         });
-        if decl.c_variadic {
+        if decl.c_variadic() {
             if !decl.inputs.is_empty() {
                 self.word(", ");
             }
@@ -2374,7 +2473,7 @@ impl<'a> State<'a> {
                     self.print_type(default);
                 }
             }
-            GenericParamKind::Const { ty, ref default, synthetic: _ } => {
+            GenericParamKind::Const { ty, ref default } => {
                 self.word_space(":");
                 self.print_type(ty);
                 if let Some(default) = default {
@@ -2439,14 +2538,6 @@ impl<'a> State<'a> {
                         self.word(":");
                     }
                 }
-            }
-            hir::WherePredicateKind::EqPredicate(hir::WhereEqPredicate {
-                lhs_ty, rhs_ty, ..
-            }) => {
-                self.print_type(lhs_ty);
-                self.space();
-                self.word_space("=");
-                self.print_type(rhs_ty);
             }
         }
     }
@@ -2541,7 +2632,8 @@ impl<'a> State<'a> {
     fn print_constness(&mut self, s: hir::Constness) {
         match s {
             hir::Constness::NotConst => {}
-            hir::Constness::Const => self.word_nbsp("const"),
+            hir::Constness::Const { always: false } => self.word_nbsp("const"),
+            hir::Constness::Const { always: true } => { /* printed as an attribute */ }
         }
     }
 
@@ -2557,6 +2649,30 @@ impl<'a> State<'a> {
             hir::IsAuto::Yes => self.word_nbsp("auto"),
             hir::IsAuto::No => {}
         }
+    }
+
+    fn print_restriction<S: Into<std::borrow::Cow<'static, str>>>(
+        &mut self,
+        k: &hir::RestrictionKind<'_>,
+        prefix: S,
+    ) {
+        match k {
+            hir::RestrictionKind::Unrestricted => {}
+            hir::RestrictionKind::Restricted(path) => {
+                self.word(prefix.into());
+                self.word_nbsp("(in");
+                self.print_path(path, false);
+                self.word_nbsp(")");
+            }
+        }
+    }
+
+    fn print_mut_restriction(&mut self, r: &hir::MutRestriction<'_>) {
+        self.print_restriction(&r.kind, "mut");
+    }
+
+    fn print_impl_restriction(&mut self, r: &hir::ImplRestriction<'_>) {
+        self.print_restriction(&r.kind, "impl");
     }
 }
 

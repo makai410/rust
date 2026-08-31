@@ -40,7 +40,7 @@ use crate::{AssistContext, AssistId, Assists};
 // fn foo() -> Result<i32, ${0:_}> { Ok(42i32) }
 // ```
 
-pub(crate) fn wrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn wrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let ret_type = ctx.find_node_at_offset::<ast::RetType>()?;
     let parent = ret_type.syntax().parent()?;
     let body_expr = match_ast! {
@@ -77,9 +77,9 @@ pub(crate) fn wrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
             kind.label(),
             type_ref.syntax().text_range(),
             |builder| {
-                let mut editor = builder.make_editor(&parent);
-                let make = SyntaxFactory::with_mappings();
-                let alias = wrapper_alias(ctx, &make, core_wrapper, type_ref, &ty, kind.symbol());
+                let editor = builder.make_editor(&parent);
+                let make = editor.make();
+                let alias = wrapper_alias(ctx, make, core_wrapper, type_ref, &ty, kind.symbol());
                 let (ast_new_return_ty, semantic_new_return_ty) = alias.unwrap_or_else(|| {
                     let (ast_ty, ty_constructor) = match kind {
                         WrapperKind::Option => {
@@ -92,7 +92,7 @@ pub(crate) fn wrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                     };
                     let semantic_ty = ty_constructor
                         .map(|ty_constructor| {
-                            hir::Adt::from(ty_constructor).ty_with_args(ctx.db(), [ty.clone()])
+                            hir::Adt::from(ty_constructor).ty(ctx.db()).instantiate([ty.clone()])
                         })
                         .unwrap_or_else(|| ty.clone());
                     (ast_ty, semantic_ty)
@@ -101,24 +101,24 @@ pub(crate) fn wrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                 let mut exprs_to_wrap = Vec::new();
                 let tail_cb = &mut |e: &_| tail_cb_impl(&mut exprs_to_wrap, e);
                 walk_expr(&body_expr, &mut |expr| {
-                    if let Expr::ReturnExpr(ret_expr) = expr {
-                        if let Some(ret_expr_arg) = &ret_expr.expr() {
-                            for_each_tail_expr(ret_expr_arg, tail_cb);
-                        }
+                    if let Expr::ReturnExpr(ret_expr) = expr
+                        && let Some(ret_expr_arg) = &ret_expr.expr()
+                    {
+                        for_each_tail_expr(ret_expr_arg, tail_cb);
                     }
                 });
                 for_each_tail_expr(&body_expr, tail_cb);
 
                 for ret_expr_arg in exprs_to_wrap {
-                    if let Some(ty) = ctx.sema.type_of_expr(&ret_expr_arg) {
-                        if ty.adjusted().could_unify_with(ctx.db(), &semantic_new_return_ty) {
-                            // The type is already correct, don't wrap it.
-                            // We deliberately don't use `could_unify_with_deeply()`, because as long as the outer
-                            // enum matches it's okay for us, as we don't trigger the assist if the return type
-                            // is already `Option`/`Result`, so mismatched exact type is more likely a mistake
-                            // than something intended.
-                            continue;
-                        }
+                    if let Some(ty) = ctx.sema.type_of_expr(&ret_expr_arg)
+                        && ty.adjusted().could_unify_with(ctx.db(), &semantic_new_return_ty)
+                    {
+                        // The type is already correct, don't wrap it.
+                        // We deliberately don't use `could_unify_with_deeply()`, because as long as the outer
+                        // enum matches it's okay for us, as we don't trigger the assist if the return type
+                        // is already `Option`/`Result`, so mismatched exact type is more likely a mistake
+                        // than something intended.
+                        continue;
                     }
 
                     let happy_wrapped = make.expr_call(
@@ -147,17 +147,15 @@ pub(crate) fn wrap_return_type(acc: &mut Assists, ctx: &AssistContext<'_>) -> Op
                         ast::GenericArg::LifetimeArg(_) => false,
                         _ => true,
                     });
-                    if let Some(error_type_arg) = error_type_arg {
-                        if let Some(cap) = ctx.config.snippet_cap {
-                            editor.add_annotation(
-                                error_type_arg.syntax(),
-                                builder.make_placeholder_snippet(cap),
-                            );
-                        }
+                    if let Some(error_type_arg) = error_type_arg
+                        && let Some(cap) = ctx.config.snippet_cap
+                    {
+                        editor.add_annotation(
+                            error_type_arg.syntax(),
+                            builder.make_placeholder_snippet(cap),
+                        );
                     }
                 }
-
-                editor.add_mappings(make.finish_with_mappings());
                 builder.add_file_edits(ctx.vfs_file_id(), editor);
             },
         );
@@ -214,7 +212,7 @@ impl WrapperKind {
 
 // Try to find an wrapper type alias in the current scope (shadowing the default).
 fn wrapper_alias<'db>(
-    ctx: &AssistContext<'db>,
+    ctx: &AssistContext<'_, 'db>,
     make: &SyntaxFactory,
     core_wrapper: hir::Enum,
     ast_ret_type: &ast::Type,
@@ -258,7 +256,7 @@ fn wrapper_alias<'db>(
             );
 
             let new_ty =
-                hir::Adt::from(enum_ty).ty_with_args(ctx.db(), [semantic_ret_type.clone()]);
+                hir::Adt::from(enum_ty).ty(ctx.db()).instantiate([semantic_ret_type.clone()]);
 
             Some((make.ty_path(path), new_ty))
         })
@@ -964,7 +962,7 @@ fn foo(num: i32) -> Option<i32> {
         check_assist_by_label(
             wrap_return_type,
             r#"
-//- minicore: option
+//- minicore: option, fn
 fn foo(the_field: u32) ->$0 u32 {
     let true_closure = || { return true; };
     if the_field < 5 {
@@ -998,7 +996,7 @@ fn foo(the_field: u32) -> Option<u32> {
         check_assist_by_label(
             wrap_return_type,
             r#"
-//- minicore: option
+//- minicore: option, fn
 fn foo(the_field: u32) -> u32$0 {
     let true_closure = || {
         return true;
@@ -2035,7 +2033,7 @@ fn foo(num: i32) -> Result<i32, ${0:_}> {
         check_assist_by_label(
             wrap_return_type,
             r#"
-//- minicore: result
+//- minicore: result, fn
 fn foo(the_field: u32) ->$0 u32 {
     let true_closure = || { return true; };
     if the_field < 5 {
@@ -2069,7 +2067,7 @@ fn foo(the_field: u32) -> Result<u32, ${0:_}> {
         check_assist_by_label(
             wrap_return_type,
             r#"
-//- minicore: result
+//- minicore: result, fn
 fn foo(the_field: u32) -> u32$0 {
     let true_closure = || {
         return true;

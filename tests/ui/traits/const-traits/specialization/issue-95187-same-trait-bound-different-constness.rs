@@ -11,11 +11,9 @@
 #[rustc_specialization_trait]
 trait Specialize {}
 
-#[const_trait]
-trait Foo {}
+const trait Foo {}
 
-#[const_trait]
-trait Bar {
+const trait Bar {
     fn bar();
 }
 
@@ -26,7 +24,7 @@ where
     default fn bar() {}
 }
 
-impl<T> const Bar for T
+const impl<T> Bar for T
 where
     T: [const] Foo,
     T: Specialize,
@@ -34,19 +32,18 @@ where
     fn bar() {}
 }
 
-#[const_trait]
-trait Baz {
+const trait Baz {
     fn baz();
 }
 
-impl<T> const Baz for T
+const impl<T> Baz for T
 where
     T: Foo,
 {
     default fn baz() {}
 }
 
-impl<T> const Baz for T
+const impl<T> Baz for T
 where
     T: [const] Foo,
     T: Specialize,

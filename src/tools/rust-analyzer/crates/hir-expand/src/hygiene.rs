@@ -8,9 +8,9 @@
 //!
 //! # The Expansion Order Hierarchy
 //!
-//! `ExpnData` in rustc, rust-analyzer's version is [`MacroCallLoc`]. Traversing the hierarchy
-//! upwards can be achieved by walking up [`MacroCallLoc::kind`]'s contained file id, as
-//! [`MacroFile`]s are interned [`MacroCallLoc`]s.
+//! `ExpnData` in rustc, rust-analyzer's version is `MacroCallLoc`. Traversing the hierarchy
+//! upwards can be achieved by walking up `MacroCallLoc::kind`'s contained file id, as
+//! `MacroFile`s are interned `MacroCallLoc`s.
 //!
 //! # The Macro Definition Hierarchy
 //!
@@ -18,7 +18,7 @@
 //!
 //! # The Call-site Hierarchy
 //!
-//! `ExpnData::call_site` in rustc, [`MacroCallLoc::call_site`] in rust-analyzer.
+//! `ExpnData::call_site` in rustc, `MacroCallLoc::call_site` in rust-analyzer.
 // FIXME: Move this into the span crate? Not quite possible today as that depends on `MacroCallLoc`
 // which contains a bunch of unrelated things
 
@@ -26,12 +26,12 @@ use std::convert::identity;
 
 use span::{Edition, MacroCallId, Span, SyntaxContext};
 
-use crate::db::ExpandDatabase;
+use base_db::SourceDatabase;
 
 pub use span::Transparency;
 
 pub fn span_with_def_site_ctxt(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     expn_id: MacroCallId,
     edition: Edition,
@@ -40,7 +40,7 @@ pub fn span_with_def_site_ctxt(
 }
 
 pub fn span_with_call_site_ctxt(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     expn_id: MacroCallId,
     edition: Edition,
@@ -49,16 +49,16 @@ pub fn span_with_call_site_ctxt(
 }
 
 pub fn span_with_mixed_site_ctxt(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     expn_id: MacroCallId,
     edition: Edition,
 ) -> Span {
-    span_with_ctxt_from_mark(db, span, expn_id, Transparency::SemiTransparent, edition)
+    span_with_ctxt_from_mark(db, span, expn_id, Transparency::SemiOpaque, edition)
 }
 
 fn span_with_ctxt_from_mark(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     span: Span,
     expn_id: MacroCallId,
     transparency: Transparency,
@@ -71,7 +71,7 @@ fn span_with_ctxt_from_mark(
 }
 
 pub(super) fn apply_mark(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     ctxt: span::SyntaxContext,
     call_id: span::MacroCallId,
     transparency: Transparency,
@@ -81,8 +81,8 @@ pub(super) fn apply_mark(
         return apply_mark_internal(db, ctxt, call_id, transparency, edition);
     }
 
-    let call_site_ctxt = db.lookup_intern_macro_call(call_id.into()).ctxt;
-    let mut call_site_ctxt = if transparency == Transparency::SemiTransparent {
+    let call_site_ctxt = crate::MacroCallId::from(call_id).loc(db).ctxt;
+    let mut call_site_ctxt = if transparency == Transparency::SemiOpaque {
         call_site_ctxt.normalize_to_macros_2_0(db)
     } else {
         call_site_ctxt.normalize_to_macro_rules(db)
@@ -108,7 +108,7 @@ pub(super) fn apply_mark(
 }
 
 fn apply_mark_internal(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     ctxt: SyntaxContext,
     call_id: MacroCallId,
     transparency: Transparency,
@@ -117,16 +117,16 @@ fn apply_mark_internal(
     let call_id = Some(call_id);
 
     let mut opaque = ctxt.opaque(db);
-    let mut opaque_and_semitransparent = ctxt.opaque_and_semitransparent(db);
+    let mut opaque_and_semiopaque = ctxt.opaque_and_semiopaque(db);
 
     if transparency >= Transparency::Opaque {
         let parent = opaque;
         opaque = SyntaxContext::new(db, call_id, transparency, edition, parent, identity, identity);
     }
 
-    if transparency >= Transparency::SemiTransparent {
-        let parent = opaque_and_semitransparent;
-        opaque_and_semitransparent =
+    if transparency >= Transparency::SemiOpaque {
+        let parent = opaque_and_semiopaque;
+        opaque_and_semiopaque =
             SyntaxContext::new(db, call_id, transparency, edition, parent, |_| opaque, identity);
     }
 
@@ -138,6 +138,6 @@ fn apply_mark_internal(
         edition,
         parent,
         |_| opaque,
-        |_| opaque_and_semitransparent,
+        |_| opaque_and_semiopaque,
     )
 }

@@ -10,7 +10,7 @@ use ide::{AnalysisHost, DiagnosticCode, DiagnosticsConfig};
 use ide_db::base_db;
 use itertools::Either;
 use profile::StopWatch;
-use project_model::toolchain_info::{QueryConfig, target_data_layout};
+use project_model::toolchain_info::{QueryConfig, target_data, version};
 use project_model::{
     CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource,
     RustSourceWorkspaceConfig, Sysroot,
@@ -18,7 +18,6 @@ use project_model::{
 
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
 use rustc_hash::FxHashMap;
-use triomphe::Arc;
 use vfs::{AbsPathBuf, FileId};
 use walkdir::WalkDir;
 
@@ -65,6 +64,7 @@ impl Tester {
     fn new() -> Result<Self> {
         let mut path = AbsPathBuf::assert_utf8(std::env::temp_dir());
         path.push("ra-rustc-test");
+        std::fs::create_dir_all(&path)?;
         let tmp_file = path.join("ra-rustc-test.rs");
         std::fs::write(&tmp_file, "")?;
         let cargo_config = CargoConfig {
@@ -75,20 +75,19 @@ impl Tester {
         };
 
         let mut sysroot = Sysroot::discover(tmp_file.parent().unwrap(), &cargo_config.extra_env);
-        let loaded_sysroot = sysroot.load_workspace(
-            &RustSourceWorkspaceConfig::default_cargo(),
-            false,
-            &path,
-            &|_| (),
-        );
+        let loaded_sysroot =
+            sysroot.load_workspace(&RustSourceWorkspaceConfig::default_cargo(), false, &|_| ());
         if let Some(loaded_sysroot) = loaded_sysroot {
             sysroot.set_workspace(loaded_sysroot);
         }
 
-        let data_layout = target_data_layout::get(
-            QueryConfig::Rustc(&sysroot, tmp_file.parent().unwrap().as_ref()),
+        let query_config = QueryConfig::Rustc(&sysroot, tmp_file.parent().unwrap().as_ref());
+        let toolchain_version = version::get(query_config, &cargo_config.extra_env).ok().flatten();
+        let target_data = target_data::get(
+            query_config,
             None,
             &cargo_config.extra_env,
+            toolchain_version.as_ref(),
         );
 
         let workspace = ProjectWorkspace {
@@ -99,7 +98,7 @@ impl Tester {
             sysroot,
             rustc_cfg: vec![],
             toolchain: None,
-            target_layout: data_layout.map(Arc::from).map_err(|it| Arc::from(it.to_string())),
+            target: target_data.map_err(|it| it.to_string().into()),
             cfg_overrides: Default::default(),
             extra_includes: vec![],
             set_test: true,
@@ -108,6 +107,8 @@ impl Tester {
             load_out_dirs_from_check: false,
             with_proc_macro_server: ProcMacroServerChoice::Sysroot,
             prefill_caches: false,
+            num_worker_threads: 1,
+            proc_macro_processes: 1,
         };
         let (db, _vfs, _proc_macro) =
             load_workspace(workspace, &cargo_config.extra_env, &load_cargo_config)?;
@@ -190,7 +191,7 @@ impl Tester {
 
             if !worker.is_finished() {
                 // attempt to cancel the worker, won't work for chalk hangs unfortunately
-                self.host.request_cancellation();
+                self.host.trigger_garbage_collection();
             }
             worker.join().and_then(identity)
         });
@@ -303,10 +304,10 @@ impl flags::RustcTests {
         for i in walk_dir {
             let i = i?;
             let p = i.into_path();
-            if let Some(f) = &self.filter {
-                if !p.as_os_str().to_string_lossy().contains(f) {
-                    continue;
-                }
+            if let Some(f) = &self.filter
+                && !p.as_os_str().to_string_lossy().contains(f)
+            {
+                continue;
             }
             if p.extension().is_none_or(|x| x != "rs") {
                 continue;

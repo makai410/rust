@@ -5,11 +5,14 @@
 //@ ignore-android: FIXME (#20004)
 //@ needs-subprocess
 //@ ignore-fuchsia must translate zircon signal to SIGABRT, FIXME (#58590)
+//@ ignore-ohos musl libc returns SIGSEGV for stack overflow rather than SIGABRT
 //@ ignore-nto no stack overflow handler used (no alternate stack available)
+//@ ignore-qnx no stack overflow handler used (no alternate stack available)
 //@ ignore-ios stack overflow handlers aren't enabled
 //@ ignore-tvos stack overflow handlers aren't enabled
 //@ ignore-watchos stack overflow handlers aren't enabled
 //@ ignore-visionos stack overflow handlers aren't enabled
+//@ ignore-backends: gcc
 
 #![feature(rustc_private)]
 
@@ -19,7 +22,7 @@ extern crate libc;
 use std::env;
 use std::hint::black_box;
 use std::process::Command;
-use std::thread;
+use std::thread::Builder;
 
 fn silent_recurse() {
     let buf = [0u8; 1000];
@@ -56,9 +59,9 @@ fn main() {
     } else if args.len() > 1 && args[1] == "loud" {
         loud_recurse();
     } else if args.len() > 1 && args[1] == "silent-thread" {
-        thread::spawn(silent_recurse).join();
+        Builder::new().name("ferris".to_string()).spawn(silent_recurse).unwrap().join();
     } else if args.len() > 1 && args[1] == "loud-thread" {
-        thread::spawn(loud_recurse).join();
+        Builder::new().name("ferris".to_string()).spawn(loud_recurse).unwrap().join();
     } else {
         let mut modes = vec![
             "silent-thread",
@@ -82,6 +85,12 @@ fn main() {
             let error = String::from_utf8_lossy(&silent.stderr);
             assert!(error.contains("has overflowed its stack"),
                     "missing overflow message: {}", error);
+
+            if mode.contains("thread") {
+                assert!(error.contains("ferris"), "missing thread name: {}", error);
+            } else {
+                assert!(error.contains("main"), "missing thread name: {}", error);
+            }
         }
     }
 }

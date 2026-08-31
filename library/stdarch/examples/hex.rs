@@ -13,7 +13,6 @@
 //! and you should see `746573740a` get printed out.
 
 #![allow(internal_features)]
-#![feature(wasm_target_feature)]
 #![cfg_attr(test, feature(test))]
 #![cfg_attr(
     any(target_arch = "x86", target_arch = "x86_64"),
@@ -22,7 +21,6 @@
 #![allow(
     clippy::unwrap_used,
     clippy::print_stdout,
-    clippy::unwrap_used,
     clippy::shadow_reuse,
     clippy::cast_possible_wrap,
     clippy::cast_ptr_alignment,
@@ -36,9 +34,13 @@ use std::{
 };
 
 #[cfg(target_arch = "x86")]
-use {core_arch::arch::x86::*, std_detect::is_x86_feature_detected};
+use core_arch::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
-use {core_arch::arch::x86_64::*, std_detect::is_x86_feature_detected};
+use core_arch::arch::x86_64::*;
+#[cfg(target_arch = "x86")]
+use std::is_x86_feature_detected;
+#[cfg(target_arch = "x86_64")]
+use std::is_x86_feature_detected;
 
 fn main() {
     let mut input = Vec::new();
@@ -352,9 +354,9 @@ mod benches {
         len: usize,
         f: for<'a> unsafe fn(&[u8], &'a mut [u8]) -> Result<&'a str, usize>,
     ) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let input = std::iter::repeat(())
-            .map(|()| rng.r#gen::<u8>())
+            .map(|()| rng.r#random::<u8>())
             .take(len)
             .collect::<Vec<_>>();
         let mut dst = vec![0; input.len() * 2];

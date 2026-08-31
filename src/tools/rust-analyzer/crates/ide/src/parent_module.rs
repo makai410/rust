@@ -1,7 +1,7 @@
 use hir::{Semantics, crate_def_map};
 use ide_db::{
     FileId, FilePosition, RootDatabase,
-    base_db::{Crate, RootQueryDb},
+    base_db::{Crate, relevant_crates},
 };
 use itertools::Itertools;
 use syntax::{
@@ -29,14 +29,13 @@ pub(crate) fn parent_module(db: &RootDatabase, position: FilePosition) -> Vec<Na
     let mut module = find_node_at_offset::<ast::Module>(source_file.syntax(), position.offset);
 
     // If cursor is literally on `mod foo`, go to the grandpa.
-    if let Some(m) = &module {
-        if !m
+    if let Some(m) = &module
+        && !m
             .item_list()
             .is_some_and(|it| it.syntax().text_range().contains_inclusive(position.offset))
-        {
-            cov_mark::hit!(test_resolve_parent_module_on_module_decl);
-            module = m.syntax().ancestors().skip(1).find_map(ast::Module::cast);
-        }
+    {
+        cov_mark::hit!(test_resolve_parent_module_on_module_decl);
+        module = m.syntax().ancestors().skip(1).find_map(ast::Module::cast);
     }
 
     match module {
@@ -54,7 +53,7 @@ pub(crate) fn parent_module(db: &RootDatabase, position: FilePosition) -> Vec<Na
 
 /// This returns `Vec` because a module may be included from several places.
 pub(crate) fn crates_for(db: &RootDatabase, file_id: FileId) -> Vec<Crate> {
-    db.relevant_crates(file_id)
+    relevant_crates(db, file_id)
         .iter()
         .copied()
         .filter(|&crate_id| {

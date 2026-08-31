@@ -1,21 +1,23 @@
 //! Some lints that are only useful in the compiler or crates that use compiler internals, such as
 //! Clippy.
 
-use rustc_hir::HirId;
+use rustc_ast as ast;
+use rustc_ast::{Pat, PatKind, Path};
+use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{self, GenericArgsRef, Ty as MiddleTy};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_hir::{Expr, ExprKind, HirId, find_attr};
+use rustc_lint_defs::{declare_lint_pass, declare_tool_lint};
+use rustc_middle::ty::{self, ClausePolarity, GenericArgsRef};
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 use rustc_span::{Span, sym};
-use tracing::debug;
-use {rustc_ast as ast, rustc_hir as hir};
 
-use crate::lints::{
-    BadOptAccessDiag, DefaultHashTypesDiag, DiagOutOfImpl, LintPassByHand,
-    NonGlobImportTypeIrInherent, QueryInstability, QueryUntracked, SpanUseEqCtxtDiag,
+use crate::diagnostics::{
+    AttributeKindInFindAttr, BadOptAccessDiag, DefaultHashTypesDiag,
+    ImplicitSysrootCrateImportDiag, LintPassByHand, NonGlobImportTypeIrInherent, QueryInstability,
+    QueryUntracked, RustcMustMatchExhaustivelyNotExhaustive, SpanUseEqCtxtDiag,
     SymbolInternStringLiteralDiag, TyQualified, TykindDiag, TykindKind, TypeIrDirectUse,
-    TypeIrInherentUsage, TypeIrTraitUsage, UntranslatableDiag,
+    TypeIrInherentUsage, TypeIrTraitUsage,
 };
 use crate::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext};
 
@@ -56,25 +58,6 @@ impl LateLintPass<'_> for DefaultHashTypes {
     }
 }
 
-/// Helper function for lints that check for expressions with calls and use typeck results to
-/// get the `DefId` and `GenericArgsRef` of the function.
-fn typeck_results_of_method_fn<'tcx>(
-    cx: &LateContext<'tcx>,
-    expr: &hir::Expr<'_>,
-) -> Option<(Span, DefId, ty::GenericArgsRef<'tcx>)> {
-    match expr.kind {
-        hir::ExprKind::MethodCall(segment, ..)
-            if let Some(def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id) =>
-        {
-            Some((segment.ident.span, def_id, cx.typeck_results().node_args(expr.hir_id)))
-        }
-        _ => match cx.typeck_results().node_type(expr.hir_id).kind() {
-            &ty::FnDef(def_id, args) => Some((expr.span, def_id, args)),
-            _ => None,
-        },
-    }
-}
-
 declare_tool_lint! {
     /// The `potential_query_instability` lint detects use of methods which can lead to
     /// potential query instability, such as iterating over a `HashMap`.
@@ -101,20 +84,30 @@ declare_tool_lint! {
 
 declare_lint_pass!(QueryStability => [POTENTIAL_QUERY_INSTABILITY, UNTRACKED_QUERY_INFORMATION]);
 
-impl LateLintPass<'_> for QueryStability {
-    fn check_expr(&mut self, cx: &LateContext<'_>, expr: &hir::Expr<'_>) {
-        let Some((span, def_id, args)) = typeck_results_of_method_fn(cx, expr) else { return };
-        if let Ok(Some(instance)) = ty::Instance::try_resolve(cx.tcx, cx.typing_env(), def_id, args)
+impl<'tcx> LateLintPass<'tcx> for QueryStability {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
+        if let Some((callee_def_id, span, generic_args, _recv, _args)) =
+            get_callee_span_generic_args_and_args(cx, expr)
+            && let Ok(Some(instance)) =
+                ty::Instance::try_resolve(cx.tcx, cx.typing_env(), callee_def_id, generic_args)
         {
             let def_id = instance.def_id();
-            if cx.tcx.has_attr(def_id, sym::rustc_lint_query_instability) {
+            if find_attr!(cx.tcx, def_id, RustcLintQueryInstability) {
                 cx.emit_span_lint(
                     POTENTIAL_QUERY_INSTABILITY,
                     span,
                     QueryInstability { query: cx.tcx.item_name(def_id) },
                 );
+            } else if has_unstable_into_iter_predicate(cx, callee_def_id, generic_args) {
+                let call_span = span.with_hi(expr.span.hi());
+                cx.emit_span_lint(
+                    POTENTIAL_QUERY_INSTABILITY,
+                    call_span,
+                    QueryInstability { query: sym::into_iter },
+                );
             }
-            if cx.tcx.has_attr(def_id, sym::rustc_lint_untracked_query_information) {
+
+            if find_attr!(cx.tcx, def_id, RustcLintUntrackedQueryInformation) {
                 cx.emit_span_lint(
                     UNTRACKED_QUERY_INFORMATION,
                     span,
@@ -123,6 +116,78 @@ impl LateLintPass<'_> for QueryStability {
             }
         }
     }
+}
+
+fn has_unstable_into_iter_predicate<'tcx>(
+    cx: &LateContext<'tcx>,
+    callee_def_id: DefId,
+    generic_args: GenericArgsRef<'tcx>,
+) -> bool {
+    let Some(into_iterator_def_id) = cx.tcx.get_diagnostic_item(sym::IntoIterator) else {
+        return false;
+    };
+    let Some(into_iter_fn_def_id) = cx.tcx.lang_items().into_iter_fn() else {
+        return false;
+    };
+    let clauses = cx.tcx.clauses_of(callee_def_id).instantiate(cx.tcx, generic_args);
+    for (clause, _) in clauses {
+        let Some(trait_clause) = clause.as_trait_clause() else {
+            continue;
+        };
+        if trait_clause.def_id() != into_iterator_def_id
+            || trait_clause.polarity() != ClausePolarity::Positive
+        {
+            continue;
+        }
+        // `IntoIterator::into_iter` has no additional method args.
+        let into_iter_fn_args = cx
+            .tcx
+            .instantiate_bound_regions_with_erased(trait_clause.skip_norm_wip())
+            .trait_ref
+            .args;
+        let Ok(Some(instance)) = ty::Instance::try_resolve(
+            cx.tcx,
+            cx.typing_env(),
+            into_iter_fn_def_id,
+            into_iter_fn_args,
+        ) else {
+            continue;
+        };
+        // Does the input type's `IntoIterator` implementation have the
+        // `rustc_lint_query_instability` attribute on its `into_iter` method?
+        if find_attr!(cx.tcx, instance.def_id(), RustcLintQueryInstability) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks whether an expression is a function or method call and, if so, returns its `DefId`,
+/// `Span`, `GenericArgs`, and arguments. This is a slight augmentation of a similarly named Clippy
+/// function, `get_callee_generic_args_and_args`.
+fn get_callee_span_generic_args_and_args<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+) -> Option<(DefId, Span, GenericArgsRef<'tcx>, Option<&'tcx Expr<'tcx>>, &'tcx [Expr<'tcx>])> {
+    if let ExprKind::Call(callee, args) = expr.kind
+        && let callee_ty = cx.typeck_results().expr_ty(callee)
+        && let ty::FnDef(callee_def_id, generic_args) = callee_ty.kind()
+    {
+        return Some((
+            *callee_def_id,
+            callee.span,
+            generic_args.no_bound_vars().unwrap(),
+            None,
+            args,
+        ));
+    }
+    if let ExprKind::MethodCall(segment, recv, args, _) = expr.kind
+        && let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
+    {
+        let generic_args = cx.typeck_results().node_args(expr.hir_id);
+        return Some((method_def_id, segment.ident.span, generic_args, Some(recv), args));
+    }
+    None
 }
 
 declare_tool_lint! {
@@ -228,15 +293,16 @@ fn lint_ty_kind_usage(cx: &LateContext<'_>, res: &Res) -> bool {
 }
 
 fn is_ty_or_ty_ctxt(cx: &LateContext<'_>, path: &hir::Path<'_>) -> Option<String> {
-    match &path.res {
+    match path.res {
         Res::Def(_, def_id) => {
-            if let Some(name @ (sym::Ty | sym::TyCtxt)) = cx.tcx.get_diagnostic_name(*def_id) {
+            if let Some(name @ (sym::Ty | sym::TyCtxt)) = cx.tcx.get_diagnostic_name(def_id) {
                 return Some(format!("{}{}", name, gen_args(path.segments.last().unwrap())));
             }
         }
         // Only lint on `&Ty` and `&TyCtxt` if it is used outside of a trait.
         Res::SelfTyAlias { alias_to: did, is_trait_impl: false, .. } => {
-            if let ty::Adt(adt, args) = cx.tcx.type_of(did).instantiate_identity().kind()
+            if let ty::Adt(adt, args) =
+                cx.tcx.type_of(did).instantiate_identity().skip_norm_wip().kind()
                 && let Some(name @ (sym::Ty | sym::TyCtxt)) = cx.tcx.get_diagnostic_name(adt.did())
             {
                 return Some(format!("{}<{}>", name, args[0]));
@@ -312,7 +378,12 @@ declare_tool_lint! {
     report_in_external_macro: true
 }
 
-declare_lint_pass!(TypeIr => [DIRECT_USE_OF_RUSTC_TYPE_IR, NON_GLOB_IMPORT_OF_TYPE_IR_INHERENT, USAGE_OF_TYPE_IR_INHERENT, USAGE_OF_TYPE_IR_TRAITS]);
+declare_lint_pass!(TypeIr => [
+    DIRECT_USE_OF_RUSTC_TYPE_IR,
+    NON_GLOB_IMPORT_OF_TYPE_IR_INHERENT,
+    USAGE_OF_TYPE_IR_INHERENT,
+    USAGE_OF_TYPE_IR_TRAITS
+]);
 
 impl<'tcx> LateLintPass<'tcx> for TypeIr {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
@@ -411,190 +482,22 @@ declare_lint_pass!(LintPassImpl => [LINT_PASS_IMPL_WITHOUT_MACRO]);
 
 impl EarlyLintPass for LintPassImpl {
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &ast::Item) {
-        if let ast::ItemKind::Impl(box ast::Impl { of_trait: Some(lint_pass), .. }) = &item.kind {
-            if let Some(last) = lint_pass.path.segments.last() {
-                if last.ident.name == sym::LintPass {
-                    let expn_data = lint_pass.path.span.ctxt().outer_expn_data();
-                    let call_site = expn_data.call_site;
-                    if expn_data.kind != ExpnKind::Macro(MacroKind::Bang, sym::impl_lint_pass)
-                        && call_site.ctxt().outer_expn_data().kind
-                            != ExpnKind::Macro(MacroKind::Bang, sym::declare_lint_pass)
-                    {
-                        cx.emit_span_lint(
-                            LINT_PASS_IMPL_WITHOUT_MACRO,
-                            lint_pass.path.span,
-                            LintPassByHand,
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-declare_tool_lint! {
-    /// The `untranslatable_diagnostic` lint detects messages passed to functions with `impl
-    /// Into<{D,Subd}iagMessage` parameters without using translatable Fluent strings.
-    ///
-    /// More details on translatable diagnostics can be found
-    /// [here](https://rustc-dev-guide.rust-lang.org/diagnostics/translation.html).
-    pub rustc::UNTRANSLATABLE_DIAGNOSTIC,
-    Allow,
-    "prevent creation of diagnostics which cannot be translated",
-    report_in_external_macro: true,
-    @eval_always = true
-}
-
-declare_tool_lint! {
-    /// The `diagnostic_outside_of_impl` lint detects calls to functions annotated with
-    /// `#[rustc_lint_diagnostics]` that are outside an `Diagnostic`, `Subdiagnostic`, or
-    /// `LintDiagnostic` impl (either hand-written or derived).
-    ///
-    /// More details on diagnostics implementations can be found
-    /// [here](https://rustc-dev-guide.rust-lang.org/diagnostics/diagnostic-structs.html).
-    pub rustc::DIAGNOSTIC_OUTSIDE_OF_IMPL,
-    Allow,
-    "prevent diagnostic creation outside of `Diagnostic`/`Subdiagnostic`/`LintDiagnostic` impls",
-    report_in_external_macro: true,
-    @eval_always = true
-}
-
-declare_lint_pass!(Diagnostics => [UNTRANSLATABLE_DIAGNOSTIC, DIAGNOSTIC_OUTSIDE_OF_IMPL]);
-
-impl LateLintPass<'_> for Diagnostics {
-    fn check_expr(&mut self, cx: &LateContext<'_>, expr: &hir::Expr<'_>) {
-        let collect_args_tys_and_spans = |args: &[hir::Expr<'_>], reserve_one_extra: bool| {
-            let mut result = Vec::with_capacity(args.len() + usize::from(reserve_one_extra));
-            result.extend(args.iter().map(|arg| (cx.typeck_results().expr_ty(arg), arg.span)));
-            result
-        };
-        // Only check function calls and method calls.
-        let (span, def_id, fn_gen_args, arg_tys_and_spans) = match expr.kind {
-            hir::ExprKind::Call(callee, args) => {
-                match cx.typeck_results().node_type(callee.hir_id).kind() {
-                    &ty::FnDef(def_id, fn_gen_args) => {
-                        (callee.span, def_id, fn_gen_args, collect_args_tys_and_spans(args, false))
-                    }
-                    _ => return, // occurs for fns passed as args
-                }
-            }
-            hir::ExprKind::MethodCall(_segment, _recv, args, _span) => {
-                let Some((span, def_id, fn_gen_args)) = typeck_results_of_method_fn(cx, expr)
-                else {
-                    return;
-                };
-                let mut args = collect_args_tys_and_spans(args, true);
-                args.insert(0, (cx.tcx.types.self_param, _recv.span)); // dummy inserted for `self`
-                (span, def_id, fn_gen_args, args)
-            }
-            _ => return,
-        };
-
-        Self::diagnostic_outside_of_impl(cx, span, expr.hir_id, def_id, fn_gen_args);
-        Self::untranslatable_diagnostic(cx, def_id, &arg_tys_and_spans);
-    }
-}
-
-impl Diagnostics {
-    // Is the type `{D,Subd}iagMessage`?
-    fn is_diag_message<'cx>(cx: &LateContext<'cx>, ty: MiddleTy<'cx>) -> bool {
-        if let Some(adt_def) = ty.ty_adt_def()
-            && let Some(name) = cx.tcx.get_diagnostic_name(adt_def.did())
-            && matches!(name, sym::DiagMessage | sym::SubdiagMessage)
+        if let ast::ItemKind::Impl(ast::Impl { of_trait: Some(of_trait), .. }) = &item.kind
+            && let Some(last) = of_trait.trait_ref.path.segments.last()
+            && last.ident.name == sym::LintPass
         {
-            true
-        } else {
-            false
-        }
-    }
-
-    fn untranslatable_diagnostic<'cx>(
-        cx: &LateContext<'cx>,
-        def_id: DefId,
-        arg_tys_and_spans: &[(MiddleTy<'cx>, Span)],
-    ) {
-        let fn_sig = cx.tcx.fn_sig(def_id).instantiate_identity().skip_binder();
-        let predicates = cx.tcx.predicates_of(def_id).instantiate_identity(cx.tcx).predicates;
-        for (i, &param_ty) in fn_sig.inputs().iter().enumerate() {
-            if let ty::Param(sig_param) = param_ty.kind() {
-                // It is a type parameter. Check if it is `impl Into<{D,Subd}iagMessage>`.
-                for pred in predicates.iter() {
-                    if let Some(trait_pred) = pred.as_trait_clause()
-                        && let trait_ref = trait_pred.skip_binder().trait_ref
-                        && trait_ref.self_ty() == param_ty // correct predicate for the param?
-                        && cx.tcx.is_diagnostic_item(sym::Into, trait_ref.def_id)
-                        && let ty1 = trait_ref.args.type_at(1)
-                        && Self::is_diag_message(cx, ty1)
-                    {
-                        // Calls to methods with an `impl Into<{D,Subd}iagMessage>` parameter must be passed an arg
-                        // with type `{D,Subd}iagMessage` or `impl Into<{D,Subd}iagMessage>`. Otherwise, emit an
-                        // `UNTRANSLATABLE_DIAGNOSTIC` lint.
-                        let (arg_ty, arg_span) = arg_tys_and_spans[i];
-
-                        // Is the arg type `{Sub,D}iagMessage`or `impl Into<{Sub,D}iagMessage>`?
-                        let is_translatable = Self::is_diag_message(cx, arg_ty)
-                            || matches!(arg_ty.kind(), ty::Param(arg_param) if arg_param.name == sig_param.name);
-                        if !is_translatable {
-                            cx.emit_span_lint(
-                                UNTRANSLATABLE_DIAGNOSTIC,
-                                arg_span,
-                                UntranslatableDiag,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn diagnostic_outside_of_impl<'cx>(
-        cx: &LateContext<'cx>,
-        span: Span,
-        current_id: HirId,
-        def_id: DefId,
-        fn_gen_args: GenericArgsRef<'cx>,
-    ) {
-        // Is the callee marked with `#[rustc_lint_diagnostics]`?
-        let Some(inst) =
-            ty::Instance::try_resolve(cx.tcx, cx.typing_env(), def_id, fn_gen_args).ok().flatten()
-        else {
-            return;
-        };
-        let has_attr = cx.tcx.has_attr(inst.def_id(), sym::rustc_lint_diagnostics);
-        if !has_attr {
-            return;
-        };
-
-        for (hir_id, _parent) in cx.tcx.hir_parent_iter(current_id) {
-            if let Some(owner_did) = hir_id.as_owner()
-                && cx.tcx.has_attr(owner_did, sym::rustc_lint_diagnostics)
+            let expn_data = of_trait.trait_ref.path.span.ctxt().outer_expn_data();
+            let call_site = expn_data.call_site;
+            if expn_data.kind != ExpnKind::Macro(MacroKind::Bang, sym::impl_lint_pass)
+                && call_site.ctxt().outer_expn_data().kind
+                    != ExpnKind::Macro(MacroKind::Bang, sym::declare_lint_pass)
             {
-                // The parent method is marked with `#[rustc_lint_diagnostics]`
-                return;
+                cx.emit_span_lint(
+                    LINT_PASS_IMPL_WITHOUT_MACRO,
+                    of_trait.trait_ref.path.span,
+                    LintPassByHand,
+                );
             }
-        }
-
-        // Calls to `#[rustc_lint_diagnostics]`-marked functions should only occur:
-        // - inside an impl of `Diagnostic`, `Subdiagnostic`, or `LintDiagnostic`, or
-        // - inside a parent function that is itself marked with `#[rustc_lint_diagnostics]`.
-        //
-        // Otherwise, emit a `DIAGNOSTIC_OUTSIDE_OF_IMPL` lint.
-        let mut is_inside_appropriate_impl = false;
-        for (_hir_id, parent) in cx.tcx.hir_parent_iter(current_id) {
-            debug!(?parent);
-            if let hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(impl_), .. }) = parent
-                && let hir::Impl { of_trait: Some(of_trait), .. } = impl_
-                && let Some(def_id) = of_trait.trait_def_id()
-                && let Some(name) = cx.tcx.get_diagnostic_name(def_id)
-                && matches!(name, sym::Diagnostic | sym::Subdiagnostic | sym::LintDiagnostic)
-            {
-                is_inside_appropriate_impl = true;
-                break;
-            }
-        }
-        debug!(?is_inside_appropriate_impl);
-        if !is_inside_appropriate_impl {
-            cx.emit_span_lint(DIAGNOSTIC_OUTSIDE_OF_IMPL, span, DiagOutOfImpl);
         }
     }
 }
@@ -616,23 +519,18 @@ impl LateLintPass<'_> for BadOptAccess {
         let Some(adt_def) = cx.typeck_results().expr_ty(base).ty_adt_def() else { return };
         // Skip types without `#[rustc_lint_opt_ty]` - only so that the rest of the lint can be
         // avoided.
-        if !cx.tcx.has_attr(adt_def.did(), sym::rustc_lint_opt_ty) {
+        if !find_attr!(cx.tcx, adt_def.did(), RustcLintOptTy) {
             return;
         }
 
         for field in adt_def.all_fields() {
             if field.name == target.name
-                && let Some(attr) =
-                    cx.tcx.get_attr(field.did, sym::rustc_lint_opt_deny_field_access)
-                && let Some(items) = attr.meta_item_list()
-                && let Some(item) = items.first()
-                && let Some(lit) = item.lit()
-                && let ast::LitKind::Str(val, _) = lit.kind
+                && let Some(lint_message) = find_attr!(cx.tcx, field.did, RustcLintOptDenyFieldAccess { lint_message, } => lint_message)
             {
                 cx.emit_span_lint(
                     BAD_OPT_ACCESS,
                     expr.span,
-                    BadOptAccessDiag { msg: val.as_str() },
+                    BadOptAccessDiag { msg: lint_message.as_str() },
                 );
             }
         }
@@ -677,8 +575,6 @@ fn is_span_ctxt_call(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
 declare_tool_lint! {
     /// The `symbol_intern_string_literal` detects `Symbol::intern` being called on a string literal
     pub rustc::SYMBOL_INTERN_STRING_LITERAL,
-    // rustc_driver crates out of the compiler can't/shouldn't add preinterned symbols;
-    // bootstrap will deny this manually
     Allow,
     "Forbid uses of string literals in `Symbol::intern`, suggesting preinterning instead",
     report_in_external_macro: true
@@ -700,6 +596,238 @@ impl<'tcx> LateLintPass<'tcx> for SymbolInternStringLiteral {
                 kind.span,
                 SymbolInternStringLiteralDiag,
             );
+        }
+    }
+}
+
+declare_tool_lint! {
+    /// The `implicit_sysroot_crate_import` detects use of `extern crate` to import non-sysroot crates
+    /// (e.g. crates.io deps) from the sysroot, which is dangerous because these crates are not guaranteed
+    /// to exist exactly once, and so may be missing entirely or appear multiple times resulting in ambiguity.
+    pub rustc::IMPLICIT_SYSROOT_CRATE_IMPORT,
+    Allow,
+    "Forbid uses of non-sysroot crates in `extern crate`",
+    report_in_external_macro: true
+}
+
+declare_lint_pass!(ImplicitSysrootCrateImport => [IMPLICIT_SYSROOT_CRATE_IMPORT]);
+
+impl EarlyLintPass for ImplicitSysrootCrateImport {
+    fn check_item(&mut self, cx: &EarlyContext<'_>, item: &ast::Item) {
+        fn is_whitelisted(crate_name: &str) -> bool {
+            // Whitelist of allowed crates.
+            crate_name.starts_with("rustc_")
+                || matches!(
+                    crate_name,
+                    "test" | "self" | "core" | "alloc" | "std" | "proc_macro" | "tikv_jemalloc_sys"
+                )
+        }
+
+        if let ast::ItemKind::ExternCrate(original_name, imported_name) = &item.kind {
+            let name = original_name.as_ref().unwrap_or(&imported_name.name).as_str();
+            let externs = &cx.builder.sess().opts.externs;
+            if externs.get(name).is_none() && !is_whitelisted(name) {
+                cx.emit_span_lint(
+                    IMPLICIT_SYSROOT_CRATE_IMPORT,
+                    item.span,
+                    ImplicitSysrootCrateImportDiag { name },
+                );
+            }
+        }
+    }
+}
+
+declare_tool_lint! {
+    pub rustc::BAD_USE_OF_FIND_ATTR,
+    Allow,
+    "Forbid `AttributeKind::` as a prefix in `find_attr!` macros.",
+    report_in_external_macro: true
+}
+declare_lint_pass!(BadUseOfFindAttr => [BAD_USE_OF_FIND_ATTR]);
+
+impl EarlyLintPass for BadUseOfFindAttr {
+    fn check_arm(&mut self, cx: &EarlyContext<'_>, arm: &rustc_ast::Arm) {
+        fn path_contains_attribute_kind(cx: &EarlyContext<'_>, path: &Path) {
+            for segment in &path.segments {
+                if segment.ident.as_str() == "AttributeKind" {
+                    cx.emit_span_lint(
+                        BAD_USE_OF_FIND_ATTR,
+                        segment.span(),
+                        AttributeKindInFindAttr,
+                    );
+                }
+            }
+        }
+
+        fn find_attr_kind_in_pat(cx: &EarlyContext<'_>, pat: &Pat) {
+            match &pat.kind {
+                PatKind::Struct(_, path, fields, _) => {
+                    path_contains_attribute_kind(cx, path);
+                    for field in fields {
+                        find_attr_kind_in_pat(cx, &field.pat);
+                    }
+                }
+                PatKind::TupleStruct(_, path, fields) => {
+                    path_contains_attribute_kind(cx, path);
+                    for field in fields {
+                        find_attr_kind_in_pat(cx, &field);
+                    }
+                }
+                PatKind::Or(options) => {
+                    for pat in options {
+                        find_attr_kind_in_pat(cx, pat);
+                    }
+                }
+                PatKind::Path(_, path) => {
+                    path_contains_attribute_kind(cx, path);
+                }
+                PatKind::Tuple(elems) => {
+                    for pat in elems {
+                        find_attr_kind_in_pat(cx, pat);
+                    }
+                }
+                PatKind::Deref(pat) => {
+                    find_attr_kind_in_pat(cx, pat);
+                }
+                PatKind::Ref(..) => {
+                    find_attr_kind_in_pat(cx, pat);
+                }
+                PatKind::Slice(elems) => {
+                    for pat in elems {
+                        find_attr_kind_in_pat(cx, pat);
+                    }
+                }
+
+                PatKind::Guard(pat, ..) => {
+                    find_attr_kind_in_pat(cx, pat);
+                }
+                PatKind::Paren(pat) => {
+                    find_attr_kind_in_pat(cx, pat);
+                }
+                PatKind::Expr(..)
+                | PatKind::Range(..)
+                | PatKind::MacCall(..)
+                | PatKind::Rest
+                | PatKind::Missing
+                | PatKind::Err(..)
+                | PatKind::Ident(..)
+                | PatKind::Never
+                | PatKind::Wild => {}
+            }
+        }
+
+        if let Some(expn_data) = arm.span.source_callee()
+            && let ExpnKind::Macro(_, name) = expn_data.kind
+            && name.as_str() == "find_attr"
+        {
+            find_attr_kind_in_pat(cx, &arm.pat);
+        }
+    }
+}
+
+declare_tool_lint! {
+    pub rustc::RUSTC_MUST_MATCH_EXHAUSTIVELY,
+    Allow,
+    "Forbids matches with wildcards, or if-let matching on enums marked with `#[rustc_must_match_exhaustively]`",
+    report_in_external_macro: true
+}
+declare_lint_pass!(RustcMustMatchExhaustively => [RUSTC_MUST_MATCH_EXHAUSTIVELY]);
+
+fn is_rustc_must_match_exhaustively(cx: &LateContext<'_>, id: HirId) -> Option<Span> {
+    let res = cx.typeck_results();
+
+    let ty = res.node_type(id);
+
+    let ty = if let ty::Ref(_, ty, _) = ty.kind() { *ty } else { ty };
+
+    if let Some(adt_def) = ty.ty_adt_def()
+        && adt_def.is_enum()
+    {
+        find_attr!(cx.tcx, adt_def.did(), RustcMustMatchExhaustively(span) => *span)
+    } else {
+        None
+    }
+}
+
+fn pat_is_not_exhaustive_heuristic(pat: &hir::Pat<'_>) -> Option<(Span, &'static str)> {
+    match pat.kind {
+        hir::PatKind::Missing => None,
+        hir::PatKind::Wild => Some((pat.span, "because of this wildcard pattern")),
+        hir::PatKind::Binding(_, _, _, Some(pat)) => pat_is_not_exhaustive_heuristic(pat),
+        hir::PatKind::Binding(..) => Some((pat.span, "because of this variable binding")),
+        hir::PatKind::Struct(..) => None,
+        hir::PatKind::TupleStruct(..) => None,
+        hir::PatKind::Or(..) => None,
+        hir::PatKind::Never => None,
+        hir::PatKind::Tuple(..) => None,
+        hir::PatKind::Deref(pat) => pat_is_not_exhaustive_heuristic(&*pat),
+        hir::PatKind::Ref(pat, _, _) => pat_is_not_exhaustive_heuristic(&*pat),
+        hir::PatKind::Expr(..) => None,
+        hir::PatKind::Guard(..) => None,
+        hir::PatKind::Range(..) => None,
+        hir::PatKind::Slice(..) => None,
+        hir::PatKind::Err(..) => None,
+    }
+}
+
+impl<'tcx> LateLintPass<'tcx> for RustcMustMatchExhaustively {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &hir::Expr<'_>) {
+        match expr.kind {
+            // This is not perfect exhaustiveness checking, that's why this is just a rustc internal
+            // attribute. But it catches most reasonable cases
+            hir::ExprKind::Match(expr, arms, _) => {
+                if let Some(attr_span) = is_rustc_must_match_exhaustively(cx, expr.hir_id) {
+                    for arm in arms {
+                        if let Some((span, message)) = pat_is_not_exhaustive_heuristic(arm.pat) {
+                            cx.emit_span_lint(
+                                RUSTC_MUST_MATCH_EXHAUSTIVELY,
+                                expr.span,
+                                RustcMustMatchExhaustivelyNotExhaustive {
+                                    attr_span,
+                                    pat_span: span,
+                                    message,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            hir::ExprKind::Let(expr, ..) => {
+                if let Some(attr_span) = is_rustc_must_match_exhaustively(cx, expr.init.hir_id) {
+                    cx.emit_span_lint(
+                        RUSTC_MUST_MATCH_EXHAUSTIVELY,
+                        expr.span,
+                        RustcMustMatchExhaustivelyNotExhaustive {
+                            attr_span,
+                            pat_span: expr.span,
+                            message: "using `if let` only matches on one variant (try using `match`)",
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_stmt(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx rustc_hir::Stmt<'tcx>) {
+        match stmt.kind {
+            rustc_hir::StmtKind::Let(let_stmt) => {
+                if let_stmt.els.is_some()
+                    && let Some(attr_span) =
+                        is_rustc_must_match_exhaustively(cx, let_stmt.pat.hir_id)
+                {
+                    cx.emit_span_lint(
+                        RUSTC_MUST_MATCH_EXHAUSTIVELY,
+                        let_stmt.span,
+                        RustcMustMatchExhaustivelyNotExhaustive {
+                            attr_span,
+                            pat_span: let_stmt.pat.span,
+                            message: "using `let else` only matches on one variant (try using `match`)",
+                        },
+                    );
+                }
+            }
+            _ => {}
         }
     }
 }

@@ -1,9 +1,8 @@
 use rustc_ast::{LitKind, StrStyle};
 use rustc_hir::{Expr, ExprKind};
 use rustc_lexer::is_ident;
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_parse_format::{ParseMode, Parser, Piece};
-use rustc_session::declare_lint_pass;
 use rustc_span::{BytePos, Span};
 
 use clippy_utils::diagnostics::span_lint;
@@ -36,7 +35,9 @@ declare_clippy_lint! {
     "Checks if string literals have formatting arguments"
 }
 
-declare_lint_pass!(LiteralStringWithFormattingArg => [LITERAL_STRING_WITH_FORMATTING_ARGS]);
+declare_lint_pass!(LiteralStringWithFormattingArg => [
+    LITERAL_STRING_WITH_FORMATTING_ARGS,
+]);
 
 fn emit_lint(cx: &LateContext<'_>, expr: &Expr<'_>, spans: &[(Span, Option<String>)]) {
     if !spans.is_empty()

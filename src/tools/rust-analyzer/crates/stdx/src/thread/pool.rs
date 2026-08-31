@@ -45,7 +45,6 @@ impl Pool {
     /// Panics if job panics
     #[must_use]
     pub fn new(threads: usize) -> Self {
-        const STACK_SIZE: usize = 8 * 1024 * 1024;
         const INITIAL_INTENT: ThreadIntent = ThreadIntent::Worker;
 
         let (job_sender, job_receiver) = crossbeam_channel::unbounded();
@@ -54,7 +53,6 @@ impl Pool {
         let mut handles = Vec::with_capacity(threads);
         for idx in 0..threads {
             let handle = Builder::new(INITIAL_INTENT, format!("Worker{idx}",))
-                .stack_size(STACK_SIZE)
                 .allow_leak(true)
                 .spawn({
                     let extant_tasks = Arc::clone(&extant_tasks);
@@ -66,7 +64,6 @@ impl Pool {
                                 job.requested_intent.apply_to_current_thread();
                                 current_intent = job.requested_intent;
                             }
-                            extant_tasks.fetch_add(1, Ordering::SeqCst);
                             // discard the panic, we should've logged the backtrace already
                             drop(panic::catch_unwind(job.f));
                             extant_tasks.fetch_sub(1, Ordering::SeqCst);
@@ -93,6 +90,7 @@ impl Pool {
         });
 
         let job = Job { requested_intent: intent, f };
+        self.extant_tasks.fetch_add(1, Ordering::SeqCst);
         self.job_sender.send(job).unwrap();
     }
 
@@ -147,6 +145,7 @@ impl<'scope> Scope<'_, 'scope> {
                 >(f)
             },
         };
+        self.pool.extant_tasks.fetch_add(1, Ordering::SeqCst);
         self.pool.job_sender.send(job).unwrap();
     }
 }

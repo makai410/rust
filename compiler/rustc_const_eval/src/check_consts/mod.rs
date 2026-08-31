@@ -6,10 +6,10 @@
 
 use rustc_errors::DiagCtxtHandle;
 use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::{self as hir, find_attr};
 use rustc_middle::ty::{self, PolyFnSig, TyCtxt};
 use rustc_middle::{bug, mir};
 use rustc_span::Symbol;
-use {rustc_attr_data_structures as attrs, rustc_hir as hir};
 
 pub use self::qualifs::Qualif;
 
@@ -66,11 +66,11 @@ impl<'mir, 'tcx> ConstCx<'mir, 'tcx> {
     pub fn fn_sig(&self) -> PolyFnSig<'tcx> {
         let did = self.def_id().to_def_id();
         if self.tcx.is_closure_like(did) {
-            let ty = self.tcx.type_of(did).instantiate_identity();
+            let ty = self.tcx.type_of(did).instantiate_identity().skip_norm_wip();
             let ty::Closure(_, args) = ty.kind() else { bug!("type_of closure not ty::Closure") };
             args.as_closure().sig()
         } else {
-            self.tcx.fn_sig(did).instantiate_identity()
+            self.tcx.fn_sig(did).instantiate_identity().skip_norm_wip()
         }
     }
 }
@@ -80,9 +80,7 @@ pub fn rustc_allow_const_fn_unstable(
     def_id: LocalDefId,
     feature_gate: Symbol,
 ) -> bool {
-    let attrs = tcx.hir_attrs(tcx.local_def_id_to_hir_id(def_id));
-
-    attrs::find_attr!(attrs, attrs::AttributeKind::AllowConstFnUnstable(syms, _) if syms.contains(&feature_gate))
+    find_attr!(tcx, def_id, RustcAllowConstFnUnstable(syms, _) if syms.contains(&feature_gate))
 }
 
 /// Returns `true` if the given `def_id` (trait or function) is "safe to expose on stable".
@@ -94,8 +92,10 @@ pub fn rustc_allow_const_fn_unstable(
 /// unstable features, not even recursively), and those that are not.
 pub fn is_fn_or_trait_safe_to_expose_on_stable(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     // A default body in a `const trait` is const-stable when the trait is const-stable.
-    if tcx.is_const_default_method(def_id) {
-        return is_fn_or_trait_safe_to_expose_on_stable(tcx, tcx.parent(def_id));
+    if let Some(trait_id) = tcx.trait_of_assoc(def_id)
+        && tcx.is_const_trait(trait_id)
+    {
+        return is_fn_or_trait_safe_to_expose_on_stable(tcx, trait_id);
     }
 
     match tcx.lookup_const_stability(def_id) {

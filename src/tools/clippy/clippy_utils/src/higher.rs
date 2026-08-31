@@ -3,17 +3,21 @@
 #![deny(clippy::missing_docs_in_private_items)]
 
 use crate::consts::{ConstEvalCtxt, Constant};
-use crate::ty::is_type_diagnostic_item;
+use crate::res::MaybeDef as _;
 use crate::{is_expn_of, sym};
 
 use rustc_ast::ast;
-use rustc_hir as hir;
-use rustc_hir::{Arm, Block, Expr, ExprKind, HirId, LoopSource, MatchSource, Node, Pat, QPath, StructTailExpr};
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::{
+    self as hir, Arm, Block, Expr, ExprKind, HirId, LetStmt, LocalSource, LoopSource, MatchSource, Node, Pat, QPath,
+    StructTailExpr,
+};
 use rustc_lint::LateContext;
 use rustc_span::{Span, symbol};
 
 /// The essential nodes of a desugared for loop as well as the entire span:
 /// `for pat in arg { body }` becomes `(pat, arg, body)`. Returns `(pat, arg, body, span)`.
+#[derive(Debug)]
 pub struct ForLoop<'tcx> {
     /// `for` loop item
     pub pat: &'tcx Pat<'tcx>,
@@ -202,71 +206,152 @@ impl<'hir> IfOrIfLet<'hir> {
 /// Represent a range akin to `ast::ExprKind::Range`.
 #[derive(Debug, Copy, Clone)]
 pub struct Range<'a> {
+    /// Type of the range, as an enum of only range types.
+    pub ty: RangeTy,
     /// The lower bound of the range, or `None` for ranges such as `..X`.
     pub start: Option<&'a Expr<'a>>,
     /// The upper bound of the range, or `None` for ranges such as `X..`.
     pub end: Option<&'a Expr<'a>>,
-    /// Whether the interval is open or closed.
-    pub limits: ast::RangeLimits,
+    pub span: Span,
 }
 
 impl<'a> Range<'a> {
     /// Higher a `hir` range to something similar to `ast::ExprKind::Range`.
-    #[allow(clippy::similar_names)]
-    pub fn hir(expr: &'a Expr<'_>) -> Option<Range<'a>> {
-        match expr.kind {
+    pub fn hir(cx: &LateContext<'_>, expr: &'a Expr<'_>) -> Option<Range<'a>> {
+        let span = expr.range_span()?;
+        let (ty, start, end) = match expr.kind {
             ExprKind::Call(path, [arg1, arg2])
-                if matches!(
-                    path.kind,
-                    ExprKind::Path(QPath::LangItem(hir::LangItem::RangeInclusiveNew, ..))
-                ) =>
+                if let ExprKind::Path(qpath) = path.kind
+                    && cx.tcx.qpath_is_lang_item(qpath, LangItem::RangeInclusiveNew) =>
             {
-                Some(Range {
-                    start: Some(arg1),
-                    end: Some(arg2),
-                    limits: ast::RangeLimits::Closed,
-                })
+                (RangeTy::OpsInclusive, Some(arg1), Some(arg2))
             },
-            ExprKind::Struct(path, fields, StructTailExpr::None) => match (path, fields) {
-                (QPath::LangItem(hir::LangItem::RangeFull, ..), []) => Some(Range {
-                    start: None,
-                    end: None,
-                    limits: ast::RangeLimits::HalfOpen,
-                }),
-                (QPath::LangItem(hir::LangItem::RangeFrom, ..), [field]) if field.ident.name == sym::start => {
-                    Some(Range {
-                        start: Some(field.expr),
-                        end: None,
-                        limits: ast::RangeLimits::HalfOpen,
-                    })
+            ExprKind::Struct(&qpath, fields, StructTailExpr::None) => match (cx.tcx.qpath_lang_item(qpath)?, fields) {
+                (LangItem::RangeFull, []) => (RangeTy::OpsFull, None, None),
+                (LangItem::RangeFrom, [start]) if start.ident.name == sym::start => {
+                    (RangeTy::OpsFrom, Some(start.expr), None)
                 },
-                (QPath::LangItem(hir::LangItem::Range, ..), [field1, field2]) => {
-                    let (start, end) = match (field1.ident.name, field2.ident.name) {
-                        (sym::start, sym::end) => (field1.expr, field2.expr),
-                        (sym::end, sym::start) => (field2.expr, field1.expr),
-                        _ => return None,
-                    };
-                    Some(Range {
-                        start: Some(start),
-                        end: Some(end),
-                        limits: ast::RangeLimits::HalfOpen,
-                    })
+                (LangItem::RangeFromCopy, [start]) if start.ident.name == sym::start => {
+                    (RangeTy::RangeFrom, Some(start.expr), None)
                 },
-                (QPath::LangItem(hir::LangItem::RangeToInclusive, ..), [field]) if field.ident.name == sym::end => {
-                    Some(Range {
-                        start: None,
-                        end: Some(field.expr),
-                        limits: ast::RangeLimits::Closed,
-                    })
+                (LangItem::Range, [start, end] | [end, start])
+                    if start.ident.name == sym::start && end.ident.name == sym::end =>
+                {
+                    (RangeTy::OpsRange, Some(start.expr), Some(end.expr))
                 },
-                (QPath::LangItem(hir::LangItem::RangeTo, ..), [field]) if field.ident.name == sym::end => Some(Range {
-                    start: None,
-                    end: Some(field.expr),
-                    limits: ast::RangeLimits::HalfOpen,
-                }),
-                _ => None,
+                (LangItem::RangeCopy, [start, end] | [end, start])
+                    if start.ident.name == sym::start && end.ident.name == sym::end =>
+                {
+                    (RangeTy::RangeRange, Some(start.expr), Some(end.expr))
+                },
+                (LangItem::RangeInclusiveCopy, [start, last] | [last, start])
+                    if start.ident.name == sym::start && last.ident.name == sym::last =>
+                {
+                    (RangeTy::RangeInclusive, Some(start.expr), Some(last.expr))
+                },
+                (LangItem::RangeToInclusive, [end]) if end.ident.name == sym::end => {
+                    (RangeTy::OpsToInclusive, None, Some(end.expr))
+                },
+                (LangItem::RangeToInclusiveCopy, [last]) if last.ident.name == sym::last => {
+                    (RangeTy::RangeToInclusive, None, Some(last.expr))
+                },
+                (LangItem::RangeTo, [end]) if end.ident.name == sym::end => (RangeTy::OpsTo, None, Some(end.expr)),
+                _ => return None,
             },
-            _ => None,
+            _ => return None,
+        };
+
+        Some(Range { ty, start, end, span })
+    }
+}
+
+/// A type that can appear as the type of a range expression.
+///
+/// This is a component of [`Range`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RangeTy {
+    /// [`core::ops::RangeFrom`]
+    OpsFrom,
+    /// [`core::range::RangeFrom`]
+    RangeFrom,
+
+    /// [`core::ops::RangeFull`]
+    OpsFull,
+
+    /// [`core::ops::Range`]
+    OpsRange,
+    /// [`core::range::Range`]
+    RangeRange,
+
+    /// [`core::ops::RangeInclusive`]
+    OpsInclusive,
+    /// [`core::range::RangeInclusive`]
+    RangeInclusive,
+
+    /// [`core::ops::RangeTo`]
+    OpsTo,
+
+    /// [`core::ops::RangeToInclusive`]
+    OpsToInclusive,
+    /// [`core::range::RangeToInclusive`]
+    RangeToInclusive,
+}
+
+#[expect(clippy::match_same_arms, reason = "regularity over density")]
+impl RangeTy {
+    /// Returns whether this type implements [`IntoIterator`] — that is, whether it is iterable —
+    /// presuming that its element type implements the `Step` trait.
+    pub fn implements_into_iterator(self) -> bool {
+        match self {
+            RangeTy::OpsFrom => true,
+            RangeTy::RangeFrom => true,
+            RangeTy::OpsRange => true,
+            RangeTy::RangeRange => true,
+            RangeTy::OpsInclusive => true,
+            RangeTy::RangeInclusive => true,
+
+            RangeTy::OpsFull => false,
+            RangeTy::OpsTo => false,
+            RangeTy::OpsToInclusive => false,
+            RangeTy::RangeToInclusive => false,
+        }
+    }
+
+    /// Returns whether this type implements [`Iterator`] directly, and [`IntoIterator`] via blanket
+    /// impl, presuming that its element type implements the `Step` trait.
+    pub fn implements_iterator(self) -> bool {
+        match self {
+            RangeTy::OpsFrom => true,
+            RangeTy::OpsRange => true,
+            RangeTy::OpsInclusive => true,
+
+            // New range types don’t implement Iterator, only IntoIterator
+            RangeTy::RangeFrom => false,
+            RangeTy::RangeRange => false,
+            RangeTy::RangeInclusive => false,
+
+            // Non-iterables
+            RangeTy::OpsFull => false,
+            RangeTy::OpsTo => false,
+            RangeTy::OpsToInclusive => false,
+            RangeTy::RangeToInclusive => false,
+        }
+    }
+
+    pub fn limits(self) -> ast::RangeLimits {
+        match self {
+            RangeTy::RangeFrom => ast::RangeLimits::HalfOpen,
+            RangeTy::OpsRange => ast::RangeLimits::HalfOpen,
+            RangeTy::RangeRange => ast::RangeLimits::HalfOpen,
+
+            RangeTy::OpsFrom => ast::RangeLimits::HalfOpen,
+            RangeTy::OpsTo => ast::RangeLimits::HalfOpen,
+            RangeTy::OpsFull => ast::RangeLimits::HalfOpen,
+
+            RangeTy::OpsInclusive => ast::RangeLimits::Closed,
+            RangeTy::RangeInclusive => ast::RangeLimits::Closed,
+            RangeTy::OpsToInclusive => ast::RangeLimits::Closed,
+            RangeTy::RangeToInclusive => ast::RangeLimits::Closed,
         }
     }
 }
@@ -285,25 +370,29 @@ impl<'a> VecArgs<'a> {
     pub fn hir(cx: &LateContext<'_>, expr: &'a Expr<'_>) -> Option<VecArgs<'a>> {
         if let ExprKind::Call(fun, args) = expr.kind
             && let ExprKind::Path(ref qpath) = fun.kind
-            && is_expn_of(fun.span, sym::vec).is_some()
             && let Some(fun_def_id) = cx.qpath_res(qpath, fun.hir_id).opt_def_id()
+            && let Some(name) = cx.tcx.get_diagnostic_name(fun_def_id)
+            && matches!(
+                name,
+                sym::vec_from_elem | sym::box_assume_init_into_vec_unsafe | sym::vec_new
+            )
+            // Do the cheap checks first, since `is_expn_of` walks the whole expansion chain.
+            && is_expn_of(fun.span, sym::vec).is_some()
         {
-            return if cx.tcx.is_diagnostic_item(sym::vec_from_elem, fun_def_id) && args.len() == 2 {
-                // `vec![elem; size]` case
-                Some(VecArgs::Repeat(&args[0], &args[1]))
-            } else if cx.tcx.is_diagnostic_item(sym::slice_into_vec, fun_def_id) && args.len() == 1 {
-                // `vec![a, b, c]` case
-                if let ExprKind::Call(_, [arg]) = &args[0].kind
-                    && let ExprKind::Array(args) = arg.kind
+            return match (name, args) {
+                (sym::vec_from_elem, [elem, size]) => {
+                    // `vec![elem; size]` case
+                    Some(VecArgs::Repeat(elem, size))
+                },
+                (sym::box_assume_init_into_vec_unsafe, [write_box_via_move])
+                    if let ExprKind::Call(_, [_box, elems]) = write_box_via_move.kind
+                        && let ExprKind::Array(elems) = elems.kind =>
                 {
-                    Some(VecArgs::Vec(args))
-                } else {
-                    None
-                }
-            } else if cx.tcx.is_diagnostic_item(sym::vec_new, fun_def_id) && args.is_empty() {
-                Some(VecArgs::Vec(&[]))
-            } else {
-                None
+                    // `vec![a, b, c]` case
+                    Some(VecArgs::Vec(elems))
+                },
+                (sym::vec_new, []) => Some(VecArgs::Vec(&[])),
+                _ => None,
             };
         }
 
@@ -319,6 +408,7 @@ pub struct While<'hir> {
     pub body: &'hir Expr<'hir>,
     /// Span of the loop header
     pub span: Span,
+    pub label: Option<ast::Label>,
 }
 
 impl<'hir> While<'hir> {
@@ -334,13 +424,18 @@ impl<'hir> While<'hir> {
                     }),
                 ..
             },
-            _,
+            label,
             LoopSource::While,
             span,
         ) = expr.kind
             && !has_let_expr(condition)
         {
-            return Some(Self { condition, body, span });
+            return Some(Self {
+                condition,
+                body,
+                span,
+                label,
+            });
         }
         None
     }
@@ -404,6 +499,54 @@ impl<'hir> WhileLet<'hir> {
     }
 }
 
+/// A desugared compound assignment statement, such as in
+/// `(a, b) = expr`.
+pub struct CompoundAssignment<'hir> {
+    /// The individual assignees
+    pub assignees: Vec<&'hir Expr<'hir>>,
+    /// The initializatiojn expression
+    pub init: &'hir Expr<'hir>,
+}
+
+impl<'hir> CompoundAssignment<'hir> {
+    /// Check if `expr` is a block which is an expansion of a compound assignment.
+    #[inline]
+    pub fn hir(expr: &'hir Expr<'_>) -> Option<Self> {
+        // A compound assignment is unsugared into a block which first assigns the RHS subexpressions to
+        // temporaries, then moves those temporaries to the assignment targets. By doing it this
+        // way, and since the moves cannot fail, the compound assignment either succeeds or not take
+        // place at all if, for example, one of the RHS subcomponent diverges.
+        if let ExprKind::Block(
+            Block {
+                stmts: [assign, rest @ ..],
+                expr: None,
+                ..
+            },
+            None,
+        ) = expr.kind
+            && let hir::StmtKind::Let(LetStmt {
+                init: Some(init),
+                source: LocalSource::AssignDesugar,
+                ..
+            }) = assign.kind
+        {
+            let mut assignees = Vec::with_capacity(rest.len());
+            for stmt in rest {
+                if let hir::StmtKind::Expr(expr) = stmt.kind
+                    && let ExprKind::Assign(target, _, _) = expr.kind
+                {
+                    assignees.push(target);
+                } else {
+                    return None;
+                }
+            }
+            Some(CompoundAssignment { assignees, init })
+        } else {
+            None
+        }
+    }
+}
+
 /// Converts a `hir` binary operator to the corresponding `ast` type.
 #[must_use]
 pub fn binop(op: hir::BinOpKind) -> ast::BinOpKind {
@@ -447,7 +590,7 @@ pub fn get_vec_init_kind<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -
     if let ExprKind::Call(func, args) = expr.kind {
         match func.kind {
             ExprKind::Path(QPath::TypeRelative(ty, name))
-                if is_type_diagnostic_item(cx, cx.typeck_results().node_type(ty.hir_id), sym::Vec) =>
+                if cx.typeck_results().node_type(ty.hir_id).is_diag_item(cx, sym::Vec) =>
             {
                 if name.ident.name == sym::new {
                     return Some(VecInitKind::New);
@@ -455,7 +598,7 @@ pub fn get_vec_init_kind<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -
                     return Some(VecInitKind::Default);
                 } else if name.ident.name == sym::with_capacity {
                     let arg = args.first()?;
-                    return match ConstEvalCtxt::new(cx).eval_simple(arg) {
+                    return match ConstEvalCtxt::new(cx).eval_local(arg, expr.span.ctxt()) {
                         Some(Constant::Int(num)) => Some(VecInitKind::WithConstCapacity(num)),
                         _ => Some(VecInitKind::WithExprCapacity(arg.hir_id)),
                     };
@@ -463,7 +606,7 @@ pub fn get_vec_init_kind<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -
             },
             ExprKind::Path(QPath::Resolved(_, path))
                 if cx.tcx.is_diagnostic_item(sym::default_fn, path.res.opt_def_id()?)
-                    && is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(expr), sym::Vec) =>
+                    && cx.typeck_results().expr_ty(expr).is_diag_item(cx, sym::Vec) =>
             {
                 return Some(VecInitKind::Default);
             },

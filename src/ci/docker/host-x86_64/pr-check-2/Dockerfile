@@ -21,22 +21,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   mingw-w64 \
   && rm -rf /var/lib/apt/lists/*
 
+RUN curl -L https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz | \
+  tar -xz
+ENV WASI_SDK_PATH=/wasi-sdk-34.0-x86_64-linux
+
 ENV RUST_CONFIGURE_ARGS="--set rust.validate-mir-opts=3"
 
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
 
-ENV SCRIPT \
-        python3 ../x.py check && \
-        python3 ../x.py clippy ci && \
+ENV SCRIPT="python3 ../x.py check && \
+        python3 ../x.py clippy ci --stage 2 && \
         python3 ../x.py test --stage 1 core alloc std test proc_macro && \
-        python3 ../x.py doc --stage 0 bootstrap && \
+        # Elsewhere, we run all tests for the host. A number of codegen tests are sensitive to the target pointer
+        # width, for example because they mention a usize. wasm32-wasip1 in test-various, so using it here can't make
+        # PR CI more strict than full CI.
+        python3 ../x.py test --stage 1 tests/codegen-llvm --target wasm32-wasip1 && \
+        python3 ../x.py test --stage 1 src/tools/compiletest && \
+        python3 ../x.py doc bootstrap --stage 1 && \
         # Build both public and internal documentation.
-        RUSTDOCFLAGS=\"--document-private-items --document-hidden-items\" python3 ../x.py doc --stage 0 compiler && \
-        RUSTDOCFLAGS=\"--document-private-items --document-hidden-items\" python3 ../x.py doc --stage 1 library && \
+        RUSTDOCFLAGS=\"--document-private-items --document-hidden-items\" python3 ../x.py doc compiler --stage 1 && \
+        RUSTDOCFLAGS=\"--document-private-items --document-hidden-items\" python3 ../x.py doc library --stage 1 && \
         mkdir -p /checkout/obj/staging/doc && \
         cp -r build/x86_64-unknown-linux-gnu/doc /checkout/obj/staging && \
-        RUSTDOCFLAGS=\"--document-private-items --document-hidden-items\" python3 ../x.py doc --stage 1 library/test && \
-        # The BOOTSTRAP_TRACING flag is added to verify whether the 
+        RUSTDOCFLAGS=\"--document-private-items --document-hidden-items\" python3 ../x.py doc library/test --stage 1 && \
+        # The BOOTSTRAP_TRACING flag is added to verify whether the
         # bootstrap process compiles successfully with this flag enabled.
-        BOOTSTRAP_TRACING=1 python3 ../x.py --help
+        BOOTSTRAP_TRACING=1 python3 ../x.py --help"

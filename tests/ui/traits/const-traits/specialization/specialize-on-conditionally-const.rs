@@ -7,39 +7,36 @@
 #![feature(rustc_attrs)]
 #![feature(min_specialization)]
 
-#[const_trait]
 #[rustc_specialization_trait]
-trait Specialize {}
+const trait Specialize {}
 
-#[const_trait]
-trait Foo {
+const trait Foo {
     fn foo();
 }
 
-impl<T> const Foo for T {
+const impl<T> Foo for T {
     default fn foo() {}
 }
 
-impl<T> const Foo for T
+const impl<T> Foo for T
 where
     T: [const] Specialize,
 {
     fn foo() {}
 }
 
-#[const_trait]
-trait Bar {
+const trait Bar {
     fn bar() {}
 }
 
-impl<T> const Bar for T
+const impl<T> Bar for T
 where
     T: [const] Foo,
 {
     default fn bar() {}
 }
 
-impl<T> const Bar for T
+const impl<T> Bar for T
 where
     T: [const] Foo,
     T: [const] Specialize,

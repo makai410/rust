@@ -1,30 +1,28 @@
-use rustc_attr_data_structures::{AttributeKind, find_attr};
 use rustc_data_structures::sorted_map::SortedIndexMultiMap;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::DefId;
-use rustc_macros::{Decodable, Encodable, HashStable};
-use rustc_span::{Ident, Symbol};
+use rustc_macros::{Decodable, Encodable, StableHash};
+use rustc_span::def_id::ModId;
+use rustc_span::{ErrorGuaranteed, Ident, Symbol};
 
 use super::{TyCtxt, Visibility};
 use crate::ty;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, HashStable, Hash, Encodable, Decodable)]
-pub enum AssocItemContainer {
+#[derive(Clone, Copy, PartialEq, Eq, Debug, StableHash, Hash, Encodable, Decodable)]
+pub enum AssocContainer {
     Trait,
-    Impl,
+    InherentImpl,
+    /// The `DefId` points to the trait item being implemented.
+    TraitImpl(Result<DefId, ErrorGuaranteed>),
 }
 
 /// Information about an associated item
-#[derive(Copy, Clone, Debug, PartialEq, HashStable, Eq, Hash, Encodable, Decodable)]
+#[derive(Copy, Clone, Debug, PartialEq, StableHash, Eq, Hash, Encodable, Decodable)]
 pub struct AssocItem {
     pub def_id: DefId,
     pub kind: AssocKind,
-    pub container: AssocItemContainer,
-
-    /// If this is an item in an impl of a trait then this is the `DefId` of
-    /// the associated item on the trait that this implements.
-    pub trait_item_def_id: Option<DefId>,
+    pub container: AssocContainer,
 }
 
 impl AssocItem {
@@ -33,7 +31,7 @@ impl AssocItem {
         match self.kind {
             ty::AssocKind::Type { data: AssocTypeData::Normal(name) } => Some(name),
             ty::AssocKind::Type { data: AssocTypeData::Rpitit(_) } => None,
-            ty::AssocKind::Const { name } => Some(name),
+            ty::AssocKind::Const { name, .. } => Some(name),
             ty::AssocKind::Fn { name, .. } => Some(name),
         }
     }
@@ -54,11 +52,38 @@ impl AssocItem {
     ///
     /// [`type_of`]: crate::ty::TyCtxt::type_of
     pub fn defaultness(&self, tcx: TyCtxt<'_>) -> hir::Defaultness {
-        tcx.defaultness(self.def_id)
+        match self.container {
+            AssocContainer::InherentImpl => hir::Defaultness::Final,
+            AssocContainer::Trait | AssocContainer::TraitImpl(_) => tcx.defaultness(self.def_id),
+        }
+    }
+
+    pub fn expect_trait_impl(&self) -> Result<DefId, ErrorGuaranteed> {
+        let AssocContainer::TraitImpl(trait_item_id) = self.container else {
+            bug!("expected item to be in a trait impl: {:?}", self.def_id);
+        };
+        trait_item_id
+    }
+
+    /// If this is a trait impl item, returns the `DefId` of the trait item this implements.
+    /// Otherwise, returns `DefId` for self. Returns an Err in case the trait item was not
+    /// resolved successfully.
+    pub fn trait_item_or_self(&self) -> Result<DefId, ErrorGuaranteed> {
+        match self.container {
+            AssocContainer::TraitImpl(id) => id,
+            AssocContainer::Trait | AssocContainer::InherentImpl => Ok(self.def_id),
+        }
+    }
+
+    pub fn trait_item_def_id(&self) -> Option<DefId> {
+        match self.container {
+            AssocContainer::TraitImpl(Ok(id)) => Some(id),
+            _ => None,
+        }
     }
 
     #[inline]
-    pub fn visibility(&self, tcx: TyCtxt<'_>) -> Visibility<DefId> {
+    pub fn visibility(&self, tcx: TyCtxt<'_>) -> Visibility<ModId> {
         tcx.visibility(self.def_id)
     }
 
@@ -70,16 +95,18 @@ impl AssocItem {
     #[inline]
     pub fn trait_container(&self, tcx: TyCtxt<'_>) -> Option<DefId> {
         match self.container {
-            AssocItemContainer::Impl => None,
-            AssocItemContainer::Trait => Some(tcx.parent(self.def_id)),
+            AssocContainer::InherentImpl | AssocContainer::TraitImpl(_) => None,
+            AssocContainer::Trait => Some(tcx.parent(self.def_id)),
         }
     }
 
     #[inline]
     pub fn impl_container(&self, tcx: TyCtxt<'_>) -> Option<DefId> {
         match self.container {
-            AssocItemContainer::Impl => Some(tcx.parent(self.def_id)),
-            AssocItemContainer::Trait => None,
+            AssocContainer::InherentImpl | AssocContainer::TraitImpl(_) => {
+                Some(tcx.parent(self.def_id))
+            }
+            AssocContainer::Trait => None,
         }
     }
 
@@ -93,37 +120,38 @@ impl AssocItem {
                 tcx.fn_sig(self.def_id).instantiate_identity().skip_binder().to_string()
             }
             ty::AssocKind::Type { .. } => format!("type {};", self.name()),
-            ty::AssocKind::Const { name } => {
+            ty::AssocKind::Const { name, .. } => {
                 format!("const {}: {:?};", name, tcx.type_of(self.def_id).instantiate_identity())
             }
         }
     }
 
     pub fn descr(&self) -> &'static str {
-        match self.kind {
-            ty::AssocKind::Const { .. } => "associated const",
-            ty::AssocKind::Fn { has_self: true, .. } => "method",
-            ty::AssocKind::Fn { has_self: false, .. } => "associated function",
-            ty::AssocKind::Type { .. } => "associated type",
-        }
+        self.kind.descr()
     }
 
     pub fn namespace(&self) -> Namespace {
-        match self.kind {
-            ty::AssocKind::Type { .. } => Namespace::TypeNS,
-            ty::AssocKind::Const { .. } | ty::AssocKind::Fn { .. } => Namespace::ValueNS,
-        }
+        self.kind.namespace()
     }
 
     pub fn as_def_kind(&self) -> DefKind {
-        match self.kind {
-            AssocKind::Const { .. } => DefKind::AssocConst,
-            AssocKind::Fn { .. } => DefKind::AssocFn,
-            AssocKind::Type { .. } => DefKind::AssocTy,
-        }
+        self.kind.as_def_kind()
     }
-    pub fn is_type(&self) -> bool {
-        matches!(self.kind, ty::AssocKind::Type { .. })
+
+    pub fn is_type_const(&self) -> bool {
+        matches!(self.kind, ty::AssocKind::Const { is_type_const: true, .. })
+    }
+
+    /// Whether this associated item can be constrained with an equality binding.
+    pub fn can_have_equality_constraint(&self, tcx: TyCtxt<'_>) -> bool {
+        match self.kind {
+            ty::AssocKind::Type { .. } => true,
+            ty::AssocKind::Const { is_type_const: true, .. } => true,
+            ty::AssocKind::Const { is_type_const: false, .. } => {
+                tcx.features().generic_const_args()
+            }
+            ty::AssocKind::Fn { .. } => false,
+        }
     }
 
     pub fn is_fn(&self) -> bool {
@@ -134,38 +162,20 @@ impl AssocItem {
         matches!(self.kind, ty::AssocKind::Fn { has_self: true, .. })
     }
 
-    pub fn as_tag(&self) -> AssocTag {
-        match self.kind {
-            AssocKind::Const { .. } => AssocTag::Const,
-            AssocKind::Fn { .. } => AssocTag::Fn,
-            AssocKind::Type { .. } => AssocTag::Type,
-        }
+    pub fn is_type(&self) -> bool {
+        matches!(self.kind, ty::AssocKind::Type { .. })
+    }
+
+    pub fn tag(&self) -> AssocTag {
+        self.kind.tag()
     }
 
     pub fn is_impl_trait_in_trait(&self) -> bool {
         matches!(self.kind, AssocKind::Type { data: AssocTypeData::Rpitit(_) })
     }
-
-    /// Returns true if:
-    /// - This trait associated item has the `#[type_const]` attribute,
-    /// - If it is in a trait impl, the item from the original trait has this attribute, or
-    /// - It is an inherent assoc const.
-    pub fn is_type_const_capable(&self, tcx: TyCtxt<'_>) -> bool {
-        if !matches!(self.kind, ty::AssocKind::Const { .. }) {
-            return false;
-        }
-
-        let def_id = match (self.container, self.trait_item_def_id) {
-            (AssocItemContainer::Trait, _) => self.def_id,
-            (AssocItemContainer::Impl, Some(trait_item_did)) => trait_item_did,
-            // Inherent impl but this attr is only applied to trait assoc items.
-            (AssocItemContainer::Impl, None) => return true,
-        };
-        find_attr!(tcx.get_all_attrs(def_id), AttributeKind::TypeConst(_))
-    }
 }
 
-#[derive(Copy, Clone, PartialEq, Debug, HashStable, Eq, Hash, Encodable, Decodable)]
+#[derive(Copy, Clone, PartialEq, Debug, StableHash, Eq, Hash, Encodable, Decodable)]
 pub enum AssocTypeData {
     Normal(Symbol),
     /// The associated type comes from an RPITIT. It has no name, and the
@@ -174,47 +184,70 @@ pub enum AssocTypeData {
     Rpitit(ty::ImplTraitInTraitData),
 }
 
-#[derive(Copy, Clone, PartialEq, Debug, HashStable, Eq, Hash, Encodable, Decodable)]
+#[derive(Copy, Clone, PartialEq, Debug, StableHash, Eq, Hash, Encodable, Decodable)]
 pub enum AssocKind {
-    Const { name: Symbol },
+    Const { name: Symbol, is_type_const: bool },
     Fn { name: Symbol, has_self: bool },
     Type { data: AssocTypeData },
 }
 
 impl AssocKind {
     pub fn namespace(&self) -> Namespace {
-        match *self {
-            ty::AssocKind::Type { .. } => Namespace::TypeNS,
-            ty::AssocKind::Const { .. } | ty::AssocKind::Fn { .. } => Namespace::ValueNS,
+        match self {
+            Self::Type { .. } => Namespace::TypeNS,
+            Self::Const { .. } | Self::Fn { .. } => Namespace::ValueNS,
+        }
+    }
+
+    pub fn tag(&self) -> AssocTag {
+        match self {
+            Self::Const { .. } => AssocTag::Const,
+            Self::Fn { .. } => AssocTag::Fn,
+            Self::Type { .. } => AssocTag::Type,
         }
     }
 
     pub fn as_def_kind(&self) -> DefKind {
         match self {
-            AssocKind::Const { .. } => DefKind::AssocConst,
-            AssocKind::Fn { .. } => DefKind::AssocFn,
-            AssocKind::Type { .. } => DefKind::AssocTy,
+            Self::Const { is_type_const, .. } => {
+                DefKind::AssocConst { is_type_const: *is_type_const }
+            }
+            Self::Fn { .. } => DefKind::AssocFn,
+            Self::Type { .. } => DefKind::AssocTy,
+        }
+    }
+
+    pub fn descr(&self) -> &'static str {
+        match self {
+            Self::Fn { has_self: true, .. } => "method",
+            _ => self.tag().descr(),
         }
     }
 }
 
 impl std::fmt::Display for AssocKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AssocKind::Fn { has_self: true, .. } => write!(f, "method"),
-            AssocKind::Fn { has_self: false, .. } => write!(f, "associated function"),
-            AssocKind::Const { .. } => write!(f, "associated const"),
-            AssocKind::Type { .. } => write!(f, "associated type"),
-        }
+        f.write_str(self.descr())
     }
 }
 
-// Like `AssocKind`, but just the tag, no fields. Used in various kinds of matching.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Like [`AssocKind`], but just the tag, no fields. Used in various kinds of matching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AssocTag {
     Const,
     Fn,
     Type,
+}
+
+impl AssocTag {
+    pub fn descr(self) -> &'static str {
+        // This should match `DefKind::descr`.
+        match self {
+            Self::Const => "associated constant",
+            Self::Fn => "associated function",
+            Self::Type => "associated type",
+        }
+    }
 }
 
 /// A list of `ty::AssocItem`s in definition order that allows for efficient lookup by name.
@@ -222,7 +255,7 @@ pub enum AssocTag {
 /// When doing lookup by name, we try to postpone hygienic comparison for as long as possible since
 /// it is relatively expensive. Instead, items are indexed by `Symbol` and hygienic comparison is
 /// done only on items with the same name.
-#[derive(Debug, Clone, PartialEq, HashStable)]
+#[derive(Debug, Clone, PartialEq, StableHash)]
 pub struct AssocItems {
     items: SortedIndexMultiMap<u32, Option<Symbol>, ty::AssocItem>,
 }
@@ -264,7 +297,7 @@ impl AssocItems {
         name: Symbol,
         assoc_tag: AssocTag,
     ) -> impl '_ + Iterator<Item = &ty::AssocItem> {
-        self.filter_by_name_unhygienic(name).filter(move |item| item.as_tag() == assoc_tag)
+        self.filter_by_name_unhygienic(name).filter(move |item| item.tag() == assoc_tag)
     }
 
     /// Returns the associated item with the given identifier and `AssocKind`, if one exists.
@@ -277,7 +310,7 @@ impl AssocItems {
         parent_def_id: DefId,
     ) -> Option<&ty::AssocItem> {
         self.filter_by_name_unhygienic(ident.name)
-            .filter(|item| item.as_tag() == assoc_tag)
+            .filter(|item| item.tag() == assoc_tag)
             .find(|item| tcx.hygienic_eq(ident, item.ident(tcx), parent_def_id))
     }
 

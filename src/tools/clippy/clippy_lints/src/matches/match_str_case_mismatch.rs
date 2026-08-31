@@ -1,12 +1,13 @@
 use std::ops::ControlFlow;
 
 use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::res::MaybeDef as _;
 use clippy_utils::sym;
-use clippy_utils::ty::is_type_lang_item;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::intravisit::{Visitor, walk_expr};
-use rustc_hir::{Arm, Expr, ExprKind, LangItem, PatExpr, PatExprKind, PatKind};
+use rustc_hir::{Arm, Expr, ExprKind, PatExpr, PatExprKind, PatKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
 use rustc_span::Span;
@@ -54,11 +55,11 @@ impl<'tcx> Visitor<'tcx> for MatchExprVisitor<'_, 'tcx> {
 }
 
 impl MatchExprVisitor<'_, '_> {
-    fn case_altered(&mut self, segment_ident: Symbol, receiver: &Expr<'_>) -> ControlFlow<CaseMethod> {
+    fn case_altered(&self, segment_ident: Symbol, receiver: &Expr<'_>) -> ControlFlow<CaseMethod> {
         if let Some(case_method) = get_case_method(segment_ident) {
             let ty = self.cx.typeck_results().expr_ty(receiver).peel_refs();
 
-            if is_type_lang_item(self.cx, ty, LangItem::String) || ty.kind() == &ty::Str {
+            if ty.is_lang_item(self.cx, LangItem::String) || ty.kind() == &ty::Str {
                 return ControlFlow::Break(case_method);
             }
         }

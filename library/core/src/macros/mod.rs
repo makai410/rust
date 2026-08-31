@@ -39,8 +39,9 @@ macro_rules! panic {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "assert_eq_macro"]
 #[allow_internal_unstable(panic_internals)]
+#[rustc_diagnostic_opaque]
 macro_rules! assert_eq {
-    ($left:expr, $right:expr $(,)?) => {
+    ($left:expr, $right:expr $(,)?) => {{
         match (&$left, &$right) {
             (left_val, right_val) => {
                 if !(*left_val == *right_val) {
@@ -52,8 +53,8 @@ macro_rules! assert_eq {
                 }
             }
         }
-    };
-    ($left:expr, $right:expr, $($arg:tt)+) => {
+    }};
+    ($left:expr, $right:expr, $($arg:tt)+) => {{
         match (&$left, &$right) {
             (left_val, right_val) => {
                 if !(*left_val == *right_val) {
@@ -65,7 +66,7 @@ macro_rules! assert_eq {
                 }
             }
         }
-    };
+    }};
 }
 
 /// Asserts that two expressions are not equal to each other (using [`PartialEq`]).
@@ -95,8 +96,9 @@ macro_rules! assert_eq {
 #[stable(feature = "assert_ne", since = "1.13.0")]
 #[rustc_diagnostic_item = "assert_ne_macro"]
 #[allow_internal_unstable(panic_internals)]
+#[rustc_diagnostic_opaque]
 macro_rules! assert_ne {
-    ($left:expr, $right:expr $(,)?) => {
+    ($left:expr, $right:expr $(,)?) => {{
         match (&$left, &$right) {
             (left_val, right_val) => {
                 if *left_val == *right_val {
@@ -108,8 +110,8 @@ macro_rules! assert_ne {
                 }
             }
         }
-    };
-    ($left:expr, $right:expr, $($arg:tt)+) => {
+    }};
+    ($left:expr, $right:expr, $($arg:tt)+) => {{
         match (&($left), &($right)) {
             (left_val, right_val) => {
                 if *left_val == *right_val {
@@ -121,7 +123,7 @@ macro_rules! assert_ne {
                 }
             }
         }
-    };
+    }};
 }
 
 /// Asserts that an expression matches the provided pattern.
@@ -138,7 +140,7 @@ macro_rules! assert_ne {
 /// be disabled. See [`debug_assert_matches!`] for assertions that are disabled in
 /// release builds by default.
 ///
-/// [`debug_assert_matches!`]: crate::assert_matches::debug_assert_matches
+/// [`debug_assert_matches!`]: crate::debug_assert_matches
 ///
 /// On panic, this macro will print the value of the expression with its debug representation.
 ///
@@ -147,9 +149,7 @@ macro_rules! assert_ne {
 /// # Examples
 ///
 /// ```
-/// #![feature(assert_matches)]
-///
-/// use std::assert_matches::assert_matches;
+/// use std::assert_matches;
 ///
 /// let a = Some(345);
 /// let b = Some(56);
@@ -166,11 +166,11 @@ macro_rules! assert_ne {
 /// assert_matches!(a, Some(x) if x > 100);
 /// // assert_matches!(a, Some(x) if x < 100); // panics
 /// ```
-#[unstable(feature = "assert_matches", issue = "82775")]
+#[stable(feature = "assert_matches", since = "1.96.0")]
 #[allow_internal_unstable(panic_internals)]
-#[rustc_macro_transparency = "semitransparent"]
+#[rustc_macro_transparency = "semiopaque"]
 pub macro assert_matches {
-    ($left:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )? $(,)?) => {
+    ($left:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )? $(,)?) => {{
         match $left {
             $( $pattern )|+ $( if $guard )? => {}
             ref left_val => {
@@ -181,8 +181,8 @@ pub macro assert_matches {
                 );
             }
         }
-    },
-    ($left:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )?, $($arg:tt)+) => {
+    }},
+    ($left:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )?, $($arg:tt)+) => {{
         match $left {
             $( $pattern )|+ $( if $guard )? => {}
             ref left_val => {
@@ -193,7 +193,7 @@ pub macro assert_matches {
                 );
             }
         }
-    },
+    }},
 }
 
 /// Selects code at compile-time based on `cfg` predicates.
@@ -208,8 +208,6 @@ pub macro assert_matches {
 /// # Example
 ///
 /// ```
-/// #![feature(cfg_select)]
-///
 /// cfg_select! {
 ///     unix => {
 ///         fn foo() { /* unix specific functionality */ }
@@ -223,17 +221,17 @@ pub macro assert_matches {
 /// }
 /// ```
 ///
-/// The `cfg_select!` macro can also be used in expression position:
+/// The `cfg_select!` macro can also be used in expression position, with or without braces on the
+/// right-hand side:
 ///
 /// ```
-/// #![feature(cfg_select)]
-///
 /// let _some_string = cfg_select! {
-///     unix => { "With great power comes great electricity bills" }
+///     unix => "With great power comes great electricity bills",
 ///     _ => { "Behind every successful diet is an unwatched pizza" }
 /// };
 /// ```
-#[unstable(feature = "cfg_select", issue = "115585")]
+#[stable(feature = "cfg_select", since = "1.95.0")]
+#[doc(alias = "cfg_if", alias = "cfg-if")]
 #[rustc_diagnostic_item = "cfg_select"]
 #[rustc_builtin_macro]
 pub macro cfg_select($($tt:tt)*) {
@@ -271,7 +269,10 @@ pub macro cfg_select($($tt:tt)*) {
 /// // expression given.
 /// debug_assert!(true);
 ///
-/// fn some_expensive_computation() -> bool { true } // a very simple function
+/// fn some_expensive_computation() -> bool {
+///     // Some expensive computation here
+///     true
+/// }
 /// debug_assert!(some_expensive_computation());
 ///
 /// // assert with a custom message
@@ -285,6 +286,7 @@ pub macro cfg_select($($tt:tt)*) {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "debug_assert_macro"]
 #[allow_internal_unstable(edition_panic)]
+#[rustc_diagnostic_opaque]
 macro_rules! debug_assert {
     ($($arg:tt)*) => {
         if $crate::cfg!(debug_assertions) {
@@ -376,9 +378,7 @@ macro_rules! debug_assert_ne {
 /// # Examples
 ///
 /// ```
-/// #![feature(assert_matches)]
-///
-/// use std::assert_matches::debug_assert_matches;
+/// use std::debug_assert_matches;
 ///
 /// let a = Some(345);
 /// let b = Some(56);
@@ -395,12 +395,12 @@ macro_rules! debug_assert_ne {
 /// debug_assert_matches!(a, Some(x) if x > 100);
 /// // debug_assert_matches!(a, Some(x) if x < 100); // panics
 /// ```
-#[unstable(feature = "assert_matches", issue = "82775")]
+#[stable(feature = "assert_matches", since = "1.96.0")]
 #[allow_internal_unstable(assert_matches)]
-#[rustc_macro_transparency = "semitransparent"]
+#[rustc_macro_transparency = "semiopaque"]
 pub macro debug_assert_matches($($arg:tt)*) {
     if $crate::cfg!(debug_assertions) {
-        $crate::assert_matches::assert_matches!($($arg)*);
+        $crate::assert_matches!($($arg)*);
     }
 }
 
@@ -426,8 +426,11 @@ pub macro debug_assert_matches($($arg:tt)*) {
 #[macro_export]
 #[stable(feature = "matches_macro", since = "1.42.0")]
 #[rustc_diagnostic_item = "matches_macro"]
+#[allow_internal_unstable(non_exhaustive_omitted_patterns_lint, stmt_expr_attributes)]
+#[rustc_diagnostic_opaque]
 macro_rules! matches {
     ($expression:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {
+        #[allow(non_exhaustive_omitted_patterns)]
         match $expression {
             $pattern $(if $guard)? => true,
             _ => false
@@ -443,7 +446,7 @@ macro_rules! matches {
 /// [raw-identifier syntax][ris]: `r#try`.
 ///
 /// [propagating-errors]: https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html#a-shortcut-for-propagating-errors-the--operator
-/// [ris]: https://doc.rust-lang.org/nightly/rust-by-example/compatibility/raw_identifiers.html
+/// [ris]: ../rust-by-example/compatibility/raw_identifiers.html
 ///
 /// `try!` matches the given [`Result`]. In case of the `Ok` variant, the
 /// expression has the value of the wrapped value.
@@ -596,14 +599,18 @@ macro_rules! r#try {
 /// }
 ///
 /// let mut m = Example{};
-/// write!(&mut m, "Hello World").expect("Not written");
+/// write!(&mut m, "Hello World").expect("Writing to `Example` should succeed");
 /// ```
 #[macro_export]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "write_macro"]
+#[rustc_diagnostic_opaque]
 macro_rules! write {
     ($dst:expr, $($arg:tt)*) => {
         $dst.write_fmt($crate::format_args!($($arg)*))
+    };
+    ($($arg:tt)*) => {
+        compile_error!("requires a destination and format arguments, like `write!(dest, \"format string\", args...)`")
     };
 }
 
@@ -636,12 +643,16 @@ macro_rules! write {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "writeln_macro"]
 #[allow_internal_unstable(format_args_nl)]
+#[rustc_diagnostic_opaque]
 macro_rules! writeln {
     ($dst:expr $(,)?) => {
         $crate::write!($dst, "\n")
     };
     ($dst:expr, $($arg:tt)*) => {
         $dst.write_fmt($crate::format_args_nl!($($arg)*))
+    };
+    ($($arg:tt)*) => {
+        compile_error!("requires a destination and format arguments, like `writeln!(dest, \"format string\", args...)`")
     };
 }
 
@@ -788,6 +799,7 @@ macro_rules! unreachable {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "unimplemented_macro"]
 #[allow_internal_unstable(panic_internals)]
+#[rustc_diagnostic_opaque]
 macro_rules! unimplemented {
     () => {
         $crate::panicking::panic("not implemented")
@@ -868,6 +880,7 @@ macro_rules! unimplemented {
 #[stable(feature = "todo_macro", since = "1.40.0")]
 #[rustc_diagnostic_item = "todo_macro"]
 #[allow_internal_unstable(panic_internals)]
+#[rustc_diagnostic_opaque]
 macro_rules! todo {
     () => {
         $crate::panicking::panic("not yet implemented")
@@ -945,8 +958,9 @@ pub(crate) mod builtin {
     /// format string in `format_args!`.
     ///
     /// ```rust
-    /// let debug = format!("{:?}", format_args!("{} foo {:?}", 1, 2));
-    /// let display = format!("{}", format_args!("{} foo {:?}", 1, 2));
+    /// let args = format_args!("{} foo {:?}", 1, 2);
+    /// let debug = format!("{args:?}");
+    /// let display = format!("{args}");
     /// assert_eq!("1 foo 2", display);
     /// assert_eq!(display, debug);
     /// ```
@@ -970,17 +984,21 @@ pub(crate) mod builtin {
     /// assert_eq!(s, format!("hello {}", "world"));
     /// ```
     ///
-    /// # Lifetime limitation
+    /// # Argument lifetimes
     ///
     /// Except when no formatting arguments are used,
-    /// the produced `fmt::Arguments` value borrows temporary values,
-    /// which means it can only be used within the same expression
-    /// and cannot be stored for later use.
-    /// This is a known limitation, see [#92698](https://github.com/rust-lang/rust/issues/92698).
+    /// the produced `fmt::Arguments` value borrows temporary values.
+    /// To allow it to be stored for later use, the arguments' lifetimes, as well as those of
+    /// temporaries they borrow, may be [extended] when `format_args!` appears in the initializer
+    /// expression of a `let` statement. The syntactic rules used to determine when temporaries'
+    /// lifetimes are extended are documented in the [Reference].
+    ///
+    /// [extended]: ../reference/destructors.html#temporary-lifetime-extension
+    /// [Reference]: ../reference/destructors.html#extending-based-on-expressions
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_diagnostic_item = "format_args_macro"]
     #[allow_internal_unsafe]
-    #[allow_internal_unstable(fmt_internals)]
+    #[allow_internal_unstable(fmt_internals, fmt_arguments_from_str)]
     #[rustc_builtin_macro]
     #[macro_export]
     macro_rules! format_args {
@@ -994,7 +1012,7 @@ pub(crate) mod builtin {
     ///
     /// This macro will be removed once `format_args` is allowed in const contexts.
     #[unstable(feature = "const_format_args", issue = "none")]
-    #[allow_internal_unstable(fmt_internals, const_fmt_arguments_new)]
+    #[allow_internal_unstable(fmt_internals, fmt_arguments_from_str)]
     #[rustc_builtin_macro]
     #[macro_export]
     macro_rules! const_format_args {
@@ -1009,8 +1027,9 @@ pub(crate) mod builtin {
         reason = "`format_args_nl` is only for internal \
                   language use and is subject to change"
     )]
-    #[allow_internal_unstable(fmt_internals)]
+    #[allow_internal_unstable(fmt_internals, fmt_arguments_from_str)]
     #[rustc_builtin_macro]
+    #[doc(hidden)]
     #[macro_export]
     macro_rules! format_args_nl {
         ($fmt:expr) => {{ /* compiler built-in */ }};
@@ -1487,8 +1506,58 @@ pub(crate) mod builtin {
     /// - `INPUT_ACTIVITIES`: Specifies one valid activity for each input parameter.
     /// - `OUTPUT_ACTIVITY`: Must not be set if the function implicitly returns nothing
     ///   (or explicitly returns `-> ()`). Otherwise, it must be set to one of the allowed activities.
+    ///
+    /// ACTIVITIES might either be `Dual` or `Const`, more options will be exposed later.
+    ///
+    /// `Const` should be used on non-float arguments, or float-based arguments as an optimization
+    /// if we are not interested in computing the derivatives with respect to this argument.
+    ///
+    /// `Dual` can be used for float scalar values or for references, raw pointers, or other
+    /// indirect input arguments. It can also be used on a scalar float return value.
+    /// If used on a return value, the generated function will return a tuple of two float scalars.
+    /// If used on an input argument, a new shadow argument of the same type will be created,
+    /// directly following the original argument.
+    ///
+    /// ### Usage examples:
+    ///
+    /// ```rust,ignore (autodiff requires a -Z flag as well as fat-lto for testing)
+    /// #![feature(autodiff)]
+    /// use std::autodiff::*;
+    /// #[autodiff_forward(rb_fwd1, Dual, Const, Dual)]
+    /// #[autodiff_forward(rb_fwd2, Const, Dual, Dual)]
+    /// #[autodiff_forward(rb_fwd3, Dual, Dual, Dual)]
+    /// fn rosenbrock(x: f64, y: f64) -> f64 {
+    ///     (1.0 - x).powi(2) + 100.0 * (y - x.powi(2)).powi(2)
+    /// }
+    /// #[autodiff_forward(rb_inp_fwd, Dual, Dual, Dual)]
+    /// fn rosenbrock_inp(x: f64, y: f64, out: &mut f64) {
+    ///     *out = (1.0 - x).powi(2) + 100.0 * (y - x.powi(2)).powi(2);
+    /// }
+    ///
+    /// fn main() {
+    ///   let x0 = rosenbrock(1.0, 3.0); // 400.0
+    ///   let (x1, dx1) = rb_fwd1(1.0, 1.0, 3.0); // (400.0, -800.0)
+    ///   let (x2, dy1) = rb_fwd2(1.0, 3.0, 1.0); // (400.0, 400.0)
+    ///   // When seeding both arguments at once the tangent return is the sum of both.
+    ///   let (x3, dxy) = rb_fwd3(1.0, 1.0, 3.0, 1.0); // (400.0, -400.0)
+    ///
+    ///   let mut out = 0.0;
+    ///   let mut dout = 0.0;
+    ///   rb_inp_fwd(1.0, 1.0, 3.0, 1.0, &mut out, &mut dout);
+    ///   // (out, dout) == (400.0, -400.0)
+    /// }
+    /// ```
+    ///
+    /// We might want to track how one input float affects one or more output floats. In this case,
+    /// the shadow of one input should be initialized to `1.0`, while the shadows of the other
+    /// inputs should be initialized to `0.0`. The shadow of the output(s) should be initialized to
+    /// `0.0`. After calling the generated function, the shadow of the input will be zeroed,
+    /// while the shadow(s) of the output(s) will contain the derivatives. Forward mode is generally
+    /// more efficient if we have more output floats marked as `Dual` than input floats.
+    /// Related information can also be found under the term "Vector-Jacobian product" (VJP).
     #[unstable(feature = "autodiff", issue = "124509")]
     #[allow_internal_unstable(rustc_attrs)]
+    #[allow_internal_unstable(core_intrinsics)]
     #[rustc_builtin_macro]
     pub macro autodiff_forward($item:item) {
         /* compiler built-in */
@@ -1505,10 +1574,107 @@ pub(crate) mod builtin {
     /// - `INPUT_ACTIVITIES`: Specifies one valid activity for each input parameter.
     /// - `OUTPUT_ACTIVITY`: Must not be set if the function implicitly returns nothing
     ///   (or explicitly returns `-> ()`). Otherwise, it must be set to one of the allowed activities.
+    ///
+    /// ACTIVITIES might either be `Active`, `Duplicated` or `Const`, more options will be exposed later.
+    ///
+    /// `Active` can be used for float scalar values.
+    /// If used on an input, a new float will be appended to the return tuple of the generated
+    /// function. If the function returns a float scalar, `Active` can be used for the return as
+    /// well. In this case a float scalar will be appended to the argument list, it works as seed.
+    ///
+    /// `Duplicated` can be used on references, raw pointers, or other indirect input
+    /// arguments. It creates a new shadow argument of the same type, following the original argument.
+    /// A const reference or pointer argument will receive a mutable reference or pointer as shadow.
+    ///
+    /// `Const` should be used on non-float arguments, or float-based arguments as an optimization
+    /// if we are not interested in computing the derivatives with respect to this argument.
+    ///
+    /// ### Usage examples:
+    ///
+    /// ```rust,ignore (autodiff requires a -Z flag as well as fat-lto for testing)
+    /// #![feature(autodiff)]
+    /// use std::autodiff::*;
+    /// #[autodiff_reverse(rb_rev, Active, Active, Active)]
+    /// fn rosenbrock(x: f64, y: f64) -> f64 {
+    ///     (1.0 - x).powi(2) + 100.0 * (y - x.powi(2)).powi(2)
+    /// }
+    /// #[autodiff_reverse(rb_inp_rev, Active, Active, Duplicated)]
+    /// fn rosenbrock_inp(x: f64, y: f64, out: &mut f64) {
+    ///     *out = (1.0 - x).powi(2) + 100.0 * (y - x.powi(2)).powi(2);
+    /// }
+    ///
+    /// fn main() {
+    ///     let (output1, dx1, dy1) = rb_rev(1.0, 3.0, 1.0);
+    ///     dbg!(output1, dx1, dy1); // (400.0, -800.0, 400.0)
+    ///     let mut output2 = 0.0;
+    ///     let mut seed = 1.0;
+    ///     let (dx2, dy2) = rb_inp_rev(1.0, 3.0, &mut output2, &mut seed);
+    ///     // (dx2, dy2, output2, seed) == (-800.0, 400.0, 400.0, 0.0)
+    /// }
+    /// ```
+    ///
+    ///
+    /// We often want to track how one or more input floats affect one output float. This output can
+    /// be a scalar return value, or a mutable reference or pointer argument. In the latter case, the
+    /// mutable input should be marked as duplicated and its shadow initialized to `0.0`. The shadow of
+    /// the output should be marked as active or duplicated and initialized to `1.0`. After calling
+    /// the generated function, the shadow(s) of the input(s) will contain the derivatives. The
+    /// shadow of the outputs ("seed") will be reset to zero.
+    /// If the function has more than one output float marked as active or duplicated, users might want to
+    /// set one of them to `1.0` and the others to `0.0` to compute partial derivatives.
+    /// Unlike forward-mode, a call to the generated function does not reset the shadow of the
+    /// inputs.
+    /// Reverse mode is generally more efficient if we have more active/duplicated input than
+    /// output floats.
+    ///
+    /// Related information can also be found under the term "Jacobian-Vector Product" (JVP).
     #[unstable(feature = "autodiff", issue = "124509")]
     #[allow_internal_unstable(rustc_attrs)]
+    #[allow_internal_unstable(core_intrinsics)]
     #[rustc_builtin_macro]
     pub macro autodiff_reverse($item:item) {
+        /* compiler built-in */
+    }
+
+    /// The `offload_kernel` macro is applied to a function to generate two separate
+    /// definitions: a host-side wrapper for dispatch and a device-side kernel.
+    ///
+    /// The macro does not perform the offload itself. It generates the necessary
+    /// code required by the compiler's offloading infrastructure.
+    ///
+    /// ### Usage example:
+    ///
+    /// ```rust,ignore (offload requires a -Z flag)
+    /// #[offload_kernel]
+    /// fn foo(a: &[f32], b: &[f32], c: *mut f32) {
+    ///     *c = a[0] + b[0];
+    /// }
+    /// ```
+    ///
+    /// This expands to the host-side function:
+    ///
+    /// ```rust,ignore (offload requires a -Z flag)
+    /// #[unsafe(no_mangle)]
+    /// #[inline(never)]
+    /// fn foo(_: &[f32], _: &[f32], _: *mut f32) {
+    ///     ::core::panicking::panic("not implemented")
+    /// }
+    /// ```
+    ///
+    /// And the device-side kernel:
+    ///
+    /// ```rust,ignore (offload requires a -Z flag)
+    /// #[rustc_offload_kernel]
+    /// #[unsafe(no_mangle)]
+    /// unsafe extern "gpu-kernel" fn foo(a: &[f32], b: &[f32], c: *mut f32) {
+    ///     *c = a[0] + b[0];
+    /// }
+    /// ```
+    #[unstable(feature = "gpu_offload", issue = "131513")]
+    #[allow_internal_unstable(rustc_attrs)]
+    #[allow_internal_unstable(core_intrinsics)]
+    #[rustc_builtin_macro]
+    pub macro offload_kernel($item:item) {
         /* compiler built-in */
     }
 
@@ -1545,7 +1711,10 @@ pub(crate) mod builtin {
     /// // expression given.
     /// assert!(true);
     ///
-    /// fn some_computation() -> bool { true } // a very simple function
+    /// fn some_computation() -> bool {
+    ///     // Some expensive computation here
+    ///     true
+    /// }
     ///
     /// assert!(some_computation());
     ///
@@ -1602,7 +1771,7 @@ pub(crate) mod builtin {
     ///
     /// See [the reference] for more info.
     ///
-    /// [the reference]: ../../../reference/attributes/derive.html
+    /// [the reference]: ../reference/attributes/derive.html
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_builtin_macro]
     pub macro derive($item:item) {
@@ -1615,7 +1784,7 @@ pub(crate) mod builtin {
     /// See [the reference] for more info.
     ///
     /// [the reference]: ../../../reference/attributes/derive.html
-    #[unstable(feature = "derive_const", issue = "none")]
+    #[unstable(feature = "derive_const", issue = "118304")]
     #[rustc_builtin_macro]
     pub macro derive_const($item:item) {
         /* compiler built-in */
@@ -1661,7 +1830,7 @@ pub(crate) mod builtin {
     ///
     /// See also [`std::alloc::GlobalAlloc`](../../../std/alloc/trait.GlobalAlloc.html).
     #[stable(feature = "global_allocator", since = "1.28.0")]
-    #[allow_internal_unstable(rustc_attrs)]
+    #[allow_internal_unstable(rustc_attrs, ptr_alignment_type)]
     #[rustc_builtin_macro]
     pub macro global_allocator($item:item) {
         /* compiler built-in */
@@ -1744,7 +1913,7 @@ pub(crate) mod builtin {
         issue = "23416",
         reason = "placeholder syntax for type ascription"
     )]
-    #[rustfmt::skip]
+    #[diagnostic::opaque]
     pub macro type_ascribe($expr:expr, $ty:ty) {
         builtin # type_ascribe($expr, $ty)
     }
@@ -1756,7 +1925,44 @@ pub(crate) mod builtin {
         issue = "87121",
         reason = "placeholder syntax for deref patterns"
     )]
+    #[diagnostic::opaque]
     pub macro deref($pat:pat) {
         builtin # deref($pat)
+    }
+
+    /// Derive macro generating an impl of the trait `From`.
+    /// Currently, it can only be used on single-field structs.
+    // Note that the macro is in a different module than the `From` trait,
+    // to avoid triggering an unstable feature being used if someone imports
+    // `std::convert::From`.
+    #[rustc_builtin_macro]
+    #[unstable(feature = "derive_from", issue = "144889")]
+    pub macro From($item: item) {
+        /* compiler built-in */
+    }
+
+    /// Externally Implementable Item: Defines an attribute macro that can override the item
+    /// this is applied to.
+    #[unstable(feature = "extern_item_impls", issue = "125418")]
+    #[rustc_builtin_macro]
+    #[allow_internal_unstable(eii_internals, decl_macro, rustc_attrs)]
+    pub macro eii($item:item) {
+        /* compiler built-in */
+    }
+
+    /// Unsafely Externally Implementable Item: Defines an unsafe attribute macro that can override
+    /// the item this is applied to.
+    #[unstable(feature = "extern_item_impls", issue = "125418")]
+    #[rustc_builtin_macro]
+    #[allow_internal_unstable(eii_internals, decl_macro, rustc_attrs)]
+    pub macro unsafe_eii($item:item) {
+        /* compiler built-in */
+    }
+
+    /// Impl detail of EII
+    #[unstable(feature = "eii_internals", issue = "none")]
+    #[rustc_builtin_macro]
+    pub macro eii_declaration($item:item) {
+        /* compiler built-in */
     }
 }

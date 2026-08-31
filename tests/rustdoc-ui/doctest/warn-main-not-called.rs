@@ -8,6 +8,7 @@
 // won't be called.
 
 //! ```
+//~vvvvv WARN the `main` function of this doctest won't be run
 //! macro_rules! bla {
 //!     ($($x:tt)*) => {}
 //! }
@@ -17,6 +18,7 @@
 //! ```
 //!
 //! ```
+//~v WARN the `main` function of this doctest won't be run
 //! let x = 12;
 //! fn main() {}
 //! ```

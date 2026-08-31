@@ -1,11 +1,5 @@
-#![deny(clippy::useless_asref)]
-#![allow(
-    clippy::explicit_auto_deref,
-    clippy::uninlined_format_args,
-    clippy::map_clone,
-    clippy::needless_pass_by_ref_mut,
-    clippy::redundant_closure
-)]
+#![warn(clippy::useless_asref)]
+#![expect(clippy::redundant_closure)]
 
 use std::fmt::Debug;
 use std::ops::Deref;
@@ -83,7 +77,7 @@ fn not_ok() {
         //~^ useless_asref
         foo_rslice(mrrrrrslice);
     }
-    #[allow(unused_parens, clippy::double_parens, clippy::needless_borrow)]
+    #[allow(clippy::double_parens, clippy::needless_borrow)]
     foo_rrrrmr((&&&&MoreRef).as_ref());
     //~^ useless_asref
 
@@ -258,7 +252,39 @@ fn issue_14828() {
     ().as_ref();
 }
 
-fn main() {
-    not_ok();
-    ok();
+fn issue16098(exts: Vec<&str>) {
+    use std::borrow::Cow;
+
+    let v: Vec<Cow<'_, str>> = exts.iter().map(|s| Cow::Borrowed(s.as_ref())).collect();
+    //~^ useless_asref
+
+    trait Identity {
+        fn id(self) -> Self
+        where
+            Self: Sized,
+        {
+            self
+        }
+    }
+    impl Identity for &str {}
+
+    let v: Vec<Cow<'_, str>> = exts.iter().map(|s| Cow::Borrowed(s.id().as_ref())).collect();
+    //~^ useless_asref
+
+    let v: Vec<Cow<'_, str>> = exts
+        .iter()
+        .map(|s| Cow::Borrowed(std::convert::identity(s).as_ref()))
+        //~^ useless_asref
+        .collect();
+
+    struct Wrapper<'a>(&'a str);
+    let exts_field: Vec<Wrapper> = exts.iter().map(|s| Wrapper(s)).collect();
+    let v: Vec<Cow<'_, str>> = exts_field.iter().map(|w| Cow::Borrowed(w.0.as_ref())).collect();
+    //~^ useless_asref
+
+    let exts_index: Vec<&[&str]> = exts.iter().map(|s| std::slice::from_ref(s)).collect();
+    let v: Vec<Cow<'_, str>> = exts_index.iter().map(|arr| Cow::Borrowed(arr[0].as_ref())).collect();
+    //~^ useless_asref
 }
+
+fn main() {}

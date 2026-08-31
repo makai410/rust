@@ -59,7 +59,9 @@ where
 
             BackendRepr::SimdVector { .. } => Class::Sse,
 
-            BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => {
+            BackendRepr::SimdScalableVector { .. } => panic!("scalable vectors are unsupported"),
+
+            BackendRepr::ScalarPair { .. } | BackendRepr::Memory { .. } => {
                 for i in 0..layout.fields.count() {
                     let field_off = off + layout.fields.offset(i);
                     classify(cx, layout.field(cx, i), cls, field_off)?;
@@ -149,7 +151,7 @@ fn reg_component(cls: &[Option<Class>], i: &mut usize, size: Size) -> Option<Reg
                     _ => Reg::f64(),
                 }
             } else {
-                Reg { kind: RegKind::Vector, size: Size::from_bytes(8) * (vec_len as u64) }
+                Reg::opaque_vector(Size::from_bytes(8) * (vec_len as u64))
             })
         }
         Some(c) => unreachable!("reg_component: unhandled class {:?}", c),
@@ -183,7 +185,13 @@ where
 
     let mut x86_64_arg_or_ret = |arg: &mut ArgAbi<'a, Ty>, is_arg: bool| {
         if !arg.layout.is_sized() {
+            // FIXME: Update int_regs?
             // Not touching this...
+            return;
+        }
+        if is_arg && arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
+            int_regs = int_regs.saturating_sub(1);
+            arg.make_indirect();
             return;
         }
         let mut cls_or_mem = classify_arg(cx, arg);

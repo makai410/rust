@@ -28,6 +28,19 @@ fn test_asm_expand() {
         r#"
 #[rustc_builtin_macro]
 macro_rules! asm {() => {}}
+#[rustc_builtin_macro]
+macro_rules! global_asm {() => {}}
+#[rustc_builtin_macro]
+macro_rules! naked_asm {() => {}}
+
+global_asm! {
+    ""
+}
+
+#[unsafe(naked)]
+extern "C" fn foo() {
+    naked_asm!("");
+}
 
 fn main() {
     let i: u64 = 3;
@@ -45,6 +58,17 @@ fn main() {
         expect![[r##"
 #[rustc_builtin_macro]
 macro_rules! asm {() => {}}
+#[rustc_builtin_macro]
+macro_rules! global_asm {() => {}}
+#[rustc_builtin_macro]
+macro_rules! naked_asm {() => {}}
+
+builtin #global_asm ("")
+
+#[unsafe(naked)]
+extern "C" fn foo() {
+    builtin #naked_asm ("");
+}
 
 fn main() {
     let i: u64 = 3;
@@ -108,13 +132,23 @@ fn test_env_expand() {
 #[rustc_builtin_macro]
 macro_rules! env {() => {}}
 
-fn main() { env!("TEST_ENV_VAR"); }
+fn main() {
+    env!("TEST_ENV_VAR");
+    env!("TEST_ENV_VAR",);
+    env!("TEST_ENV_VAR", "error");
+    env!("TEST_ENV_VAR", "error",);
+}
 "#,
         expect![[r##"
 #[rustc_builtin_macro]
 macro_rules! env {() => {}}
 
-fn main() { "UNRESOLVED_ENV_VAR"; }
+fn main() {
+    "UNRESOLVED_ENV_VAR";
+    "UNRESOLVED_ENV_VAR";
+    "UNRESOLVED_ENV_VAR";
+    "UNRESOLVED_ENV_VAR";
+}
 "##]],
     );
 }
@@ -126,13 +160,21 @@ fn test_option_env_expand() {
 #[rustc_builtin_macro]
 macro_rules! option_env {() => {}}
 
-fn main() { option_env!("TEST_ENV_VAR"); }
+fn main() {
+    option_env!("TEST_ENV_VAR");
+    option_env!("TEST_ENV_VAR",);
+    option_env!("TEST_ENV_VAR", "invalid");
+}
 "#,
         expect![[r#"
 #[rustc_builtin_macro]
 macro_rules! option_env {() => {}}
 
-fn main() { $crate::option::Option::None:: < &str>; }
+fn main() {
+    $crate::option::Option::None:: < &str>;
+    $crate::option::Option::None:: < &str>;
+    /* error: unexpected input */;
+}
 "#]],
     );
 }
@@ -524,5 +566,65 @@ macro_rules! stringify {}
 
 fn main() { "\"hello\""; }
 "##]],
+    );
+}
+
+#[test]
+fn cfg_select() {
+    check(
+        r#"
+#[rustc_builtin_macro]
+pub macro cfg_select($($tt:tt)*) {}
+
+cfg_select! {
+    false => { fn false_1() {} }
+    any(false, true) => { fn true_1() {} }
+}
+
+cfg_select! {
+    false => { fn false_2() {} }
+    _ => { fn true_2() {} }
+}
+
+const _: ((),) = cfg_select! { _ => ((), ) };
+const _: i32 = cfg_select! { true => 2 + 3, _ => 3 + 4 };
+const _: i32 = cfg_select! { false => 2 + 3, _ => 3 + 4 };
+const _: bool = cfg_select! { _ => 2 < 3 };
+const _: bool = cfg_select! { true => foo::<(), fn() -> Foo<i32, i64>>(1,), _ => false };
+
+cfg_select! {
+    false => { fn false_3() {} }
+}
+
+cfg_select! {
+    false
+}
+
+cfg_select! {
+    false =>
+}
+
+    "#,
+        expect![[r#"
+#[rustc_builtin_macro]
+pub macro cfg_select($($tt:tt)*) {}
+
+fn true_1() {}
+
+fn true_2() {}
+
+const _: ((),) = ((), );
+const _: i32 = 2+3;
+const _: i32 = 3+4;
+const _: bool = 2<3;
+const _: bool = foo::<(), fn() -> Foo<i32, i64>>(1, );
+
+/* error: none of the predicates in this `cfg_select` evaluated to true */
+
+/* error: expected `=>` after cfg expression */
+
+/* error: expected a token tree after `=>` */
+
+    "#]],
     );
 }

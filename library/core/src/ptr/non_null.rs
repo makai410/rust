@@ -1,9 +1,9 @@
+use crate::clone::TrivialClone;
 use crate::cmp::Ordering;
-use crate::marker::{PointeeSized, Unsize};
-use crate::mem::{MaybeUninit, SizedTypeProperties};
+use crate::marker::{Destruct, PointeeSized, Unsize};
+use crate::mem::{MaybeUninit, SizedTypeProperties, transmute};
 use crate::num::NonZero;
 use crate::ops::{CoerceUnsized, DispatchFromDyn};
-use crate::pin::PinCoerceUnsized;
 use crate::ptr::Unique;
 use crate::slice::{self, SliceIndex};
 use crate::ub_checks::assert_unsafe_precondition;
@@ -47,7 +47,12 @@ use crate::{fmt, hash, intrinsics, mem, ptr};
 /// it is your responsibility to ensure that `as_mut` is never called, and `as_ptr`
 /// is never used for mutation.
 ///
-/// # Representation
+/// # Layout
+///
+/// `NonNull<T>` is guaranteed to have the same layout and bit validity as `*mut T`
+/// with the exception that a null pointer is invalid.
+/// `Option<NonNull<T>>` is guaranteed to be ABI-compatible with `*mut T`, including in
+/// FFI.
 ///
 /// Thanks to the [null pointer optimization],
 /// `NonNull<T>` and `Option<NonNull<T>>`
@@ -69,13 +74,10 @@ use crate::{fmt, hash, intrinsics, mem, ptr};
 /// [null pointer optimization]: crate::option#representation
 #[stable(feature = "nonnull", since = "1.25.0")]
 #[repr(transparent)]
-#[rustc_layout_scalar_valid_range_start(1)]
 #[rustc_nonnull_optimization_guaranteed]
-#[rustc_diagnostic_item = "NonNull"]
+#[lang = "non_null"]
 pub struct NonNull<T: PointeeSized> {
-    // Remember to use `.as_ptr()` instead of `.pointer`, as field projecting to
-    // this is banned by <https://github.com/rust-lang/compiler-team/issues/807>.
-    pointer: *const T,
+    pointer: crate::pattern_type!(*const T is !null),
 }
 
 /// `NonNull` pointers are not `Send` because the data they reference may be aliased.
@@ -99,9 +101,8 @@ impl<T: Sized> NonNull<T> {
     #[must_use]
     #[inline]
     pub const fn without_provenance(addr: NonZero<usize>) -> Self {
-        let pointer = crate::ptr::without_provenance(addr.get());
-        // SAFETY: we know `addr` is non-zero.
-        unsafe { NonNull { pointer } }
+        // SAFETY: we know `addr` is non-zero and all nonzero integers are valid raw pointers.
+        unsafe { transmute(addr) }
     }
 
     /// Creates a new `NonNull` that is dangling, but well-aligned.
@@ -109,10 +110,10 @@ impl<T: Sized> NonNull<T> {
     /// This is useful for initializing types which lazily allocate, like
     /// `Vec::new` does.
     ///
-    /// Note that the pointer value may potentially represent a valid pointer to
-    /// a `T`, which means this must not be used as a "not yet initialized"
-    /// sentinel value. Types that lazily allocate must track initialization by
-    /// some other means.
+    /// Note that the address of the returned pointer may potentially
+    /// be that of a valid pointer, which means this must not be used
+    /// as a "not yet initialized" sentinel value.
+    /// Types that lazily allocate must track initialization by some other means.
     ///
     /// # Examples
     ///
@@ -128,8 +129,8 @@ impl<T: Sized> NonNull<T> {
     #[must_use]
     #[inline]
     pub const fn dangling() -> Self {
-        let align = crate::ptr::Alignment::of::<T>();
-        NonNull::without_provenance(align.as_nonzero())
+        let align = crate::mem::Alignment::of::<T>();
+        NonNull::without_provenance(align.as_nonzero_usize())
     }
 
     /// Converts an address back to a mutable pointer, picking up some previously 'exposed'
@@ -139,8 +140,9 @@ impl<T: Sized> NonNull<T> {
     ///
     /// This is an [Exposed Provenance][crate::ptr#exposed-provenance] API.
     #[stable(feature = "nonnull_provenance", since = "1.89.0")]
+    #[rustc_const_unstable(feature = "const_nonnull_with_exposed_provenance", issue = "154215")]
     #[inline]
-    pub fn with_exposed_provenance(addr: NonZero<usize>) -> Self {
+    pub const fn with_exposed_provenance(addr: NonZero<usize>) -> Self {
         // SAFETY: we know `addr` is non-zero.
         unsafe {
             let ptr = crate::ptr::with_exposed_provenance_mut(addr.get());
@@ -193,10 +195,21 @@ impl<T: Sized> NonNull<T> {
         // requirements for a reference.
         unsafe { &mut *self.cast().as_ptr() }
     }
+
+    /// Casts from a pointer-to-`T` to a pointer-to-`[T; N]`.
+    #[inline]
+    #[unstable(feature = "ptr_cast_array", issue = "144514")]
+    pub const fn cast_array<const N: usize>(self) -> NonNull<[T; N]> {
+        self.cast()
+    }
 }
 
 impl<T: PointeeSized> NonNull<T> {
     /// Creates a new `NonNull`.
+    ///
+    /// Note that if you have an `&mut`, you can use the safe [`from_mut`] instead.
+    ///
+    /// [`from_mut`]: NonNull::from_mut
     ///
     /// # Safety
     ///
@@ -231,11 +244,15 @@ impl<T: PointeeSized> NonNull<T> {
                 "NonNull::new_unchecked requires that the pointer is non-null",
                 (ptr: *mut () = ptr as *mut ()) => !ptr.is_null()
             );
-            NonNull { pointer: ptr as _ }
+            transmute(ptr)
         }
     }
 
     /// Creates a new `NonNull` if `ptr` is non-null.
+    ///
+    /// Note that if you have an `&mut`, you can use [`from_mut`] instead to avoid the `Option`.
+    ///
+    /// [`from_mut`]: NonNull::from_mut
     ///
     /// # Panics during const evaluation
     ///
@@ -250,7 +267,7 @@ impl<T: PointeeSized> NonNull<T> {
     /// use std::ptr::NonNull;
     ///
     /// let mut x = 0u32;
-    /// let ptr = NonNull::<u32>::new(&mut x as *mut _).expect("ptr is null!");
+    /// let ptr = NonNull::<u32>::new(&mut x as *mut _).expect("pointer should not be null");
     ///
     /// if let Some(ptr) = NonNull::<u32>::new(std::ptr::null_mut()) {
     ///     unreachable!();
@@ -274,7 +291,7 @@ impl<T: PointeeSized> NonNull<T> {
     #[inline]
     pub const fn from_ref(r: &T) -> Self {
         // SAFETY: A reference cannot be null.
-        unsafe { NonNull { pointer: r as *const T } }
+        unsafe { transmute(r as *const T) }
     }
 
     /// Converts a mutable reference to a `NonNull` pointer.
@@ -283,7 +300,7 @@ impl<T: PointeeSized> NonNull<T> {
     #[inline]
     pub const fn from_mut(r: &mut T) -> Self {
         // SAFETY: A mutable reference cannot be null.
-        unsafe { NonNull { pointer: r as *mut T } }
+        unsafe { transmute(r as *mut T) }
     }
 
     /// Performs the same functionality as [`std::ptr::from_raw_parts`], except that a
@@ -377,7 +394,7 @@ impl<T: PointeeSized> NonNull<T> {
     /// use std::ptr::NonNull;
     ///
     /// let mut x = 0u32;
-    /// let ptr = NonNull::new(&mut x).expect("ptr is null!");
+    /// let ptr = NonNull::new(&mut x).expect("pointer should not be null");
     ///
     /// let x_value = unsafe { *ptr.as_ptr() };
     /// assert_eq!(x_value, 0);
@@ -419,7 +436,7 @@ impl<T: PointeeSized> NonNull<T> {
     /// use std::ptr::NonNull;
     ///
     /// let mut x = 0u32;
-    /// let ptr = NonNull::new(&mut x as *mut _).expect("ptr is null!");
+    /// let ptr = NonNull::new(&mut x as *mut _).expect("pointer should not be null");
     ///
     /// let ref_x = unsafe { ptr.as_ref() };
     /// println!("{ref_x}");
@@ -455,7 +472,7 @@ impl<T: PointeeSized> NonNull<T> {
     /// use std::ptr::NonNull;
     ///
     /// let mut x = 0u32;
-    /// let mut ptr = NonNull::new(&mut x).expect("null pointer");
+    /// let mut ptr = NonNull::new(&mut x).expect("pointer should not be null");
     ///
     /// let x_ref = unsafe { ptr.as_mut() };
     /// assert_eq!(*x_ref, 0);
@@ -482,7 +499,7 @@ impl<T: PointeeSized> NonNull<T> {
     /// use std::ptr::NonNull;
     ///
     /// let mut x = 0u32;
-    /// let ptr = NonNull::new(&mut x as *mut _).expect("null pointer");
+    /// let ptr = NonNull::new(&mut x as *mut _).expect("pointer should not be null");
     ///
     /// let casted_ptr = ptr.cast::<i8>();
     /// let raw_ptr: *mut i8 = casted_ptr.as_ptr();
@@ -494,7 +511,7 @@ impl<T: PointeeSized> NonNull<T> {
     #[inline]
     pub const fn cast<U>(self) -> NonNull<U> {
         // SAFETY: `self` is a `NonNull` pointer which is necessarily non-null
-        unsafe { NonNull { pointer: self.as_ptr() as *mut U } }
+        unsafe { transmute(self.as_ptr() as *mut U) }
     }
 
     /// Try to cast to a pointer of another type by checking alignment.
@@ -524,28 +541,7 @@ impl<T: PointeeSized> NonNull<T> {
         if self.is_aligned_to(align_of::<U>()) { Some(self.cast()) } else { None }
     }
 
-    /// Adds an offset to a pointer.
-    ///
-    /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
-    /// offset of `3 * size_of::<T>()` bytes.
-    ///
-    /// # Safety
-    ///
-    /// If any of the following conditions are violated, the result is Undefined Behavior:
-    ///
-    /// * The computed offset, `count * size_of::<T>()` bytes, must not overflow `isize`.
-    ///
-    /// * If the computed offset is non-zero, then `self` must be derived from a pointer to some
-    ///   [allocation], and the entire memory range between `self` and the result must be in
-    ///   bounds of that allocation. In particular, this range must not "wrap around" the edge
-    ///   of the address space.
-    ///
-    /// Allocations can never be larger than `isize::MAX` bytes, so if the computed offset
-    /// stays in bounds of the allocation, it is guaranteed to satisfy the first requirement.
-    /// This implies, for instance, that `vec.as_ptr().add(vec.len())` (for `vec: Vec<T>`) is always
-    /// safe.
-    ///
-    /// [allocation]: crate::ptr#allocation
+    #[doc = include_str!("./docs/offset.md")]
     ///
     /// # Examples
     ///
@@ -573,7 +569,7 @@ impl<T: PointeeSized> NonNull<T> {
         // Additionally safety contract of `offset` guarantees that the resulting pointer is
         // pointing to an allocation, there can't be an allocation at null, thus it's safe to
         // construct `NonNull`.
-        unsafe { NonNull { pointer: intrinsics::offset(self.as_ptr(), count) } }
+        unsafe { transmute(intrinsics::offset(self.as_ptr(), count)) }
     }
 
     /// Calculates the offset from a pointer in bytes.
@@ -597,31 +593,10 @@ impl<T: PointeeSized> NonNull<T> {
         // Additionally safety contract of `offset` guarantees that the resulting pointer is
         // pointing to an allocation, there can't be an allocation at null, thus it's safe to
         // construct `NonNull`.
-        unsafe { NonNull { pointer: self.as_ptr().byte_offset(count) } }
+        unsafe { transmute(self.as_ptr().byte_offset(count)) }
     }
 
-    /// Adds an offset to a pointer (convenience for `.offset(count as isize)`).
-    ///
-    /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
-    /// offset of `3 * size_of::<T>()` bytes.
-    ///
-    /// # Safety
-    ///
-    /// If any of the following conditions are violated, the result is Undefined Behavior:
-    ///
-    /// * The computed offset, `count * size_of::<T>()` bytes, must not overflow `isize`.
-    ///
-    /// * If the computed offset is non-zero, then `self` must be derived from a pointer to some
-    ///   [allocation], and the entire memory range between `self` and the result must be in
-    ///   bounds of that allocation. In particular, this range must not "wrap around" the edge
-    ///   of the address space.
-    ///
-    /// Allocations can never be larger than `isize::MAX` bytes, so if the computed offset
-    /// stays in bounds of the allocation, it is guaranteed to satisfy the first requirement.
-    /// This implies, for instance, that `vec.as_ptr().add(vec.len())` (for `vec: Vec<T>`) is always
-    /// safe.
-    ///
-    /// [allocation]: crate::ptr#allocation
+    #[doc = include_str!("./docs/add.md")]
     ///
     /// # Examples
     ///
@@ -649,7 +624,7 @@ impl<T: PointeeSized> NonNull<T> {
         // Additionally safety contract of `offset` guarantees that the resulting pointer is
         // pointing to an allocation, there can't be an allocation at null, thus it's safe to
         // construct `NonNull`.
-        unsafe { NonNull { pointer: intrinsics::offset(self.as_ptr(), count) } }
+        unsafe { transmute(intrinsics::offset(self.as_ptr(), count)) }
     }
 
     /// Calculates the offset from a pointer in bytes (convenience for `.byte_offset(count as isize)`).
@@ -673,32 +648,10 @@ impl<T: PointeeSized> NonNull<T> {
         // Additionally safety contract of `add` guarantees that the resulting pointer is pointing
         // to an allocation, there can't be an allocation at null, thus it's safe to construct
         // `NonNull`.
-        unsafe { NonNull { pointer: self.as_ptr().byte_add(count) } }
+        unsafe { transmute(self.as_ptr().byte_add(count)) }
     }
 
-    /// Subtracts an offset from a pointer (convenience for
-    /// `.offset((count as isize).wrapping_neg())`).
-    ///
-    /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
-    /// offset of `3 * size_of::<T>()` bytes.
-    ///
-    /// # Safety
-    ///
-    /// If any of the following conditions are violated, the result is Undefined Behavior:
-    ///
-    /// * The computed offset, `count * size_of::<T>()` bytes, must not overflow `isize`.
-    ///
-    /// * If the computed offset is non-zero, then `self` must be derived from a pointer to some
-    ///   [allocation], and the entire memory range between `self` and the result must be in
-    ///   bounds of that allocation. In particular, this range must not "wrap around" the edge
-    ///   of the address space.
-    ///
-    /// Allocations can never be larger than `isize::MAX` bytes, so if the computed offset
-    /// stays in bounds of the allocation, it is guaranteed to satisfy the first requirement.
-    /// This implies, for instance, that `vec.as_ptr().add(vec.len())` (for `vec: Vec<T>`) is always
-    /// safe.
-    ///
-    /// [allocation]: crate::ptr#allocation
+    #[doc = include_str!("./docs/sub.md")]
     ///
     /// # Examples
     ///
@@ -755,7 +708,7 @@ impl<T: PointeeSized> NonNull<T> {
         // Additionally safety contract of `sub` guarantees that the resulting pointer is pointing
         // to an allocation, there can't be an allocation at null, thus it's safe to construct
         // `NonNull`.
-        unsafe { NonNull { pointer: self.as_ptr().byte_sub(count) } }
+        unsafe { transmute(self.as_ptr().byte_sub(count)) }
     }
 
     /// Calculates the distance between two pointers within the same allocation. The returned value is in
@@ -796,9 +749,8 @@ impl<T: PointeeSized> NonNull<T> {
     /// needed for `const`-compatibility: the distance between pointers into *different* allocated
     /// objects is not known at compile-time. However, the requirement also exists at
     /// runtime and may be exploited by optimizations. If you wish to compute the difference between
-    /// pointers that are not guaranteed to be from the same allocation, use `(self as isize -
-    /// origin as isize) / size_of::<T>()`.
-    // FIXME: recommend `addr()` instead of `as usize` once that is stable.
+    /// pointers that are not guaranteed to be from the same allocation, use
+    /// `(self.addr() as isize - origin.addr() as isize) / size_of::<T>()`.
     ///
     /// [`add`]: #method.add
     /// [allocation]: crate::ptr#allocation
@@ -1111,9 +1063,13 @@ impl<T: PointeeSized> NonNull<T> {
     /// [`ptr::drop_in_place`]: crate::ptr::drop_in_place()
     #[inline(always)]
     #[stable(feature = "non_null_convenience", since = "1.80.0")]
-    pub unsafe fn drop_in_place(self) {
+    #[rustc_const_unstable(feature = "const_drop_in_place", issue = "109342")]
+    pub const unsafe fn drop_in_place(mut self)
+    where
+        T: [const] Destruct,
+    {
         // SAFETY: the caller must uphold the safety contract for `drop_in_place`.
-        unsafe { ptr::drop_in_place(self.as_ptr()) }
+        unsafe { ptr::drop_glue(self.as_mut()) }
     }
 
     /// Overwrites a memory location with the given value without reading or
@@ -1357,6 +1313,57 @@ impl<T: PointeeSized> NonNull<T> {
     }
 }
 
+impl<T> NonNull<T> {
+    /// Casts from a type to its maybe-uninitialized version.
+    #[must_use]
+    #[inline(always)]
+    #[unstable(feature = "cast_maybe_uninit", issue = "145036")]
+    pub const fn cast_uninit(self) -> NonNull<MaybeUninit<T>> {
+        self.cast()
+    }
+
+    /// Creates a non-null raw slice from a thin pointer and a length.
+    ///
+    /// The `len` argument is the number of **elements**, not the number of bytes.
+    ///
+    /// This function is safe, but dereferencing the return value is unsafe.
+    /// See the documentation of [`slice::from_raw_parts`] for slice safety requirements.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(ptr_cast_slice)]
+    /// use std::ptr::NonNull;
+    ///
+    /// // create a slice pointer when starting out with a pointer to the first element
+    /// let mut x = [5, 6, 7];
+    /// let nonnull_pointer = NonNull::new(x.as_mut_ptr()).unwrap();
+    /// let slice = nonnull_pointer.cast_slice(3);
+    /// assert_eq!(unsafe { slice.as_ref()[2] }, 7);
+    /// ```
+    ///
+    /// (Note that this example artificially demonstrates a use of this method,
+    /// but `let slice = NonNull::from(&x[..]);` would be a better way to write code like this.)
+    #[inline]
+    #[must_use]
+    #[unstable(feature = "ptr_cast_slice", issue = "149103")]
+    pub const fn cast_slice(self, len: usize) -> NonNull<[T]> {
+        NonNull::slice_from_raw_parts(self, len)
+    }
+}
+impl<T> NonNull<MaybeUninit<T>> {
+    /// Casts from a maybe-uninitialized type to its initialized version.
+    ///
+    /// This is always safe, since UB can only occur if the pointer is read
+    /// before being initialized.
+    #[must_use]
+    #[inline(always)]
+    #[unstable(feature = "cast_maybe_uninit", issue = "145036")]
+    pub const fn cast_init(self) -> NonNull<T> {
+        self.cast()
+    }
+}
+
 impl<T> NonNull<[T]> {
     /// Creates a non-null raw slice from a thin pointer and a length.
     ///
@@ -1385,7 +1392,7 @@ impl<T> NonNull<[T]> {
     #[inline]
     pub const fn slice_from_raw_parts(data: NonNull<T>, len: usize) -> Self {
         // SAFETY: `data` is a `NonNull` pointer which is necessarily non-null
-        unsafe { Self::new_unchecked(super::slice_from_raw_parts_mut(data.as_ptr(), len)) }
+        unsafe { Self::new_unchecked(data.as_ptr().cast_slice(len)) }
     }
 
     /// Returns the length of a non-null raw slice.
@@ -1578,9 +1585,10 @@ impl<T> NonNull<[T]> {
     /// Returns a raw pointer to an element or subslice, without doing bounds
     /// checking.
     ///
-    /// Calling this method with an out-of-bounds index or when `self` is not dereferenceable
+    /// Calling this method with an [out-of-bounds index] or when `self` is not dereferenceable
     /// is *[undefined behavior]* even if the resulting pointer is not used.
     ///
+    /// [out-of-bounds index]: #method.add
     /// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
     ///
     /// # Examples
@@ -1601,7 +1609,7 @@ impl<T> NonNull<[T]> {
     #[inline]
     pub const unsafe fn get_unchecked_mut<I>(self, index: I) -> NonNull<I::Output>
     where
-        I: ~const SliceIndex<[T]>,
+        I: [const] SliceIndex<[T]>,
     {
         // SAFETY: the caller ensures that `self` is dereferenceable and `index` in-bounds.
         // As a consequence, the resulting pointer cannot be null.
@@ -1620,14 +1628,15 @@ impl<T: PointeeSized> Clone for NonNull<T> {
 #[stable(feature = "nonnull", since = "1.25.0")]
 impl<T: PointeeSized> Copy for NonNull<T> {}
 
+#[doc(hidden)]
+#[unstable(feature = "trivial_clone", issue = "none")]
+unsafe impl<T: PointeeSized> TrivialClone for NonNull<T> {}
+
 #[unstable(feature = "coerce_unsized", issue = "18598")]
 impl<T: PointeeSized, U: PointeeSized> CoerceUnsized<NonNull<U>> for NonNull<T> where T: Unsize<U> {}
 
 #[unstable(feature = "dispatch_from_dyn", issue = "none")]
 impl<T: PointeeSized, U: PointeeSized> DispatchFromDyn<NonNull<U>> for NonNull<T> where T: Unsize<U> {}
-
-#[stable(feature = "pin", since = "1.33.0")]
-unsafe impl<T: PointeeSized> PinCoerceUnsized for NonNull<T> {}
 
 #[stable(feature = "nonnull", since = "1.25.0")]
 impl<T: PointeeSized> fmt::Debug for NonNull<T> {
@@ -1682,7 +1691,8 @@ impl<T: PointeeSized> hash::Hash for NonNull<T> {
 }
 
 #[unstable(feature = "ptr_internals", issue = "none")]
-impl<T: PointeeSized> From<Unique<T>> for NonNull<T> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<T: PointeeSized> From<Unique<T>> for NonNull<T> {
     #[inline]
     fn from(unique: Unique<T>) -> Self {
         unique.as_non_null_ptr()
@@ -1690,7 +1700,8 @@ impl<T: PointeeSized> From<Unique<T>> for NonNull<T> {
 }
 
 #[stable(feature = "nonnull", since = "1.25.0")]
-impl<T: PointeeSized> From<&mut T> for NonNull<T> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<T: PointeeSized> From<&mut T> for NonNull<T> {
     /// Converts a `&mut T` to a `NonNull<T>`.
     ///
     /// This conversion is safe and infallible since references cannot be null.
@@ -1701,7 +1712,8 @@ impl<T: PointeeSized> From<&mut T> for NonNull<T> {
 }
 
 #[stable(feature = "nonnull", since = "1.25.0")]
-impl<T: PointeeSized> From<&T> for NonNull<T> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<T: PointeeSized> From<&T> for NonNull<T> {
     /// Converts a `&T` to a `NonNull<T>`.
     ///
     /// This conversion is safe and infallible since references cannot be null.

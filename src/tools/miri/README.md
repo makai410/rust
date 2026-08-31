@@ -1,5 +1,9 @@
 # Miri
 
+<img src="miri-sticker.png" align="right" width="200px"
+ alt="Corro, the Unsafe Rusturchin, drinking from a juice bottle labeled 'Miri - 100% safe'"
+ title="Art by Paige Losare-Lusby, Creative Commons Attribute-ShareAlike">
+
 Miri is an [Undefined Behavior][reference-ub] detection tool for Rust. It can run binaries and test
 suites of cargo projects and detect unsafe code that fails to uphold its safety requirements. For
 instance:
@@ -32,12 +36,13 @@ Miri has already discovered many [real-world bugs](#bugs-found-by-miri). If you
 found a bug with Miri, we'd appreciate if you tell us and we'll add it to the
 list!
 
-By default, Miri ensures a fully deterministic execution and isolates the
+By default, Miri ensures a fully deterministic execution by isolating the
 program from the host system. Some APIs that would usually access the host, such
 as gathering entropy for random number generators, environment variables, and
 clocks, are replaced by deterministic "fake" implementations. Set
 `MIRIFLAGS="-Zmiri-disable-isolation"` to access the real system APIs instead.
-(In particular, the "fake" system RNG APIs make Miri **not suited for
+(Note that this isolation is *not* a proper sandbox, and gaps in the isolation are considered
+normal bugs, not security bugs. Also, the "fake" system RNG APIs make Miri **not suited for
 cryptographic use**! Do not generate keys using Miri.)
 
 All that said, be aware that Miri does **not catch every violation of the Rust specification** in
@@ -154,6 +159,50 @@ platform. For example `cargo miri test --target s390x-unknown-linux-gnu`
 will run your test suite on a big-endian target, which is useful for testing
 endian-sensitive code.
 
+### Controlling target features
+
+Controlling target features works similar to regular rustc invocations:
+`RUSTFLAGS="-Ctarget-feature=+avx512f" cargo miri test` runs the tests with AVX512 enabled. (Miri
+only supports very few AVX512 intrinsics at the moment.) `-Ctarget-cpu` also works. If target
+features are also relevant for doctests, you have to also set `RUSTDOCFLAGS`.
+
+Unlike regular rustc, this flag has *two* effects: it builds the code with that target feature
+available (which affects `cfg(target_feature)`), and it tells Miri to consider the "virtual CPU"
+that the interpreted program runs on as having the feature available (meaning the code is allowed to
+invoke the corresponding intrinsics).
+
+### Nextest integration
+
+Miri can be combined with [`cargo-nextest`](https://nexte.st):
+
+```
+cargo install --locked cargo-nextest
+cargo miri nextest run
+```
+
+Nextest spawns a separate instance of Miri for each test, which has several advantages:
+- Tests can run in parallel. Miri itself only uses a single thread per interpreter so this can
+  give a massive speedup (but see the caveat below).
+- Tests do not stop when a single problem is found. Miri aborts execution when it encounters
+  Undefined Behavior or an unsupported operation (there is often not really any way to continue),
+  so once a single test fails, the remaining tests cannot be executed. Nextest's process-per-test
+  model means that you end up with a full list of which tests worked in Miri and which tests had a
+  problem.
+
+However, there is also a big caveat: Miri will [re-compile the test crate every time it is
+invoked](https://github.com/rust-lang/miri/issues/5013), which means a crate with N tests will be
+compiled N+1 times. If the test crate takes a long time to build, this can outweigh the benefits of
+parallelization.
+
+For more information about nextest, see the [`cargo-nextest` Miri
+documentation](https://nexte.st/book/miri.html).
+
+Note: Nextest's one-test-per-process model means that `cargo miri test` is able to detect data
+races where two tests race on a shared resource, but `cargo miri nextest run` will not detect
+such races.
+
+Note: `cargo-nextest` [does not support doctests](https://github.com/nextest-rs/nextest/issues/16).
+
 ### Testing multiple different executions
 
 Certain parts of the execution are picked randomly by Miri, such as the exact base address
@@ -167,6 +216,7 @@ MIRIFLAGS="-Zmiri-many-seeds" cargo miri test # tries the seeds in 0..64
 MIRIFLAGS="-Zmiri-many-seeds=0..16" cargo miri test
 ```
 
+Miri will test the given range of seeds with parallel interpreter instances.
 The default of 64 different seeds can be quite slow, so you often want to specify a smaller range.
 
 ### Running Miri on CI
@@ -219,32 +269,27 @@ degree documented below):
 - We have unofficial support (not maintained by the Miri team itself) for some further operating systems.
   - `solaris` / `illumos`: maintained by @devnexen. Supports the entire test suite.
   - `freebsd`: maintained by @YohDeadfall and @LorrensP-2158466. Supports the entire test suite.
-  - `android`: **maintainer wanted**. Support very incomplete, but a basic "hello world" works.
-  - `wasi`: **maintainer wanted**. Support very incomplete, not even standard output works, but an empty `main` function works.
+  - `android`: **maintainer wanted**. Supports the entire test suite.
 - For targets on other operating systems, Miri might fail before even reaching the `main` function.
 
 However, even for targets that we do support, the degree of support for accessing platform APIs
 (such as the file system) differs between targets: generally, Linux targets have the best support,
 and macOS targets are usually on par. Windows is supported less well.
 
-### Running tests in parallel
+### Directly invoking the `miri` driver
 
-Though it implements Rust threading, Miri itself is a single-threaded interpreter.
-This means that when running `cargo miri test`, you will probably see a dramatic
-increase in the amount of time it takes to run your whole test suite due to the
-inherent interpreter slowdown and a loss of parallelism.
+The recommended way to invoke Miri is via `cargo miri`. Directly invoking the underlying `miri`
+driver is not supported, which is why that binary is not even installed into the PATH. However, if
+you need to run Miri on many small tests and want to invoke it directly like you would invoke
+`rustc`, that is still possible with a bit of extra effort:
 
-You can get your test suite's parallelism back by running `cargo miri nextest run -jN`
-(note that you will need [`cargo-nextest`](https://nexte.st) installed).
-This works because `cargo-nextest` collects a list of all tests then launches a
-separate `cargo miri run` for each test. For more information about nextest, see the
-[`cargo-nextest` Miri documentation](https://nexte.st/book/miri.html).
-
-Note: This one-test-per-process model means that `cargo miri test` is able to detect data
-races where two tests race on a shared resource, but `cargo miri nextest run` will not detect
-such races.
-
-Note: `cargo-nextest` does not support doctests, see https://github.com/nextest-rs/nextest/issues/16
+```sh
+# one-time setup
+cargo +nightly miri setup
+SYSROOT=$(cargo +nightly miri setup --print-sysroot)
+# per file
+~/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/miri --sysroot "$SYSROOT" file.rs
+```
 
 ### Common Problems
 
@@ -277,6 +322,9 @@ Try running `cargo miri clean`.
 Miri adds its own set of `-Z` flags, which are usually set via the `MIRIFLAGS`
 environment variable. We first document the most relevant and most commonly used flags:
 
+* `-Zmiri-backtrace=<0|1|full>` configures how Miri prints backtraces: `1` is the default,
+  where backtraces are printed in pruned form; `full` prints backtraces without pruning, and `0`
+  disables backtraces entirely.
 * `-Zmiri-deterministic-concurrency` makes Miri's concurrency-related behavior fully deterministic.
   Strictly speaking, Miri is always fully deterministic when isolation is enabled (the default
   mode), but this determinism is achieved by using an RNG with a fixed seed. Seemingly harmless
@@ -286,11 +334,6 @@ environment variable. We first document the most relevant and most commonly used
   specific circumstances, but Miri's behavior will also be more stable across versions and targets.
   This is equivalent to `-Zmiri-fixed-schedule -Zmiri-compare-exchange-weak-failure-rate=0.0
   -Zmiri-address-reuse-cross-thread-rate=0.0 -Zmiri-disable-weak-memory-emulation`.
-* `-Zmiri-deterministic-floats` makes Miri's floating-point behavior fully deterministic. This means
-  that operations will always return the preferred NaN, imprecise operations will not have any
-  random error applied to them, and `min`/`max` as "maybe fused" multiply-add all behave
-  deterministically. Note that Miri still uses host floats for some operations, so behavior can
-  still differ depending on the host target and setup.
 * `-Zmiri-disable-isolation` disables host isolation. As a consequence,
   the program has access to host resources such as environment variables, file
   systems, and randomness.
@@ -324,6 +367,14 @@ environment variable. We first document the most relevant and most commonly used
   Can be used without a value; in that case the range defaults to `0..64`.
 * `-Zmiri-many-seeds-keep-going` tells Miri to really try all the seeds in the given range, even if
   a failing seed has already been found. This is useful to determine which fraction of seeds fails.
+* `-Zmiri-max-extra-rounding-error` tells Miri to always apply the maximum error to float operations
+  that do not have a guaranteed precision. The sign of the error is still non-deterministic.
+* `-Zmiri-no-extra-rounding-error` stops Miri from adding extra rounding errors to float operations
+  that do not have a guaranteed precision.
+* `-Zmiri-no-short-fd-operations` stops Miri from artificially forcing `read`/`write` operations
+  to only process a part of their buffer. Note that whenever Miri uses host operations to
+  implement `read`/`write` (e.g. for file-backed file descriptors), the host system can still
+  introduce short reads/writes.
 * `-Zmiri-num-cpus` states the number of available CPUs to be reported by miri. By default, the
   number of available CPUs is `1`. Note that this flag does not affect how miri handles threads in
   any way.
@@ -355,6 +406,12 @@ environment variable. We first document the most relevant and most commonly used
   ensure alignment.  (The standard library `align_to` method works fine in both modes; under
   symbolic alignment it only fills the middle slice when the allocation guarantees sufficient
   alignment.)
+* `-Zmiri-user-relevant-crates=<crate>,<crate>,...` extends the list of crates that Miri considers
+  "user-relevant". This affects the rendering of backtraces (for user-relevant crates, Miri shows
+  not just the function name but the actual code) and it affects the spans collected for data races
+  and aliasing violations (where Miri will show the span of the topmost non-`#[track_caller]` frame
+  in a user-relevant crate). When using `cargo miri`, the crates in the local workspace are always
+  considered user-relevant.
 
 The remaining flags are for advanced use only, and more likely to change or be removed.
 Some of these are **unsound**, which means they can lead
@@ -376,6 +433,12 @@ to Miri failing to detect cases of undefined behavior in a program.
   will always fail and `0.0` means it will never fail. Note that setting it to
   `1.0` will likely cause hangs, since it means programs using
   `compare_exchange_weak` cannot make progress.
+* `-Zmiri-deterministic-floats` makes Miri's floating-point behavior fully deterministic. This means
+  that operations will always return the preferred NaN, imprecise operations will not have any
+  random error applied to them, and `min`/`max` and "maybe fused" multiply-add all behave
+  deterministically. Note that Miri still uses host floats for some operations, so behavior can
+  still differ depending on the host target and setup. See `-Zmiri-no-extra-rounding-error` for
+  a flag that specifically only disables the random error.
 * `-Zmiri-disable-alignment-check` disables checking pointer alignment, so you
   can focus on other failures, but it means Miri can miss bugs in your program.
   Using this flag is **unsound**.
@@ -387,20 +450,17 @@ to Miri failing to detect cases of undefined behavior in a program.
   be detected. Using this flag is **unsound** (but the affected soundness rules
   are experimental). Later flags take precedence: borrow tracking can be reactivated
   by `-Zmiri-tree-borrows`.
-* `-Zmiri-disable-validation` disables enforcing validity invariants, which are
-  enforced by default.  This is mostly useful to focus on other failures (such
-  as out-of-bounds accesses) first.  Setting this flag means Miri can miss bugs
-  in your program.  However, this can also help to make Miri run faster.  Using
+* `-Zmiri-disable-validation` disables enforcing validity invariants, which are enforced by default.
+  This only disables these checks for typed copies; using invalid values in any other operation will
+  still cause an error. This also disables the aliasing model (Stacked/Tree Borrows). This is mostly
+  useful to focus on other failures (such as out-of-bounds accesses) first. Setting this flag means
+  Miri can miss bugs in your program. However, this can also help to make Miri run faster. Using
   this flag is **unsound**.
-* `-Zmiri-disable-weak-memory-emulation` disables the emulation of some C++11 weak
-  memory effects.
+* `-Zmiri-disable-weak-memory-emulation` disables the emulation of some C++11 weak memory effects.
 * `-Zmiri-fixed-schedule` disables preemption (like `-Zmiri-preemption-rate=0.0`) and furthermore
   disables the randomization of the next thread to be picked, instead fixing a round-robin schedule.
   Note however that other aspects of Miri's concurrency behavior are still randomize; use
   `-Zmiri-deterministic-concurrency` to disable them all.
-* `-Zmiri-force-intrinsic-fallback` forces the use of the "fallback" body for all intrinsics that
-  have one. This is useful to test the fallback bodies, but should not be used otherwise. It is
-  **unsound** since the fallback body might not be checking for all UB.
 * `-Zmiri-native-lib=<path to a shared object file or folder>` is an experimental flag for providing
   support for calling native functions from inside the interpreter via FFI. The flag is supported
   only on Unix systems. Functions not provided by that file are still executed via the usual Miri
@@ -430,13 +490,9 @@ to Miri failing to detect cases of undefined behavior in a program.
   but reports to the program that it did actually write. This is useful when you
   are not interested in the actual program's output, but only want to see Miri's
   errors and warnings.
-* `-Zmiri-recursive-validation` is a *highly experimental* flag that makes validity checking
-  recurse below references.
-* `-Zmiri-retag-fields[=<all|none|scalar>]` controls when Stacked Borrows retagging recurses into
-  fields. `all` means it always recurses (the default, and equivalent to `-Zmiri-retag-fields`
-  without an explicit value), `none` means it never recurses, `scalar` means it only recurses for
-  types where we would also emit `noalias` annotations in the generated LLVM IR (types passed as
-  individual scalars or pairs of scalars). Setting this to `none` is **unsound**.
+* `-Zmiri-recursive-validation` is a *highly experimental* flag that makes validity checking recurse
+  *one level* below references. The in-memory value is treated as-if it was inside a
+  `MaybeDangling`, i.e., nested references do not even have to be dereferenceable.
 * `-Zmiri-preemption-rate` configures the probability that at the end of a basic block, the active
   thread will be preempted. The default is `0.01` (i.e., 1%). Setting this to `0` disables
   preemption. Note that even without preemption, the schedule is still non-deterministic:
@@ -450,7 +506,8 @@ to Miri failing to detect cases of undefined behavior in a program.
 * `-Zmiri-track-alloc-id=<id1>,<id2>,...` shows a backtrace when the given allocations are
   being allocated or freed.  This helps in debugging memory leaks and
   use after free bugs. Specifying this argument multiple times does not overwrite the previous
-  values, instead it appends its values to the list. Listing an id multiple times has no effect.
+  values, instead it appends its values to the list. Listing an ID multiple times has no effect.
+  You can also add IDs at runtime using `miri_track_alloc`.
 * `-Zmiri-track-pointer-tag=<tag1>,<tag2>,...` shows a backtrace when a given pointer tag
   is created and when (if ever) it is popped from a borrow stack (which is where the tag becomes invalid
   and any future use of it will error).  This helps you in finding out why UB is
@@ -468,8 +525,8 @@ to Miri failing to detect cases of undefined behavior in a program.
   of Rust will be stricter than Tree Borrows. In other words, if you use Tree Borrows,
   even if your code is accepted today, it might be declared UB in the future.
   This is much less likely with Stacked Borrows.
-  Using Tree Borrows currently implies `-Zmiri-strict-provenance` because integer-to-pointer
-  casts are not supported in this mode, but that may change in the future.
+* `-Zmiri-tree-borrows-implicit-writes` enables implicit writes for all `&mut` function arguments.
+  This makes Tree Borrows less permissive.
 * `-Zmiri-tree-borrows-no-precise-interior-mut` makes Tree Borrows
   track interior mutable data on the level of references instead of on the
   byte-level as is done by default.  Therefore, with this flag, Tree
@@ -478,17 +535,6 @@ to Miri failing to detect cases of undefined behavior in a program.
   `4` is default for most targets. This value should always be a power of 2 and nonzero.
 
 [function ABI]: https://doc.rust-lang.org/reference/items/functions.html#extern-function-qualifier
-
-Some native rustc `-Z` flags are also very relevant for Miri:
-
-* `-Zmir-opt-level` controls how many MIR optimizations are performed.  Miri
-  overrides the default to be `0`; be advised that using any higher level can
-  make Miri miss bugs in your program because they got optimized away.
-* `-Zalways-encode-mir` makes rustc dump MIR even for completely monomorphic
-  functions.  This is needed so that Miri can execute such functions, so Miri
-  sets this flag per default.
-* `-Zmir-emit-retag` controls whether `Retag` statements are emitted. Miri
-  enables this per default because it is needed for [Stacked Borrows] and [Tree Borrows].
 
 Moreover, Miri recognizes some environment variables:
 
@@ -597,6 +643,11 @@ Definite bugs found:
 * [A bug in the new `RwLock::downgrade` implementation](https://rust-lang.zulipchat.com/#narrow/channel/269128-miri/topic/Miri.20error.20library.20test) (caught by Miri before it landed in the Rust repo)
 * [Mockall reading uninitialized memory when mocking `std::io::Read::read`, even if all expectations are satisfied](https://github.com/asomers/mockall/issues/647) (caught by Miri running Tokio's test suite)
 * [`ReentrantLock` not correctly dealing with reuse of addresses for TLS storage of different threads](https://github.com/rust-lang/rust/pull/141248)
+* [Rare Deadlock in the thread (un)parking example code](https://github.com/rust-lang/rust/issues/145816)
+* [`winit` registering a global constructor with the wrong ABI on Windows](https://github.com/rust-windowing/winit/issues/4435)
+* [`VecDeque::splice` confusing physical and logical indices](https://github.com/rust-lang/rust/issues/151758)
+* [Data race in `oneshot` channel](https://github.com/faern/oneshot/issues/69)
+* [Memory leak in serde-yaml-bw](https://github.com/bourumir-wyngs/serde-yaml-bw/issues/197)
 
 Violations of [Stacked Borrows] found that are likely bugs (but Stacked Borrows is currently just an experiment):
 
@@ -623,6 +674,11 @@ Violations of [Stacked Borrows] found that are likely bugs (but Stacked Borrows 
 * [Stacked Borrows: An Aliasing Model for Rust](https://plv.mpi-sws.org/rustbelt/stacked-borrows/)
 * [Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3](https://www.amazon.science/publications/using-lightweight-formal-methods-to-validate-a-key-value-storage-node-in-amazon-s3)
 * [SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis](https://dl.acm.org/doi/10.1145/3453483.3454084)
+* [Crabtree: Rust API Test Synthesis Guided by Coverage and Type](https://dl.acm.org/doi/10.1145/3689733)
+* [Rustlantis: Randomized Differential Testing of the Rust Compiler](https://dl.acm.org/doi/10.1145/3689780)
+* [A Study of Undefined Behavior Across Foreign Function Boundaries in Rust Libraries](https://arxiv.org/abs/2404.11671)
+* [Tree Borrows](https://plf.inf.ethz.ch/research/pldi25-tree-borrows.html)
+* [Miri: Practical Undefined Behavior Detection for Rust](https://plf.inf.ethz.ch/research/popl26-miri.html) **(this paper describes Miri itself)**
 
 ## License
 

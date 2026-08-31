@@ -7,13 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::FileType;
 use crate::core::build_steps::dist::distdir;
 use crate::core::builder::{Builder, Kind};
 use crate::core::config::BUILDER_CONFIG_FILENAME;
+use crate::core::session::FileType;
+use crate::utils::channel;
 use crate::utils::exec::BootstrapCommand;
-use crate::utils::helpers::{move_file, t};
-use crate::utils::{channel, helpers};
+use crate::utils::helpers::{self, move_file, t};
 
 #[derive(Copy, Clone)]
 pub(crate) enum OverlayKind {
@@ -25,7 +25,11 @@ pub(crate) enum OverlayKind {
     Rustfmt,
     RustAnalyzer,
     RustcCodegenCranelift,
+    RustcCodegenGcc,
+    Gcc,
     LlvmBitcodeLinker,
+    Enzyme,
+    Offload,
 }
 
 impl OverlayKind {
@@ -34,6 +38,10 @@ impl OverlayKind {
             OverlayKind::Rust => &["COPYRIGHT", "LICENSE-APACHE", "LICENSE-MIT", "README.md"],
             OverlayKind::Llvm => {
                 &["src/llvm-project/llvm/LICENSE.TXT", "src/llvm-project/llvm/README.txt"]
+            }
+            OverlayKind::Enzyme => &["src/tools/enzyme/LICENSE", "src/tools/enzyme/Readme.md"],
+            OverlayKind::Offload => {
+                &["src/llvm-project/openmp/LICENSE.TXT", "src/llvm-project/offload/README.md"]
             }
             OverlayKind::Cargo => &[
                 "src/tools/cargo/README.md",
@@ -66,11 +74,24 @@ impl OverlayKind {
                 "compiler/rustc_codegen_cranelift/LICENSE-APACHE",
                 "compiler/rustc_codegen_cranelift/LICENSE-MIT",
             ],
+            OverlayKind::RustcCodegenGcc => &[
+                "compiler/rustc_codegen_gcc/Readme.md",
+                "compiler/rustc_codegen_gcc/LICENSE-APACHE",
+                "compiler/rustc_codegen_gcc/LICENSE-MIT",
+            ],
             OverlayKind::LlvmBitcodeLinker => &[
                 "COPYRIGHT",
                 "LICENSE-APACHE",
                 "LICENSE-MIT",
                 "src/tools/llvm-bitcode-linker/README.md",
+            ],
+            OverlayKind::Gcc => &[
+                "src/gcc/README",
+                "src/gcc/COPYING",
+                "src/gcc/COPYING.LIB",
+                "src/gcc/COPYING.RUNTIME",
+                "src/gcc/COPYING3",
+                "src/gcc/COPYING3.LIB",
             ],
         }
     }
@@ -93,7 +114,11 @@ impl OverlayKind {
                 .rust_analyzer_info
                 .version(builder, &builder.release_num("rust-analyzer/crates/rust-analyzer")),
             OverlayKind::RustcCodegenCranelift => builder.rust_version(),
+            OverlayKind::RustcCodegenGcc => builder.rust_version(),
             OverlayKind::LlvmBitcodeLinker => builder.rust_version(),
+            OverlayKind::Gcc => builder.rust_version(),
+            OverlayKind::Enzyme => builder.rust_version(),
+            OverlayKind::Offload => builder.rust_version(),
         }
     }
 }
@@ -356,7 +381,7 @@ impl<'a> Tarball<'a> {
 
         // For `x install` tarball files aren't needed, so we can speed up the process by not producing them.
         let compression_profile = if self.builder.kind == Kind::Install {
-            self.builder.verbose(|| {
+            self.builder.do_if_verbose(|| {
                 println!("Forcing dist.compression-profile = 'no-op' for `x install`.")
             });
             // "no-op" indicates that the rust-installer won't produce compressed tarball sources.

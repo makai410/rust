@@ -59,6 +59,8 @@
 //! <https://rust-analyzer.github.io/blog/2020/09/28/how-to-make-a-light-bulb.html>
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+// It's useful to refer to code that is private in doc comments.
+#![allow(rustdoc::private_intra_doc_links)]
 
 mod assist_config;
 mod assist_context;
@@ -67,8 +69,8 @@ mod tests;
 pub mod utils;
 
 use hir::Semantics;
-use ide_db::{EditionedFileId, RootDatabase};
-use syntax::{Edition, TextRange};
+use ide_db::RootDatabase;
+use syntax::TextRange;
 
 pub(crate) use crate::assist_context::{AssistContext, Assists};
 
@@ -88,9 +90,7 @@ pub fn assists(
     range: ide_db::FileRange,
 ) -> Vec<Assist> {
     let sema = Semantics::new(db);
-    let file_id = sema
-        .attach_first_edition(range.file_id)
-        .unwrap_or_else(|| EditionedFileId::new(db, range.file_id, Edition::CURRENT));
+    let file_id = sema.attach_first_edition(range.file_id);
     let ctx = AssistContext::new(sema, config, hir::FileRange { file_id, range: range.range });
     let mut acc = Assists::new(&ctx, resolve);
     handlers::all().iter().for_each(|handler| {
@@ -102,9 +102,10 @@ pub fn assists(
 mod handlers {
     use crate::{AssistContext, Assists};
 
-    pub(crate) type Handler = fn(&mut Assists, &AssistContext<'_>) -> Option<()>;
+    pub(crate) type Handler = fn(&mut Assists, &AssistContext<'_, '_>) -> Option<()>;
 
     mod add_braces;
+    mod add_explicit_dot_deref;
     mod add_explicit_enum_discriminant;
     mod add_explicit_type;
     mod add_label_to_loop;
@@ -119,6 +120,7 @@ mod handlers {
     mod change_visibility;
     mod convert_bool_then;
     mod convert_bool_to_enum;
+    mod convert_char_literal;
     mod convert_closure_to_fn;
     mod convert_comment_block;
     mod convert_comment_from_or_to_doc;
@@ -131,6 +133,7 @@ mod handlers {
     mod convert_match_to_let_else;
     mod convert_named_struct_to_tuple_struct;
     mod convert_nested_function_to_closure;
+    mod convert_range_for_to_while;
     mod convert_to_guarded_return;
     mod convert_tuple_return_type_to_struct;
     mod convert_tuple_struct_to_named_struct;
@@ -153,6 +156,7 @@ mod handlers {
     mod flip_comma;
     mod flip_or_pattern;
     mod flip_trait_bound;
+    mod generate_blanket_trait_impl;
     mod generate_constant;
     mod generate_default_from_enum_variant;
     mod generate_default_from_new;
@@ -172,6 +176,7 @@ mod handlers {
     mod generate_is_empty_from_len;
     mod generate_mut_trait_impl;
     mod generate_new;
+    mod generate_single_field_struct_from;
     mod generate_trait_from_impl;
     mod inline_call;
     mod inline_const_as_literal;
@@ -199,6 +204,7 @@ mod handlers {
     mod qualify_path;
     mod raw_string;
     mod remove_dbg;
+    mod remove_else_branches;
     mod remove_mut;
     mod remove_parentheses;
     mod remove_underscore;
@@ -226,7 +232,7 @@ mod handlers {
     mod unmerge_match_arm;
     mod unnecessary_async;
     mod unqualify_method_call;
-    mod unwrap_block;
+    mod unwrap_branch;
     mod unwrap_return_type;
     mod unwrap_tuple;
     mod unwrap_type_to_generic_arg;
@@ -237,12 +243,12 @@ mod handlers {
         &[
             // These are alphabetic for the foolish consistency
             add_braces::add_braces,
+            add_explicit_dot_deref::add_explicit_method_call_deref,
             add_explicit_enum_discriminant::add_explicit_enum_discriminant,
             add_explicit_type::add_explicit_type,
             add_label_to_loop::add_label_to_loop,
             add_lifetime_to_type::add_lifetime_to_type,
             add_missing_match_arms::add_missing_match_arms,
-            add_return_type::add_return_type,
             add_turbo_fish::add_turbo_fish,
             apply_demorgan::apply_demorgan_iterator,
             apply_demorgan::apply_demorgan,
@@ -252,6 +258,7 @@ mod handlers {
             convert_bool_then::convert_bool_then_to_if,
             convert_bool_then::convert_if_to_bool_then,
             convert_bool_to_enum::convert_bool_to_enum,
+            convert_char_literal::convert_char_literal,
             convert_closure_to_fn::convert_closure_to_fn,
             convert_comment_block::convert_comment_block,
             convert_comment_from_or_to_doc::convert_comment_from_or_to_doc,
@@ -265,6 +272,7 @@ mod handlers {
             convert_match_to_let_else::convert_match_to_let_else,
             convert_named_struct_to_tuple_struct::convert_named_struct_to_tuple_struct,
             convert_nested_function_to_closure::convert_nested_function_to_closure,
+            convert_range_for_to_while::convert_range_for_to_while,
             convert_to_guarded_return::convert_to_guarded_return,
             convert_tuple_return_type_to_struct::convert_tuple_return_type_to_struct,
             convert_tuple_struct_to_named_struct::convert_tuple_struct_to_named_struct,
@@ -282,6 +290,7 @@ mod handlers {
             extract_type_alias::extract_type_alias,
             fix_visibility::fix_visibility,
             flip_binexpr::flip_binexpr,
+            flip_binexpr::flip_range_expr,
             flip_comma::flip_comma,
             flip_or_pattern::flip_or_pattern,
             flip_trait_bound::flip_trait_bound,
@@ -301,10 +310,13 @@ mod handlers {
             generate_function::generate_function,
             generate_impl::generate_impl,
             generate_impl::generate_trait_impl,
+            generate_impl::generate_impl_trait,
             generate_is_empty_from_len::generate_is_empty_from_len,
             generate_mut_trait_impl::generate_mut_trait_impl,
             generate_new::generate_new,
             generate_trait_from_impl::generate_trait_from_impl,
+            generate_single_field_struct_from::generate_single_field_struct_from,
+            generate_blanket_trait_impl::generate_blanket_trait_impl,
             inline_call::inline_call,
             inline_call::inline_into_callers,
             inline_const_as_literal::inline_const_as_literal,
@@ -337,6 +349,7 @@ mod handlers {
             raw_string::remove_hash,
             remove_dbg::remove_dbg,
             remove_mut::remove_mut,
+            remove_else_branches::remove_else_branches,
             remove_parentheses::remove_parentheses,
             remove_underscore::remove_underscore,
             remove_unused_imports::remove_unused_imports,
@@ -345,6 +358,7 @@ mod handlers {
             reorder_impl_items::reorder_impl_items,
             replace_arith_op::replace_arith_with_checked,
             replace_arith_op::replace_arith_with_saturating,
+            replace_arith_op::replace_arith_with_strict,
             replace_arith_op::replace_arith_with_wrapping,
             replace_derive_with_manual_impl::replace_derive_with_manual_impl,
             replace_if_let_with_match::replace_if_let_with_match,
@@ -367,7 +381,8 @@ mod handlers {
             unmerge_imports::unmerge_imports,
             unnecessary_async::unnecessary_async,
             unqualify_method_call::unqualify_method_call,
-            unwrap_block::unwrap_block,
+            unwrap_branch::unwrap_block,
+            unwrap_branch::unwrap_branch,
             unwrap_return_type::unwrap_return_type,
             unwrap_tuple::unwrap_tuple,
             unwrap_type_to_generic_arg::unwrap_type_to_generic_arg,
@@ -380,6 +395,7 @@ mod handlers {
             // used as a tie-breaker.
             add_missing_impl_members::add_missing_impl_members,
             add_missing_impl_members::add_missing_default_members,
+            add_return_type::add_return_type,
             //
             replace_string_with_char::replace_string_with_char,
             replace_string_with_char::replace_char_with_string,

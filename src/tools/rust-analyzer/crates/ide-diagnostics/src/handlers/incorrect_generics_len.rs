@@ -5,7 +5,7 @@ use hir::IncorrectGenericsLenKind;
 //
 // This diagnostic is triggered if the number of generic arguments does not match their declaration.
 pub(crate) fn incorrect_generics_len(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::IncorrectGenericsLen,
 ) -> Diagnostic {
     let owner_description = d.def.description();
@@ -181,6 +181,64 @@ fn main() {
     let _: i32 = Into::into(0);
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn generic_assoc_type_infer_lifetime_in_expr_position() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+struct Player;
+
+struct Foo<'c, C> {
+    _v: &'c C,
+}
+trait WithSignals: Sized {
+    type SignalCollection<'c, C>;
+    fn __signals_from_external(&self) -> Self::SignalCollection<'_, Self>;
+}
+impl WithSignals for Player {
+    type SignalCollection<'c, C> = Foo<'c, C>;
+    fn __signals_from_external(&self) -> Self::SignalCollection<'_, Self> {
+        Self::SignalCollection { _v: self }
+    }
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn enum_type_alias_default_param() {
+        check_diagnostics(
+            r#"
+//- minicore: result
+
+struct Error;
+
+type Result<T, E = Error> = core::result::Result<T, E>;
+
+fn main() {
+    let _ = Result::<()>::Ok(());
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn type_as_trait_does_not_count() {
+        check_diagnostics(
+            r#"
+pub trait Lock<T> {
+    fn new(b: T) -> Self;
+}
+pub trait LockChoice {
+    type Lock<T>: Lock<T>;
+}
+fn f<L: LockChoice>() {
+    <L as LockChoice>::Lock::new(());
+}
+        "#,
         );
     }
 }

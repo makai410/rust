@@ -1,14 +1,15 @@
 use std::iter;
 
-use hir::{EditionedFileId, FilePosition, FileRange, HirFileId, InFile, Semantics, db};
+use hir::{EditionedFileId, FilePosition, FileRange, HirFileId, InFile, Semantics};
 use ide_db::{
     FxHashMap, FxHashSet, RootDatabase,
+    base_db::SourceDatabase,
     defs::{Definition, IdentClass},
     helpers::pick_best_token,
     search::{FileReference, ReferenceCategory, SearchScope},
     syntax_helpers::node_ext::{
-        eq_label_lt, for_each_tail_expr, full_path_of_name_ref, is_closure_or_blk_with_modif,
-        preorder_expr_with_ctx_checker,
+        eq_label_lt, find_loops, for_each_tail_expr, full_path_of_name_ref,
+        is_closure_or_blk_with_modif, preorder_expr_with_ctx_checker,
     },
 };
 use syntax::{
@@ -60,9 +61,7 @@ pub(crate) fn highlight_related(
     ide_db::FilePosition { offset, file_id }: ide_db::FilePosition,
 ) -> Option<Vec<HighlightedRange>> {
     let _p = tracing::info_span!("highlight_related").entered();
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(sema.db, file_id));
+    let file_id = sema.attach_first_edition(file_id);
     let syntax = sema.parse(file_id).syntax().clone();
 
     let token = pick_best_token(syntax.token_at_offset(offset), |kind| match kind {
@@ -277,7 +276,7 @@ fn highlight_references(
                     Definition::Module(module) => {
                         NavigationTarget::from_module_to_decl(sema.db, module)
                     }
-                    def => match def.try_to_nav(sema.db) {
+                    def => match def.try_to_nav(sema) {
                         Some(it) => it,
                         None => continue,
                     },
@@ -475,7 +474,7 @@ pub(crate) fn highlight_exit_points(
                 },
                 ast::BlockExpr(blk) => match blk.modifier() {
                     Some(ast::BlockModifier::Async(t)) => hl_exit_points(sema, Some(t), blk.into()),
-                    Some(ast::BlockModifier::Try(t)) if token.kind() != T![return] => {
+                    Some(ast::BlockModifier::Try { try_token: t, .. }) if token.kind() != T![return] => {
                         hl_exit_points(sema, Some(t), blk.into())
                     },
                     _ => continue,
@@ -564,7 +563,7 @@ pub(crate) fn highlight_break_points(
         Some(highlights)
     }
 
-    let Some(loops) = goto_definition::find_loops(sema, &token) else {
+    let Some(loops) = find_loops(sema, &token) else {
         return FxHashMap::default();
     };
 
@@ -669,7 +668,10 @@ fn cover_range(r0: Option<TextRange>, r1: Option<TextRange>) -> Option<TextRange
     }
 }
 
-fn find_defs(sema: &Semantics<'_, RootDatabase>, token: SyntaxToken) -> FxHashSet<Definition> {
+fn find_defs<'db>(
+    sema: &Semantics<'db, RootDatabase>,
+    token: SyntaxToken,
+) -> FxHashSet<Definition<'db>> {
     sema.descend_into_macros_exact(token)
         .into_iter()
         .filter_map(|token| IdentClass::classify_token(sema, &token))
@@ -678,7 +680,7 @@ fn find_defs(sema: &Semantics<'_, RootDatabase>, token: SyntaxToken) -> FxHashSe
 }
 
 fn original_frange(
-    db: &dyn db::ExpandDatabase,
+    db: &dyn SourceDatabase,
     file_id: HirFileId,
     text_range: Option<TextRange>,
 ) -> Option<FileRange> {
@@ -697,14 +699,14 @@ fn merge_map(res: &mut HighlightMap, new: Option<HighlightMap>) {
 /// Preorder walk all the expression's child expressions.
 /// For macro calls, the callback will be called on the expanded expressions after
 /// visiting the macro call itself.
-struct WalkExpandedExprCtx<'a> {
-    sema: &'a Semantics<'a, RootDatabase>,
+struct WalkExpandedExprCtx<'a, 'db> {
+    sema: &'a Semantics<'db, RootDatabase>,
     depth: usize,
     check_ctx: &'static dyn Fn(&ast::Expr) -> bool,
 }
 
-impl<'a> WalkExpandedExprCtx<'a> {
-    fn new(sema: &'a Semantics<'a, RootDatabase>) -> Self {
+impl<'a, 'db> WalkExpandedExprCtx<'a, 'db> {
+    fn new(sema: &'a Semantics<'db, RootDatabase>) -> Self {
         Self { sema, depth: 0, check_ctx: &is_closure_or_blk_with_modif }
     }
 
@@ -722,20 +724,19 @@ impl<'a> WalkExpandedExprCtx<'a> {
                         self.depth += 1;
                     }
 
-                    if let ast::Expr::MacroExpr(expr) = expr {
-                        if let Some(expanded) =
+                    if let ast::Expr::MacroExpr(expr) = expr
+                        && let Some(expanded) =
                             expr.macro_call().and_then(|call| self.sema.expand_macro_call(&call))
-                        {
-                            match_ast! {
-                                match (expanded.value) {
-                                    ast::MacroStmts(it) => {
-                                        self.handle_expanded(it, cb);
-                                    },
-                                    ast::Expr(it) => {
-                                        self.walk(&it, cb);
-                                    },
-                                    _ => {}
-                                }
+                    {
+                        match_ast! {
+                            match (expanded.value) {
+                                ast::MacroStmts(it) => {
+                                    self.handle_expanded(it, cb);
+                                },
+                                ast::Expr(it) => {
+                                    self.walk(&it, cb);
+                                },
+                                _ => {}
                             }
                         }
                     }
@@ -755,10 +756,10 @@ impl<'a> WalkExpandedExprCtx<'a> {
         }
 
         for stmt in expanded.statements() {
-            if let ast::Stmt::ExprStmt(stmt) = stmt {
-                if let Some(expr) = stmt.expr() {
-                    self.walk(&expr, cb);
-                }
+            if let ast::Stmt::ExprStmt(stmt) = stmt
+                && let Some(expr) = stmt.expr()
+            {
+                self.walk(&expr, cb);
             }
         }
     }
@@ -807,11 +808,9 @@ pub(crate) fn highlight_unsafe_points(
 
         // highlight unsafe operations
         if let Some(block) = block_expr {
-            if let Some(body) = sema.body_for(InFile::new(unsafe_token_file_id, block.syntax())) {
-                let unsafe_ops = sema.get_unsafe_ops(body);
-                for unsafe_op in unsafe_ops {
-                    push_to_highlights(unsafe_op.file_id, Some(unsafe_op.value.text_range()));
-                }
+            let unsafe_ops = sema.get_unsafe_ops_for_unsafe_block(block);
+            for unsafe_op in unsafe_ops {
+                push_to_highlights(unsafe_op.file_id, Some(unsafe_op.value.text_range()));
             }
         }
 
@@ -2088,6 +2087,7 @@ fn test() {
     fn return_in_macros() {
         check(
             r#"
+//- minicore: fn
 macro_rules! N {
     ($i:ident, $x:expr, $blk:expr) => {
         for $i in 0..$x {
@@ -2534,6 +2534,45 @@ fn foo() {
     };
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn different_unsafe_block() {
+        check(
+            r#"
+fn main() {
+    unsafe$0 {
+ // ^^^^^^
+        *(0 as *const u8)
+     // ^^^^^^^^^^^^^^^^^
+    };
+    unsafe { *(1 as *const u8) };
+    unsafe { *(2 as *const u8) };
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn async_fn_param() {
+        check(
+            r#"
+async fn get_double_async(num$0: u32) -> u32 {
+                       // ^^^
+    num
+ // ^^^ read
+}
+        "#,
+        );
+        check(
+            r#"
+async fn get_double_async((num$0,): (u32,)) -> u32 {
+                        // ^^^
+    num
+ // ^^^ read
+}
+        "#,
         );
     }
 }

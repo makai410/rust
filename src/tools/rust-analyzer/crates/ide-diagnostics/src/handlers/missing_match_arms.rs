@@ -4,7 +4,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 //
 // This diagnostic is triggered if `match` block is missing one or more match arms.
 pub(crate) fn missing_match_arms(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::MissingMatchArms,
 ) -> Diagnostic {
     Diagnostic::new_with_syntax_node_ptr(
@@ -300,7 +300,7 @@ fn main() {
     }
     match (true, false) {
         (true, false, true) => (),
-      //^^^^^^^^^^^^^^^^^^^ error: expected (bool, bool), found (bool, bool, bool)
+      //^^^^^^^^^^^^^^^^^^^ error: expected (bool, bool), found (bool, bool, {unknown})
         (true) => (),
       // ^^^^  error: expected (bool, bool), found bool
     }
@@ -390,7 +390,6 @@ fn main() {
 
     #[test]
     fn expr_diverges() {
-        cov_mark::check_count!(validate_match_bailed_out, 2);
         check_diagnostics(
             r#"
 enum Either { A, B }
@@ -401,6 +400,7 @@ fn main() {
         Either::B => (),
     }
     match loop {} {
+       // ^^^^^^^ error: missing match arm: `B` not covered
         Either::A => (),
     }
     match loop { break Either::A } {
@@ -1197,5 +1197,21 @@ fn main() {
             "#,
             );
         }
+    }
+
+    #[test]
+    fn no_overloaded_deref_is_not_projection() {
+        check_diagnostics(
+            r#"
+const FOO: &str = "";
+
+fn foo() {
+    match "" {
+        FOO => {}
+        _ => {}
+    }
+}
+        "#,
+        );
     }
 }

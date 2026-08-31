@@ -106,4 +106,35 @@ fn main() {
     //~^ approx_constant
 
     let no_tau = 6.3;
+
+    let my_euler_gamma = 0.577215664901533;
+    //~^ approx_constant
+
+    let almost_euler_gamma = 0.5772;
+    //~^ approx_constant
+
+    let no_euler_gamma = 0.577;
+
+    let my_golden_ratio = 1.618033988749895;
+    //~^ approx_constant
+
+    let almost_golden_ratio = 1.6180;
+    //~^ approx_constant
+
+    let no_almost_golden_ratio = 1.618;
+
+    // issue #15194
+    #[allow(clippy::excessive_precision)]
+    let x: f64 = 3.1415926535897932384626433832;
+    //~^ approx_constant
+
+    #[allow(clippy::excessive_precision)]
+    let _: f64 = 003.14159265358979311599796346854418516159057617187500;
+    //~^ approx_constant
+
+    let almost_frac_1_sqrt_2 = 00.70711;
+    //~^ approx_constant
+
+    let almost_frac_1_sqrt_2 = 00.707_11;
+    //~^ approx_constant
 }

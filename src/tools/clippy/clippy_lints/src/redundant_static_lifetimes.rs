@@ -4,8 +4,7 @@ use clippy_utils::msrvs::{self, MsrvStack};
 use clippy_utils::source::snippet;
 use rustc_ast::ast::{ConstItem, Item, ItemKind, StaticItem, Ty, TyKind};
 use rustc_errors::Applicability;
-use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, impl_lint_pass};
 use rustc_span::symbol::kw;
 
 declare_clippy_lint! {
@@ -34,19 +33,17 @@ declare_clippy_lint! {
     "Using explicit `'static` lifetime for constants or statics when elision rules would allow omitting them."
 }
 
+impl_lint_pass!(RedundantStaticLifetimes => [REDUNDANT_STATIC_LIFETIMES]);
+
 pub struct RedundantStaticLifetimes {
     msrv: MsrvStack,
 }
 
 impl RedundantStaticLifetimes {
     pub fn new(conf: &'static Conf) -> Self {
-        Self {
-            msrv: MsrvStack::new(conf.msrv),
-        }
+        Self { msrv: conf.msrv.into() }
     }
 }
-
-impl_lint_pass!(RedundantStaticLifetimes => [REDUNDANT_STATIC_LIFETIMES]);
 
 impl RedundantStaticLifetimes {
     // Recursively visit types
@@ -66,25 +63,19 @@ impl RedundantStaticLifetimes {
                 // Match the 'static lifetime
                 if let Some(lifetime) = *optional_lifetime {
                     match borrow_type.ty.kind {
-                        TyKind::Path(..) | TyKind::Slice(..) | TyKind::Array(..) | TyKind::Tup(..) => {
-                            if lifetime.ident.name == kw::StaticLifetime {
-                                let snip = snippet(cx, borrow_type.ty.span, "<type>");
-                                let sugg = format!("&{}{snip}", borrow_type.mutbl.prefix_str());
-                                span_lint_and_then(
-                                    cx,
-                                    REDUNDANT_STATIC_LIFETIMES,
-                                    lifetime.ident.span,
-                                    reason,
-                                    |diag| {
-                                        diag.span_suggestion(
-                                            ty.span,
-                                            "consider removing `'static`",
-                                            sugg,
-                                            Applicability::MachineApplicable, //snippet
-                                        );
-                                    },
+                        TyKind::Path(..) | TyKind::Slice(..) | TyKind::Array(..) | TyKind::Tup(..)
+                            if lifetime.ident.name == kw::StaticLifetime =>
+                        {
+                            let snip = snippet(cx, borrow_type.ty.span, "<type>");
+                            let sugg = format!("&{}{snip}", borrow_type.mutbl.prefix_str());
+                            span_lint_and_then(cx, REDUNDANT_STATIC_LIFETIMES, lifetime.ident.span, reason, |diag| {
+                                diag.span_suggestion(
+                                    ty.span,
+                                    "consider removing `'static`",
+                                    sugg,
+                                    Applicability::MachineApplicable, //snippet
                                 );
-                            }
+                            });
                         },
                         _ => {},
                     }
@@ -103,13 +94,13 @@ impl EarlyLintPass for RedundantStaticLifetimes {
         }
 
         if !item.span.from_expansion() {
-            if let ItemKind::Const(box ConstItem { ty: ref var_type, .. }) = item.kind {
+            if let ItemKind::Const(ConstItem { ty: ref var_type, .. }) = item.kind {
                 Self::visit_type(var_type, cx, "constants have by default a `'static` lifetime");
                 // Don't check associated consts because `'static` cannot be elided on those (issue
                 // #2438)
             }
 
-            if let ItemKind::Static(box StaticItem { ty: ref var_type, .. }) = item.kind {
+            if let ItemKind::Static(StaticItem { ty: ref var_type, .. }) = item.kind {
                 Self::visit_type(var_type, cx, "statics have by default a `'static` lifetime");
             }
         }

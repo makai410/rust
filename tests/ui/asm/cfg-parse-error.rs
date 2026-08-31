@@ -1,5 +1,5 @@
 //@ needs-asm-support
-#![feature(asm_cfg)]
+//@ reference: asm.attributes.supported-attributes
 
 use std::arch::asm;
 

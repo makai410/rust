@@ -1,17 +1,17 @@
 // .debug_gdb_scripts binary section.
 
-use rustc_attr_data_structures::{AttributeKind, find_attr};
+use rustc_abi::Align;
 use rustc_codegen_ssa::base::collect_debugger_visualizers_transitive;
 use rustc_codegen_ssa::traits::*;
+use rustc_hir::attrs::DebuggerVisualizerType;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::bug;
-use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerType;
-use rustc_session::config::{CrateType, DebugInfo};
+use rustc_session::config::DebugInfo;
+use rustc_structures::CrateType;
 
 use crate::builder::Builder;
 use crate::common::CodegenCx;
-use crate::llvm;
-use crate::value::Value;
+use crate::llvm::{self, Value};
 
 /// Inserts a side-effect free instruction sequence that makes sure that the
 /// .debug_gdb_scripts global is referenced, so it isn't removed by the linker.
@@ -20,10 +20,7 @@ pub(crate) fn insert_reference_to_gdb_debug_scripts_section_global(bx: &mut Buil
         let gdb_debug_scripts_section = get_or_insert_gdb_debug_scripts_section_global(bx);
         // Load just the first byte as that's all that's necessary to force
         // LLVM to keep around the reference to the global.
-        let volatile_load_instruction = bx.volatile_load(bx.type_i8(), gdb_debug_scripts_section);
-        unsafe {
-            llvm::LLVMSetAlignment(volatile_load_instruction, 1);
-        }
+        bx.volatile_load(bx.type_i8(), gdb_debug_scripts_section, Align::ONE);
     }
 }
 
@@ -73,7 +70,7 @@ pub(crate) fn get_or_insert_gdb_debug_scripts_section_global<'ll>(
                 .unwrap_or_else(|| bug!("symbol `{}` is already defined", section_var_name));
             llvm::set_section(section_var, c".debug_gdb_scripts");
             llvm::set_initializer(section_var, cx.const_bytes(section_contents));
-            llvm::LLVMSetGlobalConstant(section_var, llvm::True);
+            llvm::LLVMSetGlobalConstant(section_var, llvm::TRUE);
             llvm::set_unnamed_address(section_var, llvm::UnnamedAddr::Global);
             llvm::set_linkage(section_var, llvm::Linkage::LinkOnceODRLinkage);
             // This should make sure that the whole section is not larger than
@@ -85,9 +82,6 @@ pub(crate) fn get_or_insert_gdb_debug_scripts_section_global<'ll>(
 }
 
 pub(crate) fn needs_gdb_debug_scripts_section(cx: &CodegenCx<'_, '_>) -> bool {
-    let omit_gdb_pretty_printer_section =
-        find_attr!(cx.tcx.hir_krate_attrs(), AttributeKind::OmitGdbPrettyPrinterSection);
-
     // To ensure the section `__rustc_debug_gdb_scripts_section__` will not create
     // ODR violations at link time, this section will not be emitted for rlibs since
     // each rlib could produce a different set of visualizers that would be embedded
@@ -97,7 +91,7 @@ pub(crate) fn needs_gdb_debug_scripts_section(cx: &CodegenCx<'_, '_>) -> bool {
         CrateType::Executable
         | CrateType::Dylib
         | CrateType::Cdylib
-        | CrateType::Staticlib
+        | CrateType::StaticLib
         | CrateType::Sdylib => {
             // These are crate types for which we will embed pretty printers since they
             // are treated as leaf crates.
@@ -116,8 +110,7 @@ pub(crate) fn needs_gdb_debug_scripts_section(cx: &CodegenCx<'_, '_>) -> bool {
         }
     });
 
-    !omit_gdb_pretty_printer_section
-        && cx.sess().opts.debuginfo != DebugInfo::None
+    cx.sess().opts.debuginfo != DebugInfo::None
         && cx.sess().target.emit_debug_gdb_scripts
         && embed_visualizers
 }

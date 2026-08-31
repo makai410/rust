@@ -85,12 +85,11 @@ use std::borrow::Borrow;
 use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::fmt::Display;
-use std::intrinsics::unlikely;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use std::{fs, process};
+use std::{fs, hint, process};
 
 pub use measureme::EventId;
 use measureme::{EventIdBuilder, Profiler, SerializableString, StringId};
@@ -427,7 +426,8 @@ impl SelfProfilerRef {
                     .unwrap()
                     .increment_query_cache_hit_counters(QueryInvocationId(query_invocation_id.0));
             }
-            if unlikely(profiler_ref.event_filter_mask.contains(EventFilter::QUERY_CACHE_HITS)) {
+            if profiler_ref.event_filter_mask.contains(EventFilter::QUERY_CACHE_HITS) {
+                hint::cold_path();
                 profiler_ref.instant_query_event(
                     |profiler| profiler.query_cache_hit_event_kind,
                     query_invocation_id,
@@ -437,7 +437,8 @@ impl SelfProfilerRef {
 
         // We check both kinds of query cache hit events at once, to reduce overhead in the
         // common case (with self-profile disabled).
-        if unlikely(self.event_filter_mask.intersects(EventFilter::QUERY_CACHE_HIT_COMBINED)) {
+        if self.event_filter_mask.intersects(EventFilter::QUERY_CACHE_HIT_COMBINED) {
+            hint::cold_path();
             cold_call(self, query_invocation_id);
         }
     }
@@ -550,6 +551,11 @@ impl SelfProfilerRef {
     #[inline]
     pub fn get_self_profiler(&self) -> Option<Arc<SelfProfiler>> {
         self.profiler.clone()
+    }
+
+    /// Is expensive recording of query keys and/or function arguments enabled?
+    pub fn is_args_recording_enabled(&self) -> bool {
+        self.enabled() && self.event_filter_mask.intersects(EventFilter::ARGS)
     }
 }
 
@@ -949,30 +955,25 @@ fn get_thread_id() -> u32 {
 cfg_select! {
     windows => {
         pub fn get_resident_set_size() -> Option<usize> {
-            use windows::{
-                Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
-                Win32::System::Threading::GetCurrentProcess,
+            use windows::Win32::System::ProcessStatus::{
+                K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
             };
+            use windows::Win32::System::Threading::GetCurrentProcess;
 
             let mut pmc = PROCESS_MEMORY_COUNTERS::default();
             let pmc_size = size_of_val(&pmc);
-            unsafe {
-                K32GetProcessMemoryInfo(
-                    GetCurrentProcess(),
-                    &mut pmc,
-                    pmc_size as u32,
-                )
-            }
-            .ok()
-            .ok()?;
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc_size as u32) }
+                .ok()
+                .ok()?;
 
             Some(pmc.WorkingSetSize)
         }
     }
     target_os = "macos" => {
         pub fn get_resident_set_size() -> Option<usize> {
-            use libc::{c_int, c_void, getpid, proc_pidinfo, proc_taskinfo, PROC_PIDTASKINFO};
             use std::mem;
+
+            use libc::{PROC_PIDTASKINFO, c_int, c_void, getpid, proc_pidinfo, proc_taskinfo};
             const PROC_TASKINFO_SIZE: c_int = size_of::<proc_taskinfo>() as c_int;
 
             unsafe {
@@ -980,22 +981,20 @@ cfg_select! {
                 let info_ptr = &mut info as *mut proc_taskinfo as *mut c_void;
                 let pid = getpid() as c_int;
                 let ret = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, info_ptr, PROC_TASKINFO_SIZE);
-                if ret == PROC_TASKINFO_SIZE {
-                    Some(info.pti_resident_size as usize)
-                } else {
-                    None
-                }
+                if ret == PROC_TASKINFO_SIZE { Some(info.pti_resident_size as usize) } else { None }
             }
         }
     }
     unix => {
         pub fn get_resident_set_size() -> Option<usize> {
+            use libc::{_SC_PAGESIZE, sysconf};
             let field = 1;
             let contents = fs::read("/proc/self/statm").ok()?;
             let contents = String::from_utf8(contents).ok()?;
             let s = contents.split_whitespace().nth(field)?;
             let npages = s.parse::<usize>().ok()?;
-            Some(npages * 4096)
+            // SAFETY: `sysconf(_SC_PAGESIZE)` has no side effects and is safe to call.
+            Some(npages * unsafe { sysconf(_SC_PAGESIZE) } as usize)
         }
     }
     _ => {

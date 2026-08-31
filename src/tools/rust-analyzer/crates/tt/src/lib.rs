@@ -5,6 +5,9 @@
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
 #[cfg(not(feature = "in-rust-tree"))]
 extern crate ra_ap_rustc_lexer as rustc_lexer;
 #[cfg(feature = "in-rust-tree")]
@@ -12,15 +15,22 @@ extern crate rustc_lexer;
 
 pub mod buffer;
 pub mod iter;
+mod storage;
 
 use std::fmt;
 
+use arrayvec::ArrayString;
 use buffer::Cursor;
 use intern::Symbol;
-use iter::{TtElement, TtIter};
 use stdx::{impl_from, itertools::Itertools as _};
 
+pub use span::Span;
 pub use text_size::{TextRange, TextSize};
+
+use crate::storage::TokenTreesSlice;
+
+pub use self::iter::{TtElement, TtIter};
+pub use self::storage::{TopSubtree, TopSubtreeBuilder};
 
 pub const MAX_GLUED_PUNCT_LEN: usize = 3;
 
@@ -32,9 +42,11 @@ pub struct Lit {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[repr(u8)]
+// The discriminants are important for `storage.rs` decoding.
 pub enum IdentIsRaw {
-    No,
-    Yes,
+    No = 0,
+    Yes = 1,
 }
 impl IdentIsRaw {
     pub fn yes(self) -> bool {
@@ -74,13 +86,13 @@ pub enum LitKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TokenTree<S = u32> {
-    Leaf(Leaf<S>),
-    Subtree(Subtree<S>),
+pub enum TokenTree {
+    Leaf(Leaf),
+    Subtree(Subtree),
 }
-impl_from!(Leaf<S>, Subtree<S> for TokenTree);
-impl<S: Copy> TokenTree<S> {
-    pub fn first_span(&self) -> S {
+impl_from!(Leaf, Subtree for TokenTree);
+impl TokenTree {
+    pub fn first_span(&self) -> Span {
         match self {
             TokenTree::Leaf(l) => *l.span(),
             TokenTree::Subtree(s) => s.delimiter.open,
@@ -89,297 +101,87 @@ impl<S: Copy> TokenTree<S> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Leaf<S> {
-    Literal(Literal<S>),
-    Punct(Punct<S>),
-    Ident(Ident<S>),
+pub enum Leaf {
+    Literal(Literal),
+    Punct(Punct),
+    Ident(Ident),
 }
 
-impl<S> Leaf<S> {
-    pub fn span(&self) -> &S {
+impl Leaf {
+    pub fn span(&self) -> &Span {
         match self {
             Leaf::Literal(it) => &it.span,
             Leaf::Punct(it) => &it.span,
             Leaf::Ident(it) => &it.span,
         }
     }
-}
-impl_from!(Literal<S>, Punct<S>, Ident<S> for Leaf);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Subtree<S> {
-    pub delimiter: Delimiter<S>,
+    fn symbol(&self) -> Option<&Symbol> {
+        match self {
+            Leaf::Literal(Literal { text_and_suffix: symbol, .. })
+            | Leaf::Ident(Ident { sym: symbol, .. }) => Some(symbol),
+            Leaf::Punct(_) => None,
+        }
+    }
+}
+impl_from!(Literal, Punct, Ident for Leaf);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Subtree {
+    pub delimiter: Delimiter,
     /// Number of following token trees that belong to this subtree, excluding this subtree.
     pub len: u32,
 }
 
-impl<S> Subtree<S> {
+impl Subtree {
     pub fn usize_len(&self) -> usize {
         self.len as usize
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct TopSubtree<S>(pub Box<[TokenTree<S>]>);
-
-impl<S: Copy> TopSubtree<S> {
-    pub fn empty(span: DelimSpan<S>) -> Self {
-        Self(Box::new([TokenTree::Subtree(Subtree {
-            delimiter: Delimiter::invisible_delim_spanned(span),
-            len: 0,
-        })]))
-    }
-
-    pub fn invisible_from_leaves<const N: usize>(delim_span: S, leaves: [Leaf<S>; N]) -> Self {
-        let mut builder = TopSubtreeBuilder::new(Delimiter::invisible_spanned(delim_span));
-        builder.extend(leaves);
-        builder.build()
-    }
-
-    pub fn from_token_trees(delimiter: Delimiter<S>, token_trees: TokenTreesView<'_, S>) -> Self {
-        let mut builder = TopSubtreeBuilder::new(delimiter);
-        builder.extend_with_tt(token_trees);
-        builder.build()
-    }
-
-    pub fn from_subtree(subtree: SubtreeView<'_, S>) -> Self {
-        Self(subtree.0.into())
-    }
-
-    pub fn view(&self) -> SubtreeView<'_, S> {
-        SubtreeView::new(&self.0)
-    }
-
-    pub fn iter(&self) -> TtIter<'_, S> {
-        self.view().iter()
-    }
-
-    pub fn top_subtree(&self) -> &Subtree<S> {
-        self.view().top_subtree()
-    }
-
-    pub fn top_subtree_delimiter_mut(&mut self) -> &mut Delimiter<S> {
-        let TokenTree::Subtree(subtree) = &mut self.0[0] else {
-            unreachable!("the first token tree is always the top subtree");
-        };
-        &mut subtree.delimiter
-    }
-
-    pub fn token_trees(&self) -> TokenTreesView<'_, S> {
-        self.view().token_trees()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TopSubtreeBuilder<S> {
-    unclosed_subtree_indices: Vec<usize>,
-    token_trees: Vec<TokenTree<S>>,
-    last_closed_subtree: Option<usize>,
-}
-
-impl<S: Copy> TopSubtreeBuilder<S> {
-    pub fn new(top_delimiter: Delimiter<S>) -> Self {
-        let mut result = Self {
-            unclosed_subtree_indices: Vec::new(),
-            token_trees: Vec::new(),
-            last_closed_subtree: None,
-        };
-        let top_subtree = TokenTree::Subtree(Subtree { delimiter: top_delimiter, len: 0 });
-        result.token_trees.push(top_subtree);
-        result
-    }
-
-    pub fn open(&mut self, delimiter_kind: DelimiterKind, open_span: S) {
-        self.unclosed_subtree_indices.push(self.token_trees.len());
-        self.token_trees.push(TokenTree::Subtree(Subtree {
-            delimiter: Delimiter {
-                open: open_span,
-                close: open_span, // Will be overwritten on close.
-                kind: delimiter_kind,
-            },
-            len: 0,
-        }));
-    }
-
-    pub fn close(&mut self, close_span: S) {
-        let last_unclosed_index = self
-            .unclosed_subtree_indices
-            .pop()
-            .expect("attempt to close a `tt::Subtree` when none is open");
-        let subtree_len = (self.token_trees.len() - last_unclosed_index - 1) as u32;
-        let TokenTree::Subtree(subtree) = &mut self.token_trees[last_unclosed_index] else {
-            unreachable!("unclosed token tree is always a subtree");
-        };
-        subtree.len = subtree_len;
-        subtree.delimiter.close = close_span;
-        self.last_closed_subtree = Some(last_unclosed_index);
-    }
-
-    /// You cannot call this consecutively, it will only work once after close.
-    pub fn remove_last_subtree_if_invisible(&mut self) {
-        let Some(last_subtree_idx) = self.last_closed_subtree else { return };
-        if let TokenTree::Subtree(Subtree {
-            delimiter: Delimiter { kind: DelimiterKind::Invisible, .. },
-            ..
-        }) = self.token_trees[last_subtree_idx]
-        {
-            self.token_trees.remove(last_subtree_idx);
-            self.last_closed_subtree = None;
-        }
-    }
-
-    pub fn push(&mut self, leaf: Leaf<S>) {
-        self.token_trees.push(TokenTree::Leaf(leaf));
-    }
-
-    pub fn extend(&mut self, leaves: impl IntoIterator<Item = Leaf<S>>) {
-        self.token_trees.extend(leaves.into_iter().map(TokenTree::Leaf));
-    }
-
-    /// This does not check the token trees are valid, beware!
-    pub fn extend_tt_dangerous(&mut self, tt: impl IntoIterator<Item = TokenTree<S>>) {
-        self.token_trees.extend(tt);
-    }
-
-    pub fn extend_with_tt(&mut self, tt: TokenTreesView<'_, S>) {
-        self.token_trees.extend(tt.0.iter().cloned());
-    }
-
-    /// Like [`Self::extend_with_tt()`], but makes sure the new tokens will never be
-    /// joint with whatever comes after them.
-    pub fn extend_with_tt_alone(&mut self, tt: TokenTreesView<'_, S>) {
-        if let Some((last, before_last)) = tt.0.split_last() {
-            self.token_trees.reserve(tt.0.len());
-            self.token_trees.extend(before_last.iter().cloned());
-            let last = if let TokenTree::Leaf(Leaf::Punct(last)) = last {
-                let mut last = *last;
-                last.spacing = Spacing::Alone;
-                TokenTree::Leaf(Leaf::Punct(last))
-            } else {
-                last.clone()
-            };
-            self.token_trees.push(last);
-        }
-    }
-
-    pub fn expected_delimiters(&self) -> impl Iterator<Item = &Delimiter<S>> {
-        self.unclosed_subtree_indices.iter().rev().map(|&subtree_idx| {
-            let TokenTree::Subtree(subtree) = &self.token_trees[subtree_idx] else {
-                unreachable!("unclosed token tree is always a subtree")
-            };
-            &subtree.delimiter
-        })
-    }
-
-    /// Builds, and remove the top subtree if it has only one subtree child.
-    pub fn build_skip_top_subtree(mut self) -> TopSubtree<S> {
-        let top_tts = TokenTreesView::new(&self.token_trees[1..]);
-        match top_tts.try_into_subtree() {
-            Some(_) => {
-                assert!(
-                    self.unclosed_subtree_indices.is_empty(),
-                    "attempt to build an unbalanced `TopSubtreeBuilder`"
-                );
-                TopSubtree(self.token_trees.drain(1..).collect())
-            }
-            None => self.build(),
-        }
-    }
-
-    pub fn build(mut self) -> TopSubtree<S> {
-        assert!(
-            self.unclosed_subtree_indices.is_empty(),
-            "attempt to build an unbalanced `TopSubtreeBuilder`"
-        );
-        let total_len = self.token_trees.len() as u32;
-        let TokenTree::Subtree(top_subtree) = &mut self.token_trees[0] else {
-            unreachable!("first token tree is always a subtree");
-        };
-        top_subtree.len = total_len - 1;
-        TopSubtree(self.token_trees.into_boxed_slice())
-    }
-
-    pub fn restore_point(&self) -> SubtreeBuilderRestorePoint {
-        SubtreeBuilderRestorePoint {
-            unclosed_subtree_indices_len: self.unclosed_subtree_indices.len(),
-            token_trees_len: self.token_trees.len(),
-            last_closed_subtree: self.last_closed_subtree,
-        }
-    }
-
-    pub fn restore(&mut self, restore_point: SubtreeBuilderRestorePoint) {
-        self.unclosed_subtree_indices.truncate(restore_point.unclosed_subtree_indices_len);
-        self.token_trees.truncate(restore_point.token_trees_len);
-        self.last_closed_subtree = restore_point.last_closed_subtree;
-    }
-}
-
 #[derive(Clone, Copy)]
-pub struct SubtreeBuilderRestorePoint {
-    unclosed_subtree_indices_len: usize,
-    token_trees_len: usize,
-    last_closed_subtree: Option<usize>,
+pub struct TokenTreesView<'a> {
+    slice: TokenTreesSlice<'a>,
+    len: usize,
 }
 
-#[derive(Clone, Copy)]
-pub struct TokenTreesView<'a, S>(&'a [TokenTree<S>]);
-
-impl<'a, S: Copy> TokenTreesView<'a, S> {
-    pub fn new(tts: &'a [TokenTree<S>]) -> Self {
-        if cfg!(debug_assertions) {
-            tts.iter().enumerate().for_each(|(idx, tt)| {
-                if let TokenTree::Subtree(tt) = &tt {
-                    // `<` and not `<=` because `Subtree.len` does not include the subtree node itself.
-                    debug_assert!(
-                        idx + tt.usize_len() < tts.len(),
-                        "`TokenTreeView::new()` was given a cut-in-half list"
-                    );
-                }
-            });
-        }
-        Self(tts)
+impl<'a> TokenTreesView<'a> {
+    #[inline]
+    pub fn empty() -> Self {
+        Self { slice: TokenTreesSlice::empty(), len: 0 }
     }
 
-    pub fn iter(&self) -> TtIter<'a, S> {
-        TtIter::new(self.0)
+    pub fn iter(&self) -> TtIter<'a> {
+        TtIter::new(*self)
     }
 
-    pub fn cursor(&self) -> Cursor<'a, S> {
-        Cursor::new(self.0)
+    pub fn cursor(&self) -> Cursor<'a> {
+        Cursor::new(*self)
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len() == 0
     }
 
-    pub fn try_into_subtree(self) -> Option<SubtreeView<'a, S>> {
-        if let Some(TokenTree::Subtree(subtree)) = self.0.first() {
-            if subtree.usize_len() == (self.0.len() - 1) {
-                return Some(SubtreeView::new(self.0));
-            }
-        }
-        None
+    pub fn try_into_subtree(self) -> Option<SubtreeView<'a>> {
+        let is_subtree = self.iter_flat_tokens().next().is_some_and(
+            |it| matches!(it, TokenTree::Subtree(subtree) if subtree.usize_len() == self.len - 1),
+        );
+        if is_subtree { Some(SubtreeView(self)) } else { None }
     }
 
-    pub fn strip_invisible(self) -> TokenTreesView<'a, S> {
+    pub fn strip_invisible(self) -> TokenTreesView<'a> {
         self.try_into_subtree().map(|subtree| subtree.strip_invisible()).unwrap_or(self)
-    }
-
-    /// This returns a **flat** structure of tokens (subtrees will be represented by a single node
-    /// preceding their children), so it isn't suited for most use cases, only for matching leaves
-    /// at the beginning/end with no subtrees before them. If you need a structured pass, use [`TtIter`].
-    pub fn flat_tokens(&self) -> &'a [TokenTree<S>] {
-        self.0
     }
 
     pub fn split(
         self,
-        mut split_fn: impl FnMut(TtElement<'a, S>) -> bool,
-    ) -> impl Iterator<Item = TokenTreesView<'a, S>> {
+        mut split_fn: impl FnMut(TtElement<'a>) -> bool,
+    ) -> impl Iterator<Item = TokenTreesView<'a>> {
         let mut subtree_iter = self.iter();
         let mut need_to_yield_even_if_empty = true;
 
@@ -401,9 +203,35 @@ impl<'a, S: Copy> TokenTreesView<'a, S> {
             Some(result)
         })
     }
+
+    pub fn first_span(&self) -> Option<Span> {
+        self.iter_flat_tokens().next().map(|it| it.first_span())
+    }
+
+    /// Note: this is quite expensive, this needs to decode the whole view,
+    /// although it "tricks" by skipping subtrees (since we know their byte length).
+    pub fn last_span(&self) -> Option<Span> {
+        let mut iter = self.iter();
+        loop {
+            match iter.last()? {
+                TtElement::Leaf(leaf) => return Some(*leaf.span()),
+                TtElement::Subtree(subtree, tt_iter) => {
+                    if subtree.len == 0 {
+                        return Some(subtree.delimiter.close);
+                    } else {
+                        iter = tt_iter;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn iter_flat_tokens(&self) -> impl Iterator<Item = TokenTree> + use<'a> {
+        self.slice.iter().take(self.len)
+    }
 }
 
-impl<S: fmt::Debug + Copy> fmt::Debug for TokenTreesView<'_, S> {
+impl fmt::Debug for TokenTreesView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut iter = self.iter();
         while let Some(tt) = iter.next() {
@@ -416,14 +244,14 @@ impl<S: fmt::Debug + Copy> fmt::Debug for TokenTreesView<'_, S> {
     }
 }
 
-impl<S: Copy> fmt::Display for TokenTreesView<'_, S> {
+impl fmt::Display for TokenTreesView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         return token_trees_display(f, self.iter());
 
-        fn subtree_display<S>(
-            subtree: &Subtree<S>,
+        fn subtree_display(
+            subtree: &Subtree,
             f: &mut fmt::Formatter<'_>,
-            iter: TtIter<'_, S>,
+            iter: TtIter<'_>,
         ) -> fmt::Result {
             let (l, r) = match subtree.delimiter.kind {
                 DelimiterKind::Parenthesis => ("(", ")"),
@@ -437,7 +265,7 @@ impl<S: Copy> fmt::Display for TokenTreesView<'_, S> {
             Ok(())
         }
 
-        fn token_trees_display<S>(f: &mut fmt::Formatter<'_>, iter: TtIter<'_, S>) -> fmt::Result {
+        fn token_trees_display(f: &mut fmt::Formatter<'_>, iter: TtIter<'_>) -> fmt::Result {
             let mut needs_space = false;
             for child in iter {
                 if needs_space {
@@ -448,11 +276,11 @@ impl<S: Copy> fmt::Display for TokenTreesView<'_, S> {
                 match child {
                     TtElement::Leaf(Leaf::Punct(p)) => {
                         needs_space = p.spacing == Spacing::Alone;
-                        fmt::Display::fmt(p, f)?;
+                        fmt::Display::fmt(&p, f)?;
                     }
-                    TtElement::Leaf(leaf) => fmt::Display::fmt(leaf, f)?,
+                    TtElement::Leaf(leaf) => fmt::Display::fmt(&leaf, f)?,
                     TtElement::Subtree(subtree, subtree_iter) => {
-                        subtree_display(subtree, f, subtree_iter)?
+                        subtree_display(&subtree, f, subtree_iter)?
                     }
                 }
             }
@@ -463,70 +291,59 @@ impl<S: Copy> fmt::Display for TokenTreesView<'_, S> {
 
 #[derive(Clone, Copy)]
 // Invariant: always starts with `Subtree` that covers the entire thing.
-pub struct SubtreeView<'a, S>(&'a [TokenTree<S>]);
+pub struct SubtreeView<'a>(TokenTreesView<'a>);
 
-impl<'a, S: Copy> SubtreeView<'a, S> {
-    pub fn new(tts: &'a [TokenTree<S>]) -> Self {
-        if cfg!(debug_assertions) {
-            let TokenTree::Subtree(subtree) = &tts[0] else {
-                panic!("first token tree must be a subtree in `SubtreeView`");
-            };
-            assert_eq!(
-                subtree.usize_len(),
-                tts.len() - 1,
-                "subtree must cover the entire `SubtreeView`"
-            );
-        }
-        Self(tts)
+impl<'a> SubtreeView<'a> {
+    pub fn as_token_trees(self) -> TokenTreesView<'a> {
+        self.0
     }
 
-    pub fn as_token_trees(self) -> TokenTreesView<'a, S> {
-        TokenTreesView::new(self.0)
+    pub fn iter(&self) -> TtIter<'a> {
+        self.token_trees().iter()
     }
 
-    pub fn iter(&self) -> TtIter<'a, S> {
-        TtIter::new(&self.0[1..])
-    }
-
-    pub fn top_subtree(&self) -> &'a Subtree<S> {
-        let TokenTree::Subtree(subtree) = &self.0[0] else {
+    pub fn top_subtree(&self) -> Subtree {
+        let Some(TokenTree::Subtree(subtree)) = self.0.iter_flat_tokens().next() else {
             unreachable!("the first token tree is always the top subtree");
         };
         subtree
     }
 
-    pub fn strip_invisible(&self) -> TokenTreesView<'a, S> {
+    pub fn strip_invisible(&self) -> TokenTreesView<'a> {
         if self.top_subtree().delimiter.kind == DelimiterKind::Invisible {
-            TokenTreesView::new(&self.0[1..])
+            self.token_trees()
         } else {
-            TokenTreesView::new(self.0)
+            self.0
         }
     }
 
-    pub fn token_trees(&self) -> TokenTreesView<'a, S> {
-        TokenTreesView::new(&self.0[1..])
+    pub fn token_trees(&self) -> TokenTreesView<'a> {
+        let mut result = self.0;
+        result.slice.advance();
+        result.len -= 1;
+        result
     }
 }
 
-impl<S: fmt::Debug + Copy> fmt::Debug for SubtreeView<'_, S> {
+impl fmt::Debug for SubtreeView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&TokenTreesView(self.0), f)
+        fmt::Debug::fmt(&self.0, f)
     }
 }
 
-impl<S: Copy> fmt::Display for SubtreeView<'_, S> {
+impl fmt::Display for SubtreeView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&TokenTreesView(self.0), f)
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub struct DelimSpan<S> {
-    pub open: S,
-    pub close: S,
+pub struct DelimSpan {
+    pub open: Span,
+    pub close: Span,
 }
 
-impl<Span: Copy> DelimSpan<Span> {
+impl DelimSpan {
     pub fn from_single(sp: Span) -> Self {
         DelimSpan { open: sp, close: sp }
     }
@@ -536,47 +353,88 @@ impl<Span: Copy> DelimSpan<Span> {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Delimiter<S> {
-    pub open: S,
-    pub close: S,
+pub struct Delimiter {
+    pub open: Span,
+    pub close: Span,
     pub kind: DelimiterKind,
 }
 
-impl<S: Copy> Delimiter<S> {
-    pub const fn invisible_spanned(span: S) -> Self {
+impl Delimiter {
+    pub const fn invisible_spanned(span: Span) -> Self {
         Delimiter { open: span, close: span, kind: DelimiterKind::Invisible }
     }
 
-    pub const fn invisible_delim_spanned(span: DelimSpan<S>) -> Self {
+    pub const fn invisible_delim_spanned(span: DelimSpan) -> Self {
         Delimiter { open: span.open, close: span.close, kind: DelimiterKind::Invisible }
     }
 
-    pub fn delim_span(&self) -> DelimSpan<S> {
+    pub fn delim_span(&self) -> DelimSpan {
         DelimSpan { open: self.open, close: self.close }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+// The discriminants are important for decoding for `storage.rs`.
 pub enum DelimiterKind {
-    Parenthesis,
-    Brace,
-    Bracket,
-    Invisible,
+    Parenthesis = 0,
+    Brace = 1,
+    Bracket = 2,
+    Invisible = 3,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Literal<S> {
-    // escaped
-    pub symbol: Symbol,
-    pub span: S,
+pub struct Literal {
+    /// Escaped, text then suffix concatenated.
+    pub text_and_suffix: Symbol,
+    pub span: Span,
     pub kind: LitKind,
-    pub suffix: Option<Symbol>,
+    pub suffix_len: u8,
 }
 
-pub fn token_to_literal<S>(text: &str, span: S) -> Literal<S>
-where
-    S: Copy,
-{
+impl Literal {
+    #[inline]
+    pub fn text_and_suffix(&self) -> (&str, &str) {
+        let text_and_suffix = self.text_and_suffix.as_str();
+        text_and_suffix.split_at(text_and_suffix.len() - usize::from(self.suffix_len))
+    }
+
+    #[inline]
+    pub fn text(&self) -> &str {
+        self.text_and_suffix().0
+    }
+
+    #[inline]
+    pub fn suffix(&self) -> &str {
+        self.text_and_suffix().1
+    }
+
+    pub fn new(text: &str, span: Span, kind: LitKind, suffix: &str) -> Self {
+        const MAX_INLINE_CAPACITY: usize = 30;
+        let text_and_suffix = if suffix.is_empty() {
+            Symbol::intern(text)
+        } else if (text.len() + suffix.len()) < MAX_INLINE_CAPACITY {
+            let mut text_and_suffix = ArrayString::<MAX_INLINE_CAPACITY>::new();
+            text_and_suffix.push_str(text);
+            text_and_suffix.push_str(suffix);
+            Symbol::intern(&text_and_suffix)
+        } else {
+            let mut text_and_suffix = String::with_capacity(text.len() + suffix.len());
+            text_and_suffix.push_str(text);
+            text_and_suffix.push_str(suffix);
+            Symbol::intern(&text_and_suffix)
+        };
+
+        Self { text_and_suffix, span, kind, suffix_len: suffix.len().try_into().unwrap() }
+    }
+
+    #[inline]
+    pub fn new_no_suffix(text: &str, span: Span, kind: LitKind) -> Self {
+        Self { text_and_suffix: Symbol::intern(text), span, kind, suffix_len: 0 }
+    }
+}
+
+pub fn token_to_literal(text: &str, span: Span) -> Literal {
     use rustc_lexer::LiteralKind;
 
     let token = rustc_lexer::tokenize(text, rustc_lexer::FrontmatterAllowed::No).next_tuple();
@@ -585,12 +443,7 @@ where
         ..
     },)) = token
     else {
-        return Literal {
-            span,
-            symbol: Symbol::intern(text),
-            kind: LitKind::Err(()),
-            suffix: None,
-        };
+        return Literal::new_no_suffix(text, span, LitKind::Err(()));
     };
 
     let (kind, start_offset, end_offset) = match kind {
@@ -621,25 +474,31 @@ where
     let (lit, suffix) = text.split_at(suffix_start as usize);
     let lit = &lit[start_offset..lit.len() - end_offset];
     let suffix = match suffix {
-        "" | "_" => None,
-        suffix => Some(Symbol::intern(suffix)),
+        "" | "_" => "",
+        // ill-suffixed literals
+        _ if !matches!(kind, LitKind::Integer | LitKind::Float | LitKind::Err(_)) => {
+            return Literal::new_no_suffix(text, span, LitKind::Err(()));
+        }
+        suffix => suffix,
     };
 
-    Literal { span, symbol: Symbol::intern(lit), kind, suffix }
+    Literal::new(lit, span, kind, suffix)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Punct<S> {
+pub struct Punct {
     pub char: char,
     pub spacing: Spacing,
-    pub span: S,
+    pub span: Span,
 }
 
 /// Indicates whether a token can join with the following token to form a
 /// compound token. Used for conversions to `proc_macro::Spacing`. Also used to
 /// guide pretty-printing, which is where the `JointHidden` value (which isn't
 /// part of `proc_macro::Spacing`) comes in useful.
+// The discriminants are important for decoding for `storage.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Spacing {
     /// The token cannot join with the following token to form a compound
     /// token.
@@ -656,7 +515,7 @@ pub enum Spacing {
     ///
     /// Converts to `proc_macro::Spacing::Alone`, and
     /// `proc_macro::Spacing::Alone` converts back to this.
-    Alone,
+    Alone = 0,
 
     /// The token can join with the following token to form a compound token.
     ///
@@ -670,7 +529,7 @@ pub enum Spacing {
     ///
     /// Converts to `proc_macro::Spacing::Joint`, and
     /// `proc_macro::Spacing::Joint` converts back to this.
-    Joint,
+    Joint = 1,
 
     /// The token can join with the following token to form a compound token,
     /// but this will not be visible at the proc macro level. (This is what the
@@ -692,30 +551,30 @@ pub enum Spacing {
     /// pretty-printing of `TokenStream`'s produced by other means (i.e. parsed
     /// source code, internally constructed token streams, and token streams
     /// produced by declarative macros).
-    JointHidden,
+    JointHidden = 2,
 }
 
 /// Identifier or keyword.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Ident<S> {
+pub struct Ident {
     pub sym: Symbol,
-    pub span: S,
+    pub span: Span,
     pub is_raw: IdentIsRaw,
 }
 
-impl<S> Ident<S> {
-    pub fn new(text: &str, span: S) -> Self {
+impl Ident {
+    pub fn new(text: &str, span: Span) -> Self {
         // let raw_stripped = IdentIsRaw::split_from_symbol(text.as_ref());
         let (is_raw, text) = IdentIsRaw::split_from_symbol(text);
         Ident { sym: Symbol::intern(text), span, is_raw }
     }
 }
 
-fn print_debug_subtree<S: fmt::Debug>(
+fn print_debug_subtree(
     f: &mut fmt::Formatter<'_>,
-    subtree: &Subtree<S>,
+    subtree: &Subtree,
     level: usize,
-    iter: TtIter<'_, S>,
+    iter: TtIter<'_>,
 ) -> fmt::Result {
     let align = "  ".repeat(level);
 
@@ -739,25 +598,14 @@ fn print_debug_subtree<S: fmt::Debug>(
     Ok(())
 }
 
-fn print_debug_token<S: fmt::Debug>(
-    f: &mut fmt::Formatter<'_>,
-    level: usize,
-    tt: TtElement<'_, S>,
-) -> fmt::Result {
+fn print_debug_token(f: &mut fmt::Formatter<'_>, level: usize, tt: TtElement<'_>) -> fmt::Result {
     let align = "  ".repeat(level);
 
     match tt {
         TtElement::Leaf(leaf) => match leaf {
             Leaf::Literal(lit) => {
-                write!(
-                    f,
-                    "{}LITERAL {:?} {}{} {:#?}",
-                    align,
-                    lit.kind,
-                    lit.symbol,
-                    lit.suffix.as_ref().map(|it| it.as_str()).unwrap_or(""),
-                    lit.span
-                )?;
+                let (text, suffix) = lit.text_and_suffix();
+                write!(f, "{}LITERAL {:?} {}{} {:#?}", align, lit.kind, text, suffix, lit.span)?;
             }
             Leaf::Punct(punct) => {
                 write!(
@@ -781,26 +629,26 @@ fn print_debug_token<S: fmt::Debug>(
             }
         },
         TtElement::Subtree(subtree, subtree_iter) => {
-            print_debug_subtree(f, subtree, level, subtree_iter)?;
+            print_debug_subtree(f, &subtree, level, subtree_iter)?;
         }
     }
 
     Ok(())
 }
 
-impl<S: fmt::Debug + Copy> fmt::Debug for TopSubtree<S> {
+impl fmt::Debug for TopSubtree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.view(), f)
     }
 }
 
-impl<S: fmt::Display + Copy> fmt::Display for TopSubtree<S> {
+impl fmt::Display for TopSubtree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.view(), f)
     }
 }
 
-impl<S> fmt::Display for Leaf<S> {
+impl fmt::Display for Leaf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Leaf::Ident(it) => fmt::Display::fmt(it, f),
@@ -810,207 +658,65 @@ impl<S> fmt::Display for Leaf<S> {
     }
 }
 
-impl<S> fmt::Display for Ident<S> {
+impl fmt::Display for Ident {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.is_raw.as_str(), f)?;
         fmt::Display::fmt(&self.sym, f)
     }
 }
 
-impl<S> Literal<S> {
-    pub fn display_no_minus(&self) -> impl fmt::Display {
-        struct NoMinus<'a, S>(&'a Literal<S>);
-        impl<S> fmt::Display for NoMinus<'_, S> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let symbol =
-                    self.0.symbol.as_str().strip_prefix('-').unwrap_or(self.0.symbol.as_str());
-                match self.0.kind {
-                    LitKind::Byte => write!(f, "b'{symbol}'"),
-                    LitKind::Char => write!(f, "'{symbol}'"),
-                    LitKind::Integer | LitKind::Float | LitKind::Err(_) => write!(f, "{symbol}"),
-                    LitKind::Str => write!(f, "\"{symbol}\""),
-                    LitKind::ByteStr => write!(f, "b\"{symbol}\""),
-                    LitKind::CStr => write!(f, "c\"{symbol}\""),
-                    LitKind::StrRaw(num_of_hashes) => {
-                        let num_of_hashes = num_of_hashes as usize;
-                        write!(
-                            f,
-                            r#"r{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#,
-                            "",
-                            text = symbol
-                        )
-                    }
-                    LitKind::ByteStrRaw(num_of_hashes) => {
-                        let num_of_hashes = num_of_hashes as usize;
-                        write!(
-                            f,
-                            r#"br{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#,
-                            "",
-                            text = symbol
-                        )
-                    }
-                    LitKind::CStrRaw(num_of_hashes) => {
-                        let num_of_hashes = num_of_hashes as usize;
-                        write!(
-                            f,
-                            r#"cr{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#,
-                            "",
-                            text = symbol
-                        )
-                    }
-                }?;
-                if let Some(suffix) = &self.0.suffix {
-                    write!(f, "{suffix}")?;
-                }
-                Ok(())
-            }
-        }
-        NoMinus(self)
-    }
-}
-
-impl<S> fmt::Display for Literal<S> {
+impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (text, suffix) = self.text_and_suffix();
         match self.kind {
-            LitKind::Byte => write!(f, "b'{}'", self.symbol),
-            LitKind::Char => write!(f, "'{}'", self.symbol),
-            LitKind::Integer | LitKind::Float | LitKind::Err(_) => write!(f, "{}", self.symbol),
-            LitKind::Str => write!(f, "\"{}\"", self.symbol),
-            LitKind::ByteStr => write!(f, "b\"{}\"", self.symbol),
-            LitKind::CStr => write!(f, "c\"{}\"", self.symbol),
+            LitKind::Byte => write!(f, "b'{}'", text),
+            LitKind::Char => write!(f, "'{}'", text),
+            LitKind::Integer | LitKind::Float | LitKind::Err(_) => write!(f, "{}", text),
+            LitKind::Str => write!(f, "\"{}\"", text),
+            LitKind::ByteStr => write!(f, "b\"{}\"", text),
+            LitKind::CStr => write!(f, "c\"{}\"", text),
             LitKind::StrRaw(num_of_hashes) => {
                 let num_of_hashes = num_of_hashes as usize;
-                write!(
-                    f,
-                    r#"r{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#,
-                    "",
-                    text = self.symbol
-                )
+                write!(f, r#"r{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
             }
             LitKind::ByteStrRaw(num_of_hashes) => {
                 let num_of_hashes = num_of_hashes as usize;
-                write!(
-                    f,
-                    r#"br{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#,
-                    "",
-                    text = self.symbol
-                )
+                write!(f, r#"br{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
             }
             LitKind::CStrRaw(num_of_hashes) => {
                 let num_of_hashes = num_of_hashes as usize;
-                write!(
-                    f,
-                    r#"cr{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#,
-                    "",
-                    text = self.symbol
-                )
+                write!(f, r#"cr{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
             }
         }?;
-        if let Some(suffix) = &self.suffix {
-            write!(f, "{suffix}")?;
-        }
+        write!(f, "{suffix}")?;
         Ok(())
     }
 }
 
-impl<S> fmt::Display for Punct<S> {
+impl fmt::Display for Punct {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.char, f)
     }
 }
 
-impl<S> Subtree<S> {
+impl Subtree {
     /// Count the number of tokens recursively
     pub fn count(&self) -> usize {
         self.usize_len()
     }
 }
 
-impl<S> TopSubtree<S> {
-    /// A simple line string used for debugging
-    pub fn subtree_as_debug_string(&self, subtree_idx: usize) -> String {
-        fn debug_subtree<S>(
-            output: &mut String,
-            subtree: &Subtree<S>,
-            iter: &mut std::slice::Iter<'_, TokenTree<S>>,
-        ) {
-            let delim = match subtree.delimiter.kind {
-                DelimiterKind::Brace => ("{", "}"),
-                DelimiterKind::Bracket => ("[", "]"),
-                DelimiterKind::Parenthesis => ("(", ")"),
-                DelimiterKind::Invisible => ("$", "$"),
-            };
+pub fn pretty(tkns: TokenTreesView<'_>) -> String {
+    return pretty_impl(tkns.iter());
 
-            output.push_str(delim.0);
-            let mut last = None;
-            let mut idx = 0;
-            while idx < subtree.len {
-                let child = iter.next().unwrap();
-                debug_token_tree(output, child, last, iter);
-                last = Some(child);
-                idx += 1;
-            }
-
-            output.push_str(delim.1);
-        }
-
-        fn debug_token_tree<S>(
-            output: &mut String,
-            tt: &TokenTree<S>,
-            last: Option<&TokenTree<S>>,
-            iter: &mut std::slice::Iter<'_, TokenTree<S>>,
-        ) {
-            match tt {
-                TokenTree::Leaf(it) => {
-                    let s = match it {
-                        Leaf::Literal(it) => it.symbol.to_string(),
-                        Leaf::Punct(it) => it.char.to_string(),
-                        Leaf::Ident(it) => format!("{}{}", it.is_raw.as_str(), it.sym),
-                    };
-                    match (it, last) {
-                        (Leaf::Ident(_), Some(&TokenTree::Leaf(Leaf::Ident(_)))) => {
-                            output.push(' ');
-                            output.push_str(&s);
-                        }
-                        (Leaf::Punct(_), Some(TokenTree::Leaf(Leaf::Punct(punct)))) => {
-                            if punct.spacing == Spacing::Alone {
-                                output.push(' ');
-                                output.push_str(&s);
-                            } else {
-                                output.push_str(&s);
-                            }
-                        }
-                        _ => output.push_str(&s),
-                    }
-                }
-                TokenTree::Subtree(it) => debug_subtree(output, it, iter),
-            }
-        }
-
-        let mut res = String::new();
-        debug_token_tree(
-            &mut res,
-            &self.0[subtree_idx],
-            None,
-            &mut self.0[subtree_idx + 1..].iter(),
-        );
-        res
-    }
-}
-
-pub fn pretty<S>(mut tkns: &[TokenTree<S>]) -> String {
-    fn tokentree_to_text<S>(tkn: &TokenTree<S>, tkns: &mut &[TokenTree<S>]) -> String {
+    fn tokentree_to_text(tkn: TtElement<'_>) -> String {
         match tkn {
-            TokenTree::Leaf(Leaf::Ident(ident)) => {
-                format!("{}{}", ident.is_raw.as_str(), ident.sym)
+            TtElement::Leaf(leaf) => {
+                format!("{}", leaf)
             }
-            TokenTree::Leaf(Leaf::Literal(literal)) => format!("{literal}"),
-            TokenTree::Leaf(Leaf::Punct(punct)) => format!("{}", punct.char),
-            TokenTree::Subtree(subtree) => {
-                let (subtree_content, rest) = tkns.split_at(subtree.usize_len());
-                let content = pretty(subtree_content);
-                *tkns = rest;
-                let (open, close) = match subtree.delimiter.kind {
+            TtElement::Subtree(Subtree { delimiter, .. }, subtree_content) => {
+                let content = pretty_impl(subtree_content);
+                let (open, close) = match delimiter.kind {
                     DelimiterKind::Brace => ("{", "}"),
                     DelimiterKind::Bracket => ("[", "]"),
                     DelimiterKind::Parenthesis => ("(", ")"),
@@ -1021,18 +727,93 @@ pub fn pretty<S>(mut tkns: &[TokenTree<S>]) -> String {
         }
     }
 
-    let mut last = String::new();
-    let mut last_to_joint = true;
+    fn pretty_impl(tkns: TtIter<'_>) -> String {
+        let mut last = String::new();
+        let mut last_to_joint = true;
 
-    while let Some((tkn, rest)) = tkns.split_first() {
-        tkns = rest;
-        last = [last, tokentree_to_text(tkn, &mut tkns)].join(if last_to_joint { "" } else { " " });
-        last_to_joint = false;
-        if let TokenTree::Leaf(Leaf::Punct(punct)) = tkn {
-            if punct.spacing == Spacing::Joint {
+        for tkn in tkns {
+            last =
+                [last, tokentree_to_text(tkn.clone())].join(if last_to_joint { "" } else { " " });
+            last_to_joint = false;
+            if let TtElement::Leaf(Leaf::Punct(Punct { spacing, .. })) = tkn
+                && spacing == Spacing::Joint
+            {
                 last_to_joint = true;
             }
         }
+        last
     }
-    last
+}
+
+#[derive(Debug)]
+pub enum TransformTtAction<'a> {
+    Keep,
+    ReplaceWith(TokenTreesView<'a>),
+}
+
+impl TransformTtAction<'_> {
+    #[inline]
+    pub fn remove() -> Self {
+        Self::ReplaceWith(TokenTreesView::empty())
+    }
+}
+
+/// This function takes a token tree, and calls `callback` with each token tree in it.
+/// Then it does what the callback says: keeps the tt or replaces it with a (possibly empty)
+/// tts view.
+pub fn transform_tt<'b>(
+    tt: &mut TopSubtree,
+    mut callback: impl FnMut(&TokenTree) -> TransformTtAction<'b>,
+) {
+    let mut tt_vec = tt.as_token_trees().iter_flat_tokens().collect::<Vec<_>>();
+
+    // We need to keep a stack of the currently open subtrees, because we need to update
+    // them if we change the number of items in them.
+    let mut subtrees_stack = Vec::new();
+    let mut i = 0;
+    while i < tt_vec.len() {
+        'pop_finished_subtrees: while let Some(&subtree_idx) = subtrees_stack.last() {
+            let TokenTree::Subtree(subtree) = &tt_vec[subtree_idx] else {
+                unreachable!("non-subtree on subtrees stack");
+            };
+            if i >= subtree_idx + 1 + subtree.usize_len() {
+                subtrees_stack.pop();
+            } else {
+                break 'pop_finished_subtrees;
+            }
+        }
+
+        let current = &tt_vec[i];
+        let action = callback(current);
+        match action {
+            TransformTtAction::Keep => {
+                // This cannot be shared with the replaced case, because then we may push the same subtree
+                // twice, and will update it twice which will lead to errors.
+                if let TokenTree::Subtree(_) = current {
+                    subtrees_stack.push(i);
+                }
+
+                i += 1;
+            }
+            TransformTtAction::ReplaceWith(replacement) => {
+                let old_len = 1 + match current {
+                    TokenTree::Leaf(_) => 0,
+                    TokenTree::Subtree(subtree) => subtree.usize_len(),
+                };
+                let len_diff = replacement.len() as i64 - old_len as i64;
+                tt_vec.splice(i..i + old_len, replacement.iter_flat_tokens());
+                // Skip the newly inserted replacement, we don't want to visit it.
+                i += replacement.len();
+
+                for &subtree_idx in &subtrees_stack {
+                    let TokenTree::Subtree(subtree) = &mut tt_vec[subtree_idx] else {
+                        unreachable!("non-subtree on subtrees stack");
+                    };
+                    subtree.len = (i64::from(subtree.len) + len_diff).try_into().unwrap();
+                }
+            }
+        }
+    }
+
+    *tt = TopSubtree::from_serialized(tt_vec);
 }

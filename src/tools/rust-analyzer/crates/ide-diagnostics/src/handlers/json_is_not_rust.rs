@@ -1,13 +1,12 @@
 //! This diagnostic provides an assist for creating a struct definition from a JSON
 //! example.
 
-use hir::{ImportPathConfig, PathResolution, Semantics};
+use hir::{FindPathConfig, PathResolution, Semantics};
+use ide_db::imports::insert_use::insert_uses_with_editor;
 use ide_db::text_edit::TextEdit;
 use ide_db::{
-    EditionedFileId, FileRange, FxHashMap, RootDatabase,
-    helpers::mod_path_to_ast,
-    imports::insert_use::{ImportScope, insert_use},
-    source_change::SourceChangeBuilder,
+    EditionedFileId, FileRange, FxHashMap, RootDatabase, helpers::mod_path_to_ast,
+    imports::insert_use::ImportScope, source_change::SourceChangeBuilder,
 };
 use itertools::Itertools;
 use stdx::{format_to, never};
@@ -138,48 +137,47 @@ pub(crate) fn json_in_items(
                     .stable()
                     .with_fixes(Some(vec![{
                         let mut scb = SourceChangeBuilder::new(vfs_file_id);
-                        let scope = scb.make_import_scope_mut(import_scope);
+                        let editor = scb.make_editor(import_scope.as_syntax_node());
                         let current_module = semantics_scope.module();
 
-                        let cfg = ImportPathConfig {
+                        let cfg = FindPathConfig {
                             prefer_no_std: config.prefer_no_std,
                             prefer_prelude: config.prefer_prelude,
                             prefer_absolute: config.prefer_absolute,
                             allow_unstable: true,
                         };
 
-                        if !scope_has("Serialize") {
-                            if let Some(PathResolution::Def(it)) = serialize_resolved {
-                                if let Some(it) = current_module.find_use_path(
-                                    sema.db,
-                                    it,
-                                    config.insert_use.prefix_kind,
-                                    cfg,
-                                ) {
-                                    insert_use(
-                                        &scope,
-                                        mod_path_to_ast(&it, edition),
-                                        &config.insert_use,
-                                    );
-                                }
-                            }
+                        let mut imports_to_insert = Vec::new();
+                        if !scope_has("Serialize")
+                            && let Some(PathResolution::Def(it)) = serialize_resolved
+                            && let Some(it) = current_module.find_use_path(
+                                sema.db,
+                                it,
+                                config.insert_use.prefix_kind,
+                                cfg,
+                            )
+                        {
+                            imports_to_insert.push(mod_path_to_ast(&it, edition));
                         }
-                        if !scope_has("Deserialize") {
-                            if let Some(PathResolution::Def(it)) = deserialize_resolved {
-                                if let Some(it) = current_module.find_use_path(
-                                    sema.db,
-                                    it,
-                                    config.insert_use.prefix_kind,
-                                    cfg,
-                                ) {
-                                    insert_use(
-                                        &scope,
-                                        mod_path_to_ast(&it, edition),
-                                        &config.insert_use,
-                                    );
-                                }
-                            }
+                        if !scope_has("Deserialize")
+                            && let Some(PathResolution::Def(it)) = deserialize_resolved
+                            && let Some(it) = current_module.find_use_path(
+                                sema.db,
+                                it,
+                                config.insert_use.prefix_kind,
+                                cfg,
+                            )
+                        {
+                            imports_to_insert.push(mod_path_to_ast(&it, edition));
                         }
+
+                        insert_uses_with_editor(
+                            &import_scope,
+                            imports_to_insert,
+                            &config.insert_use,
+                            &editor,
+                        );
+                        scb.add_file_edits(vfs_file_id, editor);
                         let mut sc = scb.finish();
                         sc.insert_source_edit(vfs_file_id, edit.finish());
                         fix("convert_json_to_struct", "Convert JSON to struct", sc, range)
@@ -243,7 +241,7 @@ mod tests {
             }
 
             #[derive(Serialize)]
-            struct Root1{ bar: f64, bay: i64, baz: (), r#box: bool, foo: String }
+            struct Root1 { bar: f64, bay: i64, baz: (), r#box: bool, foo: String }
 
             "#,
         );
@@ -262,9 +260,9 @@ mod tests {
             }
             "#,
             r#"
-            struct Value1{  }
-            struct Bar1{ kind: String, value: Value1 }
-            struct Root1{ bar: Bar1, foo: String }
+            struct Value1 {  }
+            struct Bar1 { kind: String, value: Value1 }
+            struct Root1 { bar: Bar1, foo: String }
 
             "#,
         );
@@ -294,12 +292,12 @@ mod tests {
             }
             "#,
             r#"
-            struct Address1{ house: i64, street: String }
-            struct User1{ address: Address1, email: String }
-            struct AnotherUser1{ user: User1 }
-            struct Address2{ house: i64, street: String }
-            struct User2{ address: Address2, email: String }
-            struct Root1{ another_user: AnotherUser1, user: User2 }
+            struct Address1 { house: i64, street: String }
+            struct User1 { address: Address1, email: String }
+            struct AnotherUser1 { user: User1 }
+            struct Address2 { house: i64, street: String }
+            struct User2 { address: Address2, email: String }
+            struct Root1 { another_user: AnotherUser1, user: User2 }
 
             "#,
         );
@@ -336,9 +334,9 @@ mod tests {
             use serde::Deserialize;
 
             #[derive(Serialize, Deserialize)]
-            struct OfObject1{ x: i64, y: i64 }
+            struct OfObject1 { x: i64, y: i64 }
             #[derive(Serialize, Deserialize)]
-            struct Root1{ empty: Vec<_>, nested: Vec<Vec<Vec<i64>>>, of_object: Vec<OfObject1>, of_string: Vec<String> }
+            struct Root1 { empty: Vec<_>, nested: Vec<Vec<Vec<i64>>>, of_object: Vec<OfObject1>, of_string: Vec<String> }
 
             "#,
         );

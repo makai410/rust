@@ -125,9 +125,9 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
 }
 
 impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
-    /// Because we want to track parent items and so forth, enable
-    /// deep walking so that we walk nested items in the context of
-    /// their outer items.
+    // Because we want to track parent items and so forth, enable
+    // deep walking so that we walk nested items in the context of
+    // their outer items.
 
     fn visit_nested_item(&mut self, item: ItemId) {
         debug!("visit_nested_item: {:?}", item);
@@ -164,11 +164,11 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
     fn visit_item(&mut self, i: &'hir Item<'hir>) {
         debug_assert_eq!(i.owner_id, self.owner);
         self.with_parent(i.hir_id(), |this| {
-            if let ItemKind::Struct(_, _, struct_def) = &i.kind {
+            if let ItemKind::Struct(_, _, struct_def) = &i.kind
                 // If this is a tuple or unit-like struct, register the constructor.
-                if let Some(ctor_hir_id) = struct_def.ctor_hir_id() {
-                    this.insert(i.span, ctor_hir_id, Node::Ctor(struct_def));
-                }
+                && let Some(ctor_hir_id) = struct_def.ctor_hir_id()
+            {
+                this.insert(i.span, ctor_hir_id, Node::Ctor(struct_def));
             }
             intravisit::walk_item(this, i);
         });
@@ -281,6 +281,13 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         });
     }
 
+    fn visit_const_arg_expr_field(&mut self, field: &'hir ConstArgExprField<'hir>) {
+        self.insert(field.span, field.hir_id, Node::ConstArgExprField(field));
+        self.with_parent(field.hir_id, |this| {
+            intravisit::walk_const_arg_expr_field(this, field);
+        })
+    }
+
     fn visit_stmt(&mut self, stmt: &'hir Stmt<'hir>) {
         self.insert(stmt.span, stmt.hir_id, Node::Stmt(stmt));
 
@@ -305,13 +312,13 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
 
     fn visit_const_arg(&mut self, const_arg: &'hir ConstArg<'hir, AmbigArg>) {
         self.insert(
-            const_arg.as_unambig_ct().span(),
+            const_arg.as_unambig_ct().span,
             const_arg.hir_id,
             Node::ConstArg(const_arg.as_unambig_ct()),
         );
 
         self.with_parent(const_arg.hir_id, |this| {
-            intravisit::walk_ambig_const_arg(this, const_arg);
+            intravisit::walk_const_arg(this, const_arg);
         });
     }
 
@@ -423,5 +430,15 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
             ),
         }
         intravisit::walk_precise_capturing_arg(self, arg);
+    }
+
+    fn visit_test_binder_forall(&mut self, forall: &'hir TestBinderForall<'hir>) -> Self::Result {
+        self.insert(forall.span, forall.hir_id, Node::TestBinderForall(forall));
+        self.with_parent(forall.hir_id, |this| intravisit::walk_test_binder_forall(this, forall))
+    }
+
+    fn visit_test_binder_exists(&mut self, exists: &'hir TestBinderExists<'hir>) -> Self::Result {
+        self.insert(exists.span, exists.hir_id, Node::TestBinderExists(exists));
+        self.with_parent(exists.hir_id, |this| intravisit::walk_test_binder_exists(this, exists))
     }
 }

@@ -1,3 +1,4 @@
+//@ edition:2015
 //@ check-pass
 //@ compile-flags: -Zinput-stats
 //@ only-64bit
@@ -9,8 +10,9 @@
 // many or all percentages, which makes the diffs hard to read.
 //@ normalize-stderr: "\([0-9 ][0-9]\.[0-9]%\)" -> "(NN.N%)"
 
-// Type layouts sometimes change. When that happens, until the next bootstrap
-// bump occurs, stage1 and stage2 will give different outputs for this test.
+// Type layouts sometimes change when layout algorithm changes.
+// When that happens, until the next bootstrap bump occurs,
+// stage1 and stage2 will give different outputs for this test.
 // Add an `ignore-stage1` comment marker to work around that problem during
 // that time.
 

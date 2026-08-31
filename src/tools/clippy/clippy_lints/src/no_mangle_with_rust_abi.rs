@@ -1,12 +1,11 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::{snippet, snippet_with_applicability};
 use rustc_abi::ExternAbi;
-use rustc_attr_data_structures::AttributeKind;
 use rustc_errors::Applicability;
+use rustc_hir::attrs::AttributeKind;
 use rustc_hir::{Attribute, Item, ItemKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
-use rustc_span::{BytePos, Pos};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
+use rustc_span::{BytePos, Pos as _};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -34,6 +33,7 @@ declare_clippy_lint! {
     pedantic,
     "convert Rust ABI functions to C ABI"
 }
+
 declare_lint_pass!(NoMangleWithRustAbi => [NO_MANGLE_WITH_RUST_ABI]);
 
 impl<'tcx> LateLintPass<'tcx> for NoMangleWithRustAbi {

@@ -5,7 +5,7 @@ use hir::{InFile, Semantics, Type};
 use parser::T;
 use span::TextSize;
 use syntax::{
-    AstNode, NodeOrToken, SyntaxToken,
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken,
     ast::{self, AstChildren, HasArgList, HasAttrs, HasName},
     match_ast,
 };
@@ -27,7 +27,7 @@ impl<'db> ActiveParameter<'db> {
 
     /// Returns information about the call argument this token is part of.
     pub fn at_arg(
-        sema: &'db Semantics<'db, RootDatabase>,
+        sema: &Semantics<'db, RootDatabase>,
         list: ast::ArgList,
         at: TextSize,
     ) -> Option<Self> {
@@ -102,8 +102,7 @@ pub fn callable_for_node<'db>(
         arg_list
             .syntax()
             .children_with_tokens()
-            .filter_map(NodeOrToken::into_token)
-            .filter(|t| t.kind() == T![,])
+            .filter_map(into_comma)
             .take_while(|t| t.text_range().start() <= offset)
             .count()
     });
@@ -114,7 +113,7 @@ pub fn generic_def_for_node(
     sema: &Semantics<'_, RootDatabase>,
     generic_arg_list: &ast::GenericArgList,
     token: &SyntaxToken,
-) -> Option<(hir::GenericDef, usize, bool, Option<hir::Variant>)> {
+) -> Option<(hir::GenericDef, usize, bool, Option<hir::EnumVariant>)> {
     let parent = generic_arg_list.syntax().parent()?;
     let mut variant = None;
     let def = match_ast! {
@@ -125,9 +124,8 @@ pub fn generic_def_for_node(
                     hir::PathResolution::Def(hir::ModuleDef::Adt(it)) => it.into(),
                     hir::PathResolution::Def(hir::ModuleDef::Function(it)) => it.into(),
                     hir::PathResolution::Def(hir::ModuleDef::Trait(it)) => it.into(),
-                    hir::PathResolution::Def(hir::ModuleDef::TraitAlias(it)) => it.into(),
                     hir::PathResolution::Def(hir::ModuleDef::TypeAlias(it)) => it.into(),
-                    hir::PathResolution::Def(hir::ModuleDef::Variant(it)) => {
+                    hir::PathResolution::Def(hir::ModuleDef::EnumVariant(it)) => {
                         variant = Some(it);
                         it.parent_enum(sema.db).into()
                     },
@@ -163,8 +161,7 @@ pub fn generic_def_for_node(
     let active_param = generic_arg_list
         .syntax()
         .children_with_tokens()
-        .filter_map(NodeOrToken::into_token)
-        .filter(|t| t.kind() == T![,])
+        .filter_map(into_comma)
         .take_while(|t| t.text_range().start() <= token.text_range().start())
         .count();
 
@@ -174,4 +171,13 @@ pub fn generic_def_for_node(
         .is_some_and(|arg| !matches!(arg, ast::GenericArg::LifetimeArg(_)));
 
     Some((def, active_param, first_arg_is_non_lifetime, variant))
+}
+
+fn into_comma(it: NodeOrToken<SyntaxNode, SyntaxToken>) -> Option<SyntaxToken> {
+    let token = match it {
+        NodeOrToken::Token(it) => it,
+        NodeOrToken::Node(node) if node.kind() == SyntaxKind::ERROR => node.first_token()?,
+        NodeOrToken::Node(_) => return None,
+    };
+    (token.kind() == T![,]).then_some(token)
 }

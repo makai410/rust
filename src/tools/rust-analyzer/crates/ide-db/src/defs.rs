@@ -5,46 +5,48 @@
 
 // FIXME: this badly needs rename/rewrite (matklad, 2020-02-06).
 
+use std::borrow::Cow;
+
 use crate::RootDatabase;
-use crate::documentation::{DocsRangeMap, Documentation, HasDocs};
+use crate::documentation::{Documentation, HasDocs};
 use crate::famous_defs::FamousDefs;
 use arrayvec::ArrayVec;
 use either::Either;
 use hir::{
     Adt, AsAssocItem, AsExternAssocItem, AssocItem, AttributeTemplate, BuiltinAttr, BuiltinType,
-    Const, Crate, DefWithBody, DeriveHelper, DisplayTarget, DocLinkDef, ExternAssocItem,
-    ExternCrateDecl, Field, Function, GenericDef, GenericParam, GenericSubstitution, HasContainer,
-    HasVisibility, HirDisplay, Impl, InlineAsmOperand, ItemContainer, Label, Local, Macro, Module,
-    ModuleDef, Name, PathResolution, Semantics, Static, StaticLifetime, Struct, ToolModule, Trait,
-    TraitAlias, TupleField, TypeAlias, Variant, VariantDef, Visibility,
+    Const, Crate, DefWithBody, DeriveHelper, DisplayTarget, DocLinkDef, EnumVariant,
+    ExpressionStoreOwner, ExternAssocItem, ExternCrateDecl, Field, Function, GenericDef,
+    GenericParam, GenericSubstitution, HasContainer, HasVisibility, HirDisplay, Impl,
+    InlineAsmOperand, ItemContainer, Label, Local, Macro, Module, ModuleDef, Name, PathResolution,
+    Semantics, Static, StaticLifetime, Struct, ToolModule, Trait, TupleField, TypeAlias, Variant,
+    Visibility,
 };
 use span::Edition;
 use stdx::{format_to, impl_from};
 use syntax::{
-    SyntaxKind, SyntaxNode, SyntaxToken, TextSize,
+    SyntaxKind, SyntaxNode, SyntaxToken,
     ast::{self, AstNode},
     match_ast,
 };
 
 // FIXME: a more precise name would probably be `Symbol`?
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
-pub enum Definition {
+pub enum Definition<'db> {
     Macro(Macro),
     Field(Field),
-    TupleField(TupleField),
+    TupleField(TupleField<'db>),
     Module(Module),
     Crate(Crate),
     Function(Function),
     Adt(Adt),
-    Variant(Variant),
+    EnumVariant(EnumVariant),
     Const(Const),
     Static(Static),
     Trait(Trait),
-    TraitAlias(TraitAlias),
     TypeAlias(TypeAlias),
     SelfType(Impl),
     GenericParam(GenericParam),
-    Local(Local),
+    Local(Local<'db>),
     Label(Label),
     DeriveHelper(DeriveHelper),
     BuiltinType(BuiltinType),
@@ -56,16 +58,16 @@ pub enum Definition {
     InlineAsmOperand(InlineAsmOperand),
 }
 
-impl Definition {
+impl<'db> Definition<'db> {
     pub fn canonical_module_path(&self, db: &RootDatabase) -> Option<impl Iterator<Item = Module>> {
         self.module(db).map(|it| it.path_to_root(db).into_iter().rev())
     }
 
     pub fn krate(&self, db: &RootDatabase) -> Option<Crate> {
         Some(match self {
-            Definition::Module(m) => m.krate(),
+            Definition::Module(m) => m.krate(db),
             &Definition::Crate(it) => it,
-            _ => self.module(db)?.krate(),
+            _ => self.module(db)?.krate(db),
         })
     }
 
@@ -83,9 +85,8 @@ impl Definition {
             Definition::Const(it) => it.module(db),
             Definition::Static(it) => it.module(db),
             Definition::Trait(it) => it.module(db),
-            Definition::TraitAlias(it) => it.module(db),
             Definition::TypeAlias(it) => it.module(db),
-            Definition::Variant(it) => it.module(db),
+            Definition::EnumVariant(it) => it.module(db),
             Definition::SelfType(it) => it.module(db),
             Definition::Local(it) => it.module(db),
             Definition::GenericParam(it) => it.module(db),
@@ -93,7 +94,7 @@ impl Definition {
             Definition::ExternCrateDecl(it) => it.module(db),
             Definition::DeriveHelper(it) => it.derive().module(db),
             Definition::InlineAsmOperand(it) => it.parent(db).module(db),
-            Definition::ToolModule(t) => t.krate().root_module(),
+            Definition::ToolModule(t) => t.krate().root_module(db),
             Definition::BuiltinAttr(_)
             | Definition::BuiltinType(_)
             | Definition::BuiltinLifetime(_)
@@ -103,8 +104,8 @@ impl Definition {
         Some(module)
     }
 
-    pub fn enclosing_definition(&self, db: &RootDatabase) -> Option<Definition> {
-        fn container_to_definition(container: ItemContainer) -> Option<Definition> {
+    pub fn enclosing_definition(&self, db: &RootDatabase) -> Option<Definition<'db>> {
+        fn container_to_definition<'db>(container: ItemContainer) -> Option<Definition<'db>> {
             match container {
                 ItemContainer::Trait(it) => Some(it.into()),
                 ItemContainer::Impl(it) => Some(it.into()),
@@ -122,9 +123,8 @@ impl Definition {
             Definition::Const(it) => container_to_definition(it.container(db)),
             Definition::Static(it) => container_to_definition(it.container(db)),
             Definition::Trait(it) => container_to_definition(it.container(db)),
-            Definition::TraitAlias(it) => container_to_definition(it.container(db)),
             Definition::TypeAlias(it) => container_to_definition(it.container(db)),
-            Definition::Variant(it) => Some(Adt::Enum(it.parent_enum(db)).into()),
+            Definition::EnumVariant(it) => Some(Adt::Enum(it.parent_enum(db)).into()),
             Definition::SelfType(it) => Some(it.module(db).into()),
             Definition::Local(it) => it.parent(db).try_into().ok(),
             Definition::GenericParam(it) => Some(it.parent().into()),
@@ -151,9 +151,8 @@ impl Definition {
             Definition::Const(it) => it.visibility(db),
             Definition::Static(it) => it.visibility(db),
             Definition::Trait(it) => it.visibility(db),
-            Definition::TraitAlias(it) => it.visibility(db),
             Definition::TypeAlias(it) => it.visibility(db),
-            Definition::Variant(it) => it.visibility(db),
+            Definition::EnumVariant(it) => it.visibility(db),
             Definition::ExternCrateDecl(it) => it.visibility(db),
             Definition::Macro(it) => it.visibility(db),
             Definition::BuiltinType(_) | Definition::TupleField(_) => Visibility::Public,
@@ -181,11 +180,10 @@ impl Definition {
             }
             Definition::Function(it) => it.name(db),
             Definition::Adt(it) => it.name(db),
-            Definition::Variant(it) => it.name(db),
+            Definition::EnumVariant(it) => it.name(db),
             Definition::Const(it) => it.name(db)?,
             Definition::Static(it) => it.name(db),
             Definition::Trait(it) => it.name(db),
-            Definition::TraitAlias(it) => it.name(db),
             Definition::TypeAlias(it) => it.name(db),
             Definition::BuiltinType(it) => it.name(),
             Definition::TupleField(it) => it.name(),
@@ -204,21 +202,25 @@ impl Definition {
         Some(name)
     }
 
-    pub fn docs(
+    pub fn docs<'a>(
         &self,
-        db: &RootDatabase,
+        db: &'a RootDatabase,
         famous_defs: Option<&FamousDefs<'_, '_>>,
         display_target: DisplayTarget,
-    ) -> Option<Documentation> {
-        self.docs_with_rangemap(db, famous_defs, display_target).map(|(docs, _)| docs)
+    ) -> Option<Documentation<'a>> {
+        self.docs_with_rangemap(db, famous_defs, display_target).map(|docs| match docs {
+            Either::Left(Cow::Borrowed(docs)) => Documentation::new_borrowed(docs.docs()),
+            Either::Left(Cow::Owned(docs)) => Documentation::new_owned(docs.into_docs()),
+            Either::Right(docs) => docs,
+        })
     }
 
-    pub fn docs_with_rangemap(
+    pub fn docs_with_rangemap<'a>(
         &self,
-        db: &RootDatabase,
+        db: &'a RootDatabase,
         famous_defs: Option<&FamousDefs<'_, '_>>,
         display_target: DisplayTarget,
-    ) -> Option<(Documentation, Option<DocsRangeMap>)> {
+    ) -> Option<Either<Cow<'a, hir::Docs>, Documentation<'a>>> {
         let docs = match self {
             Definition::Macro(it) => it.docs_with_rangemap(db),
             Definition::Field(it) => it.docs_with_rangemap(db),
@@ -226,24 +228,21 @@ impl Definition {
             Definition::Crate(it) => it.docs_with_rangemap(db),
             Definition::Function(it) => it.docs_with_rangemap(db),
             Definition::Adt(it) => it.docs_with_rangemap(db),
-            Definition::Variant(it) => it.docs_with_rangemap(db),
+            Definition::EnumVariant(it) => it.docs_with_rangemap(db),
             Definition::Const(it) => it.docs_with_rangemap(db),
             Definition::Static(it) => it.docs_with_rangemap(db),
             Definition::Trait(it) => it.docs_with_rangemap(db),
-            Definition::TraitAlias(it) => it.docs_with_rangemap(db),
             Definition::TypeAlias(it) => {
                 it.docs_with_rangemap(db).or_else(|| {
                     // docs are missing, try to fall back to the docs of the aliased item.
                     let adt = it.ty(db).as_adt()?;
-                    let (docs, range_map) = adt.docs_with_rangemap(db)?;
+                    let mut docs = adt.docs_with_rangemap(db)?.into_owned();
                     let header_docs = format!(
                         "*This is the documentation for* `{}`\n\n",
                         adt.display(db, display_target)
                     );
-                    let offset = TextSize::new(header_docs.len() as u32);
-                    let range_map = range_map.shift_docstring_line_range(offset);
-                    let docs = header_docs + docs.as_str();
-                    Some((Documentation::new(docs), range_map))
+                    docs.prepend_str(&header_docs);
+                    Some(Cow::Owned(docs))
                 })
             }
             Definition::BuiltinType(it) => {
@@ -252,7 +251,7 @@ impl Definition {
                     let primitive_mod =
                         format!("prim_{}", it.name().display(fd.0.db, display_target.edition));
                     let doc_owner = find_std_module(fd, &primitive_mod, display_target.edition)?;
-                    doc_owner.docs_with_rangemap(fd.0.db)
+                    doc_owner.docs_with_rangemap(db)
                 })
             }
             Definition::BuiltinLifetime(StaticLifetime) => None,
@@ -265,8 +264,8 @@ impl Definition {
             Definition::ExternCrateDecl(it) => it.docs_with_rangemap(db),
 
             Definition::BuiltinAttr(it) => {
-                let name = it.name(db);
-                let AttributeTemplate { word, list, name_value_str } = it.template(db)?;
+                let name = it.name();
+                let AttributeTemplate { word, list, name_value_str } = it.template()?;
                 let mut docs = "Valid forms are:".to_owned();
                 if word {
                     format_to!(docs, "\n - #\\[{}]", name.display(db, display_target.edition));
@@ -288,7 +287,7 @@ impl Definition {
                     );
                 }
 
-                return Some((Documentation::new(docs.replace('*', "\\*")), None));
+                return Some(Either::Right(Documentation::new_owned(docs.replace('*', "\\*"))));
             }
             Definition::ToolModule(_) => None,
             Definition::DeriveHelper(_) => None,
@@ -305,7 +304,7 @@ impl Definition {
             let item = trait_.items(db).into_iter().find(|it| it.name(db) == name)?;
             item.docs_with_rangemap(db)
         })
-        .map(|(docs, range_map)| (docs, Some(range_map)))
+        .map(Either::Left)
     }
 
     pub fn label(&self, db: &RootDatabase, display_target: DisplayTarget) -> String {
@@ -317,11 +316,10 @@ impl Definition {
             Definition::Crate(it) => it.display(db, display_target).to_string(),
             Definition::Function(it) => it.display(db, display_target).to_string(),
             Definition::Adt(it) => it.display(db, display_target).to_string(),
-            Definition::Variant(it) => it.display(db, display_target).to_string(),
+            Definition::EnumVariant(it) => it.display(db, display_target).to_string(),
             Definition::Const(it) => it.display(db, display_target).to_string(),
             Definition::Static(it) => it.display(db, display_target).to_string(),
             Definition::Trait(it) => it.display(db, display_target).to_string(),
-            Definition::TraitAlias(it) => it.display(db, display_target).to_string(),
             Definition::TypeAlias(it) => it.display(db, display_target).to_string(),
             Definition::BuiltinType(it) => {
                 it.name().display(db, display_target.edition).to_string()
@@ -355,7 +353,7 @@ impl Definition {
             Definition::Label(it) => it.name(db).display(db, display_target.edition).to_string(),
             Definition::ExternCrateDecl(it) => it.display(db, display_target).to_string(),
             Definition::BuiltinAttr(it) => {
-                format!("#[{}]", it.name(db).display(db, display_target.edition))
+                format!("#[{}]", it.name().display(db, display_target.edition))
             }
             Definition::ToolModule(it) => {
                 it.name(db).display(db, display_target.edition).to_string()
@@ -370,14 +368,14 @@ impl Definition {
     }
 }
 
-fn find_std_module(
+pub fn find_std_module(
     famous_defs: &FamousDefs<'_, '_>,
     name: &str,
     edition: Edition,
 ) -> Option<hir::Module> {
     let db = famous_defs.0.db;
     let std_crate = famous_defs.std()?;
-    let std_root_module = std_crate.root_module();
+    let std_root_module = std_crate.root_module(famous_defs.0.db);
     std_root_module.children(db).find(|module| {
         module.name(db).is_some_and(|module| module.display(db, edition).to_string() == name)
     })
@@ -434,7 +432,7 @@ impl<'db> IdentClass<'db> {
             .or_else(|| NameClass::classify_lifetime(sema, lifetime).map(IdentClass::NameClass))
     }
 
-    pub fn definitions(self) -> ArrayVec<(Definition, Option<GenericSubstitution<'db>>), 2> {
+    pub fn definitions(self) -> ArrayVec<(Definition<'db>, Option<GenericSubstitution<'db>>), 2> {
         let mut res = ArrayVec::new();
         match self {
             IdentClass::NameClass(NameClass::Definition(it) | NameClass::ConstReference(it)) => {
@@ -475,7 +473,7 @@ impl<'db> IdentClass<'db> {
         res
     }
 
-    pub fn definitions_no_ops(self) -> ArrayVec<Definition, 2> {
+    pub fn definitions_no_ops(self) -> ArrayVec<Definition<'db>, 2> {
         let mut res = ArrayVec::new();
         match self {
             IdentClass::NameClass(NameClass::Definition(it) | NameClass::ConstReference(it)) => {
@@ -519,14 +517,14 @@ impl<'db> IdentClass<'db> {
 /// A model special case is `None` constant in pattern.
 #[derive(Debug)]
 pub enum NameClass<'db> {
-    Definition(Definition),
+    Definition(Definition<'db>),
     /// `None` in `if let None = Some(82) {}`.
     /// Syntactically, it is a name, but semantically it is a reference.
-    ConstReference(Definition),
+    ConstReference(Definition<'db>),
     /// `field` in `if let Foo { field } = foo`. Here, `ast::Name` both introduces
     /// a definition into a local scope, and refers to an existing definition.
     PatFieldShorthand {
-        local_def: Local,
+        local_def: Local<'db>,
         field_ref: Field,
         adt_subst: GenericSubstitution<'db>,
     },
@@ -534,7 +532,7 @@ pub enum NameClass<'db> {
 
 impl<'db> NameClass<'db> {
     /// `Definition` defined by this name.
-    pub fn defined(self) -> Option<Definition> {
+    pub fn defined(self) -> Option<Definition<'db>> {
         let res = match self {
             NameClass::Definition(it) => it,
             NameClass::ConstReference(_) => return None,
@@ -559,7 +557,7 @@ impl<'db> NameClass<'db> {
                 ast::Rename(it) => classify_rename(sema, it)?,
                 ast::SelfParam(it) => Definition::Local(sema.to_def(&it)?),
                 ast::RecordField(it) => Definition::Field(sema.to_def(&it)?),
-                ast::Variant(it) => Definition::Variant(sema.to_def(&it)?),
+                ast::Variant(it) => Definition::EnumVariant(sema.to_def(&it)?),
                 ast::TypeParam(it) => Definition::GenericParam(sema.to_def(&it)?.into()),
                 ast::ConstParam(it) => Definition::GenericParam(sema.to_def(&it)?.into()),
                 ast::AsmOperandNamed(it) => Definition::InlineAsmOperand(sema.to_def(&it)?),
@@ -568,10 +566,10 @@ impl<'db> NameClass<'db> {
         };
         return Some(NameClass::Definition(definition));
 
-        fn classify_item(
-            sema: &Semantics<'_, RootDatabase>,
+        fn classify_item<'db>(
+            sema: &Semantics<'db, RootDatabase>,
             item: ast::Item,
-        ) -> Option<Definition> {
+        ) -> Option<Definition<'db>> {
             let definition = match item {
                 ast::Item::MacroRules(it) => {
                     Definition::Macro(sema.to_def(&ast::Macro::MacroRules(it))?)
@@ -589,7 +587,6 @@ impl<'db> NameClass<'db> {
                 ast::Item::Module(it) => Definition::Module(sema.to_def(&it)?),
                 ast::Item::Static(it) => Definition::Static(sema.to_def(&it)?),
                 ast::Item::Trait(it) => Definition::Trait(sema.to_def(&it)?),
-                ast::Item::TraitAlias(it) => Definition::TraitAlias(sema.to_def(&it)?),
                 ast::Item::TypeAlias(it) => Definition::TypeAlias(sema.to_def(&it)?),
                 ast::Item::Enum(it) => Definition::Adt(hir::Adt::Enum(sema.to_def(&it)?)),
                 ast::Item::Struct(it) => Definition::Adt(hir::Adt::Struct(sema.to_def(&it)?)),
@@ -610,26 +607,24 @@ impl<'db> NameClass<'db> {
 
             let local = sema.to_def(&ident_pat)?;
             let pat_parent = ident_pat.syntax().parent();
-            if let Some(record_pat_field) = pat_parent.and_then(ast::RecordPatField::cast) {
-                if record_pat_field.name_ref().is_none() {
-                    if let Some((field, _, adt_subst)) =
-                        sema.resolve_record_pat_field_with_subst(&record_pat_field)
-                    {
-                        return Some(NameClass::PatFieldShorthand {
-                            local_def: local,
-                            field_ref: field,
-                            adt_subst,
-                        });
-                    }
-                }
+            if let Some(record_pat_field) = pat_parent.and_then(ast::RecordPatField::cast)
+                && record_pat_field.name_ref().is_none()
+                && let Some((field, _, adt_subst)) =
+                    sema.resolve_record_pat_field_with_subst(&record_pat_field)
+            {
+                return Some(NameClass::PatFieldShorthand {
+                    local_def: local,
+                    field_ref: field,
+                    adt_subst,
+                });
             }
             Some(NameClass::Definition(Definition::Local(local)))
         }
 
-        fn classify_rename(
-            sema: &Semantics<'_, RootDatabase>,
+        fn classify_rename<'db>(
+            sema: &Semantics<'db, RootDatabase>,
             rename: ast::Rename,
-        ) -> Option<Definition> {
+        ) -> Option<Definition<'db>> {
             if let Some(use_tree) = rename.syntax().parent().and_then(ast::UseTree::cast) {
                 let path = use_tree.path()?;
                 sema.resolve_path(&path).map(Definition::from)
@@ -727,9 +722,9 @@ impl OperatorClass {
 /// reference to point to two different defs.
 #[derive(Debug)]
 pub enum NameRefClass<'db> {
-    Definition(Definition, Option<GenericSubstitution<'db>>),
+    Definition(Definition<'db>, Option<GenericSubstitution<'db>>),
     FieldShorthand {
-        local_ref: Local,
+        local_ref: Local<'db>,
         field_ref: Field,
         adt_subst: GenericSubstitution<'db>,
     },
@@ -755,30 +750,27 @@ impl<'db> NameRefClass<'db> {
 
         let parent = name_ref.syntax().parent()?;
 
-        if let Some(record_field) = ast::RecordExprField::for_field_name(name_ref) {
-            if let Some((field, local, _, adt_subst)) =
+        if let Some(record_field) = ast::RecordExprField::for_field_name(name_ref)
+            && let Some((field, local, _, adt_subst)) =
                 sema.resolve_record_field_with_substitution(&record_field)
-            {
-                let res = match local {
-                    None => NameRefClass::Definition(Definition::Field(field), Some(adt_subst)),
-                    Some(local) => NameRefClass::FieldShorthand {
-                        field_ref: field,
-                        local_ref: local,
-                        adt_subst,
-                    },
-                };
-                return Some(res);
-            }
+        {
+            let res = match local {
+                None => NameRefClass::Definition(Definition::Field(field), Some(adt_subst)),
+                Some(local) => {
+                    NameRefClass::FieldShorthand { field_ref: field, local_ref: local, adt_subst }
+                }
+            };
+            return Some(res);
         }
 
         if let Some(path) = ast::PathSegment::cast(parent.clone()).map(|it| it.parent_path()) {
-            if path.parent_path().is_none() {
-                if let Some(macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast) {
-                    // Only use this to resolve to macro calls for last segments as qualifiers resolve
-                    // to modules below.
-                    if let Some(macro_def) = sema.resolve_macro_call(&macro_call) {
-                        return Some(NameRefClass::Definition(Definition::Macro(macro_def), None));
-                    }
+            if path.parent_path().is_none()
+                && let Some(macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast)
+            {
+                // Only use this to resolve to macro calls for last segments as qualifiers resolve
+                // to modules below.
+                if let Some(macro_def) = sema.resolve_macro_call(&macro_call) {
+                    return Some(NameRefClass::Definition(Definition::Macro(macro_def), None));
                 }
             }
             return sema
@@ -820,8 +812,8 @@ impl<'db> NameRefClass<'db> {
                     //        ^^^^^
                     let containing_path = name_ref.syntax().ancestors().find_map(ast::Path::cast)?;
                     let resolved = sema.resolve_path(&containing_path)?;
-                    if let PathResolution::Def(ModuleDef::Trait(tr)) = resolved {
-                        if let Some(ty) = tr
+                    if let PathResolution::Def(ModuleDef::Trait(tr)) = resolved
+                        && let Some(ty) = tr
                             .items_with_supertraits(sema.db)
                             .iter()
                             .filter_map(|&assoc| match assoc {
@@ -833,7 +825,6 @@ impl<'db> NameRefClass<'db> {
                             // No substitution, this can only occur in type position.
                             return Some(NameRefClass::Definition(Definition::TypeAlias(ty), None));
                         }
-                    }
                     None
                 },
                 ast::UseBoundGenericArgs(_) => {
@@ -858,7 +849,7 @@ impl<'db> NameRefClass<'db> {
                 ast::OffsetOfExpr(_) => {
                     let (def, subst) = sema.resolve_offset_of_field(name_ref)?;
                     let def = match def {
-                        Either::Left(variant) => Definition::Variant(variant),
+                        Either::Left(variant) => Definition::EnumVariant(variant),
                         Either::Right(field) => Definition::Field(field),
                     };
                     Some(NameRefClass::Definition(def, Some(subst)))
@@ -901,30 +892,40 @@ impl<'db> NameRefClass<'db> {
 }
 
 impl_from!(
-    Field, Module, Function, Adt, Variant, Const, Static, Trait, TraitAlias, TypeAlias, BuiltinType, Local,
-    GenericParam, Label, Macro, ExternCrateDecl
-    for Definition
+    impl<'db>
+    Field,
+    TupleField<'db>,
+    Module,
+    Function,
+    Adt,
+    EnumVariant,
+    Const,
+    Static,
+    Trait,
+    TypeAlias,
+    BuiltinType,
+    Local<'db>,
+    GenericParam,
+    Label,
+    Macro,
+    ExternCrateDecl,
+    InlineAsmOperand
+    for Definition<'db>
 );
 
-impl From<Impl> for Definition {
+impl<'db> From<Impl> for Definition<'db> {
     fn from(impl_: Impl) -> Self {
         Definition::SelfType(impl_)
     }
 }
 
-impl From<InlineAsmOperand> for Definition {
-    fn from(value: InlineAsmOperand) -> Self {
-        Definition::InlineAsmOperand(value)
-    }
-}
-
-impl From<Either<PathResolution, InlineAsmOperand>> for Definition {
-    fn from(value: Either<PathResolution, InlineAsmOperand>) -> Self {
+impl<'db> From<Either<PathResolution<'db>, InlineAsmOperand>> for Definition<'db> {
+    fn from(value: Either<PathResolution<'db>, InlineAsmOperand>) -> Self {
         value.either(Definition::from, Definition::from)
     }
 }
 
-impl AsAssocItem for Definition {
+impl AsAssocItem for Definition<'_> {
     fn as_assoc_item(self, db: &dyn hir::db::HirDatabase) -> Option<AssocItem> {
         match self {
             Definition::Function(it) => it.as_assoc_item(db),
@@ -935,7 +936,7 @@ impl AsAssocItem for Definition {
     }
 }
 
-impl AsExternAssocItem for Definition {
+impl AsExternAssocItem for Definition<'_> {
     fn as_extern_assoc_item(self, db: &dyn hir::db::HirDatabase) -> Option<ExternAssocItem> {
         match self {
             Definition::Function(it) => it.as_extern_assoc_item(db),
@@ -946,7 +947,7 @@ impl AsExternAssocItem for Definition {
     }
 }
 
-impl From<AssocItem> for Definition {
+impl<'db> From<AssocItem> for Definition<'db> {
     fn from(assoc_item: AssocItem) -> Self {
         match assoc_item {
             AssocItem::Function(it) => Definition::Function(it),
@@ -956,8 +957,8 @@ impl From<AssocItem> for Definition {
     }
 }
 
-impl From<PathResolution> for Definition {
-    fn from(path_resolution: PathResolution) -> Self {
+impl<'db> From<PathResolution<'db>> for Definition<'db> {
+    fn from(path_resolution: PathResolution<'db>) -> Self {
         match path_resolution {
             PathResolution::Def(def) => def.into(),
             PathResolution::Local(local) => Definition::Local(local),
@@ -971,17 +972,16 @@ impl From<PathResolution> for Definition {
     }
 }
 
-impl From<ModuleDef> for Definition {
+impl<'db> From<ModuleDef> for Definition<'db> {
     fn from(def: ModuleDef) -> Self {
         match def {
             ModuleDef::Module(it) => Definition::Module(it),
             ModuleDef::Function(it) => Definition::Function(it),
             ModuleDef::Adt(it) => Definition::Adt(it),
-            ModuleDef::Variant(it) => Definition::Variant(it),
+            ModuleDef::EnumVariant(it) => Definition::EnumVariant(it),
             ModuleDef::Const(it) => Definition::Const(it),
             ModuleDef::Static(it) => Definition::Static(it),
             ModuleDef::Trait(it) => Definition::Trait(it),
-            ModuleDef::TraitAlias(it) => Definition::TraitAlias(it),
             ModuleDef::TypeAlias(it) => Definition::TypeAlias(it),
             ModuleDef::Macro(it) => Definition::Macro(it),
             ModuleDef::BuiltinType(it) => Definition::BuiltinType(it),
@@ -989,7 +989,7 @@ impl From<ModuleDef> for Definition {
     }
 }
 
-impl From<DocLinkDef> for Definition {
+impl<'db> From<DocLinkDef> for Definition<'db> {
     fn from(def: DocLinkDef) -> Self {
         match def {
             DocLinkDef::ModuleDef(it) => it.into(),
@@ -999,31 +999,30 @@ impl From<DocLinkDef> for Definition {
     }
 }
 
-impl From<VariantDef> for Definition {
-    fn from(def: VariantDef) -> Self {
+impl<'db> From<Variant> for Definition<'db> {
+    fn from(def: Variant) -> Self {
         ModuleDef::from(def).into()
     }
 }
 
-impl TryFrom<DefWithBody> for Definition {
+impl<'db> TryFrom<DefWithBody> for Definition<'db> {
     type Error = ();
     fn try_from(def: DefWithBody) -> Result<Self, Self::Error> {
         match def {
             DefWithBody::Function(it) => Ok(it.into()),
             DefWithBody::Static(it) => Ok(it.into()),
             DefWithBody::Const(it) => Ok(it.into()),
-            DefWithBody::Variant(it) => Ok(it.into()),
+            DefWithBody::EnumVariant(it) => Ok(it.into()),
         }
     }
 }
 
-impl From<GenericDef> for Definition {
+impl<'db> From<GenericDef> for Definition<'db> {
     fn from(def: GenericDef) -> Self {
         match def {
             GenericDef::Function(it) => it.into(),
             GenericDef::Adt(it) => it.into(),
             GenericDef::Trait(it) => it.into(),
-            GenericDef::TraitAlias(it) => it.into(),
             GenericDef::TypeAlias(it) => it.into(),
             GenericDef::Impl(it) => it.into(),
             GenericDef::Const(it) => it.into(),
@@ -1032,14 +1031,24 @@ impl From<GenericDef> for Definition {
     }
 }
 
-impl TryFrom<Definition> for GenericDef {
+impl<'db> TryFrom<ExpressionStoreOwner> for Definition<'db> {
     type Error = ();
-    fn try_from(def: Definition) -> Result<Self, Self::Error> {
+    fn try_from(def: ExpressionStoreOwner) -> Result<Self, Self::Error> {
+        match def {
+            ExpressionStoreOwner::Body(def_with_body) => def_with_body.try_into(),
+            ExpressionStoreOwner::Signature(generic_def) => Ok(generic_def.into()),
+            ExpressionStoreOwner::VariantFields(it) => Ok(it.into()),
+        }
+    }
+}
+
+impl TryFrom<Definition<'_>> for GenericDef {
+    type Error = ();
+    fn try_from(def: Definition<'_>) -> Result<Self, Self::Error> {
         match def {
             Definition::Function(it) => Ok(it.into()),
             Definition::Adt(it) => Ok(it.into()),
             Definition::Trait(it) => Ok(it.into()),
-            Definition::TraitAlias(it) => Ok(it.into()),
             Definition::TypeAlias(it) => Ok(it.into()),
             Definition::SelfType(it) => Ok(it.into()),
             Definition::Const(it) => Ok(it.into()),

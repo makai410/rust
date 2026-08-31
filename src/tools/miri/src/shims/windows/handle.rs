@@ -2,7 +2,6 @@ use std::mem::variant_count;
 
 use rustc_abi::HasDataLayout;
 
-use crate::concurrency::thread::ThreadNotFound;
 use crate::shims::files::FdNum;
 use crate::*;
 
@@ -45,7 +44,7 @@ impl PseudoHandle {
 /// Errors that can occur when constructing a [`Handle`] from a Scalar.
 pub enum HandleError {
     /// There is no thread with the given ID.
-    ThreadNotFound(ThreadNotFound),
+    ThreadNotFound,
     /// Can't convert scalar to handle because it is structurally invalid.
     InvalidHandle,
 }
@@ -185,10 +184,14 @@ impl Handle {
 
         match Self::from_packed(handle) {
             Some(Self::Thread(thread)) => {
-                // validate the thread id
+                // Validate the thread id. Windows handles remain valid even after thread
+                // termination.
+                use crate::concurrency::thread::ThreadLookupError;
                 match cx.machine.threads.thread_id_try_from(thread.to_u32()) {
-                    Ok(id) => interp_ok(Ok(Self::Thread(id))),
-                    Err(e) => interp_ok(Err(HandleError::ThreadNotFound(e))),
+                    Ok(id) | Err(ThreadLookupError::Terminated(id)) =>
+                        interp_ok(Ok(Self::Thread(id))),
+                    Err(ThreadLookupError::InvalidId) =>
+                        interp_ok(Err(HandleError::ThreadNotFound)),
                 }
             }
             Some(handle) => interp_ok(Ok(handle)),
@@ -214,7 +217,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     "invalid handle {} passed to {function_name}",
                     handle.to_target_isize(this)?,
                 ))),
-            Err(HandleError::ThreadNotFound(_)) =>
+            Err(HandleError::ThreadNotFound) =>
                 throw_machine_stop!(TerminationInfo::Abort(format!(
                     "invalid thread ID {} passed to {function_name}",
                     handle.to_target_isize(this)?,
@@ -284,14 +287,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         if target_proc != Handle::Pseudo(PseudoHandle::CurrentProcess) {
             throw_unsup_format!(
-                "`DuplicateHandle` `hSourceProcessHandle` parameter is not the current process, which is unsupported"
+                "`DuplicateHandle` `hTargetProcessHandle` parameter is not the current process, which is unsupported"
             );
         }
 
         if this.ptr_is_null(target_handle_ptr)? {
-            throw_unsup_format!(
-                "`DuplicateHandle` `lpTargetHandle` parameter is null, which is unsupported"
-            );
+            throw_machine_stop!(TerminationInfo::Abort(
+                "`DuplicateHandle` `lpTargetHandle` parameter must not be null, as otherwise the \
+                newly created handle is leaked"
+                    .to_string()
+            ));
         }
 
         if options != this.eval_windows("c", "DUPLICATE_SAME_ACCESS") {
@@ -312,7 +317,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     "`DuplicateHandle` called on a thread handle, which is unsupported"
                 );
             }
-            Handle::Pseudo(pseudo) => Handle::Pseudo(pseudo),
+            Handle::Pseudo(_) => {
+                throw_unsup_format!(
+                    "`DuplicateHandle` called on a pseudo handle, which is unsupported"
+                );
+            }
             Handle::Null | Handle::Invalid => this.invalid_handle("DuplicateHandle")?,
         };
 
@@ -333,13 +342,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             Handle::File(fd_num) =>
                 if let Some(fd) = this.machine.fds.remove(fd_num) {
-                    let err = fd.close_ref(this.machine.communicate(), this)?;
-                    if let Err(e) = err {
-                        this.set_last_error(e)?;
-                        this.eval_windows("c", "FALSE")
-                    } else {
-                        this.eval_windows("c", "TRUE")
-                    }
+                    drop(fd);
+                    this.eval_windows("c", "TRUE")
                 } else {
                     this.invalid_handle("CloseHandle")?
                 },

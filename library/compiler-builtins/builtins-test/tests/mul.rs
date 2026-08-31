@@ -1,5 +1,6 @@
-#![allow(unused_macros)]
+#![cfg_attr(f16_enabled, feature(f16))]
 #![cfg_attr(f128_enabled, feature(f128))]
+#![allow(unused_macros, unused_features)]
 
 use builtins_test::*;
 
@@ -95,7 +96,8 @@ macro_rules! float_mul {
         $(
             #[test]
             fn $fn() {
-                use compiler_builtins::float::{mul::$fn, Float};
+                use compiler_builtins::float::mul::$fn;
+                use compiler_builtins::support::Float;
                 use core::ops::Mul;
 
                 fuzz_float_2(N, |x: $f, y: $f| {
@@ -113,9 +115,14 @@ macro_rules! float_mul {
     };
 }
 
-#[cfg(not(all(target_arch = "x86", not(target_feature = "sse"))))]
+#[cfg(not(x86_no_sse2))]
 mod float_mul {
     use super::*;
+
+    #[cfg(f16_enabled)]
+    float_mul! {
+        f16, __mulhf3, Half, all();
+    }
 
     // FIXME(#616): Stop ignoring arches that don't have native support once fix for builtins is in
     // nightly.
@@ -126,7 +133,7 @@ mod float_mul {
 }
 
 #[cfg(f128_enabled)]
-#[cfg(not(all(target_arch = "x86", not(target_feature = "sse"))))]
+#[cfg(not(x86_no_sse2))]
 #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
 mod float_mul_f128 {
     use super::*;
@@ -135,7 +142,7 @@ mod float_mul_f128 {
         f128, __multf3, Quad,
         // FIXME(llvm): there is a bug in LLVM rt.
         // See <https://github.com/llvm/llvm-project/issues/91840>.
-        not(any(feature = "no-sys-f128", all(target_arch = "aarch64", target_os = "linux")));
+        not(any(no_sys_f128, all(target_arch = "aarch64", target_os = "linux")));
     }
 }
 
@@ -145,6 +152,6 @@ mod float_mul_f128_ppc {
     use super::*;
 
     float_mul! {
-        f128, __mulkf3, Quad, not(feature = "no-sys-f128");
+        f128, __mulkf3, Quad, not(no_sys_f128);
     }
 }

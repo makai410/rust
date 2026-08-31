@@ -3,15 +3,13 @@
 //! [`rustc`] module.
 
 // tidy-alphabetical-start
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-#![allow(unused_crate_dependencies)]
+#![cfg_attr(test, allow(unused_crate_dependencies))] // Used for integration tests, not unit tests
 // tidy-alphabetical-end
 
 pub(crate) mod checks;
 pub mod constructor;
 #[cfg(feature = "rustc")]
-pub mod errors;
+pub mod diagnostics;
 #[cfg(feature = "rustc")]
 pub(crate) mod lints;
 pub mod pat;
@@ -20,18 +18,12 @@ pub mod pat_column;
 pub mod rustc;
 pub mod usefulness;
 
-#[cfg(feature = "rustc")]
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
-
 use std::fmt;
 
 pub use rustc_index::{Idx, IndexVec}; // re-exported to avoid rustc_index version issues
 
 use crate::constructor::{Constructor, ConstructorSet, IntRange};
 use crate::pat::DeconstructedPat;
-
-pub trait Captures<'a> {}
-impl<'a, T: ?Sized> Captures<'a> for T {}
 
 /// `bool` newtype that indicates whether this is a privately uninhabited field that we should skip
 /// during analysis.
@@ -56,6 +48,13 @@ pub trait PatCx: Sized + fmt::Debug {
     type PatData: Clone;
 
     fn is_exhaustive_patterns_feature_on(&self) -> bool;
+
+    /// Whether to ensure the non-exhaustiveness witnesses we report for a complete set. This is
+    /// `false` by default to avoid some exponential blowup cases such as
+    /// <https://github.com/rust-lang/rust/issues/118437>.
+    fn exhaustive_witnesses(&self) -> bool {
+        false
+    }
 
     /// The number of fields for this constructor.
     fn ctor_arity(&self, ctor: &Constructor<Self>, ty: &Self::Ty) -> usize;
@@ -134,7 +133,7 @@ pub struct MatchArm<'p, Cx: PatCx> {
 
 impl<'p, Cx: PatCx> Clone for MatchArm<'p, Cx> {
     fn clone(&self) -> Self {
-        Self { pat: self.pat, has_guard: self.has_guard, arm_data: self.arm_data }
+        *self
     }
 }
 

@@ -1,42 +1,42 @@
-error: attribute must be applied to a `static` variable
-  --> $DIR/used.rs:7:1
+error: the `used` attribute cannot be used on functions
+  --> $DIR/used.rs:7:3
    |
 LL | #[used]
-   | ^^^^^^^
-LL | fn foo() {}
-   | ----------- but this is a function
+   |   ^^^^
+   |
+   = help: the `used` attribute can only be applied to statics
 
-error: attribute must be applied to a `static` variable
-  --> $DIR/used.rs:10:1
+error: the `used` attribute cannot be used on structs
+  --> $DIR/used.rs:10:3
    |
 LL | #[used]
-   | ^^^^^^^
-LL | struct Foo {}
-   | ------------- but this is a struct
+   |   ^^^^
+   |
+   = help: the `used` attribute can only be applied to statics
 
-error: attribute must be applied to a `static` variable
-  --> $DIR/used.rs:13:1
+error: the `used` attribute cannot be used on traits
+  --> $DIR/used.rs:13:3
    |
 LL | #[used]
-   | ^^^^^^^
-LL | trait Bar {}
-   | ------------ but this is a trait
+   |   ^^^^
+   |
+   = help: the `used` attribute can only be applied to statics
 
-error: attribute must be applied to a `static` variable
-  --> $DIR/used.rs:16:1
+error: the `used` attribute cannot be used on trait impl blocks
+  --> $DIR/used.rs:16:3
    |
 LL | #[used]
-   | ^^^^^^^
-LL | impl Bar for Foo {}
-   | ------------------- but this is a implementation block
+   |   ^^^^
+   |
+   = help: the `used` attribute can only be applied to statics
 
-error: attribute must be applied to a `static` variable
-  --> $DIR/used.rs:21:5
+error: the `used` attribute cannot be used on foreign statics
+  --> $DIR/used.rs:21:7
    |
 LL |     #[used]
-   |     ^^^^^^^
-LL |     static BAR: i32;
-   |     ---------------- but this is a foreign static item
+   |       ^^^^
+   |
+   = help: the `used` attribute can only be applied to statics
 
 error: aborting due to 5 previous errors
 

@@ -1,6 +1,5 @@
 //! Test non-exhaustive matches involving deref patterns.
 #![feature(deref_patterns)]
-#![expect(incomplete_features)]
 #![deny(unreachable_patterns)]
 
 fn main() {
@@ -15,7 +14,7 @@ fn main() {
     }
 
     match Box::new((true, Box::new(false))) {
-        //~^ ERROR non-exhaustive patterns: `deref!((false, deref!(false)))` and `deref!((true, deref!(true)))` not covered
+        //~^ ERROR non-exhaustive patterns: `deref!((true, deref!(true)))` and `deref!((false, deref!(false)))` not covered
         (true, false) => {}
         (false, true) => {}
     }

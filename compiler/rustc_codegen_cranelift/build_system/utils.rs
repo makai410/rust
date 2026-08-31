@@ -14,13 +14,13 @@ pub(crate) struct Compiler {
     pub(crate) rustdoc: PathBuf,
     pub(crate) rustflags: Vec<String>,
     pub(crate) rustdocflags: Vec<String>,
-    pub(crate) triple: String,
+    pub(crate) target: String,
     pub(crate) runner: Vec<String>,
 }
 
 impl Compiler {
     pub(crate) fn set_cross_linker_and_runner(&mut self) {
-        match self.triple.as_str() {
+        match self.target.as_str() {
             "aarch64-unknown-linux-gnu" => {
                 // We are cross-compiling for aarch64. Use the correct linker and run tests in qemu.
                 self.rustflags.push("-Clinker=aarch64-linux-gnu-gcc".to_owned());
@@ -75,12 +75,12 @@ impl Compiler {
 }
 
 pub(crate) struct CargoProject {
-    source: &'static RelPath,
+    source: RelPath,
     target: &'static str,
 }
 
 impl CargoProject {
-    pub(crate) const fn new(path: &'static RelPath, target: &'static str) -> CargoProject {
+    pub(crate) const fn new(path: RelPath, target: &'static str) -> CargoProject {
         CargoProject { source: path, target }
     }
 
@@ -122,7 +122,7 @@ impl CargoProject {
     fn build_cmd(&self, command: &str, compiler: &Compiler, dirs: &Dirs) -> Command {
         let mut cmd = self.base_cmd(command, &compiler.cargo, dirs);
 
-        cmd.arg("--target").arg(&compiler.triple);
+        cmd.arg("--target").arg(&compiler.target);
 
         cmd.env("RUSTC", &compiler.rustc);
         cmd.env("RUSTDOC", &compiler.rustdoc);
@@ -130,7 +130,7 @@ impl CargoProject {
         rustflags_to_cmd_env(&mut cmd, "RUSTDOCFLAGS", &compiler.rustdocflags);
         if !compiler.runner.is_empty() {
             cmd.env(
-                format!("CARGO_TARGET_{}_RUNNER", compiler.triple.to_uppercase().replace('-', "_")),
+                format!("CARGO_TARGET_{}_RUNNER", compiler.target.to_uppercase().replace('-', "_")),
                 compiler.runner.join(" "),
             );
         }
@@ -162,7 +162,7 @@ impl CargoProject {
 pub(crate) fn try_hard_link(src: impl AsRef<Path>, dst: impl AsRef<Path>) {
     let src = src.as_ref();
     let dst = dst.as_ref();
-    if let Err(_) = fs::hard_link(src, dst) {
+    if fs::hard_link(src, dst).is_err() {
         fs::copy(src, dst).unwrap(); // Fallback to copying if hardlinking failed
     }
 }
@@ -179,7 +179,7 @@ pub(crate) fn spawn_and_wait(mut cmd: Command) {
 /// Create the specified directory if it doesn't exist yet and delete all contents.
 pub(crate) fn ensure_empty_dir(path: &Path) {
     fs::create_dir_all(path).unwrap();
-    let read_dir = match fs::read_dir(&path) {
+    let read_dir = match fs::read_dir(path) {
         Ok(read_dir) => read_dir,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return;

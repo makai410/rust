@@ -1,12 +1,14 @@
+use rustc_ast::LitKind;
 use rustc_errors::Applicability;
+use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::{self as hir};
-use rustc_macros::LintDiagnostic;
+use rustc_lint_defs::{declare_lint, impl_lint_pass};
+use rustc_macros::Diagnostic;
 use rustc_middle::ty::{self, Ty};
-use rustc_session::{declare_lint, impl_lint_pass};
 use rustc_span::sym;
 
+use crate::diagnostics::{IntegerToPtrTransmutes, IntegerToPtrTransmutesSuggestion};
 use crate::{LateContext, LateLintPass};
 
 declare_lint! {
@@ -67,9 +69,44 @@ declare_lint! {
     "detects transmutes that can also be achieved by other operations"
 }
 
+declare_lint! {
+    /// The `integer_to_ptr_transmutes` lint detects integer to pointer
+    /// transmutes where the resulting pointers are undefined behavior to dereference.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// fn foo(a: usize) -> *const u8 {
+    ///    unsafe {
+    ///        std::mem::transmute::<usize, *const u8>(a)
+    ///    }
+    /// }
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// Any attempt to use the resulting pointers are undefined behavior as the resulting
+    /// pointers won't have any provenance.
+    ///
+    /// Alternatively, [`std::ptr::with_exposed_provenance`] should be used, as they do not
+    /// carry the provenance requirement. If wanting to create pointers without provenance
+    /// [`std::ptr::without_provenance`] should be used instead.
+    ///
+    /// See [`std::mem::transmute`] in the reference for more details.
+    ///
+    /// [`std::mem::transmute`]: https://doc.rust-lang.org/std/mem/fn.transmute.html
+    /// [`std::ptr::with_exposed_provenance`]: https://doc.rust-lang.org/std/ptr/fn.with_exposed_provenance.html
+    /// [`std::ptr::without_provenance`]: https://doc.rust-lang.org/std/ptr/fn.without_provenance.html
+    pub INTEGER_TO_PTR_TRANSMUTES,
+    Warn,
+    "detects integer to pointer transmutes",
+}
+
 pub(crate) struct CheckTransmutes;
 
-impl_lint_pass!(CheckTransmutes => [PTR_TO_INTEGER_TRANSMUTE_IN_CONSTS, UNNECESSARY_TRANSMUTES]);
+impl_lint_pass!(CheckTransmutes => [PTR_TO_INTEGER_TRANSMUTE_IN_CONSTS, UNNECESSARY_TRANSMUTES, INTEGER_TO_PTR_TRANSMUTES]);
 
 impl<'tcx> LateLintPass<'tcx> for CheckTransmutes {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
@@ -94,7 +131,68 @@ impl<'tcx> LateLintPass<'tcx> for CheckTransmutes {
 
         check_ptr_transmute_in_const(cx, expr, body_owner_def_id, const_context, src, dst);
         check_unnecessary_transmute(cx, expr, callee, arg, const_context, src, dst);
+        check_int_to_ptr_transmute(cx, expr, arg, src, dst);
     }
+}
+
+/// Check for transmutes from integer to pointers (*const/*mut and &/&mut).
+///
+/// Using the resulting pointers would be undefined behavior.
+fn check_int_to_ptr_transmute<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    arg: &'tcx hir::Expr<'tcx>,
+    src: Ty<'tcx>,
+    dst: Ty<'tcx>,
+) {
+    if !matches!(src.kind(), ty::Uint(_) | ty::Int(_)) {
+        return;
+    }
+    let (ty::Ref(_, inner_ty, mutbl) | ty::RawPtr(inner_ty, mutbl)) = dst.kind() else {
+        return;
+    };
+    // bail-out if the argument is literal 0 as we have other lints for those cases
+    if let hir::ExprKind::Lit(hir::Lit { node: LitKind::Int(v, _), .. }) = arg.kind
+        && v == 0
+    {
+        return;
+    }
+    // bail-out if the inner type is a ZST
+    let Ok(layout_inner_ty) = cx.tcx.layout_of(cx.typing_env().as_query_input(*inner_ty)) else {
+        return;
+    };
+    if layout_inner_ty.is_1zst() {
+        return;
+    }
+
+    let suffix = if mutbl.is_mut() { "_mut" } else { "" };
+    cx.tcx.emit_node_span_lint(
+        INTEGER_TO_PTR_TRANSMUTES,
+        expr.hir_id,
+        expr.span,
+        IntegerToPtrTransmutes {
+            suggestion: if layout_inner_ty.is_sized() {
+                Some(if dst.is_ref() {
+                    IntegerToPtrTransmutesSuggestion::ToRef {
+                        dst: *inner_ty,
+                        suffix,
+                        ref_mutbl: mutbl.prefix_str(),
+                        start_call: expr.span.shrink_to_lo().until(arg.span),
+                    }
+                } else {
+                    IntegerToPtrTransmutesSuggestion::ToPtr {
+                        dst: *inner_ty,
+                        suffix,
+                        start_call: expr.span.shrink_to_lo().until(arg.span),
+                    }
+                })
+            } else {
+                // We can't suggest using `with_exposed_provenance` for unsized type
+                // so don't suggest anything.
+                None
+            },
+        },
+    );
 }
 
 /// Check for transmutes that exhibit undefined behavior.
@@ -118,7 +216,7 @@ fn check_ptr_transmute_in_const<'tcx>(
     dst: Ty<'tcx>,
 ) {
     if matches!(const_context, Some(hir::ConstContext::ConstFn))
-        || matches!(cx.tcx.def_kind(body_owner_def_id), DefKind::AssocConst)
+        || matches!(cx.tcx.def_kind(body_owner_def_id), DefKind::AssocConst { .. })
     {
         if src.is_raw_ptr() && dst.is_integral() {
             cx.tcx.emit_node_span_lint(
@@ -259,20 +357,31 @@ fn check_unnecessary_transmute<'tcx>(
         _ => return,
     };
 
-    cx.tcx.node_span_lint(UNNECESSARY_TRANSMUTES, expr.hir_id, expr.span, |diag| {
-        diag.primary_message("unnecessary transmute");
-        if let Some(sugg) = sugg {
-            diag.multipart_suggestion("replace this with", sugg, Applicability::MachineApplicable);
-        }
-        if let Some(help) = help {
-            diag.help(help);
-        }
-    });
+    cx.tcx.emit_node_span_lint(
+        UNNECESSARY_TRANSMUTES,
+        expr.hir_id,
+        expr.span,
+        rustc_errors::DiagDecorator(|diag| {
+            diag.primary_message("unnecessary transmute");
+            if let Some(sugg) = sugg {
+                diag.multipart_suggestion(
+                    "replace this with",
+                    sugg,
+                    Applicability::MachineApplicable,
+                );
+            }
+            if let Some(help) = help {
+                diag.help(help);
+            }
+        }),
+    );
 }
 
-#[derive(LintDiagnostic)]
-#[diag(lint_undefined_transmute)]
-#[note]
-#[note(lint_note2)]
-#[help]
+#[derive(Diagnostic)]
+#[diag("pointers cannot be transmuted to integers during const eval")]
+#[note("at compile-time, pointers do not have an integer value")]
+#[note(
+    "avoiding this restriction via `union` or raw pointers leads to compile-time undefined behavior"
+)]
+#[help("for more information, see https://doc.rust-lang.org/std/mem/fn.transmute.html")]
 pub(crate) struct UndefinedTransmuteLint;

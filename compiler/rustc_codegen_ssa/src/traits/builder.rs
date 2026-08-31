@@ -1,9 +1,13 @@
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 use std::ops::Deref;
 
 use rustc_abi::{Align, Scalar, Size, WrappingRange};
+use rustc_ast::expand::typetree::{FncTree, TypeTree};
+use rustc_hir::attrs::AttributeKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
+use rustc_middle::mir;
 use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
+use rustc_middle::ty::typetree::typetree_from_ty;
 use rustc_middle::ty::{AtomicOrdering, Instance, Ty};
 use rustc_session::config::OptLevel;
 use rustc_span::Span;
@@ -36,7 +40,7 @@ pub trait BuilderMethods<'a, 'tcx>:
     + FnAbiOf<'tcx, FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>>
     + Deref<Target = Self::CodegenCx>
     + CoverageInfoBuilderMethods<'tcx>
-    + DebugInfoBuilderMethods
+    + DebugInfoBuilderMethods<'tcx>
     + ArgAbiBuilderMethods<'tcx>
     + AbiBuilderMethods
     + IntrinsicCallBuilderMethods<'tcx>
@@ -49,10 +53,10 @@ pub trait BuilderMethods<'a, 'tcx>:
     type CodegenCx: CodegenMethods<
             'tcx,
             Value = Self::Value,
-            Metadata = Self::Metadata,
             Function = Self::Function,
             BasicBlock = Self::BasicBlock,
             Type = Self::Type,
+            FunctionSignature = Self::FunctionSignature,
             Funclet = Self::Funclet,
             DIScope = Self::DIScope,
             DILocation = Self::DILocation,
@@ -76,6 +80,9 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn ret_void(&mut self);
     fn ret(&mut self, v: Self::Value);
     fn br(&mut self, dest: Self::BasicBlock);
+    fn br_with_attrs(&mut self, dest: Self::BasicBlock, _attributes: &[AttributeKind]) {
+        self.br(dest)
+    }
     fn cond_br(
         &mut self,
         cond: Self::Value,
@@ -124,7 +131,7 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     fn invoke(
         &mut self,
-        llty: Self::Type,
+        llty: Self::FunctionSignature,
         fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
@@ -234,14 +241,16 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn to_immediate_scalar(&mut self, val: Self::Value, scalar: Scalar) -> Self::Value;
 
     fn alloca(&mut self, size: Size, align: Align) -> Self::Value;
+    fn alloca_with_ty(&mut self, layout: TyAndLayout<'tcx>) -> Self::Value;
 
     fn load(&mut self, ty: Self::Type, ptr: Self::Value, align: Align) -> Self::Value;
-    fn volatile_load(&mut self, ty: Self::Type, ptr: Self::Value) -> Self::Value;
+    fn volatile_load(&mut self, ty: Self::Type, ptr: Self::Value, align: Align) -> Self::Value;
     fn atomic_load(
         &mut self,
         ty: Self::Type,
         ptr: Self::Value,
         order: AtomicOrdering,
+        volatile: bool,
         size: Size,
     ) -> Self::Value;
     fn load_from_place(&mut self, ty: Self::Type, place: PlaceValue<Self::Value>) -> Self::Value {
@@ -322,6 +331,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         val: Self::Value,
         ptr: Self::Value,
         order: AtomicOrdering,
+        volatile: bool,
         size: Size,
     );
 
@@ -405,15 +415,41 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn fcmp(&mut self, op: RealPredicate, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
 
     /// Returns `-1` if `lhs < rhs`, `0` if `lhs == rhs`, and `1` if `lhs > rhs`.
-    // FIXME: Move the default implementation from `codegen_scalar_binop` into this method and
-    // remove the `Option` return once LLVM 20 is the minimum version.
     fn three_way_compare(
         &mut self,
-        _ty: Ty<'tcx>,
-        _lhs: Self::Value,
-        _rhs: Self::Value,
-    ) -> Option<Self::Value> {
-        None
+        ty: Ty<'tcx>,
+        lhs: Self::Value,
+        rhs: Self::Value,
+    ) -> Self::Value {
+        // FIXME: This implementation was designed around LLVM's ability to optimize, but `cg_llvm`
+        // overrides this to just use `@llvm.scmp`/`ucmp` since LLVM 20. This default impl should be
+        // reevaluated with respect to the remaining backends like cg_gcc, whether they might use
+        // specialized implementations as well, or continue to use a generic implementation here.
+        use std::cmp::Ordering;
+        let pred = |op| crate::base::bin_op_to_icmp_predicate(op, ty.is_signed());
+        if self.cx().sess().opts.optimize == OptLevel::No {
+            // This actually generates tighter assembly, and is a classic trick:
+            // <https://graphics.stanford.edu/~seander/bithacks.html#CopyIntegerSign>.
+            // However, as of 2023-11 it optimized worse in LLVM in things like derived
+            // `PartialOrd`, so we were only using it in debug. Since LLVM now uses its own
+            // intrinsics, it may be be worth trying it in optimized builds for other backends.
+            let is_gt = self.icmp(pred(mir::BinOp::Gt), lhs, rhs);
+            let gtext = self.zext(is_gt, self.type_i8());
+            let is_lt = self.icmp(pred(mir::BinOp::Lt), lhs, rhs);
+            let ltext = self.zext(is_lt, self.type_i8());
+            self.unchecked_ssub(gtext, ltext)
+        } else {
+            // These operations were better optimized by LLVM, before `@llvm.scmp`/`ucmp` in 20.
+            // See <https://github.com/rust-lang/rust/pull/63767>.
+            let is_lt = self.icmp(pred(mir::BinOp::Lt), lhs, rhs);
+            let is_ne = self.icmp(pred(mir::BinOp::Ne), lhs, rhs);
+            let ge = self.select(
+                is_ne,
+                self.cx().const_i8(Ordering::Greater as i8),
+                self.cx().const_i8(Ordering::Equal as i8),
+            );
+            self.select(is_lt, self.cx().const_i8(Ordering::Less as i8), ge)
+        }
     }
 
     fn memcpy(
@@ -424,6 +460,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         src_align: Align,
         size: Self::Value,
         flags: MemFlags,
+        tt: Option<FncTree>,
     );
     fn memmove(
         &mut self,
@@ -442,6 +479,11 @@ pub trait BuilderMethods<'a, 'tcx>:
         align: Align,
         flags: MemFlags,
     );
+
+    // Produce a value from calling the `vscale` intrinsic (containing the `vscale` multiplier that
+    // a scalable vector's element size and count can be multiplied by to get the real size of the
+    // vector)
+    fn vscale(&mut self, ty: Self::Type) -> Self::Value;
 
     /// *Typed* copy for non-overlapping places.
     ///
@@ -473,14 +515,26 @@ pub trait BuilderMethods<'a, 'tcx>:
             let ty = self.backend_type(layout);
             let val = self.load_from_place(ty, src);
             self.store_to_place_with_flags(val, dst, flags);
-        } else if self.sess().opts.optimize == OptLevel::No && self.is_backend_immediate(layout) {
+        } else if self.sess().opts.optimize == OptLevel::No
+            && layout.backend_repr.is_scalar_or_simd()
+        {
             // If we're not optimizing, the aliasing information from `memcpy`
             // isn't useful, so just load-store the value for smaller code.
             let temp = self.load_operand(src.with_type(layout));
             temp.val.store_with_flags(self, dst.with_type(layout), flags);
         } else if !layout.is_zst() {
+            let tt = typetree_from_ty(self.tcx(), layout.ty);
+            // We seem to pass all values to memcpy with one more indirection.
+            let tt = tt.add_indirection();
+            let fnc_tree = FncTree { args: vec![tt.clone(), tt], ret: TypeTree::new() };
             let bytes = self.const_usize(layout.size.bytes());
-            self.memcpy(dst.llval, dst.align, src.llval, src.align, bytes, flags);
+            let bytes = if layout.peel_transparent_wrappers(self).ty.is_scalable_vector() {
+                let vscale = self.vscale(self.type_i64());
+                self.mul(vscale, bytes)
+            } else {
+                bytes
+            };
+            self.memcpy(dst.llval, dst.align, src.llval, src.align, bytes, flags, Some(fnc_tree));
         }
     }
 
@@ -523,12 +577,12 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     fn set_personality_fn(&mut self, personality: Self::Function);
 
-    // These are used by everyone except msvc
+    // These are used by everyone except msvc and wasm EH
     fn cleanup_landing_pad(&mut self, pers_fn: Self::Function) -> (Self::Value, Self::Value);
     fn filter_landing_pad(&mut self, pers_fn: Self::Function);
     fn resume(&mut self, exn0: Self::Value, exn1: Self::Value);
 
-    // These are used only by msvc
+    // These are used by msvc and wasm EH
     fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet;
     fn cleanup_ret(&mut self, funclet: &Self::Funclet, unwind: Option<Self::BasicBlock>);
     fn catch_pad(&mut self, parent: Self::Value, args: &[Self::Value]) -> Self::Funclet;
@@ -538,6 +592,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         unwind: Option<Self::BasicBlock>,
         handlers: &[Self::BasicBlock],
     ) -> Self::Value;
+    fn get_funclet_cleanuppad(&self, funclet: &Self::Funclet) -> Self::Value;
 
     fn atomic_cmpxchg(
         &mut self,
@@ -548,12 +603,15 @@ pub trait BuilderMethods<'a, 'tcx>:
         failure_order: AtomicOrdering,
         weak: bool,
     ) -> (Self::Value, Self::Value);
+    /// `ret_ptr` indicates whether the return type (which is also the type `dst` points to)
+    /// is a pointer or the same type as `src`.
     fn atomic_rmw(
         &mut self,
         op: AtomicRmwBinOp,
         dst: Self::Value,
         src: Self::Value,
         order: AtomicOrdering,
+        ret_ptr: bool,
     ) -> Self::Value;
     fn atomic_fence(&mut self, order: AtomicOrdering, scope: SynchronizationScope);
     fn set_invariant_load(&mut self, load: Self::Value);
@@ -568,10 +626,13 @@ pub trait BuilderMethods<'a, 'tcx>:
     ///
     /// ## Arguments
     ///
-    /// The `fn_attrs`, `fn_abi`, and `instance` arguments are Options because they are advisory.
-    /// They relate to optional codegen enhancements like LLVM CFI, and do not affect ABI per se.
-    /// Any ABI-related transformations should be handled by different, earlier stages of codegen.
-    /// For instance, in the caller of `BuilderMethods::call`.
+    /// `caller_attrs` are the attributes of the surrounding caller; they have nothing to do with
+    /// the callee.
+    ///
+    /// The `caller_attrs`, `fn_abi`, and `callee_instance` arguments are Options because they are
+    /// advisory. They relate to optional codegen enhancements like LLVM CFI, and do not affect ABI
+    /// per se. Any ABI-related transformations should be handled by different, earlier stages of
+    /// codegen. For instance, in the caller of `BuilderMethods::call`.
     ///
     /// This means that a codegen backend which disregards `fn_attrs`, `fn_abi`, and `instance`
     /// should still do correct codegen, and code should not be miscompiled if they are omitted.
@@ -587,14 +648,26 @@ pub trait BuilderMethods<'a, 'tcx>:
     /// assuming the function does not explicitly pass the destination as a pointer in `args`.
     fn call(
         &mut self,
-        llty: Self::Type,
-        fn_attrs: Option<&CodegenFnAttrs>,
+        llty: Self::FunctionSignature,
+        caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         fn_val: Self::Value,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
-        instance: Option<Instance<'tcx>>,
+        callee_instance: Option<Instance<'tcx>>,
     ) -> Self::Value;
+
+    fn tail_call(
+        &mut self,
+        llty: Self::FunctionSignature,
+        caller_attrs: Option<&CodegenFnAttrs>,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+        llfn: Self::Value,
+        args: &[Self::Value],
+        funclet: Option<&Self::Funclet>,
+        callee_instance: Option<Instance<'tcx>>,
+    );
+
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
 
     fn apply_attrs_to_cleanup_callsite(&mut self, llret: Self::Value);

@@ -2,8 +2,7 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Value {
+const trait Value {
     fn value() -> u32;
 }
 
@@ -13,7 +12,7 @@ const fn get_value<T: [const] Value>() -> u32 {
 
 struct FortyTwo;
 
-impl const Value for FortyTwo {
+const impl Value for FortyTwo {
     fn value() -> i64 {
         //~^ ERROR method `value` has an incompatible type for trait
         42

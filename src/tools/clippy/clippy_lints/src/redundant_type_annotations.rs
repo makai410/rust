@@ -3,9 +3,8 @@ use clippy_utils::is_lint_allowed;
 use rustc_ast::LitKind;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_middle::ty::Ty;
-use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -36,6 +35,7 @@ declare_clippy_lint! {
     restriction,
     "warns about needless / redundant type annotations."
 }
+
 declare_lint_pass!(RedundantTypeAnnotations => [REDUNDANT_TYPE_ANNOTATIONS]);
 
 fn is_same_type<'tcx>(cx: &LateContext<'tcx>, ty_resolved_path: hir::def::Res, func_return_type: Ty<'tcx>) -> bool {
@@ -57,7 +57,7 @@ fn is_same_type<'tcx>(cx: &LateContext<'tcx>, ty_resolved_path: hir::def::Res, f
     false
 }
 
-fn func_hir_id_to_func_ty<'tcx>(cx: &LateContext<'tcx>, hir_id: hir::hir_id::HirId) -> Option<Ty<'tcx>> {
+fn func_hir_id_to_func_ty<'tcx>(cx: &LateContext<'tcx>, hir_id: hir::HirId) -> Option<Ty<'tcx>> {
     if let Some((defkind, func_defid)) = cx.typeck_results().type_dependent_def(hir_id)
         && defkind == DefKind::AssocFn
         && let Some(init_ty) = cx.tcx.type_of(func_defid).no_bound_vars()
@@ -97,7 +97,6 @@ fn extract_fn_ty<'tcx>(
         // let a: String = String::new();
         // let a: String = String::get_string();
         hir::QPath::TypeRelative(..) => func_hir_id_to_func_ty(cx, call.hir_id),
-        hir::QPath::LangItem(..) => None,
     }
 }
 

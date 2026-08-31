@@ -25,17 +25,32 @@
 #![deny(unstable_features)]
 // tidy-alphabetical-end
 
-mod cursor;
-
 #[cfg(test)]
 mod tests;
 
+use std::str::Chars;
+
 use LiteralKind::*;
 use TokenKind::*;
-use cursor::EOF_CHAR;
-pub use cursor::{Cursor, FrontmatterAllowed};
+pub use unicode_ident::UNICODE_VERSION;
 use unicode_properties::UnicodeEmoji;
-pub use unicode_xid::UNICODE_VERSION as UNICODE_XID_VERSION;
+
+// Make sure that the Unicode version of the dependencies is the same.
+const _: () = {
+    let properties = unicode_properties::UNICODE_VERSION;
+    let ident = unicode_ident::UNICODE_VERSION;
+
+    if properties.0 != ident.0 as u64
+        || properties.1 != ident.1 as u64
+        || properties.2 != ident.2 as u64
+    {
+        panic!(
+            "unicode-properties and unicode-ident must use the same Unicode version, \
+            `unicode_properties::UNICODE_VERSION` and `unicode_ident::UNICODE_VERSION` are \
+            different."
+        );
+    }
+};
 
 /// Parsed token.
 /// It doesn't contain information about data that has been parsed,
@@ -331,24 +346,38 @@ pub fn is_whitespace(c: char) -> bool {
 
     matches!(
         c,
-        // Usual ASCII suspects
-        '\u{0009}'   // \t
-        | '\u{000A}' // \n
+        // End-of-line characters
+        | '\u{000A}' // line feed (\n)
         | '\u{000B}' // vertical tab
         | '\u{000C}' // form feed
-        | '\u{000D}' // \r
-        | '\u{0020}' // space
+        | '\u{000D}' // carriage return (\r)
+        | '\u{0085}' // next line (from latin1)
+        | '\u{2028}' // LINE SEPARATOR
+        | '\u{2029}' // PARAGRAPH SEPARATOR
 
-        // NEXT LINE from latin1
-        | '\u{0085}'
-
-        // Bidi markers
+        // `Default_Ignorable_Code_Point` characters
         | '\u{200E}' // LEFT-TO-RIGHT MARK
         | '\u{200F}' // RIGHT-TO-LEFT MARK
 
-        // Dedicated whitespace characters from Unicode
-        | '\u{2028}' // LINE SEPARATOR
-        | '\u{2029}' // PARAGRAPH SEPARATOR
+        // Horizontal space characters
+        | '\u{0009}'   // tab (\t)
+        | '\u{0020}' // space
+    )
+}
+
+/// True if `c` is considered horizontal whitespace according to Rust language definition.
+pub fn is_horizontal_whitespace(c: char) -> bool {
+    // This is the horizontal space subset of `Pattern_White_Space` as
+    // categorized by UAX #31, Section 4.1.
+    //
+    // Note that this set is stable (ie, it doesn't change with different
+    // Unicode versions), so it's ok to just hard-code the values.
+
+    matches!(
+        c,
+        // Horizontal space characters
+        '\u{0009}'   // tab (\t)
+        | '\u{0020}' // space
     )
 }
 
@@ -357,14 +386,14 @@ pub fn is_whitespace(c: char) -> bool {
 /// a formal definition of valid identifier name.
 pub fn is_id_start(c: char) -> bool {
     // This is XID_Start OR '_' (which formally is not a XID_Start).
-    c == '_' || unicode_xid::UnicodeXID::is_xid_start(c)
+    c == '_' || unicode_ident::is_xid_start(c)
 }
 
 /// True if `c` is valid as a non-first character of an identifier.
 /// See [Rust language reference](https://doc.rust-lang.org/reference/identifiers.html) for
 /// a formal definition of valid identifier name.
 pub fn is_id_continue(c: char) -> bool {
-    unicode_xid::UnicodeXID::is_xid_continue(c)
+    unicode_ident::is_xid_continue(c)
 }
 
 /// The passed string is lexically an identifier.
@@ -377,7 +406,129 @@ pub fn is_ident(string: &str) -> bool {
     }
 }
 
-impl Cursor<'_> {
+pub enum FrontmatterAllowed {
+    Yes,
+    No,
+}
+
+/// Peekable iterator over a char sequence.
+///
+/// Next characters can be peeked via `first` method,
+/// and position can be shifted forward via `bump` method.
+pub struct Cursor<'a> {
+    len_remaining: usize,
+    /// Iterator over chars. Slightly faster than a &str.
+    chars: Chars<'a>,
+    pub(crate) frontmatter_allowed: FrontmatterAllowed,
+    #[cfg(debug_assertions)]
+    prev: char,
+}
+
+const EOF_CHAR: char = '\0';
+
+impl<'a> Cursor<'a> {
+    pub fn new(input: &'a str, frontmatter_allowed: FrontmatterAllowed) -> Cursor<'a> {
+        Cursor {
+            len_remaining: input.len(),
+            chars: input.chars(),
+            frontmatter_allowed,
+            #[cfg(debug_assertions)]
+            prev: EOF_CHAR,
+        }
+    }
+
+    pub fn as_str(&self) -> &'a str {
+        self.chars.as_str()
+    }
+
+    /// Returns the last eaten symbol (or `'\0'` in release builds).
+    /// (For debug assertions only.)
+    pub(crate) fn prev(&self) -> char {
+        #[cfg(debug_assertions)]
+        {
+            self.prev
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            EOF_CHAR
+        }
+    }
+
+    /// Peeks the next symbol from the input stream without consuming it.
+    /// If requested position doesn't exist, `EOF_CHAR` is returned.
+    /// However, getting `EOF_CHAR` doesn't always mean actual end of file,
+    /// it should be checked with `is_eof` method.
+    pub fn first(&self) -> char {
+        // `.next()` optimizes better than `.nth(0)`
+        self.chars.clone().next().unwrap_or(EOF_CHAR)
+    }
+
+    /// Peeks the second symbol from the input stream without consuming it.
+    pub(crate) fn second(&self) -> char {
+        // `.next()` optimizes better than `.nth(1)`
+        let mut iter = self.chars.clone();
+        iter.next();
+        iter.next().unwrap_or(EOF_CHAR)
+    }
+
+    /// Peeks the third symbol from the input stream without consuming it.
+    pub fn third(&self) -> char {
+        // `.next()` optimizes better than `.nth(2)`
+        let mut iter = self.chars.clone();
+        iter.next();
+        iter.next();
+        iter.next().unwrap_or(EOF_CHAR)
+    }
+
+    /// Checks if there is nothing more to consume.
+    pub(crate) fn is_eof(&self) -> bool {
+        self.chars.as_str().is_empty()
+    }
+
+    /// Returns amount of already consumed symbols.
+    pub(crate) fn pos_within_token(&self) -> u32 {
+        (self.len_remaining - self.chars.as_str().len()) as u32
+    }
+
+    /// Resets the number of bytes consumed to 0.
+    pub(crate) fn reset_pos_within_token(&mut self) {
+        self.len_remaining = self.chars.as_str().len();
+    }
+
+    /// Moves to the next character.
+    pub(crate) fn bump(&mut self) -> Option<char> {
+        let c = self.chars.next()?;
+
+        #[cfg(debug_assertions)]
+        {
+            self.prev = c;
+        }
+
+        Some(c)
+    }
+
+    /// Moves to a substring by a number of bytes.
+    pub(crate) fn bump_bytes(&mut self, n: usize) {
+        self.chars = self.as_str()[n..].chars();
+    }
+
+    /// Eats symbols while predicate returns true or until the end of file is reached.
+    pub(crate) fn eat_while(&mut self, mut predicate: impl FnMut(char) -> bool) {
+        // It was tried making optimized version of this for eg. line comments, but
+        // LLVM can inline all of this and compile it down to fast iteration over bytes.
+        while predicate(self.first()) && !self.is_eof() {
+            self.bump();
+        }
+    }
+
+    pub(crate) fn eat_until(&mut self, byte: u8) {
+        self.chars = match memchr::memchr(byte, self.as_str().as_bytes()) {
+            Some(index) => self.as_str()[index..].chars(),
+            None => "".chars(),
+        }
+    }
+
     /// Parses a token from the input string.
     pub fn advance_token(&mut self) -> Token {
         let Some(first_char) = self.bump() else {
@@ -538,40 +689,32 @@ impl Cursor<'_> {
         debug_assert!(length_opening >= 3);
 
         // whitespace between the opening and the infostring.
-        self.eat_while(|ch| ch != '\n' && is_whitespace(ch));
+        self.eat_while(|ch| ch != '\n' && is_horizontal_whitespace(ch));
 
-        // copied from `eat_identifier`, but allows `.` in infostring to allow something like
+        // copied from `eat_identifier`, but allows `-` and `.` in infostring to allow something like
         // `---Cargo.toml` as a valid opener
         if is_id_start(self.first()) {
             self.bump();
-            self.eat_while(|c| is_id_continue(c) || c == '.');
+            self.eat_while(|c| is_id_continue(c) || c == '-' || c == '.');
         }
 
-        self.eat_while(|ch| ch != '\n' && is_whitespace(ch));
+        self.eat_while(|ch| ch != '\n' && is_horizontal_whitespace(ch));
         let invalid_infostring = self.first() != '\n';
 
-        let mut s = self.as_str();
         let mut found = false;
-        let mut size = 0;
-        while let Some(closing) = s.find(&"-".repeat(length_opening as usize)) {
-            let preceding_chars_start = s[..closing].rfind("\n").map_or(0, |i| i + 1);
-            if s[preceding_chars_start..closing].chars().all(is_whitespace) {
-                // candidate found
-                self.bump_bytes(size + closing);
-                // in case like
-                // ---cargo
-                // --- blahblah
-                // or
-                // ---cargo
-                // ----
-                // combine those stuff into this frontmatter token such that it gets detected later.
-                self.eat_until(b'\n');
-                found = true;
-                break;
-            } else {
-                s = &s[closing + length_opening as usize..];
-                size += closing + length_opening as usize;
-            }
+        let nl_fence_pattern = format!("\n{:-<1$}", "", length_opening as usize);
+        if let Some(closing) = self.as_str().find(&nl_fence_pattern) {
+            // candidate found
+            self.bump_bytes(closing + nl_fence_pattern.len());
+            // in case like
+            // ---cargo
+            // --- blahblah
+            // or
+            // ---cargo
+            // ----
+            // combine those stuff into this frontmatter token such that it gets detected later.
+            self.eat_until(b'\n');
+            found = true;
         }
 
         if !found {
@@ -594,14 +737,16 @@ impl Cursor<'_> {
             if potential_closing.is_none() {
                 // a less fortunate recovery if all else fails which finds any dashes preceded by whitespace
                 // on a standalone line. Might be wrong.
+                let mut base_index = 0;
                 while let Some(closing) = rest.find("---") {
                     let preceding_chars_start = rest[..closing].rfind("\n").map_or(0, |i| i + 1);
-                    if rest[preceding_chars_start..closing].chars().all(is_whitespace) {
+                    if rest[preceding_chars_start..closing].chars().all(is_horizontal_whitespace) {
                         // candidate found
-                        potential_closing = Some(closing);
+                        potential_closing = Some(closing + base_index);
                         break;
                     } else {
                         rest = &rest[closing + 3..];
+                        base_index += closing + 3;
                     }
                 }
             }

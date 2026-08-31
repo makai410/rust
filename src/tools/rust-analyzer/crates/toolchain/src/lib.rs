@@ -71,6 +71,9 @@ impl Tool {
     }
 }
 
+// Prevent rustup from automatically installing toolchains, see https://github.com/rust-lang/rust-analyzer/issues/20719.
+pub const NO_RUSTUP_AUTO_INSTALL_ENV: (&str, &str) = ("RUSTUP_AUTO_INSTALL", "0");
+
 #[allow(clippy::disallowed_types)] /* generic parameter allows for FxHashMap */
 pub fn command<H>(
     cmd: impl AsRef<OsStr>,
@@ -81,6 +84,7 @@ pub fn command<H>(
     #[allow(clippy::disallowed_methods)]
     let mut cmd = Command::new(cmd);
     cmd.current_dir(working_directory);
+    cmd.env(NO_RUSTUP_AUTO_INSTALL_ENV.0, NO_RUSTUP_AUTO_INSTALL_ENV.1);
     for env in extra_env {
         match env {
             (key, Some(val)) => cmd.env(key, val),
@@ -115,7 +119,7 @@ fn get_cargo_home() -> Option<Utf8PathBuf> {
         return Utf8PathBuf::try_from(PathBuf::from(path)).ok();
     }
 
-    if let Some(mut path) = home::home_dir() {
+    if let Some(mut path) = env::home_dir() {
         path.push(".cargo");
         return Utf8PathBuf::try_from(path).ok();
     }
@@ -138,4 +142,34 @@ pub fn probe_for_binary(path: Utf8PathBuf) -> Option<Utf8PathBuf> {
         it => Some(path.with_extension(it)),
     };
     iter::once(path).chain(with_extension).find(|it| it.is_file())
+}
+
+pub const MINIMUM_TOOLCHAIN_VERSION_REQUIRING_JSON_TARGET_SPEC_FLAG: semver::Version =
+    semver::Version {
+        major: 1,
+        minor: 95,
+        patch: 0,
+        pre: semver::Prerelease::EMPTY,
+        build: semver::BuildMetadata::EMPTY,
+    };
+
+/// Uses targets in a Cargo process.
+pub fn cargo_use_targets(
+    toolchain_version: Option<&semver::Version>,
+    cmd: &mut Command,
+    targets: impl IntoIterator<Item = impl AsRef<str>>,
+) {
+    let mut has_json_target = false;
+    for target in targets {
+        let target = target.as_ref();
+        cmd.args(["--target", target]);
+        has_json_target |= target.ends_with(".json");
+    }
+    if has_json_target
+        && toolchain_version.is_some_and(|version| {
+            *version >= MINIMUM_TOOLCHAIN_VERSION_REQUIRING_JSON_TARGET_SPEC_FLAG
+        })
+    {
+        cmd.arg("-Zjson-target-spec");
+    }
 }

@@ -1,4 +1,5 @@
 //@ edition: 2021
+//@ dont-require-annotations: NOTE
 
 #![feature(macro_metavar_expr_concat)]
 
@@ -43,6 +44,7 @@ macro_rules! starting_number {
     ($ident:ident) => {{
         let ${concat("1", $ident)}: () = ();
         //~^ ERROR `${concat(..)}` is not generating a valid identifier
+        //~| NOTE this `${concat(..)}` invocation generated `1_abc`, but '1' is neither '_' nor XID_Start
     }};
 }
 
@@ -56,6 +58,8 @@ macro_rules! starting_invalid_unicode {
     ($ident:ident) => {{
         let ${concat("\u{00BD}", $ident)}: () = ();
         //~^ ERROR `${concat(..)}` is not generating a valid identifier
+        //~| NOTE this `${concat(..)}` invocation generated `\u{00BD}_abc`, but '\' is neither '_' nor XID_Start
+        //~| NOTE see <https://doc.rust-lang.org/reference/identifiers.html> for the definition of valid identifiers
     }};
 }
 
@@ -75,6 +79,7 @@ macro_rules! ending_invalid_unicode {
     ($ident:ident) => {{
         let ${concat($ident, "\u{00BD}")}: () = ();
         //~^ ERROR `${concat(..)}` is not generating a valid identifier
+        //~| NOTE this `${concat(..)}` invocation generated `_abc\u{00BD}`, but '\' is not XID_Continue
     }};
 }
 
@@ -82,6 +87,7 @@ macro_rules! empty {
     () => {{
         let ${concat("", "")}: () = ();
         //~^ ERROR `${concat(..)}` is not generating a valid identifier
+        //~| NOTE this `${concat(..)}` invocation generated an empty ident
     }};
 }
 
@@ -130,6 +136,8 @@ macro_rules! bad_literal_string {
         //~| ERROR `${concat(..)}` is not generating a valid identifier
         //~| ERROR `${concat(..)}` is not generating a valid identifier
         //~| ERROR `${concat(..)}` is not generating a valid identifier
+        //~| NOTE this `${concat(..)}` invocation generated `_foo🤷`, but '🤷' is not XID_Continue
+        //~| NOTE this `${concat(..)}` invocation generated `_foo-1`, but '-' is not XID_Continue
     }
 }
 
@@ -140,7 +148,9 @@ macro_rules! bad_literal_non_string {
         //~| ERROR metavariables of `${concat(..)}` must be of type
         //~| ERROR metavariables of `${concat(..)}` must be of type
         //~| ERROR metavariables of `${concat(..)}` must be of type
-        //~| ERROR metavariables of `${concat(..)}` must be of type
+        //~| ERROR floats are not supported as metavariables of `${concat(..)}`
+        //~| ERROR integer metavariables of `${concat(..)}` must not be suffixed
+        //~| ERROR integer metavariables of `${concat(..)}` must not be suffixed
     }
 }
 
@@ -148,7 +158,6 @@ macro_rules! bad_tt_literal {
     ($tt:tt) => {
         const ${concat(_foo, $tt)}: () = ();
         //~^ ERROR metavariables of `${concat(..)}` must be of type
-        //~| ERROR metavariables of `${concat(..)}` must be of type
         //~| ERROR metavariables of `${concat(..)}` must be of type
     }
 }
@@ -178,13 +187,14 @@ fn main() {
     bad_literal_string!("1.0");
     bad_literal_string!("'1'");
 
-    bad_literal_non_string!(1);
     bad_literal_non_string!(-1);
     bad_literal_non_string!(1.0);
     bad_literal_non_string!('1');
     bad_literal_non_string!(false);
+    bad_literal_non_string!(4f64);
+    bad_literal_non_string!(5u8);
+    bad_literal_non_string!(6_u8);
 
-    bad_tt_literal!(1);
     bad_tt_literal!(1.0);
     bad_tt_literal!('1');
 }

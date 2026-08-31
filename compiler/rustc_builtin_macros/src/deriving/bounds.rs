@@ -1,4 +1,4 @@
-use rustc_ast::MetaItem;
+use rustc_ast::{MetaItem, Safety};
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::Span;
 
@@ -18,11 +18,13 @@ pub(crate) fn expand_deriving_copy(
         path: path_std!(marker::Copy),
         skip_path_as_bound: false,
         needs_copy_as_bound_if_packed: false,
-        additional_bounds: Vec::new(),
+        additional_bounds: SmallVec::new(),
         supports_unions: true,
-        methods: Vec::new(),
-        associated_types: Vec::new(),
+        methods: SmallVec::new(),
+        associated_types: SmallVec::new(),
         is_const,
+        safety: Safety::Default,
+        document: true,
     };
 
     trait_def.expand(cx, mitem, item, push);
@@ -41,48 +43,13 @@ pub(crate) fn expand_deriving_const_param_ty(
         path: path_std!(marker::ConstParamTy_),
         skip_path_as_bound: false,
         needs_copy_as_bound_if_packed: false,
-        additional_bounds: vec![ty::Ty::Path(path_std!(cmp::Eq))],
+        additional_bounds: smallvec![ty::Ty::Path(path_std!(cmp::Eq))],
         supports_unions: false,
-        methods: Vec::new(),
-        associated_types: Vec::new(),
+        methods: SmallVec::new(),
+        associated_types: SmallVec::new(),
         is_const,
-    };
-
-    trait_def.expand(cx, mitem, item, push);
-
-    let trait_def = TraitDef {
-        span,
-        path: path_std!(marker::UnsizedConstParamTy),
-        skip_path_as_bound: false,
-        needs_copy_as_bound_if_packed: false,
-        additional_bounds: vec![ty::Ty::Path(path_std!(cmp::Eq))],
-        supports_unions: false,
-        methods: Vec::new(),
-        associated_types: Vec::new(),
-        is_const,
-    };
-
-    trait_def.expand(cx, mitem, item, push);
-}
-
-pub(crate) fn expand_deriving_unsized_const_param_ty(
-    cx: &ExtCtxt<'_>,
-    span: Span,
-    mitem: &MetaItem,
-    item: &Annotatable,
-    push: &mut dyn FnMut(Annotatable),
-    is_const: bool,
-) {
-    let trait_def = TraitDef {
-        span,
-        path: path_std!(marker::UnsizedConstParamTy),
-        skip_path_as_bound: false,
-        needs_copy_as_bound_if_packed: false,
-        additional_bounds: vec![ty::Ty::Path(path_std!(cmp::Eq))],
-        supports_unions: false,
-        methods: Vec::new(),
-        associated_types: Vec::new(),
-        is_const,
+        safety: Safety::Default,
+        document: true,
     };
 
     trait_def.expand(cx, mitem, item, push);

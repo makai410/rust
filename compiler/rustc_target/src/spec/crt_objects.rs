@@ -7,13 +7,13 @@
 //!
 //! | Pre-link CRT objects | glibc                  | musl                   | bionic           | mingw             | wasi         |
 //! |----------------------|------------------------|------------------------|------------------|-------------------|--------------|
-//! | dynamic-nopic-exe    | crt1, crti, crtbegin   | crt1, crti, crtbegin   | crtbegin_dynamic | crt2, crtbegin    | crt1         |
-//! | dynamic-pic-exe      | Scrt1, crti, crtbeginS | Scrt1, crti, crtbeginS | crtbegin_dynamic | crt2, crtbegin    | crt1         |
-//! | static-nopic-exe     | crt1, crti, crtbeginT  | crt1, crti, crtbegin   | crtbegin_static  | crt2, crtbegin    | crt1         |
-//! | static-pic-exe       | rcrt1, crti, crtbeginS | rcrt1, crti, crtbeginS | crtbegin_dynamic | crt2, crtbegin    | crt1         |
-//! | dynamic-dylib        | crti, crtbeginS        | crti, crtbeginS        | crtbegin_so      | dllcrt2, crtbegin | -            |
-//! | static-dylib (gcc)   | crti, crtbeginT        | crti, crtbeginS        | crtbegin_so      | dllcrt2, crtbegin | -            |
-//! | static-dylib (clang) | crti, crtbeginT        | N/A                    | crtbegin_static  | dllcrt2, crtbegin | -            |
+//! | dynamic-nopic-exe    | crt1, crti, crtbegin   | crt1, crti, crtbegin   | crtbegin_dynamic | crt2, crtbegin    | crt1-command |
+//! | dynamic-pic-exe      | Scrt1, crti, crtbeginS | Scrt1, crti, crtbeginS | crtbegin_dynamic | crt2, crtbegin    | crt1-command |
+//! | static-nopic-exe     | crt1, crti, crtbeginT  | crt1, crti, crtbegin   | crtbegin_static  | crt2, crtbegin    | crt1-command |
+//! | static-pic-exe       | rcrt1, crti, crtbeginS | rcrt1, crti, crtbeginS | crtbegin_dynamic | crt2, crtbegin    | crt1-command |
+//! | dynamic-dylib        | crti, crtbeginS        | crti, crtbeginS        | crtbegin_so      | dllcrt2, crtbegin | crt1-reactor |
+//! | static-dylib (gcc)   | crti, crtbeginT        | crti, crtbeginS        | crtbegin_so      | dllcrt2, crtbegin | crt1-reactor |
+//! | static-dylib (clang) | crti, crtbeginT        | N/A                    | crtbegin_static  | dllcrt2, crtbegin | ctr1-reactor |
 //! | wasi-reactor-exe     | N/A                    | N/A                    | N/A              | N/A               | crt1-reactor |
 //!
 //! | Post-link CRT objects | glibc         | musl          | bionic         | mingw  | wasi |
@@ -86,6 +86,17 @@ pub(super) fn post_musl_self_contained() -> CrtObjects {
 
 pub(super) fn pre_mingw_self_contained() -> CrtObjects {
     new(&[
+        (LinkOutputKind::DynamicNoPicExe, &["crt2.o"]),
+        (LinkOutputKind::DynamicPicExe, &["crt2.o"]),
+        (LinkOutputKind::StaticNoPicExe, &["crt2.o"]),
+        (LinkOutputKind::StaticPicExe, &["crt2.o"]),
+        (LinkOutputKind::DynamicDylib, &["dllcrt2.o"]),
+        (LinkOutputKind::StaticDylib, &["dllcrt2.o"]),
+    ])
+}
+
+pub(super) fn pre_i686_mingw_self_contained() -> CrtObjects {
+    new(&[
         (LinkOutputKind::DynamicNoPicExe, &["crt2.o", "rsbegin.o"]),
         (LinkOutputKind::DynamicPicExe, &["crt2.o", "rsbegin.o"]),
         (LinkOutputKind::StaticNoPicExe, &["crt2.o", "rsbegin.o"]),
@@ -95,15 +106,15 @@ pub(super) fn pre_mingw_self_contained() -> CrtObjects {
     ])
 }
 
-pub(super) fn post_mingw_self_contained() -> CrtObjects {
+pub(super) fn post_i686_mingw_self_contained() -> CrtObjects {
     all("rsend.o")
 }
 
-pub(super) fn pre_mingw() -> CrtObjects {
+pub(super) fn pre_i686_mingw() -> CrtObjects {
     all("rsbegin.o")
 }
 
-pub(super) fn post_mingw() -> CrtObjects {
+pub(super) fn post_i686_mingw() -> CrtObjects {
     all("rsend.o")
 }
 
@@ -116,6 +127,8 @@ pub(super) fn pre_wasi_self_contained() -> CrtObjects {
         (LinkOutputKind::StaticNoPicExe, &["crt1-command.o"]),
         (LinkOutputKind::StaticPicExe, &["crt1-command.o"]),
         (LinkOutputKind::WasiReactorExe, &["crt1-reactor.o"]),
+        (LinkOutputKind::DynamicDylib, &["crt1-reactor.o"]),
+        (LinkOutputKind::StaticDylib, &["crt1-reactor.o"]),
     ])
 }
 

@@ -1,7 +1,7 @@
-use rustc_ast::{self as ast, Generics, ItemKind, MetaItem, VariantData};
+use rustc_ast::{self as ast, Generics, ItemKind, MetaItem, Safety, VariantData};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::{Ident, Span, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, Span, kw, sym};
 use thin_vec::{ThinVec, thin_vec};
 
 use crate::deriving::generic::ty::*;
@@ -38,34 +38,51 @@ pub(crate) fn expand_deriving_clone(
             | ItemKind::Enum(_, Generics { params, .. }, _) => {
                 let container_id = cx.current_expansion.id.expn_data().parent.expect_local();
                 let has_derive_copy = cx.resolver.has_derive_copy(container_id);
+                bounds = smallvec![];
                 if has_derive_copy
                     && !params
                         .iter()
                         .any(|param| matches!(param.kind, ast::GenericParamKind::Type { .. }))
                 {
-                    bounds = vec![];
                     is_simple = true;
-                    substructure = combine_substructure(Box::new(|c, s, sub| {
-                        cs_clone_simple("Clone", c, s, sub, false)
-                    }));
-                } else {
-                    bounds = vec![];
-                    is_simple = false;
                     substructure =
-                        combine_substructure(Box::new(|c, s, sub| cs_clone("Clone", c, s, sub)));
+                        combine_substructure(|c, s, sub| cs_clone_simple(c, s, sub, false));
+                } else {
+                    is_simple = false;
+                    substructure = combine_substructure(cs_clone);
                 }
             }
             ItemKind::Union(..) => {
-                bounds = vec![Path(path_std!(marker::Copy))];
+                bounds = smallvec![Path(path_std!(marker::Copy))];
                 is_simple = true;
-                substructure = combine_substructure(Box::new(|c, s, sub| {
-                    cs_clone_simple("Clone", c, s, sub, true)
-                }));
+                substructure = combine_substructure(|c, s, sub| cs_clone_simple(c, s, sub, true));
             }
             _ => cx.dcx().span_bug(span, "`#[derive(Clone)]` on wrong item kind"),
         },
 
         _ => cx.dcx().span_bug(span, "`#[derive(Clone)]` on trait item or impl item"),
+    }
+
+    // If the clone method is just copying the value, also mark the type as
+    // `TrivialClone` to allow some library optimizations.
+    if is_simple {
+        let trivial_def = TraitDef {
+            span,
+            path: path_std!(clone::TrivialClone),
+            skip_path_as_bound: false,
+            needs_copy_as_bound_if_packed: true,
+            additional_bounds: bounds.clone(),
+            supports_unions: true,
+            methods: SmallVec::new(),
+            associated_types: SmallVec::new(),
+            is_const,
+            safety: Safety::Unsafe(DUMMY_SP),
+            // `TrivialClone` is not part of an API guarantee, so it shouldn't
+            // appear in rustdoc output.
+            document: false,
+        };
+
+        trivial_def.expand_ext(cx, mitem, item, push, true);
     }
 
     let trait_def = TraitDef {
@@ -75,25 +92,26 @@ pub(crate) fn expand_deriving_clone(
         needs_copy_as_bound_if_packed: true,
         additional_bounds: bounds,
         supports_unions: true,
-        methods: vec![MethodDef {
+        methods: smallvec![MethodDef {
             name: sym::clone,
             generics: Bounds::empty(),
             explicit_self: true,
-            nonself_args: Vec::new(),
+            nonself_args: SmallVec::new(),
             ret_ty: Self_,
             attributes: thin_vec![cx.attr_word(sym::inline, span)],
             fieldless_variants_strategy: FieldlessVariantsStrategy::Default,
             combine_substructure: substructure,
         }],
-        associated_types: Vec::new(),
+        associated_types: SmallVec::new(),
         is_const,
+        safety: Safety::Default,
+        document: true,
     };
 
     trait_def.expand_ext(cx, mitem, item, push, is_simple)
 }
 
 fn cs_clone_simple(
-    name: &str,
     cx: &ExtCtxt<'_>,
     trait_span: Span,
     substr: &Substructure<'_>,
@@ -146,21 +164,13 @@ fn cs_clone_simple(
                     process_variant(&variant.data);
                 }
             }
-            _ => cx.dcx().span_bug(
-                trait_span,
-                format!("unexpected substructure in simple `derive({name})`"),
-            ),
+            _ => cx.dcx().span_bug(trait_span, "unexpected substructure in simple `derive(Clone)`"),
         }
     }
     BlockOrExpr::new_mixed(stmts, Some(cx.expr_deref(trait_span, cx.expr_self(trait_span))))
 }
 
-fn cs_clone(
-    name: &str,
-    cx: &ExtCtxt<'_>,
-    trait_span: Span,
-    substr: &Substructure<'_>,
-) -> BlockOrExpr {
+fn cs_clone(cx: &ExtCtxt<'_>, trait_span: Span, substr: &Substructure<'_>) -> BlockOrExpr {
     let ctor_path;
     let all_fields;
     let fn_path = cx.std_path(&[sym::clone, sym::Clone, sym::clone]);
@@ -182,10 +192,10 @@ fn cs_clone(
             vdata = &variant.data;
         }
         EnumDiscr(..) | AllFieldlessEnum(..) => {
-            cx.dcx().span_bug(trait_span, format!("enum discriminants in `derive({name})`",))
+            cx.dcx().span_bug(trait_span, "enum discriminants in `derive(Clone)`")
         }
         StaticEnum(..) | StaticStruct(..) => {
-            cx.dcx().span_bug(trait_span, format!("associated function in `derive({name})`"))
+            cx.dcx().span_bug(trait_span, "associated function in `derive(Clone)`")
         }
     }
 
@@ -197,7 +207,7 @@ fn cs_clone(
                     let Some(ident) = field.name else {
                         cx.dcx().span_bug(
                             trait_span,
-                            format!("unnamed field in normal struct in `derive({name})`",),
+                            "unnamed field in normal struct in `derive(Clone)`",
                         );
                     };
                     let call = subcall(cx, field);
