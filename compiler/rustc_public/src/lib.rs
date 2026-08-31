@@ -46,6 +46,23 @@
 #![doc(test(attr(allow(unused_variables), deny(warnings))))]
 #![feature(sized_hierarchy)]
 
+#[cfg(not(feature = "rustc-build"))]
+macro_rules! rustc_crates {
+    () => {
+        extern crate rustc_abi;
+        extern crate rustc_driver;
+        extern crate rustc_hir;
+        extern crate rustc_middle;
+        extern crate rustc_public_bridge;
+        extern crate rustc_session;
+        extern crate rustc_span;
+        extern crate rustc_target;
+    };
+}
+
+#[cfg(not(feature = "rustc-build"))]
+rustc_crates!();
+
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::{fmt, io};
