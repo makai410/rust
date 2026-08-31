@@ -3,31 +3,45 @@
 use either::Either;
 use hir_def::{
     CallableDefId, Lookup, MacroId, VariantId,
+    expr_store::ExpressionStore,
     nameres::{ModuleOrigin, ModuleSource},
     src::{HasChildSource, HasSource as _},
 };
 use hir_expand::{EditionedFileId, HirFileId, InFile};
-use hir_ty::db::InternedClosure;
-use syntax::ast;
+use hir_ty::{db::InternedClosure, next_solver::AnyImplId};
+use syntax::{AstNode, ast};
 use tt::TextRange;
 
 use crate::{
-    Adt, Callee, Const, Enum, ExternCrateDecl, Field, FieldSource, Function, Impl,
-    InlineAsmOperand, Label, LifetimeParam, LocalSource, Macro, Module, Param, SelfParam, Static,
-    Struct, Trait, TraitAlias, TypeAlias, TypeOrConstParam, Union, Variant, VariantDef,
-    db::HirDatabase,
+    Adt, AnyFunctionId, Callee, Const, Enum, EnumVariant, ExternCrateDecl, Field, FieldSource,
+    Function, Impl, InlineAsmOperand, Label, LifetimeParam, LocalSource, Macro, Module, Param,
+    SelfParam, Static, Struct, Trait, TypeAlias, TypeOrConstParam, Union, Variant, db::HirDatabase,
 };
 
-pub trait HasSource {
-    type Ast;
+pub trait HasSource: Sized {
+    type Ast: AstNode;
     /// Fetches the definition's source node.
-    /// Using [`crate::Semantics::source`] is preferred when working with [`crate::Semantics`],
+    /// Using [`crate::SemanticsImpl::source`] is preferred when working with [`crate::Semantics`],
     /// as that caches the parsed file in the semantics' cache.
     ///
     /// The current some implementations can return `InFile` instead of `Option<InFile>`.
     /// But we made this method `Option` to support rlib in the future
     /// by <https://github.com/rust-lang/rust-analyzer/issues/6913>
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>>;
+
+    /// Fetches the source node, along with its full range.
+    ///
+    /// The reason for the separate existence of this method is that some things, notably builtin derive impls,
+    /// do not really have a source node, at least not of the correct type. But we still can trace them
+    /// to source code (the derive producing them). So this method will return the range if it is supported,
+    /// and if the node is supported too it will return it as well.
+    fn source_with_range(
+        self,
+        db: &dyn HirDatabase,
+    ) -> Option<InFile<(TextRange, Option<Self::Ast>)>> {
+        let source = self.source(db)?;
+        Some(source.map(|node| (node.syntax().text_range(), Some(node))))
+    }
 }
 
 /// NB: Module is !HasSource, because it has two source nodes at the same time:
@@ -36,23 +50,23 @@ impl Module {
     /// Returns a node which defines this module. That is, a file or a `mod foo {}` with items.
     pub fn definition_source(self, db: &dyn HirDatabase) -> InFile<ModuleSource> {
         let def_map = self.id.def_map(db);
-        def_map[self.id.local_id].definition_source(db)
+        def_map[self.id].definition_source(db)
     }
 
     /// Returns a node which defines this module. That is, a file or a `mod foo {}` with items.
     pub fn definition_source_range(self, db: &dyn HirDatabase) -> InFile<TextRange> {
         let def_map = self.id.def_map(db);
-        def_map[self.id.local_id].definition_source_range(db)
+        def_map[self.id].definition_source_range(db)
     }
 
     pub fn definition_source_file_id(self, db: &dyn HirDatabase) -> HirFileId {
         let def_map = self.id.def_map(db);
-        def_map[self.id.local_id].definition_source_file_id()
+        def_map[self.id].definition_source_file_id()
     }
 
     pub fn is_mod_rs(self, db: &dyn HirDatabase) -> bool {
         let def_map = self.id.def_map(db);
-        match def_map[self.id.local_id].origin {
+        match def_map[self.id].origin {
             ModuleOrigin::File { is_mod_rs, .. } => is_mod_rs,
             _ => false,
         }
@@ -60,7 +74,7 @@ impl Module {
 
     pub fn as_source_file_id(self, db: &dyn HirDatabase) -> Option<EditionedFileId> {
         let def_map = self.id.def_map(db);
-        match def_map[self.id.local_id].origin {
+        match def_map[self.id].origin {
             ModuleOrigin::File { definition, .. } | ModuleOrigin::CrateRoot { definition, .. } => {
                 Some(definition)
             }
@@ -70,21 +84,21 @@ impl Module {
 
     pub fn is_inline(self, db: &dyn HirDatabase) -> bool {
         let def_map = self.id.def_map(db);
-        def_map[self.id.local_id].origin.is_inline()
+        def_map[self.id].origin.is_inline()
     }
 
     /// Returns a node which declares this module, either a `mod foo;` or a `mod foo {}`.
     /// `None` for the crate root.
     pub fn declaration_source(self, db: &dyn HirDatabase) -> Option<InFile<ast::Module>> {
         let def_map = self.id.def_map(db);
-        def_map[self.id.local_id].declaration_source(db)
+        def_map[self.id].declaration_source(db)
     }
 
     /// Returns a text range which declares this module, either a `mod foo;` or a `mod foo {}`.
     /// `None` for the crate root.
     pub fn declaration_source_range(self, db: &dyn HirDatabase) -> Option<InFile<TextRange>> {
         let def_map = self.id.def_map(db);
-        def_map[self.id.local_id].declaration_source_range(db)
+        def_map[self.id].declaration_source_range(db)
     }
 }
 
@@ -110,13 +124,13 @@ impl HasSource for Adt {
         }
     }
 }
-impl HasSource for VariantDef {
+impl HasSource for Variant {
     type Ast = ast::VariantDef;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
         match self {
-            VariantDef::Struct(s) => Some(s.source(db)?.map(ast::VariantDef::Struct)),
-            VariantDef::Union(u) => Some(u.source(db)?.map(ast::VariantDef::Union)),
-            VariantDef::Variant(v) => Some(v.source(db)?.map(ast::VariantDef::Variant)),
+            Variant::Struct(s) => Some(s.source(db)?.map(ast::VariantDef::Struct)),
+            Variant::Union(u) => Some(u.source(db)?.map(ast::VariantDef::Union)),
+            Variant::EnumVariant(v) => Some(v.source(db)?.map(ast::VariantDef::Variant)),
         }
     }
 }
@@ -138,7 +152,7 @@ impl HasSource for Enum {
         Some(self.id.lookup(db).source(db))
     }
 }
-impl HasSource for Variant {
+impl HasSource for EnumVariant {
     type Ast = ast::Variant;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<ast::Variant>> {
         Some(self.id.lookup(db).source(db))
@@ -147,7 +161,30 @@ impl HasSource for Variant {
 impl HasSource for Function {
     type Ast = ast::Fn;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(db).source(db))
+        match self.id {
+            AnyFunctionId::FunctionId(id) => Some(id.loc(db).source(db)),
+            // When calling `source()`, we use the trait method source, but when calling `source_with_range()`,
+            // we return `None` as the syntax node source. This is relying on the assumption that if you are calling
+            // `source_with_range()` (e.g. in navigation) you're prepared to deal with no source node, while if
+            // you call `source()` maybe you don't - therefore we fall back to the trait method, to not lose features.
+            AnyFunctionId::BuiltinDeriveImplMethod { method, impl_ } => method
+                .trait_method(db, impl_)
+                .and_then(|trait_method| Function::from(trait_method).source(db)),
+        }
+    }
+
+    fn source_with_range(
+        self,
+        db: &dyn HirDatabase,
+    ) -> Option<InFile<(TextRange, Option<Self::Ast>)>> {
+        match self.id {
+            AnyFunctionId::FunctionId(id) => Some(
+                id.loc(db).source(db).map(|source| (source.syntax().text_range(), Some(source))),
+            ),
+            AnyFunctionId::BuiltinDeriveImplMethod { impl_, .. } => {
+                Some(impl_.loc(db).source(db).map(|range| (range, None)))
+            }
+        }
     }
 }
 impl HasSource for Const {
@@ -164,12 +201,6 @@ impl HasSource for Static {
 }
 impl HasSource for Trait {
     type Ast = ast::Trait;
-    fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(db).source(db))
-    }
-}
-impl HasSource for TraitAlias {
-    type Ast = ast::TraitAlias;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
         Some(self.id.lookup(db).source(db))
     }
@@ -197,12 +228,29 @@ impl HasSource for Macro {
 impl HasSource for Impl {
     type Ast = ast::Impl;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(db).source(db))
+        match self.id {
+            AnyImplId::ImplId(id) => Some(id.loc(db).source(db)),
+            AnyImplId::BuiltinDeriveImplId(_) => None,
+        }
+    }
+
+    fn source_with_range(
+        self,
+        db: &dyn HirDatabase,
+    ) -> Option<InFile<(TextRange, Option<Self::Ast>)>> {
+        match self.id {
+            AnyImplId::ImplId(id) => Some(
+                id.loc(db).source(db).map(|source| (source.syntax().text_range(), Some(source))),
+            ),
+            AnyImplId::BuiltinDeriveImplId(impl_) => {
+                Some(impl_.loc(db).source(db).map(|range| (range, None)))
+            }
+        }
     }
 }
 
 impl HasSource for TypeOrConstParam {
-    type Ast = Either<ast::TypeOrConstParam, ast::TraitOrAlias>;
+    type Ast = Either<ast::TypeOrConstParam, ast::Trait>;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
         let child_source = self.id.parent.child_source(db);
         child_source.map(|it| it.get(self.id.local_id).cloned()).transpose()
@@ -217,7 +265,7 @@ impl HasSource for LifetimeParam {
     }
 }
 
-impl HasSource for LocalSource {
+impl HasSource for LocalSource<'_> {
     type Ast = Either<ast::IdentPat, ast::SelfParam>;
 
     fn source(self, _: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
@@ -231,7 +279,7 @@ impl HasSource for Param<'_> {
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
         match self.func {
             Callee::Def(CallableDefId::FunctionId(func)) => {
-                let InFile { file_id, value } = Function { id: func }.source(db)?;
+                let InFile { file_id, value } = Function::from(func).source(db)?;
                 let params = value.param_list()?;
                 if let Some(self_param) = params.self_param() {
                     if let Some(idx) = self.idx.checked_sub(1) {
@@ -245,10 +293,11 @@ impl HasSource for Param<'_> {
                 .map(|value| InFile { file_id, value })
             }
             Callee::Closure(closure, _) => {
-                let InternedClosure(owner, expr_id) = db.lookup_intern_closure(closure.into());
-                let (_, source_map) = db.body_with_source_map(owner);
+                let InternedClosure { owner, expr: expr_id, .. } = closure.loc(db);
+                let (_, source_map) =
+                    ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
                 let ast @ InFile { file_id, value } = source_map.expr_syntax(expr_id).ok()?;
-                let root = db.parse_or_expand(file_id);
+                let root = file_id.parse_or_expand(db);
                 match value.to_node(&root) {
                     Either::Left(ast::Expr::ClosureExpr(it)) => it
                         .param_list()?
@@ -268,7 +317,7 @@ impl HasSource for SelfParam {
     type Ast = ast::SelfParam;
 
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
-        let InFile { file_id, value } = Function::from(self.func).source(db)?;
+        let InFile { file_id, value } = self.func.source(db)?;
         value
             .param_list()
             .and_then(|params| params.self_param())
@@ -280,10 +329,9 @@ impl HasSource for Label {
     type Ast = ast::Label;
 
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
-        let (_body, source_map) = db.body_with_source_map(self.parent);
-        let src = source_map.label_syntax(self.label_id);
+        let src = ExpressionStore::with_source_map(db, self.parent).1.label_syntax(self.label_id);
         let root = src.file_syntax(db);
-        Some(src.map(|ast| ast.to_node(&root)))
+        src.map(|ast| ast.to_node(&root).left()).transpose()
     }
 }
 
@@ -298,7 +346,7 @@ impl HasSource for ExternCrateDecl {
 impl HasSource for InlineAsmOperand {
     type Ast = ast::AsmOperandNamed;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
-        let source_map = db.body_with_source_map(self.owner).1;
+        let (_, source_map) = ExpressionStore::with_source_map(db, self.owner);
         if let Ok(src) = source_map.expr_syntax(self.expr) {
             let root = src.file_syntax(db);
             return src

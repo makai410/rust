@@ -5,18 +5,17 @@ use std::iter::once;
 use rustc_abi::{FIRST_VARIANT, FieldIdx, Integer, VariantIdx};
 use rustc_arena::DroplessArena;
 use rustc_hir::HirId;
-use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
+use rustc_lint_defs::builtin::{NON_CONTIGUOUS_RANGE_ENDPOINTS, OVERLAPPING_RANGE_ENDPOINTS};
 use rustc_middle::middle::stability::EvalResult;
-use rustc_middle::mir::{self, Const};
 use rustc_middle::thir::{self, Pat, PatKind, PatRange, PatRangeBoundary};
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::ty::{
     self, FieldDef, OpaqueTypeKey, ScalarInt, Ty, TyCtxt, TypeVisitableExt, VariantDef,
 };
 use rustc_middle::{bug, span_bug};
-use rustc_session::lint;
-use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, sym};
+use rustc_span::def_id::LocalModId;
+use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span};
 
 use crate::constructor::Constructor::*;
 use crate::constructor::{
@@ -26,7 +25,7 @@ use crate::lints::lint_nonexhaustive_missing_variants;
 use crate::pat_column::PatternColumn;
 use crate::rustc::print::EnumInfo;
 use crate::usefulness::{PlaceValidity, compute_match_usefulness};
-use crate::{PatCx, PrivateUninhabitedField, errors};
+use crate::{PatCx, PrivateUninhabitedField, diagnostics};
 
 mod print;
 
@@ -85,7 +84,7 @@ pub struct RustcPatCtxt<'p, 'tcx: 'p> {
     /// inhabited can depend on whether it was defined in the current module or
     /// not. E.g., `struct Foo { _private: ! }` cannot be seen to be empty
     /// outside its module and should not be matchable with an empty match statement.
-    pub module: DefId,
+    pub module: LocalModId,
     pub typing_env: ty::TypingEnv<'tcx>,
     /// To allocate the result of `self.ctor_sub_tys()`
     pub dropless_arena: &'p DroplessArena,
@@ -121,22 +120,26 @@ impl<'p, 'tcx: 'p> fmt::Debug for RustcPatCtxt<'p, 'tcx> {
 impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
     /// Type inference occasionally gives us opaque types in places where corresponding patterns
     /// have more specific types. To avoid inconsistencies as well as detect opaque uninhabited
-    /// types, we use the corresponding concrete type if possible.
+    /// types, we use the corresponding hidden type if possible.
     // FIXME(#132279): This will be unnecessary once we have a TypingMode which supports revealing
     // opaque types defined in a body.
     #[inline]
     pub fn reveal_opaque_ty(&self, ty: Ty<'tcx>) -> RevealedTy<'tcx> {
         fn reveal_inner<'tcx>(cx: &RustcPatCtxt<'_, 'tcx>, ty: Ty<'tcx>) -> RevealedTy<'tcx> {
-            let ty::Alias(ty::Opaque, alias_ty) = *ty.kind() else { bug!() };
-            if let Some(local_def_id) = alias_ty.def_id.as_local() {
-                let key = ty::OpaqueTypeKey { def_id: local_def_id, args: alias_ty.args };
+            debug_assert!(!cx.tcx.next_trait_solver_globally());
+            let ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) = *ty.kind()
+            else {
+                bug!()
+            };
+            if let Some(local_def_id) = def_id.as_local() {
+                let key = ty::OpaqueTypeKey { def_id: local_def_id, args };
                 if let Some(ty) = cx.reveal_opaque_key(key) {
                     return RevealedTy(ty);
                 }
             }
             RevealedTy(ty)
         }
-        if let ty::Alias(ty::Opaque, _) = ty.kind() {
+        if let ty::Alias(ty::IsRigid::No, ty::AliasTy { kind: ty::Opaque { .. }, .. }) = ty.kind() {
             reveal_inner(self, ty)
         } else {
             RevealedTy(ty)
@@ -147,9 +150,9 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
     /// know it.
     fn reveal_opaque_key(&self, key: OpaqueTypeKey<'tcx>) -> Option<Ty<'tcx>> {
         self.typeck_results
-            .concrete_opaque_types
+            .hidden_types
             .get(&key.def_id)
-            .map(|x| ty::EarlyBinder::bind(x.ty).instantiate(self.tcx, key.args))
+            .map(|x| x.ty.instantiate(self.tcx, key.args).skip_norm_wip())
     }
     // This can take a non-revealed `Ty` because it reveals opaques itself.
     pub fn is_uninhabited(&self, ty: Ty<'tcx>) -> bool {
@@ -192,7 +195,18 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
         variant.fields.iter().map(move |field| {
             let ty = field.ty(self.tcx, args);
             // `field.ty()` doesn't normalize after instantiating.
-            let ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
+            let ty =
+                self.tcx.try_normalize_erasing_regions(self.typing_env, ty).unwrap_or_else(|e| {
+                    self.tcx.dcx().span_delayed_bug(
+                        self.scrut_span,
+                        format!(
+                            "Failed to normalize {:?} in typing_env={:?} while getting variant sub tys for {ty:?}",
+                            e.get_type_for_failure(),
+                            self.typing_env,
+                        ),
+                    );
+                    ty.skip_norm_wip()
+                });
             let ty = self.reveal_opaque_ty(ty);
             (field, ty)
         })
@@ -238,10 +252,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                         let is_visible =
                             adt.is_enum() || field.vis.is_accessible_from(cx.module, cx.tcx);
                         let is_uninhabited = cx.is_uninhabited(*ty);
-                        let is_unstable = cx.tcx.lookup_stability(field.did).is_some_and(|stab| {
-                            stab.is_unstable() && stab.feature != sym::rustc_private
-                        });
-                        let skip = is_uninhabited && (!is_visible || is_unstable);
+                        let skip = is_uninhabited && !is_visible;
                         (ty, PrivateUninhabitedField(skip))
                     });
                     cx.dropless_arena.alloc_from_iter(tys)
@@ -411,7 +422,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
             | ty::FnDef(_, _)
             | ty::FnPtr(..)
             | ty::Pat(_, _)
-            | ty::Dynamic(_, _, _)
+            | ty::Dynamic(_, _)
             | ty::Closure(..)
             | ty::CoroutineClosure(..)
             | ty::Coroutine(_, _)
@@ -433,7 +444,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
         match bdy {
             PatRangeBoundary::NegInfinity => MaybeInfiniteInt::NegInfinity,
             PatRangeBoundary::Finite(value) => {
-                let bits = value.eval_bits(self.tcx, self.typing_env);
+                let bits = value.to_leaf().to_bits_unchecked();
                 match *ty.kind() {
                     ty::Int(ity) => {
                         let size = Integer::from_int_ty(&self.tcx, ity).size().bits();
@@ -455,19 +466,22 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
         let arity;
         let fields: Vec<_>;
         match &pat.kind {
-            PatKind::AscribeUserType { subpattern, .. }
-            | PatKind::ExpandedConstant { subpattern, .. } => return self.lower_pat(subpattern),
-            PatKind::Binding { subpattern: Some(subpat), .. } => return self.lower_pat(subpat),
+            PatKind::Binding { subpattern: Some(subpat), .. }
+            | PatKind::Guard { subpattern: subpat, .. } => return self.lower_pat(subpat),
             PatKind::Missing | PatKind::Binding { subpattern: None, .. } | PatKind::Wild => {
                 ctor = Wildcard;
                 fields = vec![];
                 arity = 0;
             }
-            PatKind::Deref { subpattern } => {
+            PatKind::Deref { pin, subpattern } => {
                 fields = vec![self.lower_pat(subpattern).at_index(0)];
                 arity = 1;
-                ctor = match ty.kind() {
-                    ty::Ref(..) => Ref,
+                ctor = match (pin, ty.maybe_pinned_ref()) {
+                    (ty::Pinnedness::Not, Some((_, ty::Pinnedness::Not, _, _))) => Ref,
+                    (ty::Pinnedness::Pinned, Some((inner_ty, ty::Pinnedness::Pinned, _, _))) => {
+                        self.internal_state.has_lowered_deref_pat.set(true);
+                        DerefPattern(RevealedTy(inner_ty))
+                    }
                     _ => span_bug!(
                         pat.span,
                         "pattern has unexpected type: pat: {:?}, ty: {:?}",
@@ -523,91 +537,64 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
             PatKind::Constant { value } => {
                 match ty.kind() {
                     ty::Bool => {
-                        ctor = match value.try_eval_bool(cx.tcx, cx.typing_env) {
-                            Some(b) => Bool(b),
-                            None => Opaque(OpaqueId::new()),
-                        };
+                        ctor = Bool(value.try_to_bool().unwrap());
                         fields = vec![];
                         arity = 0;
                     }
                     ty::Char | ty::Int(_) | ty::Uint(_) => {
-                        ctor = match value.try_eval_bits(cx.tcx, cx.typing_env) {
-                            Some(bits) => {
-                                let x = match *ty.kind() {
-                                    ty::Int(ity) => {
-                                        let size = Integer::from_int_ty(&cx.tcx, ity).size().bits();
-                                        MaybeInfiniteInt::new_finite_int(bits, size)
-                                    }
-                                    _ => MaybeInfiniteInt::new_finite_uint(bits),
-                                };
-                                IntRange(IntRange::from_singleton(x))
-                            }
-                            None => Opaque(OpaqueId::new()),
+                        ctor = {
+                            let bits = value.to_leaf().to_bits_unchecked();
+                            let x = match *ty.kind() {
+                                ty::Int(ity) => {
+                                    let size = Integer::from_int_ty(&cx.tcx, ity).size().bits();
+                                    MaybeInfiniteInt::new_finite_int(bits, size)
+                                }
+                                _ => MaybeInfiniteInt::new_finite_uint(bits),
+                            };
+                            IntRange(IntRange::from_singleton(x))
                         };
                         fields = vec![];
                         arity = 0;
                     }
                     ty::Float(ty::FloatTy::F16) => {
-                        ctor = match value.try_eval_bits(cx.tcx, cx.typing_env) {
-                            Some(bits) => {
-                                use rustc_apfloat::Float;
-                                let value = rustc_apfloat::ieee::Half::from_bits(bits);
-                                F16Range(value, value, RangeEnd::Included)
-                            }
-                            None => Opaque(OpaqueId::new()),
-                        };
+                        use rustc_apfloat::Float;
+                        let bits = value.to_leaf().to_u16();
+                        let value = rustc_apfloat::ieee::Half::from_bits(bits.into());
+                        ctor = F16Range(value, value, RangeEnd::Included);
                         fields = vec![];
                         arity = 0;
                     }
                     ty::Float(ty::FloatTy::F32) => {
-                        ctor = match value.try_eval_bits(cx.tcx, cx.typing_env) {
-                            Some(bits) => {
-                                use rustc_apfloat::Float;
-                                let value = rustc_apfloat::ieee::Single::from_bits(bits);
-                                F32Range(value, value, RangeEnd::Included)
-                            }
-                            None => Opaque(OpaqueId::new()),
-                        };
+                        use rustc_apfloat::Float;
+                        let bits = value.to_leaf().to_u32();
+                        let value = rustc_apfloat::ieee::Single::from_bits(bits.into());
+                        ctor = F32Range(value, value, RangeEnd::Included);
                         fields = vec![];
                         arity = 0;
                     }
                     ty::Float(ty::FloatTy::F64) => {
-                        ctor = match value.try_eval_bits(cx.tcx, cx.typing_env) {
-                            Some(bits) => {
-                                use rustc_apfloat::Float;
-                                let value = rustc_apfloat::ieee::Double::from_bits(bits);
-                                F64Range(value, value, RangeEnd::Included)
-                            }
-                            None => Opaque(OpaqueId::new()),
-                        };
+                        use rustc_apfloat::Float;
+                        let bits = value.to_leaf().to_u64();
+                        let value = rustc_apfloat::ieee::Double::from_bits(bits.into());
+                        ctor = F64Range(value, value, RangeEnd::Included);
                         fields = vec![];
                         arity = 0;
                     }
                     ty::Float(ty::FloatTy::F128) => {
-                        ctor = match value.try_eval_bits(cx.tcx, cx.typing_env) {
-                            Some(bits) => {
-                                use rustc_apfloat::Float;
-                                let value = rustc_apfloat::ieee::Quad::from_bits(bits);
-                                F128Range(value, value, RangeEnd::Included)
-                            }
-                            None => Opaque(OpaqueId::new()),
-                        };
+                        use rustc_apfloat::Float;
+                        let bits = value.to_leaf().to_u128();
+                        let value = rustc_apfloat::ieee::Quad::from_bits(bits);
+                        ctor = F128Range(value, value, RangeEnd::Included);
                         fields = vec![];
                         arity = 0;
                     }
-                    ty::Ref(_, t, _) if t.is_str() => {
-                        // We want a `&str` constant to behave like a `Deref` pattern, to be compatible
-                        // with other `Deref` patterns. This could have been done in `const_to_pat`,
-                        // but that causes issues with the rest of the matching code.
-                        // So here, the constructor for a `"foo"` pattern is `&` (represented by
-                        // `Ref`), and has one field. That field has constructor `Str(value)` and no
-                        // subfields.
-                        // Note: `t` is `str`, not `&str`.
-                        let ty = self.reveal_opaque_ty(*t);
-                        let subpattern = DeconstructedPat::new(Str(*value), Vec::new(), 0, ty, pat);
-                        ctor = Ref;
-                        fields = vec![subpattern.at_index(0)];
-                        arity = 1;
+                    ty::Str => {
+                        // For constant/literal patterns of type `&str`, the THIR
+                        // pattern is a `PatKind::Deref` of type `&str` wrapping a
+                        // `PatKind::Const` of type `str`.
+                        ctor = Str(*value);
+                        fields = vec![];
+                        arity = 0;
                     }
                     // All constants that can be structurally matched have already been expanded
                     // into the corresponding `Pat`s by `const_to_pat`. Constants that remain are
@@ -633,8 +620,8 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                     }
                     ty::Float(fty) => {
                         use rustc_apfloat::Float;
-                        let lo = lo.as_finite().map(|c| c.eval_bits(cx.tcx, cx.typing_env));
-                        let hi = hi.as_finite().map(|c| c.eval_bits(cx.tcx, cx.typing_env));
+                        let lo = lo.as_finite().map(|c| c.to_leaf().to_bits_unchecked());
+                        let hi = hi.as_finite().map(|c| c.to_leaf().to_bits_unchecked());
                         match fty {
                             ty::FloatTy::F16 => {
                                 use rustc_apfloat::ieee::Half;
@@ -742,8 +729,8 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                 };
                 match ScalarInt::try_from_uint(bits, size) {
                     Some(scalar) => {
-                        let value = mir::Const::from_scalar(tcx, scalar.into(), ty.inner());
-                        PatRangeBoundary::Finite(value)
+                        let valtree = ty::ValTree::from_scalar_int(tcx, scalar);
+                        PatRangeBoundary::Finite(valtree)
                     }
                     // The value doesn't fit. Since `x >= 0` and 0 always encodes the minimum value
                     // for a type, the problem isn't that the value is too small. So it must be too
@@ -763,7 +750,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
             "_".to_string()
         } else if range.is_singleton() {
             let lo = cx.hoist_pat_range_bdy(range.lo, ty);
-            let value = lo.as_finite().unwrap();
+            let value = ty::Value { ty: ty.inner(), valtree: lo.as_finite().unwrap() };
             value.to_string()
         } else {
             // We convert to an inclusive range for diagnostics.
@@ -775,7 +762,9 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                 // fictitious values after `{u,i}size::MAX` (see [`IntRange::split`] for why we do
                 // this). We show this to the user as `usize::MAX..` which is slightly incorrect but
                 // probably clear enough.
-                lo = PatRangeBoundary::Finite(ty.numeric_max_val(cx.tcx).unwrap());
+                let max = ty.numeric_max_val(cx.tcx).unwrap();
+                let max = ty::ValTree::from_scalar_int(cx.tcx, max.try_to_scalar_int().unwrap());
+                lo = PatRangeBoundary::Finite(max);
             }
             let hi = if let Some(hi) = range.hi.minus_one() {
                 hi
@@ -834,14 +823,6 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                 let mut s = String::new();
                 print::write_ref_like(&mut s, pat.ty().inner(), &print(&pat.fields[0])).unwrap();
                 s
-            }
-            DerefPattern(_) if pat.ty().is_box() && !self.tcx.features().deref_patterns() => {
-                // FIXME(deref_patterns): Remove this special handling once `box_patterns` is gone.
-                // HACK(@dianne): `box _` syntax is exposed on stable in diagnostics, e.g. to
-                // witness non-exhaustiveness of `match Box::new(0) { Box { .. } if false => {} }`.
-                // To avoid changing diagnostics before deref pattern syntax is finalized, let's use
-                // `box _` syntax unless `deref_patterns` is enabled.
-                format!("box {}", print(&pat.fields[0]))
             }
             DerefPattern(_) => format!("deref!({})", print(&pat.fields[0])),
             Slice(slice) => {
@@ -910,7 +891,7 @@ impl<'p, 'tcx: 'p> PatCx for RustcPatCtxt<'p, 'tcx> {
     type Ty = RevealedTy<'tcx>;
     type Error = ErrorGuaranteed;
     type VariantIdx = VariantIdx;
-    type StrLit = Const<'tcx>;
+    type StrLit = ty::Value<'tcx>;
     type ArmData = HirId;
     type PatData = &'p Pat<'tcx>;
 
@@ -961,14 +942,14 @@ impl<'p, 'tcx: 'p> PatCx for RustcPatCtxt<'p, 'tcx> {
         let overlaps: Vec<_> = overlaps_with
             .iter()
             .map(|pat| pat.data().span)
-            .map(|span| errors::Overlap { range: overlap_as_pat.to_string(), span })
+            .map(|span| diagnostics::Overlap { range: overlap_as_pat.to_string(), span })
             .collect();
         let pat_span = pat.data().span;
         self.tcx.emit_node_span_lint(
-            lint::builtin::OVERLAPPING_RANGE_ENDPOINTS,
+            OVERLAPPING_RANGE_ENDPOINTS,
             self.match_lint_level,
             pat_span,
-            errors::OverlappingRangeEndpoints { overlap: overlaps, range: pat_span },
+            diagnostics::OverlappingRangeEndpoints { overlap: overlaps, range: pat_span },
         );
     }
 
@@ -1001,10 +982,10 @@ impl<'p, 'tcx: 'p> PatCx for RustcPatCtxt<'p, 'tcx> {
         if gapped_with.is_empty() {
             // If `gapped_with` is empty, `gap == T::MAX`.
             self.tcx.emit_node_span_lint(
-                lint::builtin::NON_CONTIGUOUS_RANGE_ENDPOINTS,
+                NON_CONTIGUOUS_RANGE_ENDPOINTS,
                 self.match_lint_level,
                 thir_pat.span,
-                errors::ExclusiveRangeMissingMax {
+                diagnostics::ExclusiveRangeMissingMax {
                     // Point at this range.
                     first_range: thir_pat.span,
                     // That's the gap that isn't covered.
@@ -1015,10 +996,10 @@ impl<'p, 'tcx: 'p> PatCx for RustcPatCtxt<'p, 'tcx> {
             );
         } else {
             self.tcx.emit_node_span_lint(
-                lint::builtin::NON_CONTIGUOUS_RANGE_ENDPOINTS,
+                NON_CONTIGUOUS_RANGE_ENDPOINTS,
                 self.match_lint_level,
                 thir_pat.span,
-                errors::ExclusiveRangeMissingGap {
+                diagnostics::ExclusiveRangeMissingGap {
                     // Point at this range.
                     first_range: thir_pat.span,
                     // That's the gap that isn't covered.
@@ -1029,7 +1010,7 @@ impl<'p, 'tcx: 'p> PatCx for RustcPatCtxt<'p, 'tcx> {
                     // mistake.
                     gap_with: gapped_with
                         .iter()
-                        .map(|pat| errors::GappedRange {
+                        .map(|pat| diagnostics::GappedRange {
                             span: pat.data().span,
                             gap: gap_as_pat.to_string(),
                             first_range: range.to_string(),
@@ -1051,7 +1032,7 @@ impl<'p, 'tcx: 'p> PatCx for RustcPatCtxt<'p, 'tcx> {
     ) -> Self::Error {
         let deref_pattern_label = deref_pat.data().span;
         let normal_constructor_label = normal_pat.data().span;
-        self.tcx.dcx().emit_err(errors::MixedDerefPatternConstructors {
+        self.tcx.dcx().emit_err(diagnostics::MixedDerefPatternConstructors {
             spans: vec![deref_pattern_label, normal_constructor_label],
             smart_pointer_ty: deref_pat.ty().inner(),
             deref_pattern_label,

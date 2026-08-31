@@ -1,3 +1,4 @@
+//@ edition:2015
 // Regression test for the ICE reported in issue #83471.
 
 #![crate_type="lib"]
@@ -21,7 +22,7 @@ trait Sized: MetaSized {}
 //~| ERROR: `fn` lang item must be applied to a trait with 1 generic argument
 trait Fn {
     fn call(export_name);
-    //~^ ERROR: expected type
+    //~^ ERROR: cannot find type `export_name` in this scope
     //~| WARNING: anonymous parameters are deprecated
     //~| WARNING: this is accepted in the current edition
 }

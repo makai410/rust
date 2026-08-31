@@ -1,11 +1,12 @@
 //! Doctest functionality used only for doctests in `.rs` source files.
 
 use std::cell::Cell;
-use std::env;
+use std::str::FromStr;
 use std::sync::Arc;
 
-use rustc_ast_pretty::pprust;
-use rustc_data_structures::fx::FxHashSet;
+use proc_macro2::{TokenStream, TokenTree};
+use rustc_attr_parsing::eval_config_entry;
+use rustc_hir::attrs::{AttributeKind, CfgEntry};
 use rustc_hir::def_id::{CRATE_DEF_ID, LocalDefId};
 use rustc_hir::{self as hir, CRATE_HIR_ID, intravisit};
 use rustc_middle::hir::nested_filter;
@@ -15,8 +16,9 @@ use rustc_span::source_map::SourceMap;
 use rustc_span::{BytePos, DUMMY_SP, FileName, Pos, Span, sym};
 
 use super::{DocTestVisitor, ScrapedDocTest};
-use crate::clean::{Attributes, extract_cfg_from_attrs};
-use crate::html::markdown::{self, ErrorCodes, LangString, MdRelLine};
+use crate::clean::cfg::Cfg;
+use crate::clean::{Attributes, CfgInfo};
+use crate::html::markdown::{self, CodeLineMapping, ErrorCodes, LangString, MdRelLine};
 
 struct RustCollector {
     source_map: Arc<SourceMap>,
@@ -29,15 +31,6 @@ struct RustCollector {
 impl RustCollector {
     fn get_filename(&self) -> FileName {
         let filename = self.source_map.span_to_filename(self.position);
-        if let FileName::Real(ref filename) = filename {
-            let path = filename.remapped_path_if_available();
-            // Strip the cwd prefix from the path. This will likely exist if
-            // the path was not remapped.
-            let path = env::current_dir()
-                .map(|cur_dir| path.strip_prefix(&cur_dir).unwrap_or(path))
-                .unwrap_or(path);
-            return path.to_owned().into();
-        }
         filename
     }
 
@@ -49,7 +42,13 @@ impl RustCollector {
 }
 
 impl DocTestVisitor for RustCollector {
-    fn visit_test(&mut self, test: String, config: LangString, rel_line: MdRelLine) {
+    fn visit_test(
+        &mut self,
+        test: String,
+        config: LangString,
+        rel_line: MdRelLine,
+        code_mappings: Vec<CodeLineMapping>,
+    ) {
         let base_line = self.get_base_line();
         let line = base_line + rel_line.offset();
         let count = Cell::new(base_line);
@@ -77,6 +76,7 @@ impl DocTestVisitor for RustCollector {
             config,
             test,
             span,
+            code_mappings,
             self.global_crate_attrs.clone(),
         ));
     }
@@ -119,32 +119,87 @@ impl HirCollector<'_> {
         sp: Span,
         nested: F,
     ) {
-        let ast_attrs = self.tcx.hir_attrs(self.tcx.local_def_id_to_hir_id(def_id));
-        if let Some(ref cfg) =
-            extract_cfg_from_attrs(ast_attrs.iter(), self.tcx, &FxHashSet::default())
-            && !cfg.matches(&self.tcx.sess.psess)
-        {
-            return;
+        let hir_attrs = self.tcx.hir_attrs(self.tcx.local_def_id_to_hir_id(def_id));
+
+        let mut cfg_info = CfgInfo::default();
+        let mut found_features = 0;
+
+        let source_map = self.tcx.sess.source_map();
+        let old_global_crate_attrs_len = self.collector.global_crate_attrs.len();
+        // This loop does two things:
+        //
+        // 1. Collect `#[target_feature(...)]`.
+        // 2. Collect `#[doc(test(attr(...)))]`.
+        for attr in hir_attrs.iter() {
+            let hir::Attribute::Parsed(attr) = attr else { continue };
+            if let AttributeKind::TargetFeature { features, .. } = attr {
+                for (feature, _) in features {
+                    found_features += 1;
+                    cfg_info.current_cfg &= Cfg(CfgEntry::NameValue {
+                        name: sym::target_feature,
+                        value: Some(*feature),
+                        span: DUMMY_SP,
+                    });
+                }
+            } else if let AttributeKind::Doc(d) = attr {
+                for attr_span in &d.test_attrs {
+                    // FIXME: This is ugly, remove when `test_attrs` has been ported to new
+                    // attribute API.
+                    if let Ok(snippet) = source_map.span_to_snippet(*attr_span)
+                        && let Ok(stream) = TokenStream::from_str(&snippet)
+                    {
+                        let mut iter = stream.into_iter().peekable();
+                        while let Some(token) = iter.next() {
+                            if let TokenTree::Ident(i) = token {
+                                let i = i.to_string();
+                                let peek = iter.peek();
+                                // From this ident, we can have things like:
+                                //
+                                // * Group: `allow(...)`
+                                // * Name/value: `crate_name = "..."`
+                                // * Tokens: `html_no_url`
+                                //
+                                // So we peek next element to know what case we are in.
+                                match peek {
+                                    Some(TokenTree::Group(g)) => {
+                                        let g = g.to_string();
+                                        iter.next();
+                                        // Add the additional attributes to the `global_crate_attrs`
+                                        // vector
+                                        self.collector.global_crate_attrs.push(format!("{i}{g}"));
+                                    }
+                                    // If next item is `=`, it means it's a name value so we will
+                                    // need to get the value as well.
+                                    Some(TokenTree::Punct(p)) if p.as_char() == '=' => {
+                                        let p = p.to_string();
+                                        iter.next();
+                                        if let Some(last) = iter.next() {
+                                            // Add the additional attributes to the
+                                            // `global_crate_attrs` vector.
+                                            self.collector
+                                                .global_crate_attrs
+                                                .push(format!("{i}{p}{last}"));
+                                        }
+                                    }
+                                    _ => {
+                                        // Add the additional attributes to the `global_crate_attrs`
+                                        // vector.
+                                        self.collector.global_crate_attrs.push(i.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Try collecting `#[doc(test(attr(...)))]`
-        let old_global_crate_attrs_len = self.collector.global_crate_attrs.len();
-        for doc_test_attrs in ast_attrs
-            .iter()
-            .filter(|a| a.has_name(sym::doc))
-            .flat_map(|a| a.meta_item_list().unwrap_or_default())
-            .filter(|a| a.has_name(sym::test))
+        // We only look at the `target_feature` attributes as the `cfg` attributes have already been
+        // applied at this point, so no need to take them into account again.
+        if found_features != 0
+            && !eval_config_entry(&self.tcx.sess, &cfg_info.current_cfg.inner()).as_bool()
         {
-            let Some(doc_test_attrs) = doc_test_attrs.meta_item_list() else { continue };
-            for attr in doc_test_attrs
-                .iter()
-                .filter(|a| a.has_name(sym::attr))
-                .flat_map(|a| a.meta_item_list().unwrap_or_default())
-                .map(|i| pprust::meta_list_item_to_string(i))
-            {
-                // Add the additional attributes to the global_crate_attrs vector
-                self.collector.global_crate_attrs.push(attr);
-            }
+            return;
         }
 
         let mut has_name = false;
@@ -155,7 +210,7 @@ impl HirCollector<'_> {
 
         // The collapse-docs pass won't combine sugared/raw doc attributes, or included files with
         // anything else, this will combine them for us.
-        let attrs = Attributes::from_hir(ast_attrs);
+        let attrs = Attributes::from_hir(hir_attrs);
         if let Some(doc) = attrs.opt_doc_value() {
             let span = span_of_fragments(&attrs.doc_strings).unwrap_or(sp);
             self.collector.position = if span.edition().at_least_rust_2024() {
@@ -163,7 +218,7 @@ impl HirCollector<'_> {
             } else {
                 // this span affects filesystem path resolution,
                 // so we need to keep it the same as it was previously
-                ast_attrs
+                hir_attrs
                     .iter()
                     .find(|attr| attr.doc_str().is_some())
                     .map(|attr| {
@@ -175,7 +230,12 @@ impl HirCollector<'_> {
                 &doc,
                 &mut self.collector,
                 self.codes,
-                Some(&crate::html::markdown::ExtraInfo::new(self.tcx, def_id, span)),
+                Some(&crate::html::markdown::ExtraInfo::new(
+                    self.tcx,
+                    def_id,
+                    span,
+                    Some(&attrs.doc_strings),
+                )),
             );
         }
 

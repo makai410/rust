@@ -1,6 +1,8 @@
-//@revisions: stack tree
+//@revisions: stack tree tree_implicit_writes
+//@[tree_implicit_writes]compile-flags: -Zmiri-tree-borrows -Zmiri-tree-borrows-implicit-writes
 //@[tree]compile-flags: -Zmiri-tree-borrows
-#![feature(allocator_api)]
+
+use std::alloc::{Layout, alloc, dealloc};
 use std::cell::Cell;
 use std::ptr;
 
@@ -23,7 +25,9 @@ fn main() {
     not_unpin_not_protected();
     write_does_not_invalidate_all_aliases();
     box_into_raw_allows_interior_mutable_alias();
-    cell_inside_struct()
+    cell_inside_struct();
+    zst();
+    mut_derefer();
 }
 
 // Make sure that reading from an `&mut` does, like reborrowing to `&`,
@@ -286,4 +290,42 @@ fn cell_inside_struct() {
 
     // Writing to `field1`, which is reserved, should also be allowed.
     (*a).field1 = 88;
+}
+
+/// ZST reborrows on various kinds of dangling pointers are valid.
+fn zst() {
+    unsafe {
+        // Integer pointer.
+        let ptr = ptr::without_provenance_mut::<()>(15);
+        let _ref = &mut *ptr;
+
+        // Out-of-bounds pointer.
+        let mut b = Box::new(0u8);
+        let ptr = (&raw mut *b).wrapping_add(15) as *mut ();
+        let _ref = &mut *ptr;
+
+        // Deallocated pointer.
+        let ptr = &raw mut *b as *mut ();
+        drop(b);
+        let _ref = &mut *ptr;
+
+        // zero-sized protectors do not affect deallocation
+        fn with_protector(_x: &mut (), ptr: *mut u8, l: Layout) {
+            // `_x` here is strongly protected but covers zero bytes.
+            unsafe { dealloc(ptr, l) };
+        }
+        let l = Layout::from_size_align(1, 1).unwrap();
+        let ptr = alloc(l);
+        with_protector(&mut *ptr.cast::<()>(), ptr, l);
+    }
+}
+
+fn mut_derefer() {
+    // The nested derefs get adjusted by the derefer pass, ensure we handle
+    // the resulting MIR correctly.
+    let x = &mut &mut (1, 2);
+    let l = &mut x.0;
+    *l += 1;
+    let _r = &mut x.1;
+    *l += 1;
 }

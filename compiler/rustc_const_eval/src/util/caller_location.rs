@@ -1,5 +1,5 @@
 use rustc_abi::FieldIdx;
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_middle::{bug, mir};
 use rustc_span::Symbol;
@@ -37,17 +37,18 @@ fn alloc_caller_location<'tcx>(
     let loc_ty = ecx
         .tcx
         .type_of(ecx.tcx.require_lang_item(LangItem::PanicLocation, ecx.tcx.span))
-        .instantiate(*ecx.tcx, ecx.tcx.mk_args(&[ecx.tcx.lifetimes.re_erased.into()]));
+        .instantiate(*ecx.tcx, ecx.tcx.mk_args(&[ecx.tcx.lifetimes.re_erased.into()]))
+        .skip_norm_wip();
     let loc_layout = ecx.layout_of(loc_ty).unwrap();
     let location = ecx.allocate(loc_layout, MemoryKind::CallerLocation).unwrap();
 
     // Initialize fields.
-    ecx.write_immediate(filename, &ecx.project_field(&location, FieldIdx::from_u32(0)).unwrap())
+    let [filename_field, line_field, col_field] =
+        ecx.project_fields(&location, [0, 1, 2].map(FieldIdx::from_u32)).unwrap();
+    ecx.write_immediate(filename, &filename_field)
         .expect("writing to memory we just allocated cannot fail");
-    ecx.write_scalar(line, &ecx.project_field(&location, FieldIdx::from_u32(1)).unwrap())
-        .expect("writing to memory we just allocated cannot fail");
-    ecx.write_scalar(col, &ecx.project_field(&location, FieldIdx::from_u32(2)).unwrap())
-        .expect("writing to memory we just allocated cannot fail");
+    ecx.write_scalar(line, &line_field).expect("writing to memory we just allocated cannot fail");
+    ecx.write_scalar(col, &col_field).expect("writing to memory we just allocated cannot fail");
 
     location
 }
@@ -57,11 +58,11 @@ pub(crate) fn const_caller_location_provider(
     file: Symbol,
     line: u32,
     col: u32,
-) -> mir::ConstValue<'_> {
+) -> mir::ConstValue {
     trace!("const_caller_location: {}:{}:{}", file, line, col);
     let mut ecx = mk_eval_cx_to_read_const_val(
         tcx,
-        rustc_span::DUMMY_SP, // FIXME: use a proper span here?
+        rustc_span::DUMMY_SP, // This interpreter cannot fail, so the span is irrelevant.
         ty::TypingEnv::fully_monomorphized(),
         CanAccessMutGlobal::No,
     );

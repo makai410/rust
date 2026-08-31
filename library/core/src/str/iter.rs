@@ -3,18 +3,18 @@
 use super::pattern::{DoubleEndedSearcher, Pattern, ReverseSearcher, Searcher};
 use super::validations::{next_code_point, next_code_point_reverse};
 use super::{
-    BytesIsNotEmpty, CharEscapeDebugContinue, CharEscapeDefault, CharEscapeUnicode,
-    IsAsciiWhitespace, IsNotEmpty, IsWhitespace, LinesMap, UnsafeBytesToStr, from_utf8_unchecked,
+    BytesIsNotEmpty, CharEscapeDebug, CharEscapeDefault, CharEscapeUnicode, IsAsciiWhitespace,
+    IsNotEmpty, IsWhitespace, LinesMap, UnsafeBytesToStr, from_utf8_unchecked,
 };
+use crate::char as char_mod;
 use crate::fmt::{self, Write};
 use crate::iter::{
-    Chain, Copied, Filter, FlatMap, Flatten, FusedIterator, Map, TrustedLen, TrustedRandomAccess,
+    Copied, Filter, FlatMap, FusedIterator, Map, TrustedLen, TrustedRandomAccess,
     TrustedRandomAccessNoCoerce,
 };
 use crate::num::NonZero;
 use crate::ops::Try;
 use crate::slice::{self, Split as SliceSplit};
-use crate::{char as char_mod, option};
 
 /// An iterator over the [`char`]s of a string slice.
 ///
@@ -52,7 +52,7 @@ impl<'a> Iterator for Chars<'a> {
         const CHUNK_SIZE: usize = 32;
 
         if remainder >= CHUNK_SIZE {
-            let mut chunks = self.iter.as_slice().array_chunks::<CHUNK_SIZE>();
+            let mut chunks = self.iter.as_slice().as_chunks::<CHUNK_SIZE>().0.iter();
             let mut bytes_skipped: usize = 0;
 
             while remainder > CHUNK_SIZE
@@ -99,9 +99,6 @@ impl<'a> Iterator for Chars<'a> {
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = self.iter.len();
-        // `(len + 3)` can't overflow, because we know that the `slice::Iter`
-        // belongs to a slice in memory which has a maximum length of
-        // `isize::MAX` (that's well below `usize::MAX`).
         (len.div_ceil(4), Some(len))
     }
 
@@ -1413,7 +1410,7 @@ impl<'a> SplitAsciiWhitespace<'a> {
         }
 
         // SAFETY: Slice is created from str.
-        Some(unsafe { crate::str::from_utf8_unchecked(&self.inner.iter.iter.v) })
+        Some(unsafe { crate::str::from_utf8_unchecked(self.inner.iter.iter.v) })
     }
 }
 
@@ -1528,9 +1525,6 @@ impl<'a> Iterator for EncodeUtf16<'a> {
         // is therefore determined by assuming the remaining bytes contain as
         // many 3-byte sequences as possible. The highest bytes:code units
         // ratio is for 1-byte sequences, so use this for the upper bound.
-        // `(len + 2)` can't overflow, because we know that the `slice::Iter`
-        // belongs to a slice in memory which has a maximum length of
-        // `isize::MAX` (that's well below `usize::MAX`)
         if self.extra == 0 {
             (len.div_ceil(3), Some(len))
         } else {
@@ -1538,6 +1532,43 @@ impl<'a> Iterator for EncodeUtf16<'a> {
             // surrogate to the bounds.
             (len.div_ceil(3) + 1, Some(len + 1))
         }
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        let extra = if self.extra == 0 { 0 } else { 1 };
+        // Find UTF-8 non-continuation bytes and map:
+        //
+        // len_utf8() | len_utf16()
+        // -----------|------------
+        // 1          | 1
+        // 2          | 1
+        // 3          | 1
+        // 4          | 2
+        //
+        // Because we never map to larger values the result is never larger than
+        // `self.chars.as_str().len()` so the sum can never overflow
+        self.chars.as_str().as_bytes().iter().fold(extra, |acc, &byte| {
+            acc.wrapping_add({
+                if byte < 0b1000_0000 {
+                    // 0b0xxx_xxxx: ASCII-compatible U+0000 to U+007F
+                    1
+                } else if byte < 0b1100_0000 {
+                    // 0b10xx_xxxx: UTF-8 continuation byte, skip
+                    0
+                } else if byte < 0b1111_0000 {
+                    // 0b110x_xxxx: start of a 2-byte UTF-8 sequence for U+0080 to U+07FF
+                    // 0b1110_xxxx: start of a 3-byte UTF-8 sequence for U+0800 to U+FFFF
+                    1
+                } else {
+                    // 0b1111_0xxx: start of a 4-byte UTF-8 sequence for U+010000 to U+10FFFF
+                    // This is exactly the range encoded as a surrogate pair in UTF-16
+                    //
+                    // 0b1111_1xxx: would fall here but never occurs in valid UTF-8
+                    2
+                }
+            })
+        })
     }
 }
 
@@ -1548,10 +1579,7 @@ impl FusedIterator for EncodeUtf16<'_> {}
 #[stable(feature = "str_escape", since = "1.34.0")]
 #[derive(Clone, Debug)]
 pub struct EscapeDebug<'a> {
-    pub(super) inner: Chain<
-        Flatten<option::IntoIter<char_mod::EscapeDebug>>,
-        FlatMap<Chars<'a>, char_mod::EscapeDebug, CharEscapeDebugContinue>,
-    >,
+    pub(super) inner: FlatMap<Chars<'a>, char_mod::EscapeDebug, CharEscapeDebug>,
 }
 
 /// The return type of [`str::escape_default`].

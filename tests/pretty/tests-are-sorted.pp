@@ -1,9 +1,8 @@
 #![feature(prelude_import)]
 #![no_std]
+extern crate std;
 #[prelude_import]
 use ::std::prelude::rust_2015::*;
-#[macro_use]
-extern crate std;
 //@ compile-flags: --crate-type=lib --test --remap-path-prefix={{src-base}}/=/the/src/ --remap-path-prefix={{src-base}}\=/the/src/
 //@ pretty-compare-only
 //@ pretty-mode:expanded

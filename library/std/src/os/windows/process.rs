@@ -9,8 +9,7 @@ use crate::mem::MaybeUninit;
 use crate::os::windows::io::{
     AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle,
 };
-use crate::sealed::Sealed;
-use crate::sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
+use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
 use crate::{io, marker, process, ptr, sys};
 
 #[stable(feature = "process_extensions", since = "1.2.0")]
@@ -117,7 +116,7 @@ impl IntoRawHandle for process::ChildStderr {
 impl From<OwnedHandle> for process::ChildStdin {
     fn from(handle: OwnedHandle) -> process::ChildStdin {
         let handle = sys::handle::Handle::from_inner(handle);
-        let pipe = sys::pipe::AnonPipe::from_inner(handle);
+        let pipe = sys::process::ChildPipe::from_inner(handle);
         process::ChildStdin::from_inner(pipe)
     }
 }
@@ -130,7 +129,7 @@ impl From<OwnedHandle> for process::ChildStdin {
 impl From<OwnedHandle> for process::ChildStdout {
     fn from(handle: OwnedHandle) -> process::ChildStdout {
         let handle = sys::handle::Handle::from_inner(handle);
-        let pipe = sys::pipe::AnonPipe::from_inner(handle);
+        let pipe = sys::process::ChildPipe::from_inner(handle);
         process::ChildStdout::from_inner(pipe)
     }
 }
@@ -143,17 +142,14 @@ impl From<OwnedHandle> for process::ChildStdout {
 impl From<OwnedHandle> for process::ChildStderr {
     fn from(handle: OwnedHandle) -> process::ChildStderr {
         let handle = sys::handle::Handle::from_inner(handle);
-        let pipe = sys::pipe::AnonPipe::from_inner(handle);
+        let pipe = sys::process::ChildPipe::from_inner(handle);
         process::ChildStderr::from_inner(pipe)
     }
 }
 
 /// Windows-specific extensions to [`process::ExitStatus`].
-///
-/// This trait is sealed: it cannot be implemented outside the standard library.
-/// This is so that future additional methods are not breaking changes.
 #[stable(feature = "exit_status_from", since = "1.12.0")]
-pub trait ExitStatusExt: Sealed {
+pub impl(self) trait ExitStatusExt {
     /// Creates a new `ExitStatus` from the raw underlying `u32` return value of
     /// a process.
     #[stable(feature = "exit_status_from", since = "1.12.0")]
@@ -168,11 +164,8 @@ impl ExitStatusExt for process::ExitStatus {
 }
 
 /// Windows-specific extensions to the [`process::Command`] builder.
-///
-/// This trait is sealed: it cannot be implemented outside the standard library.
-/// This is so that future additional methods are not breaking changes.
 #[stable(feature = "windows_process_extensions", since = "1.16.0")]
-pub trait CommandExt: Sealed {
+pub impl(self) trait CommandExt {
     /// Sets the [process creation flags][1] to be passed to `CreateProcess`.
     ///
     /// These will always be ORed with `CREATE_UNICODE_ENVIRONMENT`.
@@ -180,6 +173,15 @@ pub trait CommandExt: Sealed {
     /// [1]: https://docs.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
     #[stable(feature = "windows_process_extensions", since = "1.16.0")]
     fn creation_flags(&mut self, flags: u32) -> &mut process::Command;
+
+    /// Places the child process on the desktop named `desktop` by setting the
+    /// `lpDesktop` field of the [STARTUPINFO][1] passed to `CreateProcess`.
+    ///
+    /// The name may be a desktop or a `window-station\desktop` path.
+    ///
+    /// [1]: <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/ns-processthreadsapi-startupinfow>
+    #[unstable(feature = "windows_process_extensions_desktop", issue = "158852")]
+    fn desktop<S: AsRef<OsStr>>(&mut self, desktop: S) -> &mut process::Command;
 
     /// Sets the field `wShowWindow` of [STARTUPINFO][1] that is passed to `CreateProcess`.
     /// Allowed values are the ones listed in
@@ -280,7 +282,8 @@ pub trait CommandExt: Sealed {
     ///
     /// # Example
     ///
-    /// ```
+    #[cfg_attr(windows, doc = "```")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// #![feature(windows_process_extensions_async_pipes)]
     /// use std::os::windows::process::CommandExt;
     /// use std::process::{Command, Stdio};
@@ -311,7 +314,8 @@ pub trait CommandExt: Sealed {
     ///
     /// # Example
     ///
-    /// ```
+    #[cfg_attr(windows, doc = "```")]
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
     /// #![feature(windows_process_extensions_raw_attribute)]
     /// use std::os::windows::io::AsRawHandle;
     /// use std::os::windows::process::{CommandExt, ProcThreadAttributeList};
@@ -365,12 +369,31 @@ pub trait CommandExt: Sealed {
     /// [1]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/ns-processthreadsapi-startupinfoa
     #[unstable(feature = "windows_process_extensions_startupinfo", issue = "141010")]
     fn startupinfo_force_feedback(&mut self, enabled: Option<bool>) -> &mut process::Command;
+
+    /// If this flag is set to `true`, each inheritable handle in the calling
+    /// process is inherited by the new process. If the flag is `false`, the
+    /// handles are not inherited.
+    ///
+    /// The default value for this flag is `true`.
+    ///
+    /// **Note** that inherited handles have the same value and access rights
+    /// as the original handles. For additional discussion of inheritable handles,
+    /// see the [Remarks][1] section of the `CreateProcessW` documentation.
+    ///
+    /// [1]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw#remarks
+    #[unstable(feature = "windows_process_extensions_inherit_handles", issue = "146407")]
+    fn inherit_handles(&mut self, inherit_handles: bool) -> &mut process::Command;
 }
 
 #[stable(feature = "windows_process_extensions", since = "1.16.0")]
 impl CommandExt for process::Command {
     fn creation_flags(&mut self, flags: u32) -> &mut process::Command {
         self.as_inner_mut().creation_flags(flags);
+        self
+    }
+
+    fn desktop<S: AsRef<OsStr>>(&mut self, desktop: S) -> &mut process::Command {
+        self.as_inner_mut().desktop(desktop.as_ref());
         self
     }
 
@@ -421,10 +444,15 @@ impl CommandExt for process::Command {
         self.as_inner_mut().startupinfo_force_feedback(enabled);
         self
     }
+
+    fn inherit_handles(&mut self, inherit_handles: bool) -> &mut process::Command {
+        self.as_inner_mut().inherit_handles(inherit_handles);
+        self
+    }
 }
 
 #[unstable(feature = "windows_process_extensions_main_thread_handle", issue = "96723")]
-pub trait ChildExt: Sealed {
+pub impl(self) trait ChildExt {
     /// Extracts the main thread raw handle, without taking ownership
     #[unstable(feature = "windows_process_extensions_main_thread_handle", issue = "96723")]
     fn main_thread_handle(&self) -> BorrowedHandle<'_>;
@@ -438,11 +466,8 @@ impl ChildExt for process::Child {
 }
 
 /// Windows-specific extensions to [`process::ExitCode`].
-///
-/// This trait is sealed: it cannot be implemented outside the standard library.
-/// This is so that future additional methods are not breaking changes.
 #[unstable(feature = "windows_process_exit_code_from", issue = "111688")]
-pub trait ExitCodeExt: Sealed {
+pub impl(self) trait ExitCodeExt {
     /// Creates a new `ExitCode` from the raw underlying `u32` return value of
     /// a process.
     ///
@@ -554,7 +579,9 @@ impl<'a> ProcThreadAttributeListBuilder<'a> {
     ///
     /// # Example
     ///
-    /// ```
+    #[cfg_attr(not(windows), doc = "```ignore (needs windows)")]
+    #[cfg_attr(all(windows, target_vendor = "win7"), doc = "```no_run")]
+    #[cfg_attr(all(windows, not(target_vendor = "win7")), doc = "```")]
     /// #![feature(windows_process_extensions_raw_attribute)]
     /// use std::ffi::c_void;
     /// use std::os::windows::process::{CommandExt, ProcThreadAttributeList};

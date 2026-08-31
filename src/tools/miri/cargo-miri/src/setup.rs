@@ -88,6 +88,8 @@ pub fn setup(
     };
     let cargo_cmd = {
         let mut command = cargo();
+        // Allow JSON targets since users do not have a good way to set this flag otherwise.
+        command.arg("-Zjson-target-spec");
         // Use Miri as rustc to build a libstd compatible with us (and use the right flags).
         // We set ourselves (`cargo-miri`) instead of Miri directly to be able to patch the flags
         // for `libpanic_abort` (usually this is done by bootstrap but we have to do it ourselves).
@@ -160,7 +162,7 @@ pub fn setup(
 
     // Do the build.
     let status = SysrootBuilder::new(&sysroot_dir, target)
-        .build_mode(BuildMode::Check)
+        .build_mode(BuildMode::Build) // not a real build, since we use dummy codegen
         .rustc_version(rustc_version.clone())
         .sysroot_config(sysroot_config)
         .rustflags(rustflags)

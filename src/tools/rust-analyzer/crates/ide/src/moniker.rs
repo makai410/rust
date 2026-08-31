@@ -118,7 +118,7 @@ pub enum MonikerResult {
 }
 
 impl MonikerResult {
-    pub fn from_def(db: &RootDatabase, def: Definition, from_crate: Crate) -> Option<Self> {
+    pub fn from_def(db: &RootDatabase, def: Definition<'_>, from_crate: Crate) -> Option<Self> {
         def_to_moniker(db, def, from_crate)
     }
 }
@@ -178,7 +178,7 @@ pub(crate) fn moniker(
     Some(RangeInfo::new(original_token.text_range(), navs))
 }
 
-pub(crate) fn def_to_kind(db: &RootDatabase, def: Definition) -> SymbolInformationKind {
+pub(crate) fn def_to_kind(db: &RootDatabase, def: Definition<'_>) -> SymbolInformationKind {
     use SymbolInformationKind::*;
 
     match def {
@@ -205,11 +205,10 @@ pub(crate) fn def_to_kind(db: &RootDatabase, def: Definition) -> SymbolInformati
         Definition::Adt(Adt::Struct(..)) => Struct,
         Definition::Adt(Adt::Union(..)) => Union,
         Definition::Adt(Adt::Enum(..)) => Enum,
-        Definition::Variant(..) => EnumMember,
+        Definition::EnumVariant(..) => EnumMember,
         Definition::Const(..) => Constant,
         Definition::Static(..) => StaticVariable,
         Definition::Trait(..) => Trait,
-        Definition::TraitAlias(..) => Trait,
         Definition::TypeAlias(it) => {
             if it.as_assoc_item(db).is_some() {
                 AssociatedType
@@ -251,7 +250,7 @@ pub(crate) fn def_to_kind(db: &RootDatabase, def: Definition) -> SymbolInformati
 ///   definitions.
 pub(crate) fn def_to_moniker(
     db: &RootDatabase,
-    definition: Definition,
+    definition: Definition<'_>,
     from_crate: Crate,
 ) -> Option<MonikerResult> {
     match definition {
@@ -267,7 +266,7 @@ pub(crate) fn def_to_moniker(
 
 fn enclosing_def_to_moniker(
     db: &RootDatabase,
-    mut def: Definition,
+    mut def: Definition<'_>,
     from_crate: Crate,
 ) -> Option<Moniker> {
     loop {
@@ -281,14 +280,14 @@ fn enclosing_def_to_moniker(
 
 fn def_to_non_local_moniker(
     db: &RootDatabase,
-    definition: Definition,
+    definition: Definition<'_>,
     from_crate: Crate,
 ) -> Option<Moniker> {
     let module = match definition {
-        Definition::Module(module) if module.is_crate_root() => module,
+        Definition::Module(module) if module.is_crate_root(db) => module,
         _ => definition.module(db)?,
     };
-    let krate = module.krate();
+    let krate = module.krate(db);
     let edition = krate.edition(db);
 
     // Add descriptors for this definition and every enclosing definition.
@@ -322,7 +321,7 @@ fn def_to_non_local_moniker(
                     });
                 } else {
                     match def {
-                        Definition::Module(module) if module.is_crate_root() => {
+                        Definition::Module(module) if module.is_crate_root(db) => {
                             // only include `crate` namespace by itself because we prefer
                             // `rust-analyzer cargo foo . bar/` over `rust-analyzer cargo foo . crate/bar/`
                             if reverse_description.is_empty() {
@@ -385,12 +384,13 @@ fn def_to_non_local_moniker(
     })
 }
 
-fn display<T: HirDisplay>(db: &RootDatabase, module: hir::Module, it: T) -> String {
+fn display<'db, T: HirDisplay<'db>>(db: &'db RootDatabase, module: hir::Module, it: T) -> String {
     match it.display_source_code(db, module.into(), true) {
         Ok(result) => result,
         // Fallback on display variant that always succeeds
         Err(_) => {
-            let fallback_result = it.display(db, module.krate().to_display_target(db)).to_string();
+            let fallback_result =
+                it.display(db, module.krate(db).to_display_target(db)).to_string();
             tracing::error!(
                 display = %fallback_result, "`display_source_code` failed; falling back to using display"
             );

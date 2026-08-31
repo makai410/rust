@@ -2,13 +2,15 @@
 use gccjit::FnAttribute;
 use gccjit::Function;
 #[cfg(feature = "master")]
-use rustc_attr_data_structures::InlineAttr;
-use rustc_attr_data_structures::InstructionSetAttr;
+use rustc_hir::attrs::InlineAttr;
+use rustc_hir::attrs::InstructionSetAttr;
 #[cfg(feature = "master")]
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 #[cfg(feature = "master")]
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty;
+#[cfg(feature = "master")]
+use rustc_target::spec::Arch;
 
 use crate::context::CodegenCx;
 use crate::gcc_util::to_gcc_features;
@@ -70,7 +72,7 @@ fn inline_attr<'gcc, 'tcx>(
         InlineAttr::Hint => Some(FnAttribute::Inline),
         InlineAttr::Force { .. } => Some(FnAttribute::AlwaysInline),
         InlineAttr::Never => {
-            if cx.sess().target.arch != "amdgpu" {
+            if cx.sess().target.arch != Arch::AmdGpu {
                 Some(FnAttribute::NoInline)
             } else {
                 None
@@ -84,10 +86,10 @@ fn inline_attr<'gcc, 'tcx>(
 /// attributes.
 pub fn from_fn_attrs<'gcc, 'tcx>(
     cx: &CodegenCx<'gcc, 'tcx>,
-    #[cfg_attr(not(feature = "master"), allow(unused_variables))] func: Function<'gcc>,
+    #[cfg_attr(not(feature = "master"), expect(unused_variables))] func: Function<'gcc>,
     instance: ty::Instance<'tcx>,
 ) {
-    let codegen_fn_attrs = cx.tcx.codegen_fn_attrs(instance.def_id());
+    let codegen_fn_attrs = cx.tcx.codegen_instance_attrs(instance.def);
 
     #[cfg(feature = "master")]
     {
@@ -124,19 +126,19 @@ pub fn from_fn_attrs<'gcc, 'tcx>(
         .map(|features| features.name.as_str())
         .flat_map(|feat| to_gcc_features(cx.tcx.sess, feat).into_iter())
         .chain(codegen_fn_attrs.instruction_set.iter().map(|x| match *x {
-            InstructionSetAttr::ArmA32 => "-thumb-mode", // TODO(antoyo): support removing feature.
+            InstructionSetAttr::ArmA32 => "-thumb-mode", // FIXME(antoyo): support removing feature.
             InstructionSetAttr::ArmT32 => "thumb-mode",
         }))
         .collect::<Vec<_>>();
 
-    // TODO(antoyo): cg_llvm adds global features to each function so that LTO keep them.
+    // FIXME(antoyo): cg_llvm adds global features to each function so that LTO keep them.
     // Check if GCC requires the same.
     let mut global_features = cx.tcx.global_backend_features(()).iter().map(|s| s.as_str());
     function_features.extend(&mut global_features);
     let target_features = function_features
         .iter()
         .filter_map(|feature| {
-            // TODO(antoyo): support soft-float.
+            // FIXME(antoyo): support soft-float.
             if feature.contains("soft-float") {
                 return None;
             }
@@ -153,8 +155,8 @@ pub fn from_fn_attrs<'gcc, 'tcx>(
         .join(",");
     if !target_features.is_empty() {
         #[cfg(feature = "master")]
-        match cx.sess().target.arch.as_ref() {
-            "x86" | "x86_64" | "powerpc" => {
+        match cx.sess().target.arch {
+            Arch::X86 | Arch::X86_64 | Arch::PowerPC => {
                 func.add_attribute(FnAttribute::Target(&target_features))
             }
             // The target attribute is not supported on other targets in GCC.

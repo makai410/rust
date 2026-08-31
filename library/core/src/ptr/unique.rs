@@ -1,7 +1,7 @@
+use crate::clone::TrivialClone;
 use crate::fmt;
 use crate::marker::{PhantomData, PointeeSized, Unsize};
 use crate::ops::{CoerceUnsized, DispatchFromDyn};
-use crate::pin::PinCoerceUnsized;
 use crate::ptr::NonNull;
 
 /// A wrapper around a raw non-null `*mut T` that indicates that the possessor
@@ -32,8 +32,6 @@ use crate::ptr::NonNull;
 )]
 #[doc(hidden)]
 #[repr(transparent)]
-// Lang item used experimentally by Miri to define the semantics of `Unique`.
-#[lang = "ptr_unique"]
 pub struct Unique<T: PointeeSized> {
     pointer: NonNull<T>,
     // NOTE: this marker has no consequences for variance, but is necessary
@@ -65,10 +63,10 @@ impl<T: Sized> Unique<T> {
     /// This is useful for initializing types which lazily allocate, like
     /// `Vec::new` does.
     ///
-    /// Note that the pointer value may potentially represent a valid pointer to
-    /// a `T`, which means this must not be used as a "not yet initialized"
-    /// sentinel value. Types that lazily allocate must track initialization by
-    /// some other means.
+    /// Note that the address of the returned pointer may potentially
+    /// be that of a valid pointer, which means this must not be used
+    /// as a "not yet initialized" sentinel value.
+    /// Types that lazily allocate must track initialization by some other means.
     #[must_use]
     #[inline]
     pub const fn dangling() -> Self {
@@ -167,14 +165,15 @@ impl<T: PointeeSized> Clone for Unique<T> {
 #[unstable(feature = "ptr_internals", issue = "none")]
 impl<T: PointeeSized> Copy for Unique<T> {}
 
+#[doc(hidden)]
+#[unstable(feature = "trivial_clone", issue = "none")]
+unsafe impl<T: PointeeSized> TrivialClone for Unique<T> {}
+
 #[unstable(feature = "ptr_internals", issue = "none")]
 impl<T: PointeeSized, U: PointeeSized> CoerceUnsized<Unique<U>> for Unique<T> where T: Unsize<U> {}
 
 #[unstable(feature = "ptr_internals", issue = "none")]
 impl<T: PointeeSized, U: PointeeSized> DispatchFromDyn<Unique<U>> for Unique<T> where T: Unsize<U> {}
-
-#[unstable(feature = "pin_coerce_unsized_trait", issue = "123430")]
-unsafe impl<T: PointeeSized> PinCoerceUnsized for Unique<T> {}
 
 #[unstable(feature = "ptr_internals", issue = "none")]
 impl<T: PointeeSized> fmt::Debug for Unique<T> {
@@ -191,7 +190,8 @@ impl<T: PointeeSized> fmt::Pointer for Unique<T> {
 }
 
 #[unstable(feature = "ptr_internals", issue = "none")]
-impl<T: PointeeSized> From<&mut T> for Unique<T> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<T: PointeeSized> From<&mut T> for Unique<T> {
     /// Converts a `&mut T` to a `Unique<T>`.
     ///
     /// This conversion is infallible since references cannot be null.
@@ -202,7 +202,8 @@ impl<T: PointeeSized> From<&mut T> for Unique<T> {
 }
 
 #[unstable(feature = "ptr_internals", issue = "none")]
-impl<T: PointeeSized> From<NonNull<T>> for Unique<T> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<T: PointeeSized> From<NonNull<T>> for Unique<T> {
     /// Converts a `NonNull<T>` to a `Unique<T>`.
     ///
     /// This conversion is infallible since `NonNull` cannot be null.

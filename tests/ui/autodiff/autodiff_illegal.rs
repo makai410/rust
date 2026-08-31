@@ -47,15 +47,18 @@ pub fn f6(x: f64) {
 
 fn dummy() {
     #[autodiff_forward(df7, Dual)]
+    //~^ ERROR macro attributes on statements are unstable
     let mut x = 5;
     //~^ ERROR autodiff must be applied to function
 
     #[autodiff_forward(df7, Dual)]
     x = x + 3;
-    //~^^ ERROR attributes on expressions are experimental [E0658]
-    //~^^ ERROR autodiff must be applied to function
+    //~^^  ERROR attributes on expressions are experimental [E0658]
+    //~|   ERROR macro attributes on expressions are unstable
+    //~^^^ ERROR autodiff must be applied to function
 
     #[autodiff_forward(df7, Dual)]
+    //~^ ERROR macro attributes on statements are unstable
     let add_one_v2 = |x: u32| -> u32 { x + 1 };
     //~^ ERROR autodiff must be applied to function
 }
@@ -110,15 +113,6 @@ fn f14(x: f32) -> Foo {
 
 type MyFloat = f32;
 
-// We would like to support type alias to f32/f64 in argument type in the future,
-// but that requires us to implement our checks at a later stage
-// like THIR which has type information available.
-#[autodiff_reverse(df15, Active, Active)]
-fn f15(x: MyFloat) -> f32 {
-    //~^^ ERROR failed to resolve: use of undeclared type `MyFloat` [E0433]
-    unimplemented!()
-}
-
 // We would like to support type alias to f32/f64 in return type in the future
 #[autodiff_reverse(df16, Active, Active)]
 fn f16(x: f32) -> MyFloat {
@@ -133,13 +127,6 @@ struct F64Trans {
 // We would like to support `#[repr(transparent)]` f32/f64 wrapper in return type in the future
 #[autodiff_reverse(df17, Active, Active)]
 fn f17(x: f64) -> F64Trans {
-    unimplemented!()
-}
-
-// We would like to support `#[repr(transparent)]` f32/f64 wrapper in argument type in the future
-#[autodiff_reverse(df18, Active, Active)]
-fn f18(x: F64Trans) -> f64 {
-    //~^^ ERROR failed to resolve: use of undeclared type `F64Trans` [E0433]
     unimplemented!()
 }
 
@@ -160,13 +147,6 @@ fn f20(x: f32) -> f32 {
 #[autodiff_reverse(df21, Active, Duplicated)]
 fn f21(x: f32) -> f32 {
     //~^^ ERROR invalid return activity Duplicated in Reverse Mode
-    unimplemented!()
-}
-
-struct DoesNotImplDefault;
-#[autodiff_forward(df22, Dual)]
-pub fn f22() -> DoesNotImplDefault {
-    //~^^ ERROR the function or associated item `default` exists for tuple `(DoesNotImplDefault, DoesNotImplDefault)`, but its trait bounds were not satisfied
     unimplemented!()
 }
 

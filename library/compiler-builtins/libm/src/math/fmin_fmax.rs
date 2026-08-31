@@ -3,7 +3,7 @@
 /// This coincides with IEEE 754-2011 `minNum`. The result disregards signed zero (meaning if
 /// the inputs are -0.0 and +0.0, either may be returned).
 #[cfg(f16_enabled)]
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn fminf16(x: f16, y: f16) -> f16 {
     super::generic::fmin(x, y)
 }
@@ -12,7 +12,7 @@ pub fn fminf16(x: f16, y: f16) -> f16 {
 ///
 /// This coincides with IEEE 754-2011 `minNum`. The result disregards signed zero (meaning if
 /// the inputs are -0.0 and +0.0, either may be returned).
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn fminf(x: f32, y: f32) -> f32 {
     super::generic::fmin(x, y)
 }
@@ -21,7 +21,7 @@ pub fn fminf(x: f32, y: f32) -> f32 {
 ///
 /// This coincides with IEEE 754-2011 `minNum`. The result disregards signed zero (meaning if
 /// the inputs are -0.0 and +0.0, either may be returned).
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn fmin(x: f64, y: f64) -> f64 {
     super::generic::fmin(x, y)
 }
@@ -31,7 +31,7 @@ pub fn fmin(x: f64, y: f64) -> f64 {
 /// This coincides with IEEE 754-2011 `minNum`. The result disregards signed zero (meaning if
 /// the inputs are -0.0 and +0.0, either may be returned).
 #[cfg(f128_enabled)]
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn fminf128(x: f128, y: f128) -> f128 {
     super::generic::fmin(x, y)
 }
@@ -41,7 +41,7 @@ pub fn fminf128(x: f128, y: f128) -> f128 {
 /// This coincides with IEEE 754-2011 `maxNum`. The result disregards signed zero (meaning if
 /// the inputs are -0.0 and +0.0, either may be returned).
 #[cfg(f16_enabled)]
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn fmaxf16(x: f16, y: f16) -> f16 {
     super::generic::fmax(x, y)
 }
@@ -50,7 +50,7 @@ pub fn fmaxf16(x: f16, y: f16) -> f16 {
 ///
 /// This coincides with IEEE 754-2011 `maxNum`. The result disregards signed zero (meaning if
 /// the inputs are -0.0 and +0.0, either may be returned).
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn fmaxf(x: f32, y: f32) -> f32 {
     super::generic::fmax(x, y)
 }
@@ -59,7 +59,7 @@ pub fn fmaxf(x: f32, y: f32) -> f32 {
 ///
 /// This coincides with IEEE 754-2011 `maxNum`. The result disregards signed zero (meaning if
 /// the inputs are -0.0 and +0.0, either may be returned).
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn fmax(x: f64, y: f64) -> f64 {
     super::generic::fmax(x, y)
 }
@@ -69,7 +69,7 @@ pub fn fmax(x: f64, y: f64) -> f64 {
 /// This coincides with IEEE 754-2011 `maxNum`. The result disregards signed zero (meaning if
 /// the inputs are -0.0 and +0.0, either may be returned).
 #[cfg(f128_enabled)]
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn fmaxf128(x: f128, y: f128) -> f128 {
     super::generic::fmax(x, y)
 }
@@ -77,9 +77,11 @@ pub fn fmaxf128(x: f128, y: f128) -> f128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::support::{Float, Hexf};
+    use crate::support::{Float, Hex};
 
     fn fmin_spec_test<F: Float>(f: impl Fn(F, F) -> F) {
+        // Note that (YaN, sNaN) and (sNaN, YaN) results differ from 754-2008. This is intentional,
+        // see comments in the generic implementations.
         let cases = [
             (F::ZERO, F::ZERO, F::ZERO),
             (F::ZERO, F::ONE, F::ZERO),
@@ -88,6 +90,8 @@ mod tests {
             (F::ZERO, F::NEG_INFINITY, F::NEG_INFINITY),
             (F::ZERO, F::NAN, F::ZERO),
             (F::ZERO, F::NEG_NAN, F::ZERO),
+            (F::ZERO, F::SNAN, F::ZERO),
+            (F::ZERO, F::NEG_SNAN, F::ZERO),
             (F::NEG_ZERO, F::NEG_ZERO, F::NEG_ZERO),
             (F::NEG_ZERO, F::ONE, F::NEG_ZERO),
             (F::NEG_ZERO, F::NEG_ONE, F::NEG_ONE),
@@ -95,6 +99,8 @@ mod tests {
             (F::NEG_ZERO, F::NEG_INFINITY, F::NEG_INFINITY),
             (F::NEG_ZERO, F::NAN, F::NEG_ZERO),
             (F::NEG_ZERO, F::NEG_NAN, F::NEG_ZERO),
+            (F::NEG_ZERO, F::SNAN, F::NEG_ZERO),
+            (F::NEG_ZERO, F::NEG_SNAN, F::NEG_ZERO),
             (F::ONE, F::ZERO, F::ZERO),
             (F::ONE, F::NEG_ZERO, F::NEG_ZERO),
             (F::ONE, F::ONE, F::ONE),
@@ -103,6 +109,8 @@ mod tests {
             (F::ONE, F::NEG_INFINITY, F::NEG_INFINITY),
             (F::ONE, F::NAN, F::ONE),
             (F::ONE, F::NEG_NAN, F::ONE),
+            (F::ONE, F::SNAN, F::ONE),
+            (F::ONE, F::NEG_SNAN, F::ONE),
             (F::NEG_ONE, F::ZERO, F::NEG_ONE),
             (F::NEG_ONE, F::NEG_ZERO, F::NEG_ONE),
             (F::NEG_ONE, F::ONE, F::NEG_ONE),
@@ -111,6 +119,8 @@ mod tests {
             (F::NEG_ONE, F::NEG_INFINITY, F::NEG_INFINITY),
             (F::NEG_ONE, F::NAN, F::NEG_ONE),
             (F::NEG_ONE, F::NEG_NAN, F::NEG_ONE),
+            (F::NEG_ONE, F::SNAN, F::NEG_ONE),
+            (F::NEG_ONE, F::NEG_SNAN, F::NEG_ONE),
             (F::INFINITY, F::ZERO, F::ZERO),
             (F::INFINITY, F::NEG_ZERO, F::NEG_ZERO),
             (F::INFINITY, F::ONE, F::ONE),
@@ -119,6 +129,8 @@ mod tests {
             (F::INFINITY, F::NEG_INFINITY, F::NEG_INFINITY),
             (F::INFINITY, F::NAN, F::INFINITY),
             (F::INFINITY, F::NEG_NAN, F::INFINITY),
+            (F::INFINITY, F::SNAN, F::INFINITY),
+            (F::INFINITY, F::NEG_SNAN, F::INFINITY),
             (F::NEG_INFINITY, F::ZERO, F::NEG_INFINITY),
             (F::NEG_INFINITY, F::NEG_ZERO, F::NEG_INFINITY),
             (F::NEG_INFINITY, F::ONE, F::NEG_INFINITY),
@@ -127,6 +139,8 @@ mod tests {
             (F::NEG_INFINITY, F::NEG_INFINITY, F::NEG_INFINITY),
             (F::NEG_INFINITY, F::NAN, F::NEG_INFINITY),
             (F::NEG_INFINITY, F::NEG_NAN, F::NEG_INFINITY),
+            (F::NEG_INFINITY, F::SNAN, F::NEG_INFINITY),
+            (F::NEG_INFINITY, F::NEG_SNAN, F::NEG_INFINITY),
             (F::NAN, F::ZERO, F::ZERO),
             (F::NAN, F::NEG_ZERO, F::NEG_ZERO),
             (F::NAN, F::ONE, F::ONE),
@@ -140,19 +154,48 @@ mod tests {
             (F::NEG_NAN, F::NEG_ONE, F::NEG_ONE),
             (F::NEG_NAN, F::INFINITY, F::INFINITY),
             (F::NEG_NAN, F::NEG_INFINITY, F::NEG_INFINITY),
+            (F::SNAN, F::ZERO, F::ZERO),
+            (F::SNAN, F::NEG_ZERO, F::NEG_ZERO),
+            (F::SNAN, F::ONE, F::ONE),
+            (F::SNAN, F::NEG_ONE, F::NEG_ONE),
+            (F::SNAN, F::INFINITY, F::INFINITY),
+            (F::SNAN, F::NEG_INFINITY, F::NEG_INFINITY),
+            (F::NEG_SNAN, F::ZERO, F::ZERO),
+            (F::NEG_SNAN, F::NEG_ZERO, F::NEG_ZERO),
+            (F::NEG_SNAN, F::ONE, F::ONE),
+            (F::NEG_SNAN, F::NEG_ONE, F::NEG_ONE),
+            (F::NEG_SNAN, F::INFINITY, F::INFINITY),
+            (F::NEG_SNAN, F::NEG_INFINITY, F::NEG_INFINITY),
         ];
 
         for (x, y, res) in cases {
             let val = f(x, y);
-            assert_biteq!(val, res, "fmin({}, {})", Hexf(x), Hexf(y));
+            assert_biteq!(val, res, "fmin({}, {})", Hex(x), Hex(y));
         }
 
-        // Ordering between zeros and NaNs does not matter
+        // Ordering between zeros does not matter
         assert_eq!(f(F::ZERO, F::NEG_ZERO), F::ZERO);
         assert_eq!(f(F::NEG_ZERO, F::ZERO), F::ZERO);
-        assert!(f(F::NAN, F::NEG_NAN).is_nan());
-        assert!(f(F::NEG_NAN, F::NAN).is_nan());
-        assert!(f(F::NEG_NAN, F::NEG_NAN).is_nan());
+
+        // Selection between NaNs does not matter, it just must be quiet
+        assert!(f(F::NAN, F::NEG_NAN).is_qnan());
+        assert!(f(F::NEG_NAN, F::NAN).is_qnan());
+        assert!(f(F::NEG_NAN, F::NEG_NAN).is_qnan());
+
+        // These operations should technically return a qnan, but LLVM optimizes out our
+        // `* 1.0` canonicalization.
+        assert!(f(F::NAN, F::NEG_SNAN).is_nan());
+        assert!(f(F::NAN, F::SNAN).is_nan());
+        assert!(f(F::NEG_NAN, F::NEG_SNAN).is_nan());
+        assert!(f(F::NEG_NAN, F::SNAN).is_nan());
+        assert!(f(F::NEG_SNAN, F::NAN).is_nan());
+        assert!(f(F::NEG_SNAN, F::NEG_NAN).is_nan());
+        assert!(f(F::NEG_SNAN, F::NEG_SNAN).is_nan());
+        assert!(f(F::NEG_SNAN, F::SNAN).is_nan());
+        assert!(f(F::SNAN, F::NAN).is_nan());
+        assert!(f(F::SNAN, F::NAN).is_nan());
+        assert!(f(F::SNAN, F::NEG_NAN).is_nan());
+        assert!(f(F::SNAN, F::NEG_SNAN).is_nan());
     }
 
     #[test]
@@ -186,6 +229,8 @@ mod tests {
             (F::ZERO, F::NEG_INFINITY, F::ZERO),
             (F::ZERO, F::NAN, F::ZERO),
             (F::ZERO, F::NEG_NAN, F::ZERO),
+            (F::ZERO, F::SNAN, F::ZERO),
+            (F::ZERO, F::NEG_SNAN, F::ZERO),
             (F::NEG_ZERO, F::NEG_ZERO, F::NEG_ZERO),
             (F::NEG_ZERO, F::ONE, F::ONE),
             (F::NEG_ZERO, F::NEG_ONE, F::NEG_ZERO),
@@ -193,6 +238,8 @@ mod tests {
             (F::NEG_ZERO, F::NEG_INFINITY, F::NEG_ZERO),
             (F::NEG_ZERO, F::NAN, F::NEG_ZERO),
             (F::NEG_ZERO, F::NEG_NAN, F::NEG_ZERO),
+            (F::NEG_ZERO, F::SNAN, F::NEG_ZERO),
+            (F::NEG_ZERO, F::NEG_SNAN, F::NEG_ZERO),
             (F::ONE, F::ZERO, F::ONE),
             (F::ONE, F::NEG_ZERO, F::ONE),
             (F::ONE, F::ONE, F::ONE),
@@ -201,6 +248,8 @@ mod tests {
             (F::ONE, F::NEG_INFINITY, F::ONE),
             (F::ONE, F::NAN, F::ONE),
             (F::ONE, F::NEG_NAN, F::ONE),
+            (F::ONE, F::SNAN, F::ONE),
+            (F::ONE, F::NEG_SNAN, F::ONE),
             (F::NEG_ONE, F::ZERO, F::ZERO),
             (F::NEG_ONE, F::NEG_ZERO, F::NEG_ZERO),
             (F::NEG_ONE, F::ONE, F::ONE),
@@ -209,6 +258,8 @@ mod tests {
             (F::NEG_ONE, F::NEG_INFINITY, F::NEG_ONE),
             (F::NEG_ONE, F::NAN, F::NEG_ONE),
             (F::NEG_ONE, F::NEG_NAN, F::NEG_ONE),
+            (F::NEG_ONE, F::SNAN, F::NEG_ONE),
+            (F::NEG_ONE, F::NEG_SNAN, F::NEG_ONE),
             (F::INFINITY, F::ZERO, F::INFINITY),
             (F::INFINITY, F::NEG_ZERO, F::INFINITY),
             (F::INFINITY, F::ONE, F::INFINITY),
@@ -217,6 +268,8 @@ mod tests {
             (F::INFINITY, F::NEG_INFINITY, F::INFINITY),
             (F::INFINITY, F::NAN, F::INFINITY),
             (F::INFINITY, F::NEG_NAN, F::INFINITY),
+            (F::INFINITY, F::SNAN, F::INFINITY),
+            (F::INFINITY, F::NEG_SNAN, F::INFINITY),
             (F::NEG_INFINITY, F::ZERO, F::ZERO),
             (F::NEG_INFINITY, F::NEG_ZERO, F::NEG_ZERO),
             (F::NEG_INFINITY, F::ONE, F::ONE),
@@ -225,6 +278,8 @@ mod tests {
             (F::NEG_INFINITY, F::NEG_INFINITY, F::NEG_INFINITY),
             (F::NEG_INFINITY, F::NAN, F::NEG_INFINITY),
             (F::NEG_INFINITY, F::NEG_NAN, F::NEG_INFINITY),
+            (F::NEG_INFINITY, F::SNAN, F::NEG_INFINITY),
+            (F::NEG_INFINITY, F::NEG_SNAN, F::NEG_INFINITY),
             (F::NAN, F::ZERO, F::ZERO),
             (F::NAN, F::NEG_ZERO, F::NEG_ZERO),
             (F::NAN, F::ONE, F::ONE),
@@ -238,19 +293,54 @@ mod tests {
             (F::NEG_NAN, F::NEG_ONE, F::NEG_ONE),
             (F::NEG_NAN, F::INFINITY, F::INFINITY),
             (F::NEG_NAN, F::NEG_INFINITY, F::NEG_INFINITY),
+            (F::SNAN, F::ZERO, F::ZERO),
+            (F::SNAN, F::NEG_ZERO, F::NEG_ZERO),
+            (F::SNAN, F::ONE, F::ONE),
+            (F::SNAN, F::NEG_ONE, F::NEG_ONE),
+            (F::SNAN, F::INFINITY, F::INFINITY),
+            (F::SNAN, F::NEG_INFINITY, F::NEG_INFINITY),
+            (F::NEG_SNAN, F::ZERO, F::ZERO),
+            (F::NEG_SNAN, F::NEG_ZERO, F::NEG_ZERO),
+            (F::NEG_SNAN, F::ONE, F::ONE),
+            (F::NEG_SNAN, F::NEG_ONE, F::NEG_ONE),
+            (F::NEG_SNAN, F::INFINITY, F::INFINITY),
+            (F::NEG_SNAN, F::NEG_INFINITY, F::NEG_INFINITY),
         ];
 
         for (x, y, res) in cases {
             let val = f(x, y);
-            assert_biteq!(val, res, "fmax({}, {})", Hexf(x), Hexf(y));
+            assert_biteq!(
+                val,
+                res,
+                "fmax({}, {}) ({}, {})",
+                Hex(x),
+                Hex(y),
+                Hex(x.to_bits()),
+                Hex(y.to_bits()),
+            );
         }
 
-        // Ordering between zeros and NaNs does not matter
+        // Ordering between zeros
         assert_eq!(f(F::ZERO, F::NEG_ZERO), F::ZERO);
         assert_eq!(f(F::NEG_ZERO, F::ZERO), F::ZERO);
-        assert!(f(F::NAN, F::NEG_NAN).is_nan());
-        assert!(f(F::NEG_NAN, F::NAN).is_nan());
-        assert!(f(F::NEG_NAN, F::NEG_NAN).is_nan());
+
+        // Selection between NaNs does not matter, it just must be quiet
+        assert!(f(F::NAN, F::NEG_NAN).is_qnan());
+        assert!(f(F::NEG_NAN, F::NAN).is_qnan());
+        assert!(f(F::NEG_NAN, F::NEG_NAN).is_qnan());
+
+        assert!(f(F::NAN, F::NEG_SNAN).is_nan());
+        assert!(f(F::NAN, F::SNAN).is_nan());
+        assert!(f(F::NEG_NAN, F::NEG_SNAN).is_nan());
+        assert!(f(F::NEG_NAN, F::SNAN).is_nan());
+        assert!(f(F::NEG_SNAN, F::NAN).is_nan());
+        assert!(f(F::NEG_SNAN, F::NEG_NAN).is_nan());
+        assert!(f(F::NEG_SNAN, F::NEG_SNAN).is_nan());
+        assert!(f(F::NEG_SNAN, F::SNAN).is_nan());
+        assert!(f(F::SNAN, F::NAN).is_nan());
+        assert!(f(F::SNAN, F::NEG_NAN).is_nan());
+        assert!(f(F::SNAN, F::NEG_SNAN).is_nan());
+        assert!(f(F::SNAN, F::SNAN).is_nan());
     }
 
     #[test]

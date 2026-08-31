@@ -1,46 +1,49 @@
-//! Implementation of StableMIR Context.
+//! Implementation of CompilerCtxt.
 
 #![allow(rustc::usage_of_qualified_ty)]
 
 use std::iter;
 
 use rustc_abi::{Endian, Layout, ReprOptions};
+use rustc_crate_store::ForeignModule;
+use rustc_hir::Attribute;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
-use rustc_hir::{Attribute, LangItem};
 use rustc_middle::mir::interpret::{AllocId, ConstAllocation, ErrorHandled, GlobalAlloc, Scalar};
 use rustc_middle::mir::{BinOp, Body, Const as MirConst, ConstValue, UnOp};
 use rustc_middle::ty::layout::{FnAbiOf, LayoutOf};
-use rustc_middle::ty::print::{with_forced_trimmed_paths, with_no_trimmed_paths};
+use rustc_middle::ty::print::{
+    with_forced_trimmed_paths, with_no_trimmed_paths, with_resolve_crate_name,
+};
 use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
     AdtDef, AdtKind, AssocItem, Binder, ClosureKind, CoroutineArgsExt, EarlyBinder,
     ExistentialTraitRef, FnSig, GenericArgsRef, Instance, InstanceKind, IntrinsicDef, List,
     PolyFnSig, ScalarInt, TraitDef, TraitRef, Ty, TyCtxt, TyKind, TypeVisitableExt, UintTy,
-    ValTree, VariantDef,
+    ValTree, VariantDef, VtblEntry,
 };
 use rustc_middle::{mir, ty};
-use rustc_session::cstore::ForeignModule;
 use rustc_span::def_id::{CrateNum, DefId, LOCAL_CRATE};
-use rustc_span::{FileNameDisplayPreference, Span, Symbol};
+use rustc_span::{Span, Symbol};
 use rustc_target::callconv::FnAbi;
 
-use super::{SmirAllocRange, SmirCtxt, SmirTy, SmirTypingEnv};
+use super::{AllocRangeHelpers, CompilerCtxt, TyHelpers, TypingEnvHelpers};
 use crate::builder::BodyBuilder;
-use crate::{Bridge, SmirError, Tables, filter_def_ids};
+use crate::{Bridge, Error, Tables, filter_def_ids};
 
-impl<'tcx, B: Bridge> SmirTy<'tcx> for SmirCtxt<'tcx, B> {
+impl<'tcx, B: Bridge> TyHelpers<'tcx> for CompilerCtxt<'tcx, B> {
     fn new_foreign(&self, def_id: DefId) -> ty::Ty<'tcx> {
         ty::Ty::new_foreign(self.tcx, def_id)
     }
 }
 
-impl<'tcx, B: Bridge> SmirTypingEnv<'tcx> for SmirCtxt<'tcx, B> {
+impl<'tcx, B: Bridge> TypingEnvHelpers<'tcx> for CompilerCtxt<'tcx, B> {
     fn fully_monomorphized(&self) -> ty::TypingEnv<'tcx> {
         ty::TypingEnv::fully_monomorphized()
     }
 }
 
-impl<'tcx, B: Bridge> SmirAllocRange<'tcx> for SmirCtxt<'tcx, B> {
+impl<'tcx, B: Bridge> AllocRangeHelpers<'tcx> for CompilerCtxt<'tcx, B> {
     fn alloc_range(
         &self,
         offset: rustc_abi::Size,
@@ -50,8 +53,18 @@ impl<'tcx, B: Bridge> SmirAllocRange<'tcx> for SmirCtxt<'tcx, B> {
     }
 }
 
-impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
-    pub fn lift<T: ty::Lift<TyCtxt<'tcx>>>(&self, value: T) -> Option<T::Lifted> {
+impl<'tcx, B: Bridge> rustc_hir_pretty::PpAnn for CompilerCtxt<'tcx, B> {
+    fn nested(&self, state: &mut rustc_hir_pretty::State<'_>, nested: rustc_hir_pretty::Nested) {
+        rustc_hir_pretty::PpAnn::nested(
+            &(&self.tcx as &dyn rustc_hir::intravisit::HirTyCtxt<'_>),
+            state,
+            nested,
+        )
+    }
+}
+
+impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
+    pub fn lift<T: ty::Lift<TyCtxt<'tcx>>>(&self, value: T) -> T::Lifted {
         self.tcx.lift(value)
     }
 
@@ -63,7 +76,7 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
         self.tcx.coroutine_movability(def_id)
     }
 
-    pub fn valtree_to_const_val(&self, key: ty::Value<'tcx>) -> ConstValue<'tcx> {
+    pub fn valtree_to_const_val(&self, key: ty::Value<'tcx>) -> ConstValue {
         self.tcx.valtree_to_const_val(key)
     }
 
@@ -85,14 +98,15 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
     /// Return whether the item has a body defined by the user.
     ///
     /// Note that intrinsics may have a placeholder body that shouldn't be used in practice.
-    /// In StableMIR, we handle this case as if the body is not available.
+    /// In rustc_public, we handle this case as if the body is not available.
     pub(crate) fn item_has_body(&self, def_id: DefId) -> bool {
         let must_override = if let Some(intrinsic) = self.tcx.intrinsic(def_id) {
             intrinsic.must_be_overridden
         } else {
             false
         };
-        !must_override && self.tcx.is_mir_available(def_id)
+        // FIXME: A good reason to make is_mir_available or mir_keys change behavior
+        !must_override && self.tcx.is_mir_available(def_id) && !self.tcx.is_trivial_const(def_id)
     }
 
     fn filter_fn_def(&self, def_id: DefId) -> Option<DefId> {
@@ -105,6 +119,11 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
 
     fn filter_static_def(&self, def_id: DefId) -> Option<DefId> {
         matches!(self.tcx.def_kind(def_id), DefKind::Static { .. }).then(|| def_id)
+    }
+
+    fn filter_adt_def(&self, def_id: DefId) -> Option<DefId> {
+        matches!(self.tcx.def_kind(def_id), DefKind::Struct | DefKind::Enum | DefKind::Union)
+            .then(|| def_id)
     }
 
     pub fn target_endian(&self) -> Endian {
@@ -149,6 +168,11 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
         filter_def_ids(self.tcx, crate_num, |def_id| self.filter_static_def(def_id))
     }
 
+    /// Retrieve all ADTs defined in this crate.
+    pub fn crate_adts(&self, crate_num: CrateNum) -> Vec<DefId> {
+        filter_def_ids(self.tcx, crate_num, |def_id| self.filter_adt_def(def_id))
+    }
+
     pub fn foreign_module(&self, mod_def: DefId) -> &ForeignModule {
         self.tcx.foreign_modules(mod_def.krate).get(&mod_def).unwrap()
     }
@@ -188,39 +212,35 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
         self.tcx.trait_impls_in_crate(crate_num).iter().map(|impl_def_id| *impl_def_id).collect()
     }
 
+    /// Returns the inherent implementations of the given definition.
+    pub fn inherent_impls(&self, def_id: DefId) -> Vec<DefId> {
+        self.tcx.inherent_impls(def_id).iter().copied().collect()
+    }
+
     pub fn trait_impl(&self, impl_def: DefId) -> EarlyBinder<'tcx, TraitRef<'tcx>> {
-        self.tcx.impl_trait_ref(impl_def).unwrap()
+        self.tcx.impl_trait_ref(impl_def)
     }
 
     pub fn generics_of(&self, def_id: DefId) -> &'tcx ty::Generics {
         self.tcx.generics_of(def_id)
     }
 
-    pub fn predicates_of(
-        &self,
-        def_id: DefId,
-    ) -> (Option<DefId>, Vec<(ty::PredicateKind<'tcx>, Span)>) {
-        let ty::GenericPredicates { parent, predicates } = self.tcx.predicates_of(def_id);
+    pub fn clauses_of(&self, def_id: DefId) -> (Option<DefId>, Vec<(ty::ClauseKind<'tcx>, Span)>) {
+        let ty::GenericClauses { parent, clauses } = self.tcx.clauses_of(def_id);
         (
             parent,
-            predicates
-                .iter()
-                .map(|(clause, span)| (clause.as_predicate().kind().skip_binder(), *span))
-                .collect(),
+            clauses.iter().map(|(clause, span)| (clause.kind().skip_binder(), *span)).collect(),
         )
     }
 
-    pub fn explicit_predicates_of(
+    pub fn explicit_clauses_of(
         &self,
         def_id: DefId,
-    ) -> (Option<DefId>, Vec<(ty::PredicateKind<'tcx>, Span)>) {
-        let ty::GenericPredicates { parent, predicates } = self.tcx.explicit_predicates_of(def_id);
+    ) -> (Option<DefId>, Vec<(ty::ClauseKind<'tcx>, Span)>) {
+        let ty::GenericClauses { parent, clauses } = self.tcx.explicit_clauses_of(def_id);
         (
             parent,
-            predicates
-                .iter()
-                .map(|(clause, span)| (clause.as_predicate().kind().skip_binder(), *span))
-                .collect(),
+            clauses.iter().map(|(clause, span)| (clause.kind().skip_binder(), *span)).collect(),
         )
     }
 
@@ -263,8 +283,14 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
         if trimmed {
             with_forced_trimmed_paths!(self.tcx.def_path_str(def_id))
         } else {
-            with_no_trimmed_paths!(self.tcx.def_path_str(def_id))
+            // For local definitions, we need to prepend with crate name.
+            with_resolve_crate_name!(with_no_trimmed_paths!(self.tcx.def_path_str(def_id)))
         }
+    }
+
+    /// Returns the parent of the given `DefId`.
+    pub fn def_parent(&self, def_id: DefId) -> Option<DefId> {
+        self.tcx.opt_parent(def_id)
     }
 
     /// Return registered tool attributes with the given attribute name.
@@ -280,7 +306,7 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
             .get_attrs_by_path(def_id, &attr_name)
             .filter_map(|attribute| {
                 if let Attribute::Unparsed(u) = attribute {
-                    let attr_str = rustc_hir_pretty::attribute_to_string(&self.tcx, attribute);
+                    let attr_str = rustc_hir_pretty::attribute_to_string(self, attribute);
                     Some((attr_str, u.span))
                 } else {
                     None
@@ -299,7 +325,7 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
         attrs_iter
             .filter_map(|attribute| {
                 if let Attribute::Unparsed(u) = attribute {
-                    let attr_str = rustc_hir_pretty::attribute_to_string(&self.tcx, attribute);
+                    let attr_str = rustc_hir_pretty::attribute_to_string(self, attribute);
                     Some((attr_str, u.span))
                 } else {
                     None
@@ -315,12 +341,7 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
 
     /// Return filename from given `Span`, for diagnostic purposes.
     pub fn get_filename(&self, span: Span) -> String {
-        self.tcx
-            .sess
-            .source_map()
-            .span_to_filename(span)
-            .display(FileNameDisplayPreference::Local)
-            .to_string()
+        self.tcx.sess.source_map().span_to_filename(span).prefer_local_unconditionally().to_string()
     }
 
     /// Return lines corresponding to this `Span`.
@@ -375,8 +396,18 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
         def_id: DefId,
         args_ref: GenericArgsRef<'tcx>,
     ) -> Binder<'tcx, FnSig<'tcx>> {
-        let sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args_ref);
+        let sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args_ref).skip_norm_wip();
         sig
+    }
+
+    /// Retrieve the constness for the given function definition.
+    pub fn constness(&self, def_id: DefId) -> rustc_hir::Constness {
+        self.tcx.constness(def_id)
+    }
+
+    /// Retrieve the asyncness for the given function definition.
+    pub fn asyncness(&self, def_id: DefId) -> ty::Asyncness {
+        self.tcx.asyncness(def_id)
     }
 
     /// Retrieve the intrinsic definition if the item corresponds one.
@@ -426,7 +457,7 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
 
     /// Evaluate constant as a target usize.
     pub fn eval_target_usize(&self, cnst: MirConst<'tcx>) -> Result<u64, B::Error> {
-        use crate::context::SmirTypingEnv;
+        use crate::context::TypingEnvHelpers;
         cnst.try_eval_target_usize(self.tcx, self.fully_monomorphized())
             .ok_or_else(|| B::Error::new(format!("Const `{cnst:?}` cannot be encoded as u64")))
     }
@@ -459,6 +490,16 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
 
     pub fn const_zero_sized(&self, ty_internal: Ty<'tcx>) -> ty::Const<'tcx> {
         ty::Const::zero_sized(self.tcx, ty_internal)
+    }
+
+    /// Create a caller location constant from a span.
+    ///
+    /// This produces a `&'static core::panic::Location<'static>` constant,
+    /// which is the implicit extra argument for `#[track_caller]` functions.
+    pub fn span_as_caller_location(&self, span: Span) -> MirConst<'tcx> {
+        let val = self.tcx.span_as_caller_location(span);
+        let ty = self.tcx.caller_location_ty();
+        MirConst::from_value(val, ty)
     }
 
     /// Create a new constant that represents the given string value.
@@ -537,7 +578,7 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
 
     /// Returns the type of given crate item.
     pub fn def_ty(&self, item: DefId) -> Ty<'tcx> {
-        self.tcx.type_of(item).instantiate_identity()
+        self.tcx.type_of(item).instantiate_identity().skip_norm_wip()
     }
 
     /// Returns the type of given definition instantiated with the given arguments.
@@ -550,8 +591,8 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
         )
     }
 
-    /// `Span` of an item.
-    pub fn span_of_an_item(&self, def_id: DefId) -> Span {
+    /// `Span` of a `DefId`.
+    pub fn span_of_a_def(&self, def_id: DefId) -> Span {
         self.tcx.def_span(def_id)
     }
 
@@ -621,7 +662,16 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
 
     /// Check if this is an empty DropGlue shim.
     pub fn is_empty_drop_shim(&self, instance: ty::Instance<'tcx>) -> bool {
-        matches!(instance.def, ty::InstanceKind::DropGlue(_, None))
+        matches!(instance.def, ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)))
+    }
+
+    /// Check if this instance requires a caller location argument.
+    ///
+    /// Functions with `#[track_caller]` have an implicit extra
+    /// `&'static core::panic::Location<'static>` argument appended to their ABI,
+    /// which is not visible in their MIR body signature.
+    pub fn instance_requires_caller_location(&self, instance: ty::Instance<'tcx>) -> bool {
+        instance.def.requires_caller_location(self.tcx)
     }
 
     /// Convert a non-generic crate item into an instance.
@@ -651,7 +701,7 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
 
     /// Resolve an instance for drop_in_place for the given type.
     pub fn resolve_drop_in_place(&self, internal_ty: Ty<'tcx>) -> Instance<'tcx> {
-        let instance = Instance::resolve_drop_in_place(self.tcx, internal_ty);
+        let instance = Instance::resolve_drop_glue(self.tcx, internal_ty);
         instance
     }
 
@@ -675,10 +725,7 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
     }
 
     /// Try to evaluate an instance into a constant.
-    pub fn eval_instance(
-        &self,
-        instance: ty::Instance<'tcx>,
-    ) -> Result<ConstValue<'tcx>, ErrorHandled> {
+    pub fn eval_instance(&self, instance: ty::Instance<'tcx>) -> Result<ConstValue, ErrorHandled> {
         self.tcx.const_eval_instance(
             self.fully_monomorphized(),
             instance,
@@ -721,9 +768,9 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
                 self.tcx.def_path_str_with_args(instance.def_id(), instance.args)
             )
         } else {
-            with_no_trimmed_paths!(
+            with_resolve_crate_name!(with_no_trimmed_paths!(
                 self.tcx.def_path_str_with_args(instance.def_id(), instance.args)
-            )
+            ))
         }
     }
 
@@ -755,5 +802,22 @@ impl<'tcx, B: Bridge> SmirCtxt<'tcx, B> {
                 .collect()
         };
         assoc_items
+    }
+
+    /// Returns the associated item of the given `DefId`, or `None` if it is not an associated item.
+    pub fn associated_item(&self, def_id: DefId) -> Option<AssocItem> {
+        self.tcx.opt_associated_item(def_id)
+    }
+
+    /// Get all vtable entries of a trait.
+    pub fn vtable_entries(&self, trait_ref: TraitRef<'tcx>) -> Vec<VtblEntry<'tcx>> {
+        self.tcx.vtable_entries(trait_ref).to_vec()
+    }
+
+    /// Returns the vtable entry at the given index.
+    ///
+    /// Returns `None` if the index is out of bounds.
+    pub fn vtable_entry(&self, trait_ref: TraitRef<'tcx>, idx: usize) -> Option<VtblEntry<'tcx>> {
+        self.vtable_entries(trait_ref).get(idx).copied()
     }
 }

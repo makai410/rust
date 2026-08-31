@@ -1,7 +1,12 @@
 //@aux-build:proc_macros.rs
-//@no-rustfix: overlapping suggestions
-#![allow(clippy::no_effect, clippy::unnecessary_operation, clippy::useless_vec, unused)]
+//@revisions: old_range new_range
+//@[new_range] compile-flags: --cfg=new_range
+
+// When feature(new_range) stabilizes, this should be converted to testing
+// old and new editions instead.
+#![cfg_attr(new_range, feature(new_range))]
 #![warn(clippy::single_range_in_vec_init)]
+#![expect(clippy::no_effect, clippy::useless_vec)]
 
 #[macro_use]
 extern crate proc_macros;
@@ -65,4 +70,28 @@ fn main() {
         [0..200];
         vec![0..200];
     }
+}
+
+fn issue16042() {
+    use std::ops::Range;
+
+    let input = vec![Range { start: 0, end: 5 }];
+}
+
+fn issue16044() {
+    macro_rules! as_i32 {
+        ($x:expr) => {
+            $x as i32
+        };
+    }
+
+    let input = vec![0..as_i32!(10)];
+    //~^ single_range_in_vec_init
+}
+
+fn issue16508() {
+    [0..=10];
+    //~^ single_range_in_vec_init
+    vec![0..=10];
+    //~^ single_range_in_vec_init
 }

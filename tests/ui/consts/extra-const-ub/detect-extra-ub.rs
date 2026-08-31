@@ -1,7 +1,6 @@
 //@ revisions: no_flag with_flag
 //@ [no_flag] check-pass
 //@ [with_flag] compile-flags: -Zextra-const-ub-checks
-#![feature(never_type)]
 #![allow(unnecessary_transmutes)]
 
 use std::mem::transmute;
@@ -50,6 +49,16 @@ const INVALID_SLICE_TO_USIZE_TRANSMUTE: () = unsafe {
 const UNALIGNED_PTR: () = unsafe {
     let _x: &u32 = transmute(&[0u8; 4]);
     //[with_flag]~^ ERROR: invalid value
+};
+
+// A function pointer offset to be maybe-null.
+const MAYBE_NULL_FN_PTR: () = unsafe {
+    let _x: fn() = transmute({
+    //[with_flag]~^ ERROR: invalid value
+        fn fun() {}
+        let ptr = fun as fn();
+        (ptr as *const u8).wrapping_add(10)
+    });
 };
 
 const UNINHABITED_VARIANT: () = unsafe {

@@ -2,9 +2,8 @@ use clippy_utils::diagnostics::span_lint_hir_and_then;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{HirId, Impl, ItemKind, Node, Path, QPath, TraitRef, TyKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::{AssocKind, AssocItem};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
+use rustc_middle::ty::{AssocItem, AssocKind};
 use rustc_span::Span;
 use rustc_span::symbol::Symbol;
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,11 +52,7 @@ impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
         for id in cx.tcx.hir_free_items() {
             if matches!(cx.tcx.def_kind(id.owner_id), DefKind::Impl { .. })
                 && let item = cx.tcx.hir_item(id)
-                && let ItemKind::Impl(Impl {
-                    of_trait,
-                    self_ty,
-                    ..
-                }) = &item.kind
+                && let ItemKind::Impl(Impl { of_trait, self_ty, .. }) = &item.kind
                 && let TyKind::Path(QPath::Resolved(_, Path { res, .. })) = self_ty.kind
             {
                 if !map.contains_key(res) {
@@ -72,9 +67,9 @@ impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
                 let existing_name = map.get_mut(res).unwrap();
 
                 match of_trait {
-                    Some(trait_ref) => {
+                    Some(of_trait) => {
                         let mut methods_in_trait: BTreeSet<Symbol> = if let Node::TraitRef(TraitRef { path, .. }) =
-                            cx.tcx.hir_node(trait_ref.hir_ref_id)
+                            cx.tcx.hir_node(of_trait.trait_ref.hir_ref_id)
                             && let Res::Def(DefKind::Trait, did) = path.res
                         {
                             // FIXME: if
@@ -127,7 +122,9 @@ impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
                     },
                     None => {
                         for assoc_item in cx.tcx.associated_items(id.owner_id).in_definition_order() {
-                            let AssocKind::Fn { name, .. } = assoc_item.kind else { continue };
+                            let AssocKind::Fn { name, .. } = assoc_item.kind else {
+                                continue;
+                            };
                             let impl_span = cx.tcx.def_span(assoc_item.def_id);
                             let hir_id = cx.tcx.local_def_id_to_hir_id(assoc_item.def_id.expect_local());
                             if let Some(trait_spans) = existing_name.trait_methods.get(&name) {
@@ -140,10 +137,7 @@ impl<'tcx> LateLintPass<'tcx> for SameNameMethod {
                                     |diag| {
                                         // TODO should we `span_note` on every trait?
                                         // iterate on trait_spans?
-                                        diag.span_note(
-                                            trait_spans[0],
-                                            format!("existing `{name}` defined here"),
-                                        );
+                                        diag.span_note(trait_spans[0], format!("existing `{name}` defined here"));
                                     },
                                 );
                             }

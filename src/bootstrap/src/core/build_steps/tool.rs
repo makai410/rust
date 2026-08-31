@@ -10,23 +10,22 @@
 //! return `ToolBuildResult` and should never prepare `cargo` invocations manually.
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-#[cfg(feature = "tracing")]
-use tracing::instrument;
-
-use crate::core::build_steps::compile::is_lto_stage;
+use crate::core::build_steps::compile::{CargoMessage, is_lto_stage};
+use crate::core::build_steps::dist::LLD_FILE_NAMES;
 use crate::core::build_steps::toolstate::ToolState;
 use crate::core::build_steps::{compile, llvm};
-use crate::core::builder;
 use crate::core::builder::{
-    Builder, Cargo as CargoCommand, RunConfig, ShouldRun, Step, StepMetadata, cargo_profile_var,
+    self, Builder, Cargo as CargoCommand, CommandLineStep, Kind, RunConfig, ShouldRun, Step,
+    StepMetadata, apply_pgo, cargo_profile_var,
 };
-use crate::core::config::{DebuginfoLevel, RustcLto, TargetSelection};
+use crate::core::compiler::Compiler;
+use crate::core::config::{Allocator, DebuginfoLevel, RustcLto, TargetSelection};
+use crate::core::session::{FileType, Mode};
 use crate::utils::exec::{BootstrapCommand, command};
-use crate::utils::helpers::{add_dylib_path, exe, t};
-use crate::{Compiler, FileType, Kind, Mode, gha};
+use crate::utils::helpers::{self, add_dylib_path, exe, t};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum SourceType {
@@ -42,7 +41,8 @@ pub enum ToolArtifactKind {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct ToolBuild {
-    compiler: Compiler,
+    /// Compiler that will build this tool.
+    build_compiler: Compiler,
     target: TargetSelection,
     tool: &'static str,
     path: &'static str,
@@ -57,89 +57,51 @@ struct ToolBuild {
     artifact_kind: ToolArtifactKind,
 }
 
-impl Builder<'_> {
-    #[track_caller]
-    pub(crate) fn msg_tool(
-        &self,
-        kind: Kind,
-        mode: Mode,
-        tool: &str,
-        build_stage: u32,
-        host: &TargetSelection,
-        target: &TargetSelection,
-    ) -> Option<gha::Group> {
-        match mode {
-            // depends on compiler stage, different to host compiler
-            Mode::ToolRustc => self.msg_sysroot_tool(
-                kind,
-                build_stage,
-                format_args!("tool {tool}"),
-                *host,
-                *target,
-            ),
-            // doesn't depend on compiler, same as host compiler
-            _ => self.msg(kind, build_stage, format_args!("tool {tool}"), *host, *target),
-        }
-    }
-}
-
 /// Result of the tool build process. Each `Step` in this module is responsible
 /// for using this type as `type Output = ToolBuildResult;`
 #[derive(Clone)]
 pub struct ToolBuildResult {
     /// Artifact path of the corresponding tool that was built.
     pub tool_path: PathBuf,
-    /// Compiler used to build the tool. For non-`ToolRustc` tools this is equal to `target_compiler`.
-    /// For `ToolRustc` this is one stage before of the `target_compiler`.
+    /// Compiler used to build the tool.
     pub build_compiler: Compiler,
-    /// Target compiler passed to `Step`.
-    pub target_compiler: Compiler,
+    /// All Cargo artifacts produced during the compilation of this tool
+    pub artifacts: Vec<PathBuf>,
 }
 
 impl Step for ToolBuild {
     type Output = ToolBuildResult;
 
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
     /// Builds a tool in `src/tools`
     ///
     /// This will build the specified tool with the specified `host` compiler in
     /// `stage` into the normal cargo output directory.
-    fn run(mut self, builder: &Builder<'_>) -> ToolBuildResult {
+    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
         let target = self.target;
         let mut tool = self.tool;
         let path = self.path;
 
-        let target_compiler = self.compiler;
-        self.compiler = if self.mode == Mode::ToolRustc {
-            get_tool_rustc_compiler(builder, self.compiler)
-        } else {
-            self.compiler
-        };
-
         match self.mode {
-            Mode::ToolRustc => {
-                // If compiler was forced, its artifacts should have been prepared earlier.
-                if !self.compiler.is_forced_compiler() {
-                    builder.std(self.compiler, self.compiler.host);
-                    builder.ensure(compile::Rustc::new(self.compiler, target));
+            Mode::ToolRustcPrivate => {
+                // FIXME: remove this, it's only needed for download-rustc...
+                if !self.build_compiler.is_forced_compiler() && builder.download_rustc() {
+                    builder.std(self.build_compiler, self.build_compiler.host);
+                    builder.ensure(compile::Rustc::new(self.build_compiler, target));
                 }
             }
             Mode::ToolStd => {
                 // If compiler was forced, its artifacts should have been prepared earlier.
-                if !self.compiler.is_forced_compiler() {
-                    builder.std(self.compiler, target)
+                if !self.build_compiler.is_forced_compiler() {
+                    builder.std(self.build_compiler, target);
                 }
             }
-            Mode::ToolBootstrap => {} // uses downloaded stage0 compiler libs
+            Mode::ToolBootstrap | Mode::ToolTarget => {} // uses downloaded stage0 compiler libs
             _ => panic!("unexpected Mode for tool build"),
         }
 
         let mut cargo = prepare_tool_cargo(
             builder,
-            self.compiler,
+            self.build_compiler,
             self.mode,
             target,
             Kind::Build,
@@ -159,9 +121,11 @@ impl Step for ToolBuild {
             cargo.env("RUSTC_WRAPPER", ccache);
         }
 
-        // Rustc tools (miri, clippy, cargo, rustfmt, rust-analyzer)
+        // RustcPrivate tools (miri, clippy, rustfmt, rust-analyzer) and cargo
         // could use the additional optimizations.
-        if self.mode == Mode::ToolRustc && is_lto_stage(&self.compiler) {
+        if is_lto_stage(&self.build_compiler)
+            && (self.mode == Mode::ToolRustcPrivate || self.path == "src/tools/cargo")
+        {
             let lto = match builder.config.rust_lto {
                 RustcLto::Off => Some("off"),
                 RustcLto::Thin => Some("thin"),
@@ -169,8 +133,18 @@ impl Step for ToolBuild {
                 RustcLto::ThinLocal => None,
             };
             if let Some(lto) = lto {
-                cargo.env(cargo_profile_var("LTO", &builder.config), lto);
+                cargo.env(cargo_profile_var("LTO", &builder.config, self.mode), lto);
             }
+        }
+
+        let pgo_config = match self.path {
+            "src/tools/rustdoc" => Some(&builder.config.rustdoc_pgo),
+            "src/tools/cargo" => Some(&builder.config.cargo_pgo),
+            "src/tools/clippy" => Some(&builder.config.clippy_pgo),
+            _ => None,
+        };
+        if let Some(pgo_config) = pgo_config {
+            apply_pgo(builder, &mut cargo, self.build_compiler, pgo_config);
         }
 
         if !self.allow_features.is_empty() {
@@ -179,17 +153,18 @@ impl Step for ToolBuild {
 
         cargo.args(self.cargo_args);
 
-        let _guard = builder.msg_tool(
-            Kind::Build,
-            self.mode,
-            self.tool,
-            self.compiler.stage,
-            &self.compiler.host,
-            &self.target,
-        );
+        let _guard =
+            builder.msg(Kind::Build, self.tool, self.mode, self.build_compiler, self.target);
 
         // we check this below
-        let build_success = compile::stream_cargo(builder, cargo, vec![], &mut |_| {});
+        let mut artifacts = vec![];
+        let build_success = compile::stream_cargo(builder, cargo, vec![], &mut |msg| match msg {
+            CargoMessage::CompilerArtifact { filenames, .. } => {
+                artifacts.extend(filenames.into_iter().map(|p| PathBuf::from(p.as_ref())));
+            }
+            CargoMessage::BuildScriptExecuted => {}
+            CargoMessage::BuildFinished => {}
+        });
 
         builder.save_toolstate(
             tool,
@@ -197,7 +172,7 @@ impl Step for ToolBuild {
         );
 
         if !build_success {
-            crate::exit!(1);
+            helpers::exit_process(1);
         } else {
             // HACK(#82501): on Windows, the tools directory gets added to PATH when running tests, and
             // compiletest confuses HTML tidy with the in-tree tidy. Name the in-tree tidy something
@@ -207,14 +182,14 @@ impl Step for ToolBuild {
             }
             let tool_path = match self.artifact_kind {
                 ToolArtifactKind::Binary => {
-                    copy_link_tool_bin(builder, self.compiler, self.target, self.mode, tool)
+                    copy_link_tool_bin(builder, self.build_compiler, self.target, self.mode, tool)
                 }
                 ToolArtifactKind::Library => builder
-                    .cargo_out(self.compiler, self.mode, self.target)
+                    .cargo_out(self.build_compiler, self.mode, self.target)
                     .join(format!("lib{tool}.rlib")),
             };
 
-            ToolBuildResult { tool_path, build_compiler: self.compiler, target_compiler }
+            ToolBuildResult { tool_path, build_compiler: self.build_compiler, artifacts }
         }
     }
 }
@@ -237,7 +212,7 @@ pub fn prepare_tool_cargo(
     cargo.arg("--manifest-path").arg(dir.join("Cargo.toml"));
 
     let mut features = extra_features.to_vec();
-    if builder.build.config.cargo_native_static {
+    if builder.sess.config.cargo_native_static {
         if path.ends_with("cargo")
             || path.ends_with("clippy")
             || path.ends_with("miri")
@@ -266,9 +241,30 @@ pub fn prepare_tool_cargo(
     // avoid rebuilding when running tests.
     cargo.env("SYSROOT", builder.sysroot(compiler));
 
+    // Make sure we explicitly add rustc_private libs to path centrally here so that
+    // RustcPrivate tools can pick them up.
+    if mode == Mode::ToolRustcPrivate {
+        cargo.add_rustc_lib_path(builder);
+    }
+
     // if tools are using lzma we want to force the build script to build its
     // own copy
     cargo.env("LZMA_API_STATIC", "1");
+
+    // See also the "JEMALLOC_SYS_WITH_LG_PAGE" setting in the compile build step.
+    if builder.config.allocator(target) == Allocator::Jemalloc
+        && env::var_os("JEMALLOC_SYS_WITH_LG_PAGE").is_none()
+    {
+        // Build jemalloc on AArch64 with support for page sizes up to 64K
+        // See: https://github.com/rust-lang/rust/pull/135081
+        if target.starts_with("aarch64") {
+            cargo.env("JEMALLOC_SYS_WITH_LG_PAGE", "16");
+        }
+        // Build jemalloc on LoongArch with support for page sizes up to 16K
+        else if target.starts_with("loongarch") {
+            cargo.env("JEMALLOC_SYS_WITH_LG_PAGE", "14");
+        }
+    }
 
     // CFG_RELEASE is needed by rustfmt (and possibly other tools) which
     // import rustc-ap-rustc_attr which requires this to be set for the
@@ -344,38 +340,62 @@ pub fn prepare_tool_cargo(
     cargo
 }
 
-/// Handle stage-off logic for `ToolRustc` tools when necessary.
-pub(crate) fn get_tool_rustc_compiler(
+/// Determines how to build a `ToolTarget`, i.e. which compiler should be used to compile it.
+/// The compiler stage is automatically bumped if we need to cross-compile a stage 1 tool.
+pub enum ToolTargetBuildMode {
+    /// Build the tool for the given `target` using rustc that corresponds to the top CLI
+    /// stage.
+    Build(TargetSelection),
+    /// Build the tool so that it can be attached to the sysroot of the passed compiler.
+    /// Since we always dist stage 2+, the compiler that builds the tool in this case has to be
+    /// stage 1+.
+    Dist(Compiler),
+}
+
+/// Returns compiler that is able to compile a `ToolTarget` tool with the given `mode`.
+pub(crate) fn get_tool_target_compiler(
     builder: &Builder<'_>,
-    target_compiler: Compiler,
+    mode: ToolTargetBuildMode,
 ) -> Compiler {
-    if target_compiler.is_forced_compiler() {
-        return target_compiler;
-    }
+    let (target, build_compiler_stage) = match mode {
+        ToolTargetBuildMode::Build(target) => {
+            assert!(builder.top_stage > 0);
+            // If we want to build a stage N tool, we need to compile it with stage N-1 rustc
+            (target, builder.top_stage - 1)
+        }
+        ToolTargetBuildMode::Dist(target_compiler) => {
+            assert!(target_compiler.stage > 0);
+            // If we want to dist a stage N rustc, we want to attach stage N tool to it.
+            // And to build that tool, we need to compile it with stage N-1 rustc
+            (target_compiler.host, target_compiler.stage - 1)
+        }
+    };
 
-    if builder.download_rustc() && target_compiler.stage == 1 {
-        // We shouldn't drop to stage0 compiler when using CI rustc.
-        return builder.compiler(1, builder.config.host_target);
-    }
-
-    // Similar to `compile::Assemble`, build with the previous stage's compiler. Otherwise
-    // we'd have stageN/bin/rustc and stageN/bin/$rustc_tool be effectively different stage
-    // compilers, which isn't what we want. Rustc tools should be linked in the same way as the
-    // compiler it's paired with, so it must be built with the previous stage compiler.
-    builder.compiler(target_compiler.stage.saturating_sub(1), builder.config.host_target)
+    let compiler = if builder.host_target == target {
+        builder.compiler(build_compiler_stage, builder.host_target)
+    } else {
+        // If we are cross-compiling a stage 1 tool, we cannot do that with a stage 0 compiler,
+        // so we auto-bump the tool's stage to 2, which means we need a stage 1 compiler.
+        let build_compiler = builder.compiler(build_compiler_stage.max(1), builder.host_target);
+        // We also need the host stdlib to compile host code (proc macros/build scripts)
+        builder.std(build_compiler, builder.host_target);
+        build_compiler
+    };
+    builder.std(compiler, target);
+    compiler
 }
 
 /// Links a built tool binary with the given `name` from the build directory to the
 /// tools directory.
 fn copy_link_tool_bin(
     builder: &Builder<'_>,
-    compiler: Compiler,
+    build_compiler: Compiler,
     target: TargetSelection,
     mode: Mode,
     name: &str,
 ) -> PathBuf {
-    let cargo_out = builder.cargo_out(compiler, mode, target).join(exe(name, target));
-    let bin = builder.tools_dir(compiler).join(exe(name, target));
+    let cargo_out = builder.cargo_out(build_compiler, mode, target).join(exe(name, target));
+    let bin = builder.tools_dir(build_compiler).join(exe(name, target));
     builder.copy_link(&cargo_out, &bin, FileType::Executable);
     bin
 }
@@ -384,27 +404,37 @@ macro_rules! bootstrap_tool {
     ($(
         $name:ident, $path:expr, $tool_name:expr
         $(,is_external_tool = $external:expr)*
-        $(,is_unstable_tool = $unstable:expr)*
         $(,allow_features = $allow_features:expr)?
         $(,submodules = $submodules:expr)?
         $(,artifact_kind = $artifact_kind:expr)?
         ;
     )+) => {
         #[derive(PartialEq, Eq, Clone)]
-        pub enum Tool {
+        pub(crate) enum Tool {
             $(
+                #[allow(dead_code, reason = "not all bootstrap-tools need a variant")]
                 $name,
             )+
         }
 
         impl<'a> Builder<'a> {
-            pub fn tool_exe(&self, tool: Tool) -> PathBuf {
+            /// Ensure a tool is built, then get the path to its executable.
+            ///
+            /// The actual building, if any, will be handled via [`ToolBuild`].
+            pub(crate) fn tool_exe(&self, tool: Tool) -> PathBuf {
+                self.tool(tool).tool_path
+            }
+
+            /// Ensure a tool is built, then return its build output.
+            ///
+            /// The actual building, if any, will be handled via [`ToolBuild`].
+            pub(crate) fn tool(&self, tool: Tool) -> ToolBuildResult {
                 match tool {
                     $(Tool::$name =>
                         self.ensure($name {
                             compiler: self.compiler(0, self.config.host_target),
                             target: self.config.host_target,
-                        }).tool_path,
+                        }),
                     )+
                 }
             }
@@ -417,7 +447,7 @@ macro_rules! bootstrap_tool {
             pub target: TargetSelection,
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ToolBuildResult;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -432,14 +462,6 @@ macro_rules! bootstrap_tool {
                 });
             }
 
-            #[cfg_attr(
-                feature = "tracing",
-                instrument(
-                    level = "debug",
-                    name = $tool_name,
-                    skip_all,
-                ),
-            )]
             fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
                 $(
                     for submodule in $submodules {
@@ -447,19 +469,11 @@ macro_rules! bootstrap_tool {
                     }
                 )*
 
-                let is_unstable = false $(|| $unstable)*;
-                let compiletest_wants_stage0 = $tool_name == "compiletest" && builder.config.compiletest_use_stage0_libtest;
-
                 builder.ensure(ToolBuild {
-                    compiler: self.compiler,
+                    build_compiler: self.compiler,
                     target: self.target,
                     tool: $tool_name,
-                    mode: if is_unstable && !compiletest_wants_stage0 {
-                        // use in-tree libraries for unstable features
-                        Mode::ToolStd
-                    } else {
-                        Mode::ToolBootstrap
-                    },
+                    mode: Mode::ToolBootstrap,
                     path: $path,
                     source_type: if false $(|| $external)* {
                         SourceType::Submodule
@@ -492,8 +506,6 @@ macro_rules! bootstrap_tool {
     }
 }
 
-pub(crate) const COMPILETEST_ALLOW_FEATURES: &str = "internal_output_capture";
-
 bootstrap_tool!(
     // This is marked as an external tool because it includes dependencies
     // from submodules. Trying to keep the lints in sync between all the repos
@@ -504,8 +516,7 @@ bootstrap_tool!(
     Tidy, "src/tools/tidy", "tidy";
     Linkchecker, "src/tools/linkchecker", "linkchecker";
     CargoTest, "src/tools/cargotest", "cargotest";
-    Compiletest, "src/tools/compiletest", "compiletest", is_unstable_tool = true, allow_features = COMPILETEST_ALLOW_FEATURES;
-    BuildManifest, "src/tools/build-manifest", "build-manifest";
+    Compiletest, "src/tools/compiletest", "compiletest";
     RemoteTestClient, "src/tools/remote-test-client", "remote-test-client";
     RustInstaller, "src/tools/rust-installer", "rust-installer";
     RustdocTheme, "src/tools/rustdoc-themes", "rustdoc-themes";
@@ -518,14 +529,13 @@ bootstrap_tool!(
     CollectLicenseMetadata, "src/tools/collect-license-metadata", "collect-license-metadata";
     GenerateCopyright, "src/tools/generate-copyright", "generate-copyright";
     GenerateWindowsSys, "src/tools/generate-windows-sys", "generate-windows-sys";
-    // rustdoc-gui-test has a crate dependency on compiletest, so it needs the same unstable features.
-    RustdocGUITest, "src/tools/rustdoc-gui-test", "rustdoc-gui-test", is_unstable_tool = true, allow_features = COMPILETEST_ALLOW_FEATURES;
+    RustdocGUITest, "src/tools/rustdoc-gui-test", "rustdoc-gui-test";
     CoverageDump, "src/tools/coverage-dump", "coverage-dump";
-    WasmComponentLd, "src/tools/wasm-component-ld", "wasm-component-ld", is_unstable_tool = true, allow_features = "min_specialization";
     UnicodeTableGenerator, "src/tools/unicode-table-generator", "unicode-table-generator";
     FeaturesStatusDump, "src/tools/features-status-dump", "features-status-dump";
     OptimizedDist, "src/tools/opt-dist", "opt-dist", submodules = &["src/tools/rustc-perf"];
     RunMakeSupport, "src/tools/run-make-support", "run_make_support", artifact_kind = ToolArtifactKind::Library;
+    IntrinsicTest, "library/stdarch/crates/intrinsic-test", "intrinsic-test";
 );
 
 /// These are the submodules that are required for rustbook to work due to
@@ -540,7 +550,7 @@ pub struct RustcPerf {
     pub target: TargetSelection,
 }
 
-impl Step for RustcPerf {
+impl CommandLineStep for RustcPerf {
     /// Path to the built `collector` binary.
     type Output = ToolBuildResult;
 
@@ -560,7 +570,7 @@ impl Step for RustcPerf {
         builder.require_submodule("src/tools/rustc-perf", None);
 
         let tool = ToolBuild {
-            compiler: self.compiler,
+            build_compiler: self.compiler,
             target: self.target,
             tool: "collector",
             mode: Mode::ToolBootstrap,
@@ -576,32 +586,32 @@ impl Step for RustcPerf {
         let res = builder.ensure(tool.clone());
         // We also need to symlink the `rustc-fake` binary to the corresponding directory,
         // because `collector` expects it in the same directory.
-        copy_link_tool_bin(builder, tool.compiler, tool.target, tool.mode, "rustc-fake");
+        copy_link_tool_bin(builder, tool.build_compiler, tool.target, tool.mode, "rustc-fake");
 
         res
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ErrorIndex {
-    pub compiler: Compiler,
+    compilers: RustcPrivateCompilers,
 }
 
 impl ErrorIndex {
-    pub fn command(builder: &Builder<'_>) -> BootstrapCommand {
+    pub fn command(builder: &Builder<'_>, compilers: RustcPrivateCompilers) -> BootstrapCommand {
         // Error-index-generator links with the rustdoc library, so we need to add `rustc_lib_paths`
         // for rustc_private and libLLVM.so, and `sysroot_lib` for libstd, etc.
-        let host = builder.config.host_target;
-        let compiler = builder.compiler_for(builder.top_stage, host, host);
-        let mut cmd = command(builder.ensure(ErrorIndex { compiler }).tool_path);
-        let mut dylib_paths = builder.rustc_lib_paths(compiler);
-        dylib_paths.push(builder.sysroot_target_libdir(compiler, compiler.host));
+        let mut cmd = command(builder.ensure(ErrorIndex { compilers }).tool_path);
+
+        let target_compiler = compilers.target_compiler();
+        let mut dylib_paths = builder.rustc_lib_paths(target_compiler);
+        dylib_paths.push(builder.sysroot_target_libdir(target_compiler, target_compiler.host));
         add_dylib_path(dylib_paths, &mut cmd);
         cmd
     }
 }
 
-impl Step for ErrorIndex {
+impl CommandLineStep for ErrorIndex {
     type Output = ToolBuildResult;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -614,16 +624,27 @@ impl Step for ErrorIndex {
         // src/tools/error-index-generator` which almost nobody does.
         // Normally, `x.py test` or `x.py doc` will use the
         // `ErrorIndex::command` function instead.
-        let compiler = run.builder.compiler(run.builder.top_stage, run.builder.config.host_target);
-        run.builder.ensure(ErrorIndex { compiler });
+        run.builder.ensure(ErrorIndex {
+            compilers: RustcPrivateCompilers::new(
+                run.builder,
+                run.builder.top_stage,
+                run.builder.host_target,
+            ),
+        });
     }
 
     fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
+        builder.require_submodule(
+            "src/doc/reference",
+            Some("error_index_generator requires mdbook-spec"),
+        );
+        builder
+            .require_submodule("src/doc/book", Some("error_index_generator requires mdbook-trpl"));
         builder.ensure(ToolBuild {
-            compiler: self.compiler,
-            target: self.compiler.host,
+            build_compiler: self.compilers.build_compiler,
+            target: self.compilers.target(),
             tool: "error_index_generator",
-            mode: Mode::ToolRustc,
+            mode: Mode::ToolRustcPrivate,
             path: "src/tools/error_index_generator",
             source_type: SourceType::InTree,
             extra_features: Vec::new(),
@@ -632,15 +653,22 @@ impl Step for ErrorIndex {
             artifact_kind: ToolArtifactKind::Binary,
         })
     }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(
+            StepMetadata::build("error-index", self.compilers.target())
+                .built_by(self.compilers.build_compiler),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RemoteTestServer {
-    pub compiler: Compiler,
+    pub build_compiler: Compiler,
     pub target: TargetSelection,
 }
 
-impl Step for RemoteTestServer {
+impl CommandLineStep for RemoteTestServer {
     type Output = ToolBuildResult;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -649,17 +677,20 @@ impl Step for RemoteTestServer {
 
     fn make_run(run: RunConfig<'_>) {
         run.builder.ensure(RemoteTestServer {
-            compiler: run.builder.compiler(run.builder.top_stage, run.builder.config.host_target),
+            build_compiler: get_tool_target_compiler(
+                run.builder,
+                ToolTargetBuildMode::Build(run.target),
+            ),
             target: run.target,
         });
     }
 
     fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
         builder.ensure(ToolBuild {
-            compiler: self.compiler,
+            build_compiler: self.build_compiler,
             target: self.target,
             tool: "remote-test-server",
-            mode: Mode::ToolStd,
+            mode: Mode::ToolTarget,
             path: "src/tools/remote-test-server",
             source_type: SourceType::InTree,
             extra_features: Vec::new(),
@@ -668,45 +699,57 @@ impl Step for RemoteTestServer {
             artifact_kind: ToolArtifactKind::Binary,
         })
     }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::build("remote-test-server", self.target).built_by(self.build_compiler))
+    }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
+/// Represents `Rustdoc` that either comes from the external stage0 sysroot or that is built
+/// locally.
+/// Rustdoc is special, because it both essentially corresponds to a `Compiler` (that can be
+/// externally provided), but also to a `ToolRustcPrivate` tool.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Rustdoc {
-    /// This should only ever be 0 or 2.
-    /// We sometimes want to reference the "bootstrap" rustdoc, which is why this option is here.
-    pub compiler: Compiler,
+    /// If the stage of `target_compiler` is `0`, then rustdoc is externally provided.
+    /// Otherwise it is built locally.
+    pub target_compiler: Compiler,
 }
 
-impl Step for Rustdoc {
-    type Output = ToolBuildResult;
-    const DEFAULT: bool = true;
-    const ONLY_HOSTS: bool = true;
+impl CommandLineStep for Rustdoc {
+    /// Path to the built rustdoc binary.
+    type Output = PathBuf;
+
+    const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("src/tools/rustdoc").path("src/librustdoc")
+        run.multi_path(&["src/tools/rustdoc", "src/librustdoc"])
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder
-            .ensure(Rustdoc { compiler: run.builder.compiler(run.builder.top_stage, run.target) });
+        run.builder.ensure(Rustdoc {
+            target_compiler: run.builder.compiler(run.builder.top_stage, run.target),
+        });
     }
 
-    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
-        let target_compiler = self.compiler;
+    fn run(self, builder: &Builder<'_>) -> Self::Output {
+        let target_compiler = self.target_compiler;
         let target = target_compiler.host;
 
+        // If stage is 0, we use a prebuilt rustdoc from stage0
         if target_compiler.stage == 0 {
             if !target_compiler.is_snapshot(builder) {
                 panic!("rustdoc in stage 0 must be snapshot rustdoc");
             }
 
-            return ToolBuildResult {
-                tool_path: builder.initial_rustdoc.clone(),
-                build_compiler: target_compiler,
-                target_compiler,
-            };
+            return builder.initial_rustdoc.clone();
         }
 
+        // If stage is higher, we build rustdoc instead
         let bin_rustdoc = || {
             let sysroot = builder.sysroot(target_compiler);
             let bindir = sysroot.join("bin");
@@ -718,10 +761,7 @@ impl Step for Rustdoc {
 
         // If CI rustc is enabled and we haven't modified the rustdoc sources,
         // use the precompiled rustdoc from CI rustc's sysroot to speed up bootstrapping.
-        if builder.download_rustc()
-            && target_compiler.stage > 0
-            && builder.rust_info().is_managed_git_subrepository()
-        {
+        if builder.download_rustc() && builder.rust_info().is_managed_git_subrepository() {
             let files_to_track = &["src/librustdoc", "src/tools/rustdoc", "src/rustdoc-json-types"];
 
             // Check if unchanged
@@ -734,12 +774,7 @@ impl Step for Rustdoc {
 
                 let bin_rustdoc = bin_rustdoc();
                 builder.copy_link(&precompiled_rustdoc, &bin_rustdoc, FileType::Executable);
-
-                return ToolBuildResult {
-                    tool_path: bin_rustdoc,
-                    build_compiler: target_compiler,
-                    target_compiler,
-                };
+                return bin_rustdoc;
             }
         }
 
@@ -749,134 +784,168 @@ impl Step for Rustdoc {
         // they'll be linked to those libraries). As such, don't explicitly `ensure` any additional
         // libraries here. The intuition here is that If we've built a compiler, we should be able
         // to build rustdoc.
-        //
         let mut extra_features = Vec::new();
-        if builder.config.jemalloc(target) {
-            extra_features.push("jemalloc".to_string());
+        if !builder.config.rust_debug_logging {
+            extra_features.push("max_level_info".to_string())
         }
 
-        let ToolBuildResult { tool_path, build_compiler, target_compiler } =
-            builder.ensure(ToolBuild {
-                compiler: target_compiler,
+        let compilers = RustcPrivateCompilers::from_target_compiler(builder, target_compiler);
+        let tool_path = builder
+            .ensure(ToolBuild {
+                build_compiler: compilers.build_compiler,
                 target,
                 // Cargo adds a number of paths to the dylib search path on windows, which results in
                 // the wrong rustdoc being executed. To avoid the conflicting rustdocs, we name the "tool"
                 // rustdoc a different name.
-                tool: "rustdoc_tool_binary",
-                mode: Mode::ToolRustc,
+                tool: "rustdoc-tool-binary",
+                mode: Mode::ToolRustcPrivate,
                 path: "src/tools/rustdoc",
                 source_type: SourceType::InTree,
                 extra_features,
                 allow_features: "",
                 cargo_args: Vec::new(),
                 artifact_kind: ToolArtifactKind::Binary,
-            });
+            })
+            .tool_path;
 
-        // don't create a stage0-sysroot/bin directory.
-        if target_compiler.stage > 0 {
-            if builder.config.rust_debuginfo_level_tools == DebuginfoLevel::None {
-                // Due to LTO a lot of debug info from C++ dependencies such as jemalloc can make it into
-                // our final binaries
-                compile::strip_debug(builder, target, &tool_path);
-            }
-            let bin_rustdoc = bin_rustdoc();
-            builder.copy_link(&tool_path, &bin_rustdoc, FileType::Executable);
-            ToolBuildResult { tool_path: bin_rustdoc, build_compiler, target_compiler }
-        } else {
-            ToolBuildResult { tool_path, build_compiler, target_compiler }
+        if builder.config.rust_debuginfo_level_tools == DebuginfoLevel::None {
+            // Due to LTO a lot of debug info from C++ dependencies such as jemalloc can make it into
+            // our final binaries
+            compile::strip_debug(builder, target, &tool_path);
         }
+        let bin_rustdoc = bin_rustdoc();
+        builder.copy_link(&tool_path, &bin_rustdoc, FileType::Executable);
+        bin_rustdoc
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
         Some(
-            StepMetadata::build("rustdoc", self.compiler.host)
-                // rustdoc is ToolRustc, so stage N rustdoc is built by stage N-1 rustc
-                // FIXME: make this stage deduction automatic somehow
-                // FIXME: log the compiler that actually built ToolRustc steps
-                .stage(self.compiler.stage.saturating_sub(1)),
+            StepMetadata::build("rustdoc", self.target_compiler.host)
+                .stage(self.target_compiler.stage),
         )
     }
 }
 
+/// Builds the cargo tool.
+/// Note that it can be built using a stable compiler.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Cargo {
-    pub compiler: Compiler,
-    pub target: TargetSelection,
+    build_compiler: Compiler,
+    target: TargetSelection,
 }
 
-impl Step for Cargo {
+impl Cargo {
+    /// Returns `Cargo` that will be **compiled** by the passed compiler, for the given
+    /// `target`.
+    pub fn from_build_compiler(build_compiler: Compiler, target: TargetSelection) -> Self {
+        Self { build_compiler, target }
+    }
+}
+
+impl CommandLineStep for Cargo {
     type Output = ToolBuildResult;
-    const DEFAULT: bool = true;
-    const ONLY_HOSTS: bool = true;
+    const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/tools/cargo").default_condition(builder.tool_enabled("cargo"))
+        run.path("src/tools/cargo")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.tool_enabled("cargo")
     }
 
     fn make_run(run: RunConfig<'_>) {
         run.builder.ensure(Cargo {
-            compiler: run.builder.compiler(run.builder.top_stage, run.builder.config.host_target),
+            build_compiler: get_tool_target_compiler(
+                run.builder,
+                ToolTargetBuildMode::Build(run.target),
+            ),
             target: run.target,
         });
     }
 
     fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
-        builder.build.require_submodule("src/tools/cargo", None);
+        builder.sess.require_submodule("src/tools/cargo", None);
+
+        builder.std(self.build_compiler, builder.host_target);
+        builder.std(self.build_compiler, self.target);
 
         builder.ensure(ToolBuild {
-            compiler: self.compiler,
+            build_compiler: self.build_compiler,
             target: self.target,
             tool: "cargo",
-            mode: Mode::ToolRustc,
+            mode: Mode::ToolTarget,
             path: "src/tools/cargo",
             source_type: SourceType::Submodule,
             extra_features: Vec::new(),
-            allow_features: "",
+            // Cargo is compilable with a stable compiler, but since we run in bootstrap,
+            // with RUSTC_BOOTSTRAP being set, some "clever" build scripts enable specialization
+            // based on this, which breaks stuff. We thus have to explicitly allow these features
+            // here.
+            allow_features: "min_specialization,specialization",
             cargo_args: Vec::new(),
             artifact_kind: ToolArtifactKind::Binary,
         })
     }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::build("cargo", self.target).built_by(self.build_compiler))
+    }
+}
+
+/// Represents a built LldWrapper, the `lld-wrapper` tool itself, and a directory
+/// containing a build of LLD.
+#[derive(Clone)]
+pub struct BuiltLldWrapper {
+    tool: ToolBuildResult,
+    lld_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct LldWrapper {
     pub build_compiler: Compiler,
-    pub target_compiler: Compiler,
+    pub target: TargetSelection,
 }
 
-impl Step for LldWrapper {
-    type Output = ToolBuildResult;
+impl LldWrapper {
+    /// Returns `LldWrapper` that should be **used** by the passed compiler.
+    pub fn for_use_by_compiler(builder: &Builder<'_>, target_compiler: Compiler) -> Self {
+        Self {
+            build_compiler: get_tool_target_compiler(
+                builder,
+                ToolTargetBuildMode::Dist(target_compiler),
+            ),
+            target: target_compiler.host,
+        }
+    }
+}
+
+impl CommandLineStep for LldWrapper {
+    type Output = BuiltLldWrapper;
+
+    const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
+        run.path("src/tools/lld-wrapper")
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        instrument(
-            level = "debug",
-            name = "LldWrapper::run",
-            skip_all,
-            fields(build_compiler = ?self.build_compiler, target_compiler = ?self.target_compiler),
-        ),
-    )]
-    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
-        if builder.config.dry_run() {
-            return ToolBuildResult {
-                tool_path: Default::default(),
-                build_compiler: self.build_compiler,
-                target_compiler: self.target_compiler,
-            };
-        }
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(LldWrapper {
+            build_compiler: get_tool_target_compiler(
+                run.builder,
+                ToolTargetBuildMode::Build(run.target),
+            ),
+            target: run.target,
+        });
+    }
 
-        let target = self.target_compiler.host;
-
-        let tool_result = builder.ensure(ToolBuild {
-            compiler: self.build_compiler,
-            target,
+    fn run(self, builder: &Builder<'_>) -> Self::Output {
+        let lld_dir = builder.ensure(llvm::Lld { target: self.target });
+        let tool = builder.ensure(ToolBuild {
+            build_compiler: self.build_compiler,
+            target: self.target,
             tool: "lld-wrapper",
-            mode: Mode::ToolStd,
+            mode: Mode::ToolTarget,
             path: "src/tools/lld-wrapper",
             source_type: SourceType::InTree,
             extra_features: Vec::new(),
@@ -884,74 +953,145 @@ impl Step for LldWrapper {
             cargo_args: Vec::new(),
             artifact_kind: ToolArtifactKind::Binary,
         });
-
-        let libdir_bin = builder.sysroot_target_bindir(self.target_compiler, target);
-        t!(fs::create_dir_all(&libdir_bin));
-
-        let lld_install = builder.ensure(llvm::Lld { target });
-        let src_exe = exe("lld", target);
-        let dst_exe = exe("rust-lld", target);
-
-        builder.copy_link(
-            &lld_install.join("bin").join(src_exe),
-            &libdir_bin.join(dst_exe),
-            FileType::Executable,
-        );
-        let self_contained_lld_dir = libdir_bin.join("gcc-ld");
-        t!(fs::create_dir_all(&self_contained_lld_dir));
-
-        for name in crate::LLD_FILE_NAMES {
-            builder.copy_link(
-                &tool_result.tool_path,
-                &self_contained_lld_dir.join(exe(name, target)),
-                FileType::Executable,
-            );
-        }
-
-        tool_result
+        BuiltLldWrapper { tool, lld_dir }
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
-        Some(
-            StepMetadata::build("LldWrapper", self.target_compiler.host)
-                .built_by(self.build_compiler),
-        )
+        Some(StepMetadata::build("LldWrapper", self.target).built_by(self.build_compiler))
     }
 }
 
+pub(crate) fn copy_lld_artifacts(
+    builder: &Builder<'_>,
+    lld_wrapper: BuiltLldWrapper,
+    target_compiler: Compiler,
+) {
+    let target = target_compiler.host;
+
+    let libdir_bin = builder.sysroot_target_bindir(target_compiler, target);
+    t!(fs::create_dir_all(&libdir_bin));
+
+    let src_exe = exe("lld", target);
+    let dst_exe = exe("rust-lld", target);
+
+    builder.copy_link(
+        &lld_wrapper.lld_dir.join("bin").join(src_exe),
+        &libdir_bin.join(dst_exe),
+        FileType::Executable,
+    );
+    let self_contained_lld_dir = libdir_bin.join("gcc-ld");
+    t!(fs::create_dir_all(&self_contained_lld_dir));
+
+    for name in LLD_FILE_NAMES {
+        builder.copy_link(
+            &lld_wrapper.tool.tool_path,
+            &self_contained_lld_dir.join(exe(name, target)),
+            FileType::Executable,
+        );
+    }
+}
+
+/// Builds the `wasm-component-ld` linker wrapper, which is shipped with rustc to be executed on the
+/// host platform where rustc runs.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct RustAnalyzer {
-    pub compiler: Compiler,
-    pub target: TargetSelection,
+pub struct WasmComponentLd {
+    build_compiler: Compiler,
+    target: TargetSelection,
 }
 
-impl RustAnalyzer {
-    pub const ALLOW_FEATURES: &'static str = "rustc_private,proc_macro_internals,proc_macro_diagnostic,proc_macro_span,proc_macro_span_shrink,proc_macro_def_site";
+impl WasmComponentLd {
+    /// Returns `WasmComponentLd` that should be **used** by the passed compiler.
+    pub fn for_use_by_compiler(builder: &Builder<'_>, target_compiler: Compiler) -> Self {
+        Self {
+            build_compiler: get_tool_target_compiler(
+                builder,
+                ToolTargetBuildMode::Dist(target_compiler),
+            ),
+            target: target_compiler.host,
+        }
+    }
 }
 
-impl Step for RustAnalyzer {
+impl CommandLineStep for WasmComponentLd {
     type Output = ToolBuildResult;
-    const DEFAULT: bool = true;
-    const ONLY_HOSTS: bool = true;
+
+    const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
-        run.path("src/tools/rust-analyzer").default_condition(builder.tool_enabled("rust-analyzer"))
+        run.path("src/tools/wasm-component-ld")
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(RustAnalyzer {
-            compiler: run.builder.compiler(run.builder.top_stage, run.builder.config.host_target),
+        run.builder.ensure(WasmComponentLd {
+            build_compiler: get_tool_target_compiler(
+                run.builder,
+                ToolTargetBuildMode::Build(run.target),
+            ),
             target: run.target,
         });
     }
 
     fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
         builder.ensure(ToolBuild {
-            compiler: self.compiler,
+            build_compiler: self.build_compiler,
             target: self.target,
+            tool: "wasm-component-ld",
+            mode: Mode::ToolTarget,
+            path: "src/tools/wasm-component-ld",
+            source_type: SourceType::InTree,
+            extra_features: vec![],
+            allow_features: "",
+            cargo_args: vec![],
+            artifact_kind: ToolArtifactKind::Binary,
+        })
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::build("WasmComponentLd", self.target).built_by(self.build_compiler))
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct RustAnalyzer {
+    compilers: RustcPrivateCompilers,
+}
+
+impl RustAnalyzer {
+    pub fn from_compilers(compilers: RustcPrivateCompilers) -> Self {
+        Self { compilers }
+    }
+}
+
+impl RustAnalyzer {
+    pub const ALLOW_FEATURES: &'static str = "rustc_private,proc_macro_internals,proc_macro_diagnostic,proc_macro_span,proc_macro_span_shrink,proc_macro_def_site,new_zeroed_alloc";
+}
+
+impl CommandLineStep for RustAnalyzer {
+    type Output = ToolBuildResult;
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.path("src/tools/rust-analyzer")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.tool_enabled("rust-analyzer")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(RustAnalyzer {
+            compilers: RustcPrivateCompilers::new(run.builder, run.builder.top_stage, run.target),
+        });
+    }
+
+    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
+        let build_compiler = self.compilers.build_compiler;
+        let target = self.compilers.target();
+        builder.ensure(ToolBuild {
+            build_compiler,
+            target,
             tool: "rust-analyzer",
-            mode: Mode::ToolRustc,
+            mode: Mode::ToolRustcPrivate,
             path: "src/tools/rust-analyzer",
             extra_features: vec!["in-rust-tree".to_owned()],
             source_type: SourceType::InTree,
@@ -960,43 +1100,56 @@ impl Step for RustAnalyzer {
             artifact_kind: ToolArtifactKind::Binary,
         })
     }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(
+            StepMetadata::build("rust-analyzer", self.compilers.target())
+                .built_by(self.compilers.build_compiler),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RustAnalyzerProcMacroSrv {
-    pub compiler: Compiler,
-    pub target: TargetSelection,
+    compilers: RustcPrivateCompilers,
 }
 
-impl Step for RustAnalyzerProcMacroSrv {
-    type Output = Option<ToolBuildResult>;
-    const DEFAULT: bool = true;
-    const ONLY_HOSTS: bool = true;
+impl RustAnalyzerProcMacroSrv {
+    pub fn from_compilers(compilers: RustcPrivateCompilers) -> Self {
+        Self { compilers }
+    }
+}
+
+impl CommandLineStep for RustAnalyzerProcMacroSrv {
+    type Output = ToolBuildResult;
+    const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
         // Allow building `rust-analyzer-proc-macro-srv` both as part of the `rust-analyzer` and as a stand-alone tool.
-        run.path("src/tools/rust-analyzer")
-            .path("src/tools/rust-analyzer/crates/proc-macro-srv-cli")
-            .default_condition(
-                builder.tool_enabled("rust-analyzer")
-                    || builder.tool_enabled("rust-analyzer-proc-macro-srv"),
-            )
+        // FIXME(Zalathar): Should we stop registering "src/tools/rust-analyzer" here?
+        run.path("src/tools/rust-analyzer").path_with_alias(
+            "src/tools/rust-analyzer/crates/proc-macro-srv-cli",
+            "rust-analyzer-proc-macro-srv",
+        )
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.tool_enabled("rust-analyzer")
+            || builder.tool_enabled("rust-analyzer-proc-macro-srv")
     }
 
     fn make_run(run: RunConfig<'_>) {
         run.builder.ensure(RustAnalyzerProcMacroSrv {
-            compiler: run.builder.compiler(run.builder.top_stage, run.builder.config.host_target),
-            target: run.target,
+            compilers: RustcPrivateCompilers::new(run.builder, run.builder.top_stage, run.target),
         });
     }
 
-    fn run(self, builder: &Builder<'_>) -> Option<ToolBuildResult> {
+    fn run(self, builder: &Builder<'_>) -> Self::Output {
         let tool_result = builder.ensure(ToolBuild {
-            compiler: self.compiler,
-            target: self.target,
+            build_compiler: self.compilers.build_compiler,
+            target: self.compilers.target(),
             tool: "rust-analyzer-proc-macro-srv",
-            mode: Mode::ToolRustc,
+            mode: Mode::ToolRustcPrivate,
             path: "src/tools/rust-analyzer/crates/proc-macro-srv-cli",
             extra_features: vec!["in-rust-tree".to_owned()],
             source_type: SourceType::InTree,
@@ -1007,7 +1160,7 @@ impl Step for RustAnalyzerProcMacroSrv {
 
         // Copy `rust-analyzer-proc-macro-srv` to `<sysroot>/libexec/`
         // so that r-a can use it.
-        let libexec_path = builder.sysroot(self.compiler).join("libexec");
+        let libexec_path = builder.sysroot(self.compilers.target_compiler).join("libexec");
         t!(fs::create_dir_all(&libexec_path));
         builder.copy_link(
             &tool_result.tool_path,
@@ -1015,46 +1168,75 @@ impl Step for RustAnalyzerProcMacroSrv {
             FileType::Executable,
         );
 
-        Some(tool_result)
+        tool_result
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(
+            StepMetadata::build("rust-analyzer-proc-macro-srv", self.compilers.target())
+                .built_by(self.compilers.build_compiler),
+        )
     }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct LlvmBitcodeLinker {
-    pub build_compiler: Compiler,
-    pub target: TargetSelection,
+    build_compiler: Compiler,
+    target: TargetSelection,
 }
 
-impl Step for LlvmBitcodeLinker {
+impl LlvmBitcodeLinker {
+    /// Returns `LlvmBitcodeLinker` that will be **compiled** by the passed compiler, for the given
+    /// `target`.
+    pub fn from_build_compiler(build_compiler: Compiler, target: TargetSelection) -> Self {
+        Self { build_compiler, target }
+    }
+
+    /// Returns `LlvmBitcodeLinker` that should be **used** by the passed compiler.
+    pub fn from_target_compiler(builder: &Builder<'_>, target_compiler: Compiler) -> Self {
+        Self {
+            build_compiler: get_tool_target_compiler(
+                builder,
+                ToolTargetBuildMode::Dist(target_compiler),
+            ),
+            target: target_compiler.host,
+        }
+    }
+
+    /// Return a compiler that is able to build this tool for the given `target`.
+    pub fn get_build_compiler_for_target(
+        builder: &Builder<'_>,
+        target: TargetSelection,
+    ) -> Compiler {
+        get_tool_target_compiler(builder, ToolTargetBuildMode::Build(target))
+    }
+}
+
+impl CommandLineStep for LlvmBitcodeLinker {
     type Output = ToolBuildResult;
-    const DEFAULT: bool = true;
-    const ONLY_HOSTS: bool = true;
+    const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let builder = run.builder;
         run.path("src/tools/llvm-bitcode-linker")
-            .default_condition(builder.tool_enabled("llvm-bitcode-linker"))
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.tool_enabled("llvm-bitcode-linker")
     }
 
     fn make_run(run: RunConfig<'_>) {
         run.builder.ensure(LlvmBitcodeLinker {
-            build_compiler: run
-                .builder
-                .compiler(run.builder.top_stage, run.builder.config.host_target),
+            build_compiler: Self::get_build_compiler_for_target(run.builder, run.target),
             target: run.target,
         });
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        instrument(level = "debug", name = "LlvmBitcodeLinker::run", skip_all)
-    )]
     fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
         builder.ensure(ToolBuild {
-            compiler: self.build_compiler,
+            build_compiler: self.build_compiler,
             target: self.target,
             tool: "llvm-bitcode-linker",
-            mode: Mode::ToolRustc,
+            mode: Mode::ToolTarget,
             path: "src/tools/llvm-bitcode-linker",
             source_type: SourceType::InTree,
             extra_features: vec![],
@@ -1083,12 +1265,6 @@ pub enum LibcxxVersion {
 
 impl Step for LibcxxVersionTool {
     type Output = LibcxxVersion;
-    const DEFAULT: bool = false;
-    const ONLY_HOSTS: bool = true;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
 
     fn run(self, builder: &Builder<'_>) -> LibcxxVersion {
         let out_dir = builder.out.join(self.target.to_string()).join("libcxx-version");
@@ -1132,128 +1308,258 @@ impl Step for LibcxxVersionTool {
     }
 }
 
-macro_rules! tool_extended {
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct BuildManifest {
+    compiler: Compiler,
+    target: TargetSelection,
+}
+
+impl BuildManifest {
+    pub fn new(builder: &Builder<'_>, target: TargetSelection) -> Self {
+        BuildManifest { compiler: builder.compiler(1, builder.config.host_target), target }
+    }
+}
+
+impl CommandLineStep for BuildManifest {
+    type Output = ToolBuildResult;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.path("src/tools/build-manifest")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(BuildManifest::new(run.builder, run.target));
+    }
+
+    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
+        // Building with the beta compiler will produce a broken build-manifest that doesn't support
+        // recently stabilized targets/hosts.
+        assert!(self.compiler.stage != 0);
+        builder.ensure(ToolBuild {
+            build_compiler: self.compiler,
+            target: self.target,
+            tool: "build-manifest",
+            mode: Mode::ToolStd,
+            path: "src/tools/build-manifest",
+            source_type: SourceType::InTree,
+            extra_features: vec![],
+            allow_features: "",
+            cargo_args: vec![],
+            artifact_kind: ToolArtifactKind::Binary,
+        })
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::build("build-manifest", self.target).built_by(self.compiler))
+    }
+}
+
+/// Represents which compilers are involved in the compilation of a tool
+/// that depends on compiler internals (`rustc_private`).
+/// Their compilation looks like this:
+///
+/// - `build_compiler` (stage N-1) builds `target_compiler` (stage N) to produce .rlibs
+///     - These .rlibs are copied into the sysroot of `build_compiler`
+/// - `build_compiler` (stage N-1) builds `<tool>` (stage N)
+///     - `<tool>` links to .rlibs from `target_compiler`
+///
+/// Eventually, this could also be used for .rmetas and check builds, but so far we only deal with
+/// normal builds here.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct RustcPrivateCompilers {
+    /// Compiler that builds the tool and that builds `target_compiler`.
+    build_compiler: Compiler,
+    /// Compiler to which .rlib artifacts the tool links to.
+    /// The host target of this compiler corresponds to the target of the tool.
+    target_compiler: Compiler,
+}
+
+impl RustcPrivateCompilers {
+    /// Create compilers for a `rustc_private` tool with the given `stage` and for the given
+    /// `target`.
+    pub fn new(builder: &Builder<'_>, stage: u32, target: TargetSelection) -> Self {
+        let build_compiler = Self::build_compiler_from_stage(builder, stage);
+
+        // This is the compiler we'll link to
+        // FIXME: make 100% sure that `target_compiler` was indeed built with `build_compiler`...
+        let target_compiler = builder.compiler(build_compiler.stage + 1, target);
+
+        Self { build_compiler, target_compiler }
+    }
+
+    pub fn from_build_and_target_compiler(
+        build_compiler: Compiler,
+        target_compiler: Compiler,
+    ) -> Self {
+        Self { build_compiler, target_compiler }
+    }
+
+    /// Create rustc tool compilers from the build compiler.
+    pub fn from_build_compiler(
+        builder: &Builder<'_>,
+        build_compiler: Compiler,
+        target: TargetSelection,
+    ) -> Self {
+        let target_compiler = builder.compiler(build_compiler.stage + 1, target);
+        Self { build_compiler, target_compiler }
+    }
+
+    /// Create rustc tool compilers from the target compiler.
+    pub fn from_target_compiler(builder: &Builder<'_>, target_compiler: Compiler) -> Self {
+        Self {
+            build_compiler: Self::build_compiler_from_stage(builder, target_compiler.stage),
+            target_compiler,
+        }
+    }
+
+    fn build_compiler_from_stage(builder: &Builder<'_>, stage: u32) -> Compiler {
+        assert!(stage > 0);
+
+        if builder.download_rustc() && stage == 1 {
+            // We shouldn't drop to stage0 compiler when using CI rustc.
+            builder.compiler(1, builder.config.host_target)
+        } else {
+            builder.compiler(stage - 1, builder.config.host_target)
+        }
+    }
+
+    pub fn build_compiler(&self) -> Compiler {
+        self.build_compiler
+    }
+
+    pub fn target_compiler(&self) -> Compiler {
+        self.target_compiler
+    }
+
+    /// Target of the tool being compiled
+    pub fn target(&self) -> TargetSelection {
+        self.target_compiler.host
+    }
+}
+
+/// Creates a step that builds an extended `Mode::ToolRustcPrivate` tool
+/// and installs it into the sysroot of a corresponding compiler.
+macro_rules! tool_rustc_extended {
     (
         $name:ident {
             path: $path:expr,
             tool_name: $tool_name:expr,
             stable: $stable:expr
             $( , add_bins_to_sysroot: $add_bins_to_sysroot:expr )?
-            $( , add_features: $add_features:expr )?
             $( , cargo_args: $cargo_args:expr )?
             $( , )?
         }
     ) => {
         #[derive(Debug, Clone, Hash, PartialEq, Eq)]
         pub struct $name {
-            pub compiler: Compiler,
-            pub target: TargetSelection,
+            compilers: RustcPrivateCompilers,
         }
 
-        impl Step for $name {
+        impl $name {
+            pub fn from_compilers(compilers: RustcPrivateCompilers) -> Self {
+                Self {
+                    compilers,
+                }
+            }
+        }
+
+        impl CommandLineStep for $name {
             type Output = ToolBuildResult;
-            const DEFAULT: bool = true; // Overridden by `should_run_tool_build_step`
-            const ONLY_HOSTS: bool = true;
+            const IS_HOST: bool = true;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-                should_run_tool_build_step(
+                should_run_extended_rustc_tool(
                     run,
-                    $tool_name,
                     $path,
+                )
+            }
+
+            fn is_default_step(builder: &Builder<'_>) -> bool {
+                extended_rustc_tool_is_default_step(
+                    builder,
+                    $tool_name,
                     $stable,
                 )
             }
 
             fn make_run(run: RunConfig<'_>) {
                 run.builder.ensure($name {
-                    compiler: run.builder.compiler(run.builder.top_stage, run.builder.config.host_target),
-                    target: run.target,
+                    compilers: RustcPrivateCompilers::new(run.builder, run.builder.top_stage, run.target),
                 });
             }
 
             fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
-                let Self { compiler, target } = self;
-                run_tool_build_step(
+                let Self { compilers } = self;
+                build_extended_rustc_tool(
                     builder,
-                    compiler,
-                    target,
+                    compilers,
                     $tool_name,
                     $path,
                     None $( .or(Some(&$add_bins_to_sysroot)) )?,
-                    None $( .or(Some($add_features)) )?,
                     None $( .or(Some($cargo_args)) )?,
                 )
             }
 
             fn metadata(&self) -> Option<StepMetadata> {
-                // FIXME: refactor extended tool steps to make the build_compiler explicit,
-                // it is offset by one now for rustc tools
                 Some(
-                    StepMetadata::build($tool_name, self.target)
-                        .built_by(self.compiler.with_stage(self.compiler.stage.saturating_sub(1)))
+                    StepMetadata::build($tool_name, self.compilers.target())
+                        .built_by(self.compilers.build_compiler)
                 )
             }
         }
     }
 }
 
-fn should_run_tool_build_step<'a>(
-    run: ShouldRun<'a>,
-    tool_name: &'static str,
-    path: &'static str,
-    stable: bool,
-) -> ShouldRun<'a> {
-    let builder = run.builder;
-    run.path(path).default_condition(
-        builder.config.extended
-            && builder.config.tools.as_ref().map_or(
-                // By default, on nightly/dev enable all tools, else only
-                // build stable tools.
-                stable || builder.build.unstable_features(),
-                // If `tools` is set, search list for this tool.
-                |tools| {
-                    tools.iter().any(|tool| match tool.as_ref() {
-                        "clippy" => tool_name == "clippy-driver",
-                        x => tool_name == x,
-                    })
-                },
-            ),
-    )
+fn should_run_extended_rustc_tool<'a>(run: ShouldRun<'a>, path: &'static str) -> ShouldRun<'a> {
+    run.path(path)
 }
 
-#[expect(clippy::too_many_arguments)] // silence overeager clippy lint
-fn run_tool_build_step(
+fn extended_rustc_tool_is_default_step(
     builder: &Builder<'_>,
-    compiler: Compiler,
-    target: TargetSelection,
+    tool_name: &'static str,
+    stable: bool,
+) -> bool {
+    builder.config.extended
+        && builder.config.tools.as_ref().map_or(
+            // By default, on nightly/dev enable all tools, else only
+            // build stable tools.
+            stable || builder.sess.unstable_features(),
+            // If `tools` is set, search list for this tool.
+            |tools| {
+                tools.iter().any(|tool| match tool.as_ref() {
+                    "clippy" => tool_name == "clippy-driver",
+                    x => tool_name == x,
+                })
+            },
+        )
+}
+
+fn build_extended_rustc_tool(
+    builder: &Builder<'_>,
+    compilers: RustcPrivateCompilers,
     tool_name: &'static str,
     path: &'static str,
     add_bins_to_sysroot: Option<&[&str]>,
-    add_features: Option<fn(&Builder<'_>, TargetSelection, &mut Vec<String>)>,
     cargo_args: Option<&[&'static str]>,
 ) -> ToolBuildResult {
-    let mut extra_features = Vec::new();
-    if let Some(func) = add_features {
-        func(builder, target, &mut extra_features);
-    }
+    let target = compilers.target();
+    let build_compiler = compilers.build_compiler;
+    let ToolBuildResult { tool_path, artifacts, .. } = builder.ensure(ToolBuild {
+        build_compiler,
+        target,
+        tool: tool_name,
+        mode: Mode::ToolRustcPrivate,
+        path,
+        extra_features: Vec::new(),
+        source_type: SourceType::InTree,
+        allow_features: "",
+        cargo_args: cargo_args.unwrap_or_default().iter().map(|s| String::from(*s)).collect(),
+        artifact_kind: ToolArtifactKind::Binary,
+    });
 
-    let ToolBuildResult { tool_path, build_compiler, target_compiler } =
-        builder.ensure(ToolBuild {
-            compiler,
-            target,
-            tool: tool_name,
-            mode: Mode::ToolRustc,
-            path,
-            extra_features,
-            source_type: SourceType::InTree,
-            allow_features: "",
-            cargo_args: cargo_args.unwrap_or_default().iter().map(|s| String::from(*s)).collect(),
-            artifact_kind: ToolArtifactKind::Binary,
-        });
-
+    let target_compiler = compilers.target_compiler;
     if let Some(add_bins_to_sysroot) = add_bins_to_sysroot
         && !add_bins_to_sysroot.is_empty()
-        && target_compiler.stage > 0
     {
         let bindir = builder.sysroot(target_compiler).join("bin");
         t!(fs::create_dir_all(&bindir));
@@ -1265,36 +1571,31 @@ fn run_tool_build_step(
 
         // Return a path into the bin dir.
         let path = bindir.join(exe(tool_name, target_compiler.host));
-        ToolBuildResult { tool_path: path, build_compiler, target_compiler }
+        ToolBuildResult { tool_path: path, build_compiler, artifacts }
     } else {
-        ToolBuildResult { tool_path, build_compiler, target_compiler }
+        ToolBuildResult { tool_path, build_compiler, artifacts }
     }
 }
 
-tool_extended!(Cargofmt {
+tool_rustc_extended!(Cargofmt {
     path: "src/tools/rustfmt",
     tool_name: "cargo-fmt",
     stable: true,
     add_bins_to_sysroot: ["cargo-fmt"]
 });
-tool_extended!(CargoClippy {
+tool_rustc_extended!(CargoClippy {
     path: "src/tools/clippy",
     tool_name: "cargo-clippy",
     stable: true,
     add_bins_to_sysroot: ["cargo-clippy"]
 });
-tool_extended!(Clippy {
+tool_rustc_extended!(Clippy {
     path: "src/tools/clippy",
     tool_name: "clippy-driver",
     stable: true,
-    add_bins_to_sysroot: ["clippy-driver"],
-    add_features: |builder, target, features| {
-        if builder.config.jemalloc(target) {
-            features.push("jemalloc".to_string());
-        }
-    }
+    add_bins_to_sysroot: ["clippy-driver"]
 });
-tool_extended!(Miri {
+tool_rustc_extended!(Miri {
     path: "src/tools/miri",
     tool_name: "miri",
     stable: false,
@@ -1302,60 +1603,27 @@ tool_extended!(Miri {
     // Always compile also tests when building miri. Otherwise feature unification can cause rebuilds between building and testing miri.
     cargo_args: &["--all-targets"],
 });
-tool_extended!(CargoMiri {
+tool_rustc_extended!(CargoMiri {
     path: "src/tools/miri/cargo-miri",
     tool_name: "cargo-miri",
     stable: false,
     add_bins_to_sysroot: ["cargo-miri"]
 });
-tool_extended!(Rustfmt {
+tool_rustc_extended!(Rustfmt {
     path: "src/tools/rustfmt",
     tool_name: "rustfmt",
     stable: true,
     add_bins_to_sysroot: ["rustfmt"]
 });
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TestFloatParse {
-    pub host: TargetSelection,
-}
-
-impl TestFloatParse {
-    pub const ALLOW_FEATURES: &'static str = "f16,cfg_target_has_reliable_f16_f128";
-}
-
-impl Step for TestFloatParse {
-    type Output = ToolBuildResult;
-    const ONLY_HOSTS: bool = true;
-    const DEFAULT: bool = false;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("src/tools/test-float-parse")
-    }
-
-    fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
-        let bootstrap_host = builder.config.host_target;
-        let compiler = builder.compiler(builder.top_stage, bootstrap_host);
-
-        builder.ensure(ToolBuild {
-            compiler,
-            target: bootstrap_host,
-            tool: "test-float-parse",
-            mode: Mode::ToolStd,
-            path: "src/tools/test-float-parse",
-            source_type: SourceType::InTree,
-            extra_features: Vec::new(),
-            allow_features: Self::ALLOW_FEATURES,
-            cargo_args: Vec::new(),
-            artifact_kind: ToolArtifactKind::Binary,
-        })
-    }
-}
+pub const TEST_FLOAT_PARSE_ALLOW_FEATURES: &str = "f16,cfg_target_has_reliable_f16_f128";
 
 impl Builder<'_> {
     /// Gets a `BootstrapCommand` which is ready to run `tool` in `stage` built for
     /// `host`.
-    pub fn tool_cmd(&self, tool: Tool) -> BootstrapCommand {
+    ///
+    /// This also ensures that the given tool is built (using [`ToolBuild`]).
+    pub(crate) fn tool_cmd(&self, tool: Tool) -> BootstrapCommand {
         let mut cmd = command(self.tool_exe(tool));
         let compiler = self.compiler(0, self.config.host_target);
         let host = &compiler.host;
@@ -1363,8 +1631,9 @@ impl Builder<'_> {
         //
         // Notably this munges the dynamic library lookup path to point to the
         // right location to run `compiler`.
-        let mut lib_paths: Vec<PathBuf> =
-            vec![self.cargo_out(compiler, Mode::ToolBootstrap, *host).join("deps")];
+        let mut lib_paths: Vec<PathBuf> = discover_out_dirs_with_dylibs(
+            self.cargo_out(compiler, Mode::ToolBootstrap, *host).join("build"),
+        );
 
         // On MSVC a tool may invoke a C compiler (e.g., compiletest in run-make
         // mode) and that C compiler may need some extra PATH modification. Do
@@ -1391,4 +1660,24 @@ impl Builder<'_> {
 
         cmd
     }
+}
+
+/// Gets all of the `out` dirs in a given Cargo `build-dir/<profile>/build` dir.
+fn discover_out_dirs_with_dylibs(dir: PathBuf) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let read_dir = |path: &Path| path.read_dir().ok().into_iter().flatten().filter_map(Result::ok);
+    let has_dylib = |path: &Path| {
+        read_dir(path)
+            .any(|e| e.path().extension().is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION))
+    };
+    dir.read_dir()
+        .unwrap_or_else(|e| panic!("Couldn't read {}: {}", dir.display(), e))
+        .map(|e| e.unwrap())
+        .flat_map(|e| read_dir(&e.path()))
+        .flat_map(|e| read_dir(&e.path()))
+        .map(|e| e.path())
+        .filter(|path| path.ends_with("out") && has_dylib(path))
+        .collect::<Vec<_>>()
 }

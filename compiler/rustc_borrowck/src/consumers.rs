@@ -17,7 +17,7 @@ pub use super::polonius::legacy::{
     RichLocation, RustcFacts,
 };
 pub use super::region_infer::RegionInferenceContext;
-use crate::{BorrowCheckRootCtxt, do_mir_borrowck};
+use crate::BorrowCheckRootCtxt;
 
 /// Struct used during mir borrowck to collect bodies with facts for a typeck root and all
 /// its nested bodies.
@@ -125,15 +125,13 @@ pub fn get_bodies_with_borrowck_facts(
     root_def_id: LocalDefId,
     options: ConsumerOptions,
 ) -> FxHashMap<LocalDefId, BodyWithBorrowckFacts<'_>> {
-    let mut root_cx =
-        BorrowCheckRootCtxt::new(tcx, root_def_id, Some(BorrowckConsumer::new(options)));
-
-    // See comment in `rustc_borrowck::mir_borrowck`
-    let nested_bodies = tcx.nested_bodies_within(root_def_id);
-    for def_id in nested_bodies {
-        root_cx.get_or_insert_nested(def_id);
-    }
-
-    do_mir_borrowck(&mut root_cx, root_def_id);
+    let tainted_by_errors = Default::default();
+    let mut root_cx = BorrowCheckRootCtxt::new(
+        tcx,
+        root_def_id,
+        Some(BorrowckConsumer::new(options)),
+        &tainted_by_errors,
+    );
+    root_cx.do_mir_borrowck();
     root_cx.consumer.unwrap().bodies
 }

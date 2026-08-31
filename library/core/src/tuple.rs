@@ -1,7 +1,8 @@
 // See core/src/primitive_docs.rs for documentation.
 
+use crate::cell::CloneFromCell;
 use crate::cmp::Ordering::{self, *};
-use crate::marker::{ConstParamTy_, StructuralPartialEq, UnsizedConstParamTy};
+use crate::marker::{ConstParamTy_, StructuralPartialEq};
 use crate::ops::ControlFlow::{self, Break, Continue};
 
 // Recursive macro for implementing n-ary tuple functions and operations
@@ -23,7 +24,8 @@ macro_rules! tuple_impls {
         maybe_tuple_doc! {
             $($T)+ @
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl<$($T: PartialEq),+> PartialEq for ($($T,)+) {
+            #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+            const impl<$($T: [const] PartialEq),+> PartialEq for ($($T,)+) {
                 #[inline]
                 fn eq(&self, other: &($($T,)+)) -> bool {
                     $( ${ignore($T)} self.${index()} == other.${index()} )&&+
@@ -38,21 +40,15 @@ macro_rules! tuple_impls {
         maybe_tuple_doc! {
             $($T)+ @
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl<$($T: Eq),+> Eq for ($($T,)+)
+            #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+            const impl<$($T: [const] Eq),+> Eq for ($($T,)+)
             {}
         }
 
         maybe_tuple_doc! {
             $($T)+ @
-            #[unstable(feature = "adt_const_params", issue = "95174")]
+            #[unstable(feature = "min_adt_const_params", issue = "154042")]
             impl<$($T: ConstParamTy_),+> ConstParamTy_ for ($($T,)+)
-            {}
-        }
-
-        maybe_tuple_doc! {
-            $($T)+ @
-            #[unstable(feature = "unsized_const_params", issue = "95174")]
-            impl<$($T: UnsizedConstParamTy),+> UnsizedConstParamTy for ($($T,)+)
             {}
         }
 
@@ -66,7 +62,8 @@ macro_rules! tuple_impls {
         maybe_tuple_doc! {
             $($T)+ @
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl<$($T: PartialOrd),+> PartialOrd for ($($T,)+)
+            #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+            const impl<$($T: [const] PartialOrd),+> PartialOrd for ($($T,)+)
             {
                 #[inline]
                 fn partial_cmp(&self, other: &($($T,)+)) -> Option<Ordering> {
@@ -110,7 +107,8 @@ macro_rules! tuple_impls {
         maybe_tuple_doc! {
             $($T)+ @
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl<$($T: Ord),+> Ord for ($($T,)+)
+            #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+            const impl<$($T: [const] Ord),+> Ord for ($($T,)+)
             {
                 #[inline]
                 fn cmp(&self, other: &($($T,)+)) -> Ordering {
@@ -122,7 +120,8 @@ macro_rules! tuple_impls {
         maybe_tuple_doc! {
             $($T)+ @
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl<$($T: Default),+> Default for ($($T,)+) {
+            #[rustc_const_unstable(feature = "const_default", issue = "143894")]
+            const impl<$($T: [const] Default),+> Default for ($($T,)+) {
                 #[inline]
                 fn default() -> ($($T,)+) {
                     ($({ let x: $T = Default::default(); x},)+)
@@ -133,6 +132,7 @@ macro_rules! tuple_impls {
         maybe_tuple_doc! {
             $($T)+ @
             #[stable(feature = "array_tuple_conv", since = "1.71.0")]
+            // can't do const From due to https://github.com/rust-lang/rust/issues/144280
             impl<T> From<[T; ${count($T)}]> for ($(${ignore($T)} T,)+) {
                 #[inline]
                 #[allow(non_snake_case)]
@@ -146,6 +146,7 @@ macro_rules! tuple_impls {
         maybe_tuple_doc! {
             $($T)+ @
             #[stable(feature = "array_tuple_conv", since = "1.71.0")]
+            // can't do const From due to https://github.com/rust-lang/rust/issues/144280
             impl<T> From<($(${ignore($T)} T,)+)> for [T; ${count($T)}] {
                 #[inline]
                 #[allow(non_snake_case)]
@@ -154,6 +155,15 @@ macro_rules! tuple_impls {
                     [$($T,)+]
                 }
             }
+        }
+
+        maybe_tuple_doc! {
+            $($T)+ @
+            // SAFETY: tuples introduce no additional indirection, so they can be copied whenever T
+            // can.
+            #[unstable(feature = "cell_get_cloned", issue = "145329")]
+            unsafe impl<$($T: CloneFromCell),+> CloneFromCell for ($($T,)+)
+            {}
         }
     }
 }

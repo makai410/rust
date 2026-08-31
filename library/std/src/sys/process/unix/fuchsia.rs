@@ -2,6 +2,7 @@ use libc::{c_int, size_t};
 
 use super::common::*;
 use crate::num::NonZero;
+use crate::process::StdioPipes;
 use crate::sys::pal::fuchsia::*;
 use crate::{fmt, io, mem, ptr};
 
@@ -153,6 +154,11 @@ impl Process {
     }
 
     pub fn send_signal(&self, _signal: i32) -> io::Result<()> {
+        // Fuchsia doesn't have a direct equivalent for signals
+        unimplemented!()
+    }
+
+    pub fn send_process_group_signal(&self, _signal: i32) -> io::Result<()> {
         // Fuchsia doesn't have a direct equivalent for signals
         unimplemented!()
     }

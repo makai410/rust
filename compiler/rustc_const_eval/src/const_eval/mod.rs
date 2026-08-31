@@ -9,10 +9,12 @@ use tracing::instrument;
 use crate::interpret::InterpCx;
 
 mod dummy_machine;
+mod dyn_trait;
 mod error;
 mod eval_queries;
 mod fn_queries;
 mod machine;
+mod type_info;
 mod valtrees;
 
 pub use self::dummy_machine::*;
@@ -28,7 +30,7 @@ const VALTREE_MAX_NODES: usize = 100000;
 #[instrument(skip(tcx), level = "debug")]
 pub(crate) fn try_destructure_mir_constant_for_user_output<'tcx>(
     tcx: TyCtxt<'tcx>,
-    val: mir::ConstValue<'tcx>,
+    val: mir::ConstValue,
     ty: Ty<'tcx>,
 ) -> Option<mir::DestructuredConstant<'tcx>> {
     let typing_env = ty::TypingEnv::fully_monomorphized();

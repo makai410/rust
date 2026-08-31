@@ -1,7 +1,6 @@
-#[prelude_import]
-use std::prelude::rust_2024::*;
-#[macro_use]
 extern crate std;
+#[attr = PreludeImport]
+use std::prelude::rust_2024::*;
 //@ revisions: expanded hir
 //@[expanded]compile-flags: -Zunpretty=expanded
 //@[expanded]check-pass
@@ -22,6 +21,10 @@ mod expressions {
             out(reg)
             _);
     }
+
+    /// ExprKind::InlineAsm, with the `naked_asm!` macro
+    #[attr = Naked]
+    extern "C" fn expr_naked_asm() { naked_asm!("ret"); }
 }
 
 mod items {

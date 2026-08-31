@@ -1,4 +1,4 @@
-use rustc_ast::{ast, ptr};
+use rustc_ast::{Label, ast};
 use rustc_span::Span;
 use thin_vec::thin_vec;
 use tracing::debug;
@@ -14,7 +14,9 @@ use crate::rewrite::{Rewrite, RewriteContext, RewriteError, RewriteErrorExt, Rew
 use crate::shape::Shape;
 use crate::source_map::SpanUtils;
 use crate::types::rewrite_bound_params;
-use crate::utils::{NodeIdExt, last_line_width, left_most_sub_expr, stmt_expr};
+use crate::utils::{
+    NodeIdExt, format_coro, last_line_width, left_most_sub_expr, outer_attributes, stmt_expr,
+};
 
 // This module is pretty messy because of the rules around closures and blocks:
 // FIXME - the below is probably no longer true in full.
@@ -30,7 +32,7 @@ pub(crate) fn rewrite_closure(
     binder: &ast::ClosureBinder,
     constness: ast::Const,
     capture: ast::CaptureBy,
-    coroutine_kind: &Option<ast::CoroutineKind>,
+    coroutine_marker: &Option<ast::CoroutineMarker>,
     movability: ast::Movability,
     fn_decl: &ast::FnDecl,
     body: &ast::Expr,
@@ -44,7 +46,7 @@ pub(crate) fn rewrite_closure(
         binder,
         constness,
         capture,
-        coroutine_kind,
+        coroutine_marker,
         movability,
         fn_decl,
         body,
@@ -53,9 +55,7 @@ pub(crate) fn rewrite_closure(
         shape,
     )?;
     // 1 = space between `|...|` and body.
-    let body_shape = shape
-        .offset_left(extra_offset)
-        .max_width_error(shape.width, span)?;
+    let body_shape = shape.offset_left(extra_offset, span)?;
 
     if let ast::ExprKind::Block(ref block, _) = body.kind {
         // The body of the closure is an empty block.
@@ -74,7 +74,7 @@ pub(crate) fn rewrite_closure(
 
         result.or_else(|_| {
             // Either we require a block, or tried without and failed.
-            rewrite_closure_block(block, &prefix, context, body_shape)
+            rewrite_closure_block(body, &prefix, context, body_shape)
         })
     } else {
         rewrite_closure_expr(body, &prefix, context, body_shape).or_else(|_| {
@@ -106,8 +106,8 @@ fn get_inner_expr<'a>(
     prefix: &str,
     context: &RewriteContext<'_>,
 ) -> &'a ast::Expr {
-    if let ast::ExprKind::Block(ref block, _) = expr.kind {
-        if !needs_block(block, prefix, context) {
+    if let ast::ExprKind::Block(ref block, ref label) = expr.kind {
+        if !needs_block(block, label, prefix, context) {
             // block.stmts.len() == 1 except with `|| {{}}`;
             // https://github.com/rust-lang/rustfmt/issues/3844
             if let Some(expr) = block.stmts.first().and_then(stmt_expr) {
@@ -120,7 +120,12 @@ fn get_inner_expr<'a>(
 }
 
 // Figure out if a block is necessary.
-fn needs_block(block: &ast::Block, prefix: &str, context: &RewriteContext<'_>) -> bool {
+fn needs_block(
+    block: &ast::Block,
+    label: &Option<Label>,
+    prefix: &str,
+    context: &RewriteContext<'_>,
+) -> bool {
     let has_attributes = block.stmts.first().map_or(false, |first_stmt| {
         !get_attrs_from_stmt(first_stmt).is_empty()
     });
@@ -130,6 +135,7 @@ fn needs_block(block: &ast::Block, prefix: &str, context: &RewriteContext<'_>) -
         || has_attributes
         || block_contains_comment(context, block)
         || prefix.contains('\n')
+        || label.is_some()
 }
 
 fn veto_block(e: &ast::Expr) -> bool {
@@ -162,17 +168,17 @@ fn rewrite_closure_with_block(
         return Err(RewriteError::Unknown);
     }
 
+    // `body.attrs` may hold inner attributes from a nested block, e.g. `while cond { #![attr] }`.
+    let outer_attrs = outer_attributes(&body.attrs);
     let block = ast::Block {
         stmts: thin_vec![ast::Stmt {
             id: ast::NodeId::root(),
-            kind: ast::StmtKind::Expr(ptr::P(body.clone())),
+            kind: ast::StmtKind::Expr(Box::new(body.clone())),
             span: body.span,
         }],
         id: ast::NodeId::root(),
         rules: ast::BlockCheckMode::Default,
-        tokens: None,
-        span: body
-            .attrs
+        span: outer_attrs
             .first()
             .map(|attr| attr.span.to(body.span))
             .unwrap_or(body.span),
@@ -181,7 +187,7 @@ fn rewrite_closure_with_block(
         context,
         "",
         &block,
-        Some(&body.attrs),
+        Some(&outer_attrs),
         None,
         shape,
         false,
@@ -231,11 +237,16 @@ fn rewrite_closure_expr(
 
 // Rewrite closure whose body is block.
 fn rewrite_closure_block(
-    block: &ast::Block,
+    block: &ast::Expr,
     prefix: &str,
     context: &RewriteContext<'_>,
     shape: Shape,
 ) -> RewriteResult {
+    debug_assert!(
+        matches!(block.kind, ast::ExprKind::Block(..)),
+        "expected a block expression"
+    );
+
     Ok(format!(
         "{} {}",
         prefix,
@@ -248,7 +259,7 @@ fn rewrite_closure_fn_decl(
     binder: &ast::ClosureBinder,
     constness: ast::Const,
     capture: ast::CaptureBy,
-    coroutine_kind: &Option<ast::CoroutineKind>,
+    coroutine_marker: &Option<ast::CoroutineMarker>,
     movability: ast::Movability,
     fn_decl: &ast::FnDecl,
     body: &ast::Expr,
@@ -279,30 +290,20 @@ fn rewrite_closure_fn_decl(
     } else {
         ""
     };
-    let coro = match coroutine_kind {
-        Some(ast::CoroutineKind::Async { .. }) => "async ",
-        Some(ast::CoroutineKind::Gen { .. }) => "gen ",
-        Some(ast::CoroutineKind::AsyncGen { .. }) => "async gen ",
-        None => "",
-    };
-    let mover = if matches!(capture, ast::CaptureBy::Value { .. }) {
-        "move "
-    } else {
-        ""
+    let coro = coroutine_marker.map_or_default(format_coro);
+    let capture_str = match capture {
+        ast::CaptureBy::Value { .. } => "move ",
+        ast::CaptureBy::Use { .. } => "use ",
+        ast::CaptureBy::Ref => "",
     };
     // 4 = "|| {".len(), which is overconservative when the closure consists of
     // a single expression.
-    let nested_shape = shape
-        .shrink_left(binder.len() + const_.len() + immovable.len() + coro.len() + mover.len())
-        .and_then(|shape| shape.sub_width(4))
-        .max_width_error(shape.width, span)?;
+    let offset = binder.len() + const_.len() + immovable.len() + coro.len() + capture_str.len();
+    let nested_shape = shape.shrink_left(offset, span)?.sub_width(4, span)?;
 
     // 1 = |
     let param_offset = nested_shape.indent + 1;
-    let param_shape = nested_shape
-        .offset_left(1)
-        .max_width_error(nested_shape.width, span)?
-        .visual_indent(0);
+    let param_shape = nested_shape.offset_left(1, span)?.visual_indent(0);
     let ret_str = fn_decl.output.rewrite_result(context, param_shape)?;
 
     let param_items = itemize_list(
@@ -327,9 +328,7 @@ fn rewrite_closure_fn_decl(
         horizontal_budget,
     );
     let param_shape = match tactic {
-        DefinitiveListTactic::Horizontal => param_shape
-            .sub_width(ret_str.len() + 1)
-            .max_width_error(param_shape.width, span)?,
+        DefinitiveListTactic::Horizontal => param_shape.sub_width(ret_str.len() + 1, span)?,
         _ => param_shape,
     };
 
@@ -337,7 +336,7 @@ fn rewrite_closure_fn_decl(
         .tactic(tactic)
         .preserve_newline(true);
     let list_str = write_list(&item_vec, &fmt)?;
-    let mut prefix = format!("{binder}{const_}{immovable}{coro}{mover}|{list_str}|");
+    let mut prefix = format!("{binder}{const_}{immovable}{coro}{capture_str}|{list_str}|");
 
     if !ret_str.is_empty() {
         if prefix.contains('\n') {
@@ -361,12 +360,14 @@ pub(crate) fn rewrite_last_closure(
     expr: &ast::Expr,
     shape: Shape,
 ) -> RewriteResult {
+    debug!("rewrite_last_closure {:?}", expr);
+
     if let ast::ExprKind::Closure(ref closure) = expr.kind {
         let ast::Closure {
             ref binder,
             constness,
             capture_clause,
-            ref coroutine_kind,
+            ref coroutine_marker,
             movability,
             ref fn_decl,
             ref body,
@@ -374,10 +375,11 @@ pub(crate) fn rewrite_last_closure(
             fn_arg_span: _,
         } = **closure;
         let body = match body.kind {
-            ast::ExprKind::Block(ref block, _)
+            ast::ExprKind::Block(ref block, ref label)
                 if !is_unsafe_block(block)
                     && !context.inside_macro()
-                    && is_simple_block(context, block, Some(&body.attrs)) =>
+                    && is_simple_block(context, block, Some(&body.attrs))
+                    && label.is_none() =>
             {
                 stmt_expr(&block.stmts[0]).unwrap_or(body)
             }
@@ -387,7 +389,7 @@ pub(crate) fn rewrite_last_closure(
             binder,
             constness,
             capture_clause,
-            coroutine_kind,
+            coroutine_marker,
             movability,
             fn_decl,
             body,
@@ -400,9 +402,7 @@ pub(crate) fn rewrite_last_closure(
             return Err(RewriteError::Unknown);
         }
 
-        let body_shape = shape
-            .offset_left(extra_offset)
-            .max_width_error(shape.width, expr.span)?;
+        let body_shape = shape.offset_left(extra_offset, expr.span)?;
 
         // We force to use block for the body of the closure for certain kinds of expressions.
         if is_block_closure_forced(context, body) {
@@ -480,7 +480,7 @@ fn is_block_closure_forced_inner(expr: &ast::Expr, style_edition: StyleEdition) 
 ///     if true {...} else {...}
 ///      |x| 5
 /// isn't parsed as (if true {...} else {...} | x) | 5
-// From https://github.com/rust-lang/rust/blob/master/src/libsyntax/parse/classify.rs.
+// From https://github.com/rust-lang/rust/blob/HEAD/src/libsyntax/parse/classify.rs.
 fn expr_requires_semi_to_be_stmt(e: &ast::Expr) -> bool {
     match e.kind {
         ast::ExprKind::If(..)

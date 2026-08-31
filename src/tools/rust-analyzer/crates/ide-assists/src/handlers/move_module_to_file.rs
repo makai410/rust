@@ -1,7 +1,6 @@
 use std::iter;
 
 use ast::edit::IndentLevel;
-use hir::{HasAttrs, sym};
 use ide_db::base_db::AnchoredPathBuf;
 use itertools::Itertools;
 use stdx::format_to;
@@ -25,7 +24,7 @@ use crate::{AssistContext, AssistId, Assists};
 // ```
 // mod foo;
 // ```
-pub(crate) fn move_module_to_file(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn move_module_to_file(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let module_ast = ctx.find_node_at_offset::<ast::Module>()?;
     let module_items = module_ast.item_list()?;
 
@@ -53,14 +52,7 @@ pub(crate) fn move_module_to_file(acc: &mut Assists, ctx: &AssistContext<'_>) ->
                 let mut buf = String::from("./");
                 let db = ctx.db();
                 match parent_module.name(db) {
-                    Some(name)
-                        if !parent_module.is_mod_rs(db)
-                            && parent_module
-                                .attrs(db)
-                                .by_key(sym::path)
-                                .string_value_unescape()
-                                .is_none() =>
-                    {
+                    Some(name) if !parent_module.is_mod_rs(db) && !parent_module.has_path(db) => {
                         format_to!(buf, "{}/", name.as_str())
                     }
                     _ => (),

@@ -1,12 +1,12 @@
-// By compiling this file we check that all the intrinsics we care about continue to be provided by
-// the `compiler_builtins` crate regardless of the changes we make to it. If we, by mistake, stop
-// compiling a C implementation and forget to implement that intrinsic in Rust, this file will fail
-// to link due to the missing intrinsic (symbol).
+//! Tests that require unmangled symbols from `compiler-builtins`.
+//!
+//! By compiling this file we check that all the intrinsics we care about continue to be provided by
+//! the `compiler_builtins` crate regardless of the changes we make to it. If we, by mistake, stop
+//! compiling a C implementation and forget to implement that intrinsic in Rust, this file will fail
+//! to link due to the missing intrinsic (symbol).
 
-#![allow(unused_features)]
-#![allow(internal_features)]
+#![allow(internal_features, unused_features)]
 #![deny(dead_code)]
-#![feature(allocator_api)]
 #![feature(f128)]
 #![feature(f16)]
 #![feature(lang_items)]
@@ -40,11 +40,7 @@ mod intrinsics {
         x as f64
     }
 
-    #[cfg(all(
-        f16_enabled,
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(all(f16_enabled, f128_enabled))]
     pub fn extendhftf(x: f16) -> f128 {
         x as f128
     }
@@ -201,11 +197,7 @@ mod intrinsics {
 
     /* f128 operations */
 
-    #[cfg(all(
-        f16_enabled,
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(all(f16_enabled, f128_enabled))]
     pub fn trunctfhf(x: f128) -> f16 {
         x as f16
     }
@@ -220,50 +212,32 @@ mod intrinsics {
         x as f64
     }
 
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     pub fn fixtfsi(x: f128) -> i32 {
         x as i32
     }
 
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     pub fn fixtfdi(x: f128) -> i64 {
         x as i64
     }
 
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     pub fn fixtfti(x: f128) -> i128 {
         x as i128
     }
 
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     pub fn fixunstfsi(x: f128) -> u32 {
         x as u32
     }
 
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     pub fn fixunstfdi(x: f128) -> u64 {
         x as u64
     }
 
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     pub fn fixunstfti(x: f128) -> u128 {
         x as u128
     }
@@ -540,47 +514,25 @@ fn run() {
     bb(extendhfdf(bb(2.)));
     #[cfg(f16_enabled)]
     bb(extendhfsf(bb(2.)));
-    #[cfg(all(
-        f16_enabled,
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(all(f16_enabled, f128_enabled))]
     bb(extendhftf(bb(2.)));
     #[cfg(f128_enabled)]
     bb(extendsftf(bb(2.)));
     bb(fixdfti(bb(2.)));
     bb(fixsfti(bb(2.)));
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     bb(fixtfdi(bb(2.)));
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     bb(fixtfsi(bb(2.)));
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     bb(fixtfti(bb(2.)));
     bb(fixunsdfti(bb(2.)));
     bb(fixunssfti(bb(2.)));
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     bb(fixunstfdi(bb(2.)));
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     bb(fixunstfsi(bb(2.)));
-    #[cfg(all(
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(f128_enabled)]
     bb(fixunstfti(bb(2.)));
     #[cfg(f128_enabled)]
     bb(floatditf(bb(2)));
@@ -616,11 +568,7 @@ fn run() {
     bb(truncsfhf(bb(2.)));
     #[cfg(f128_enabled)]
     bb(trunctfdf(bb(2.)));
-    #[cfg(all(
-        f16_enabled,
-        f128_enabled,
-        not(any(target_arch = "powerpc", target_arch = "powerpc64"))
-    ))]
+    #[cfg(all(f16_enabled, f128_enabled))]
     bb(trunctfhf(bb(2.)));
     #[cfg(f128_enabled)]
     bb(trunctfsf(bb(2.)));

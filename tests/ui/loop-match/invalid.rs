@@ -142,6 +142,25 @@ fn break_without_value_unit() {
     }
 }
 
+fn break_without_label() {
+    let mut state = State::A;
+    let _ = {
+        #[loop_match]
+        loop {
+            state = 'blk: {
+                match state {
+                    _ => {
+                        #[const_continue]
+                        break State::A;
+                        //~^ ERROR unlabeled `break` inside of a labeled block
+                        //~| ERROR a `#[const_continue]` must break to a label with a value
+                    }
+                }
+            }
+        }
+    };
+}
+
 fn arm_has_guard(cond: bool) {
     let mut state = State::A;
     #[loop_match]
@@ -183,7 +202,7 @@ fn invalid_range_pattern(state: f32) {
                     break 'blk 2.5;
                 }
                 4.0..3.0 => {
-                    //~^ ERROR lower range bound must be less than upper
+                    //~^ ERROR lower bound for range pattern must be less than upper bound
                     todo!()
                 }
             }

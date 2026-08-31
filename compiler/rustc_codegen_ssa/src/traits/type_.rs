@@ -23,7 +23,7 @@ pub trait BaseTypeCodegenMethods: BackendTypes {
     fn type_f128(&self) -> Self::Type;
 
     fn type_array(&self, ty: Self::Type, len: u64) -> Self::Type;
-    fn type_func(&self, args: &[Self::Type], ret: Self::Type) -> Self::Type;
+    fn type_func(&self, args: &[Self::Type], ret: Self::Type) -> Self::FunctionSignature;
     fn type_kind(&self, ty: Self::Type) -> TypeKind;
     fn type_ptr(&self) -> Self::Type;
     fn type_ptr_ext(&self, address_space: AddressSpace) -> Self::Type;
@@ -114,7 +114,7 @@ pub trait LayoutTypeCodegenMethods<'tcx>: BackendTypes {
     /// such as when it's stack-allocated or when it's being loaded or stored.
     fn backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type;
     fn cast_backend_type(&self, ty: &CastTarget) -> Self::Type;
-    fn fn_decl_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Self::Type;
+    fn fn_decl_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Self::FunctionSignature;
     fn fn_ptr_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Self::Type;
     fn reg_backend_type(&self, ty: &Reg) -> Self::Type;
     /// The backend type used for a rust type when it's in an SSA register.
@@ -127,28 +127,12 @@ pub trait LayoutTypeCodegenMethods<'tcx>: BackendTypes {
     /// [`from_immediate`](super::BuilderMethods::from_immediate) and
     /// [`to_immediate_scalar`](super::BuilderMethods::to_immediate_scalar).
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type;
-    fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool;
-    fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool;
     fn scalar_pair_element_backend_type(
         &self,
         layout: TyAndLayout<'tcx>,
         index: usize,
         immediate: bool,
     ) -> Self::Type;
-
-    /// A type that produces an [`OperandValue::Ref`] when loaded.
-    ///
-    /// AKA one that's not a ZST, not `is_backend_immediate`, and
-    /// not `is_backend_scalar_pair`. For such a type, a
-    /// [`load_operand`] doesn't actually `load` anything.
-    ///
-    /// [`OperandValue::Ref`]: crate::mir::operand::OperandValue::Ref
-    /// [`load_operand`]: super::BuilderMethods::load_operand
-    fn is_backend_ref(&self, layout: TyAndLayout<'tcx>) -> bool {
-        !(layout.is_zst()
-            || self.is_backend_immediate(layout)
-            || self.is_backend_scalar_pair(layout))
-    }
 }
 
 // For backends that support CFI using type membership (i.e., testing whether a given pointer is
@@ -156,9 +140,6 @@ pub trait LayoutTypeCodegenMethods<'tcx>: BackendTypes {
 pub trait TypeMembershipCodegenMethods<'tcx>: BackendTypes {
     fn add_type_metadata(&self, _function: Self::Function, _typeid: &[u8]) {}
     fn set_type_metadata(&self, _function: Self::Function, _typeid: &[u8]) {}
-    fn typeid_metadata(&self, _typeid: &[u8]) -> Option<Self::Metadata> {
-        None
-    }
     fn add_kcfi_type_metadata(&self, _function: Self::Function, _typeid: u32) {}
     fn set_kcfi_type_metadata(&self, _function: Self::Function, _typeid: u32) {}
 }

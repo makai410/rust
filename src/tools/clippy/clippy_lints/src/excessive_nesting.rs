@@ -4,8 +4,7 @@ use clippy_utils::source::snippet;
 use rustc_ast::node_id::NodeSet;
 use rustc_ast::visit::{Visitor, walk_block, walk_item};
 use rustc_ast::{Block, Crate, Inline, Item, ItemKind, ModKind, NodeId};
-use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, LintContext as _, impl_lint_pass};
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -61,6 +60,7 @@ declare_clippy_lint! {
     complexity,
     "checks for blocks nested beyond a certain threshold"
 }
+
 impl_lint_pass!(ExcessiveNesting => [EXCESSIVE_NESTING]);
 
 pub struct ExcessiveNesting {
@@ -164,7 +164,7 @@ impl Visitor<'_> for NestingVisitor<'_, '_> {
         }
 
         match &item.kind {
-            ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Mod(.., ModKind::Loaded(_, Inline::Yes, _, _)) => {
+            ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Mod(.., ModKind::Loaded(_, Inline::Yes, _)) => {
                 self.nest_level += 1;
 
                 if !self.check_indent(item.span, item.id) {

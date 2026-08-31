@@ -1,12 +1,11 @@
 //@ check-pass
 #![feature(const_trait_impl, const_cmp)]
 
-#[const_trait]
-trait MyPartialEq {
+const trait MyPartialEq {
     fn eq(&self, other: &Self) -> bool;
 }
 
-impl<T: [const] PartialEq> const MyPartialEq for T {
+const impl<T: [const] PartialEq> MyPartialEq for T {
     fn eq(&self, other: &Self) -> bool {
         PartialEq::eq(self, other)
     }

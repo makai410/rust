@@ -1,7 +1,6 @@
 use std::alloc::Layout;
 use std::ptr::NonNull;
 
-use nix::sys::mman;
 use rustc_index::bit_set::DenseBitSet;
 
 /// How many bytes of memory each bit in the bitset represents.
@@ -44,6 +43,10 @@ impl IsolatedAlloc {
         }
     }
 
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
     /// For simplicity, we serve small allocations in multiples of COMPRESSION_FACTOR
     /// bytes with at least that alignment.
     #[inline]
@@ -63,10 +66,10 @@ impl IsolatedAlloc {
         // And make sure the align is at least one page
         let align = std::cmp::max(layout.align(), self.page_size);
         // pg_count gives us the # of pages needed to satisfy the size. For
-        // align > page_size where align = n * page_size, a sufficently-aligned
+        // align > page_size where align = n * page_size, a sufficiently-aligned
         // address must exist somewhere in the range of
         // some_page_aligned_address..some_page_aligned_address + (n-1) * page_size
-        // (since if some_page_aligned_address + n * page_size is sufficently aligned,
+        // (since if some_page_aligned_address + n * page_size is sufficiently aligned,
         // then so is some_page_aligned_address itself per the definition of n, so we
         // can avoid using that 1 extra page).
         // Thus we allocate n-1 extra pages
@@ -302,50 +305,11 @@ impl IsolatedAlloc {
         }
     }
 
-    /// Returns a list of page addresses managed by the allocator.
-    pub fn pages(&self) -> impl Iterator<Item = usize> {
-        let pages = self.page_ptrs.iter().map(|p| p.expose_provenance().get());
-        pages.chain(self.huge_ptrs.iter().flat_map(|(ptr, size)| {
-            (0..size / self.page_size)
-                .map(|i| ptr.expose_provenance().get().strict_add(i * self.page_size))
-        }))
-    }
-
-    /// Protects all owned memory as `PROT_NONE`, preventing accesses.
-    ///
-    /// SAFETY: Accessing memory after this point will result in a segfault
-    /// unless it is first unprotected.
-    pub unsafe fn start_ffi(&mut self) -> Result<(), nix::errno::Errno> {
-        let prot = mman::ProtFlags::PROT_NONE;
-        unsafe { self.mprotect(prot) }
-    }
-
-    /// Deprotects all owned memory by setting it to RW. Erroring here is very
-    /// likely unrecoverable, so it may panic if applying those permissions
-    /// fails.
-    pub fn end_ffi(&mut self) {
-        let prot = mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE;
-        unsafe {
-            self.mprotect(prot).unwrap();
-        }
-    }
-
-    /// Applies `prot` to every page managed by the allocator.
-    ///
-    /// SAFETY: Accessing memory in violation of the protection flags will
-    /// trigger a segfault.
-    unsafe fn mprotect(&mut self, prot: mman::ProtFlags) -> Result<(), nix::errno::Errno> {
-        for &pg in &self.page_ptrs {
-            unsafe {
-                mman::mprotect(pg.cast(), self.page_size, prot)?;
-            }
-        }
-        for &(hpg, size) in &self.huge_ptrs {
-            unsafe {
-                mman::mprotect(hpg.cast(), size.next_multiple_of(self.page_size), prot)?;
-            }
-        }
-        Ok(())
+    /// Returns a list of page ranges managed by the allocator, given in terms of pointers
+    /// and size (in bytes).
+    pub fn pages(&self) -> impl Iterator<Item = (NonNull<u8>, usize)> {
+        let pages = self.page_ptrs.iter().map(|&p| (p, self.page_size));
+        pages.chain(self.huge_ptrs.iter().copied())
     }
 }
 

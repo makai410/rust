@@ -7,11 +7,11 @@
 use rustc_codegen_ssa::common;
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt, HasTypingEnv};
 use rustc_middle::ty::{self, Instance, TypeVisitableExt};
+use rustc_target::spec::{Arch, Env};
 use tracing::debug;
 
 use crate::context::CodegenCx;
-use crate::llvm;
-use crate::value::Value;
+use crate::llvm::{self, Value};
 
 /// Codegens a reference to a fn/method item, monomorphizing and
 /// inlining as it goes.
@@ -36,21 +36,17 @@ pub(crate) fn get_fn<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'t
         llfn
     } else {
         let instance_def_id = instance.def_id();
-        let llfn = if tcx.sess.target.arch == "x86"
+        let llfn = if tcx.sess.target.arch == Arch::X86
             && let Some(dllimport) = crate::common::get_dllimport(tcx, instance_def_id, sym)
         {
-            // When calling functions in generated import libraries, MSVC needs
-            // the fully decorated name (as would have been in the declaring
-            // object file), but MinGW wants the name as exported (as would be
-            // in the def file) which may be missing decorations.
-            let mingw_gnu_toolchain = common::is_mingw_gnu_toolchain(&tcx.sess.target);
+            // When calling functions in generated import libraries,
+            // LLVM/ar_archive_writer needs the fully decorated name
+            // (as would have been in the declaring object file), but dlltool
+            // wants the name as exported (as would be in the def file)
+            // which may be missing decorations.
+            let using_dlltool = common::is_using_dlltool(&tcx.sess.target);
             let llfn = cx.declare_fn(
-                &common::i686_decorated_name(
-                    dllimport,
-                    mingw_gnu_toolchain,
-                    true,
-                    !mingw_gnu_toolchain,
-                ),
+                &common::i686_decorated_name(dllimport, using_dlltool, true, !using_dlltool),
                 fn_abi,
                 Some(instance),
             );
@@ -102,8 +98,8 @@ pub(crate) fn get_fn<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'t
         let is_hidden = if is_generic {
             // This is a monomorphization of a generic function.
             if !(cx.tcx.sess.opts.share_generics()
-                || tcx.codegen_fn_attrs(instance_def_id).inline
-                    == rustc_attr_data_structures::InlineAttr::Never)
+                || tcx.codegen_instance_attrs(instance.def).inline
+                    == rustc_hir::attrs::InlineAttr::Never)
             {
                 // When not sharing generics, all instances are in the same
                 // crate and have hidden visibility.
@@ -145,7 +141,7 @@ pub(crate) fn get_fn<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, instance: Instance<'t
         if cx.use_dll_storage_attrs
             && let Some(library) = tcx.native_library(instance_def_id)
             && library.kind.is_dllimport()
-            && !matches!(tcx.sess.target.env.as_ref(), "gnu" | "uclibc")
+            && !matches!(tcx.sess.target.env, Env::Gnu | Env::Uclibc)
         {
             llvm::set_dllimport_storage_class(llfn);
         }

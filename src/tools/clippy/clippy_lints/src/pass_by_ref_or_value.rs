@@ -5,20 +5,53 @@ use clippy_utils::ty::{for_each_top_level_late_bound_region, is_copy};
 use clippy_utils::{is_self, is_self_ty};
 use core::ops::ControlFlow;
 use rustc_abi::ExternAbi;
-use rustc_attr_data_structures::{AttributeKind, InlineAttr, find_attr};
 use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::unord::UnordItems;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
+use rustc_hir::attrs::InlineAttr;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{BindingMode, Body, FnDecl, Impl, ItemKind, MutTy, Mutability, Node, PatKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_hir::{BindingMode, Body, FnDecl, Impl, ItemKind, MutTy, Mutability, Node, PatKind, find_attr};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::adjustment::{Adjust, PointerCoercion};
-use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::ty::{self, RegionKind, TyCtxt};
-use rustc_session::impl_lint_pass;
+use rustc_middle::ty::layout::LayoutOf as _;
+use rustc_middle::ty::{self, BoundVarIndexKind, RegionKind, TyCtxt};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, sym};
 use std::iter;
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for functions taking arguments by value, where
+    /// the argument type is `Copy` and large enough to be worth considering
+    /// passing by reference. Does not trigger if the function is being exported,
+    /// because that might induce API breakage, if the parameter is declared as mutable,
+    /// or if the argument is a `self`.
+    ///
+    /// ### Why is this bad?
+    /// Arguments passed by value might result in an unnecessary
+    /// shallow copy, taking up more space in the stack and requiring a call to
+    /// `memcpy`, which can be expensive.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// #[derive(Clone, Copy)]
+    /// struct TooLarge([u8; 2048]);
+    ///
+    /// fn foo(v: TooLarge) {}
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// # #[derive(Clone, Copy)]
+    /// # struct TooLarge([u8; 2048]);
+    /// fn foo(v: &TooLarge) {}
+    /// ```
+    #[clippy::version = "1.49.0"]
+    pub LARGE_TYPES_PASSED_BY_VALUE,
+    pedantic,
+    "functions taking large arguments by value"
+}
 
 declare_clippy_lint! {
     /// ### What it does
@@ -68,38 +101,10 @@ declare_clippy_lint! {
     "functions taking small copyable arguments by reference"
 }
 
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for functions taking arguments by value, where
-    /// the argument type is `Copy` and large enough to be worth considering
-    /// passing by reference. Does not trigger if the function is being exported,
-    /// because that might induce API breakage, if the parameter is declared as mutable,
-    /// or if the argument is a `self`.
-    ///
-    /// ### Why is this bad?
-    /// Arguments passed by value might result in an unnecessary
-    /// shallow copy, taking up more space in the stack and requiring a call to
-    /// `memcpy`, which can be expensive.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// #[derive(Clone, Copy)]
-    /// struct TooLarge([u8; 2048]);
-    ///
-    /// fn foo(v: TooLarge) {}
-    /// ```
-    ///
-    /// Use instead:
-    /// ```no_run
-    /// # #[derive(Clone, Copy)]
-    /// # struct TooLarge([u8; 2048]);
-    /// fn foo(v: &TooLarge) {}
-    /// ```
-    #[clippy::version = "1.49.0"]
-    pub LARGE_TYPES_PASSED_BY_VALUE,
-    pedantic,
-    "functions taking large arguments by value"
-}
+impl_lint_pass!(PassByRefOrValue => [
+    LARGE_TYPES_PASSED_BY_VALUE,
+    TRIVIALLY_COPY_PASS_BY_REF,
+]);
 
 pub struct PassByRefOrValue {
     ref_min_size: u64,
@@ -120,12 +125,12 @@ impl PassByRefOrValue {
         }
     }
 
-    fn check_poly_fn(&mut self, cx: &LateContext<'_>, def_id: LocalDefId, decl: &FnDecl<'_>, span: Option<Span>) {
+    fn check_poly_fn(&self, cx: &LateContext<'_>, def_id: LocalDefId, decl: &FnDecl<'_>, span: Option<Span>) {
         if self.avoid_breaking_exported_api && cx.effective_visibilities.is_exported(def_id) {
             return;
         }
 
-        let fn_sig = cx.tcx.fn_sig(def_id).instantiate_identity();
+        let fn_sig = cx.tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip();
         let fn_body = cx.enclosing_body.map(|id| cx.tcx.hir_body(id));
 
         // Gather all the lifetimes found in the output type which may affect whether
@@ -151,7 +156,7 @@ impl PassByRefOrValue {
             match *ty.skip_binder().kind() {
                 ty::Ref(lt, ty, Mutability::Not) => {
                     match lt.kind() {
-                        RegionKind::ReBound(index, region)
+                        RegionKind::ReBound(BoundVarIndexKind::Bound(index), region)
                             if index.as_u32() == 0 && output_regions.contains(&region) =>
                         {
                             continue;
@@ -168,7 +173,7 @@ impl PassByRefOrValue {
                         && size <= self.ref_min_size
                         && let hir::TyKind::Ref(_, MutTy { ty: decl_ty, .. }) = input.kind
                     {
-                        if let Some(typeck) = cx.maybe_typeck_results()
+                        if let Some(typeck) = cx.typeck_results
                             // Don't lint if a raw pointer is created.
                             // TODO: Limit the check only to raw pointers to the argument (or part of the argument)
                             //       which escape the current function.
@@ -176,7 +181,7 @@ impl PassByRefOrValue {
                                 || typeck
                                     .adjustments()
                                     .items()
-                                    .flat_map(|(_, a)| a)
+                                    .flat_map(|(_, a)| UnordItems::new(a.iter()))
                                     .any(|a| matches!(a.kind, Adjust::Pointer(PointerCoercion::UnsafeFnPointer))))
                         {
                             continue;
@@ -237,8 +242,6 @@ impl PassByRefOrValue {
     }
 }
 
-impl_lint_pass!(PassByRefOrValue => [TRIVIALLY_COPY_PASS_BY_REF, LARGE_TYPES_PASSED_BY_VALUE]);
-
 impl<'tcx> LateLintPass<'tcx> for PassByRefOrValue {
     fn check_trait_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::TraitItem<'_>) {
         if item.span.from_expansion() {
@@ -270,7 +273,7 @@ impl<'tcx> LateLintPass<'tcx> for PassByRefOrValue {
                     return;
                 }
                 let attrs = cx.tcx.hir_attrs(hir_id);
-                if find_attr!(attrs, AttributeKind::Inline(InlineAttr::Always, _)) {
+                if find_attr!(attrs, Inline(InlineAttr::Always, _)) {
                     return;
                 }
 
@@ -289,7 +292,7 @@ impl<'tcx> LateLintPass<'tcx> for PassByRefOrValue {
         if let Node::Item(item) = cx.tcx.parent_hir_node(hir_id)
             && matches!(
                 item.kind,
-                ItemKind::Impl(Impl { of_trait: Some(_), .. }) | ItemKind::Trait(..)
+                ItemKind::Impl(Impl { of_trait: Some(_), .. }) | ItemKind::Trait { .. }
             )
         {
             return;

@@ -17,11 +17,14 @@ use crate::num::NonZero;
 /// - Neither `Self` nor `Rhs` have provenance, so integer comparisons are correct.
 /// - `<Self as PartialEq<Rhs>>::{eq,ne}` are equivalent to comparing the bytes.
 #[rustc_specialization_trait]
-pub(crate) unsafe trait BytewiseEq<Rhs = Self>: PartialEq<Rhs> + Sized {}
+pub(crate) const unsafe trait BytewiseEq<Rhs = Self>:
+    [const] PartialEq<Rhs> + Sized
+{
+}
 
 macro_rules! is_bytewise_comparable {
     ($($t:ty),+ $(,)?) => {$(
-        unsafe impl BytewiseEq for $t {}
+        const unsafe impl BytewiseEq for $t {}
     )+};
 }
 
@@ -30,7 +33,7 @@ is_bytewise_comparable!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128,
 
 // SAFETY: These have *niches*, but no *padding* and no *provenance*,
 // so we can compare them directly.
-is_bytewise_comparable!(bool, char, super::Ordering);
+is_bytewise_comparable!(bool, char, super::Ordering, crate::ascii::Char);
 
 // SAFETY: Similarly, the `NonZero` type has a niche, but no undef and no pointers,
 // and they compare like their underlying numeric type.

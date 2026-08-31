@@ -1,8 +1,7 @@
-//! Logic required to produce a monomorphic stable body.
+//! Logic required to produce a monomorphic body.
 //!
-//! We first retrieve and monomorphize the rustc body representation, i.e., we generate a
+//! We retrieve and monomorphize the rustc body representation, i.e., we generate a
 //! monomorphic body using internal representation.
-//! After that, we convert the internal representation into a stable one.
 
 use rustc_hir::def::DefKind;
 use rustc_middle::mir;
@@ -25,7 +24,7 @@ impl<'tcx> BodyBuilder<'tcx> {
         BodyBuilder { tcx, instance }
     }
 
-    /// Build a stable monomorphic body for a given instance based on the MIR body.
+    /// Build a monomorphic body for a given instance based on the MIR body.
     ///
     /// All constants are also evaluated.
     pub(crate) fn build(mut self) -> mir::Body<'tcx> {
@@ -39,7 +38,7 @@ impl<'tcx> BodyBuilder<'tcx> {
             let mut mono_body = self.instance.instantiate_mir_and_normalize_erasing_regions(
                 self.tcx,
                 ty::TypingEnv::fully_monomorphized(),
-                ty::EarlyBinder::bind(body),
+                ty::EarlyBinder::bind(self.tcx, body),
             );
             self.visit_body(&mut mono_body);
             mono_body

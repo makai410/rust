@@ -112,8 +112,7 @@ pub fn run_command_with_output(
     cwd: Option<&Path>,
 ) -> Result<(), String> {
     let exit_status = exec_command(input, cwd, None)?;
-    check_exit_status(input, cwd, exit_status, None, true)?;
-    Ok(())
+    check_exit_status(input, cwd, exit_status, None, true)
 }
 
 pub fn run_command_with_output_and_env(
@@ -122,8 +121,7 @@ pub fn run_command_with_output_and_env(
     env: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     let exit_status = exec_command(input, cwd, env)?;
-    check_exit_status(input, cwd, exit_status, None, true)?;
-    Ok(())
+    check_exit_status(input, cwd, exit_status, None, true)
 }
 
 #[cfg(not(unix))]
@@ -133,8 +131,7 @@ pub fn run_command_with_output_and_env_no_err(
     env: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     let exit_status = exec_command(input, cwd, env)?;
-    check_exit_status(input, cwd, exit_status, None, false)?;
-    Ok(())
+    check_exit_status(input, cwd, exit_status, None, false)
 }
 
 pub fn cargo_install(to_install: &str) -> Result<(), String> {
@@ -301,19 +298,6 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> Result<(), String> {
     fs::create_dir_all(&path).map_err(|error| {
         format!("Failed to create directory `{}`: {:?}", path.as_ref().display(), error)
     })
-}
-
-pub fn copy_file<F: AsRef<Path>, T: AsRef<Path>>(from: F, to: T) -> Result<(), String> {
-    fs::copy(&from, &to)
-        .map_err(|error| {
-            format!(
-                "Failed to copy file `{}` into `{}`: {:?}",
-                from.as_ref().display(),
-                to.as_ref().display(),
-                error
-            )
-        })
-        .map(|_| ())
 }
 
 /// This function differs from `git_clone` in how it handles *where* the repository will be cloned.

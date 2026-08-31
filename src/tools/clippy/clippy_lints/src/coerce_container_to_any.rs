@@ -3,10 +3,9 @@ use clippy_utils::sugg::{self, Sugg};
 use clippy_utils::sym;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_middle::ty::adjustment::{Adjust, PointerCoercion};
 use rustc_middle::ty::{self, ExistentialPredicate, Ty, TyCtxt};
-use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -41,11 +40,12 @@ declare_clippy_lint! {
     /// // Succeeds since we have a &dyn Any to the inner u32!
     /// assert_eq!(dyn_any_of_u32.downcast_ref::<u32>(), Some(&0u32));
     /// ```
-    #[clippy::version = "1.88.0"]
+    #[clippy::version = "1.89.0"]
     pub COERCE_CONTAINER_TO_ANY,
     nursery,
     "coercing to `&dyn Any` when dereferencing could produce a `dyn Any` without coercion is usually not intended"
 }
+
 declare_lint_pass!(CoerceContainerToAny => [COERCE_CONTAINER_TO_ANY]);
 
 impl<'tcx> LateLintPass<'tcx> for CoerceContainerToAny {

@@ -5,6 +5,7 @@
 new_issue = true
 exclude_labels = [
     "A-diagnostics",
+    "C-date-reference-triage",
     "C-tracking-issue",
 ]
 
@@ -53,20 +54,10 @@ allow-unauthenticated = [
 # Documentation at: https://forge.rust-lang.org/triagebot/note.html
 [note]
 
-# Prevents mentions in commits to avoid users being spammed
-# Documentation at: https://forge.rust-lang.org/triagebot/no-mentions.html
-[no-mentions]
-
 # Canonicalize issue numbers to avoid closing the wrong issue
 # when commits are included in subtrees, as well as warning links in commits.
 # Documentation at: https://forge.rust-lang.org/triagebot/issue-links.html
 [issue-links]
-
-# Automatically close and reopen PRs made by bots to run CI on them
-[bot-pull-requests]
-
-[behind-upstream]
-days-threshold = 7
 
 # Enable triagebot (PR) assignment.
 # Documentation at: https://forge.rust-lang.org/triagebot/pr-assignment.html
@@ -76,12 +67,12 @@ days-threshold = 7
 # reviewer model, as `[assign.owners]` will cause triagebot auto-reviewer
 # assignment to kick in.
 
-# Custom PR welcome message for when no auto reviewer assignment is performed
+# Set custom PR welcome message for when no auto reviewer assignment is performed
 # and no explicit manual reviewer selection is made.
-# Documentation at: https://forge.rust-lang.org/triagebot/pr-assignment.html#custom-welcome-messages
-[assign.custom_welcome_messages]
-welcome-message = ""
-welcome-message-no-reviewer = """\
+# Documentation at: https://forge.rust-lang.org/triagebot/pr-assignment.html#custom-messages
+[assign.custom_messages]
+auto-assign-someone = ""
+auto-assign-no-one = """\
 Thanks for the PR. If you have write access, feel free to merge this PR if it \
 does not need reviews. You can request a review using `r? rustc-dev-guide` or \
 `r? <username>`.
@@ -93,7 +84,10 @@ does not need reviews. You can request a review using `r? rustc-dev-guide` or \
 [assign.adhoc_groups]
 rustc-dev-guide = [
     "@BoxyUwU",
-    "@jieyouxu",
     "@jyn514",
+    "@reddevilmidzy",
     "@tshepang",
 ]
+
+# Make rebases more easy to read: https://forge.rust-lang.org/triagebot/range-diff.html
+[range-diff]

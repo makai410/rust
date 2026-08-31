@@ -1,4 +1,4 @@
-use rustc_ast::{self as ast, MetaItem};
+use rustc_ast::{self as ast, MetaItem, Safety};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::{Span, sym};
@@ -23,26 +23,28 @@ pub(crate) fn expand_deriving_eq(
         path: path_std!(cmp::Eq),
         skip_path_as_bound: false,
         needs_copy_as_bound_if_packed: true,
-        additional_bounds: Vec::new(),
+        additional_bounds: SmallVec::new(),
         supports_unions: true,
-        methods: vec![MethodDef {
-            name: sym::assert_receiver_is_total_eq,
+        methods: smallvec![MethodDef {
+            name: sym::assert_fields_are_eq,
             generics: Bounds::empty(),
             explicit_self: true,
-            nonself_args: vec![],
+            nonself_args: smallvec![],
             ret_ty: Unit,
             attributes: thin_vec![
+                // This method will never be called, so doing codegen etc. for it is unnecessary.
+                // We prevent this by adding `#[inline]`, which improves compile-time.
                 cx.attr_word(sym::inline, span),
                 cx.attr_nested_word(sym::doc, sym::hidden, span),
-                cx.attr_nested_word(sym::coverage, sym::off, span)
+                cx.attr_nested_word(sym::coverage, sym::off, span),
             ],
             fieldless_variants_strategy: FieldlessVariantsStrategy::Unify,
-            combine_substructure: combine_substructure(Box::new(|a, b, c| {
-                cs_total_eq_assert(a, b, c)
-            })),
+            combine_substructure: combine_substructure(cs_total_eq_assert),
         }],
-        associated_types: Vec::new(),
+        associated_types: SmallVec::new(),
         is_const,
+        safety: Safety::Default,
+        document: true,
     };
     trait_def.expand_ext(cx, mitem, item, push, true)
 }

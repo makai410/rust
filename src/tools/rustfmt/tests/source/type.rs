@@ -146,7 +146,7 @@ trait T: [   const ] Super {}
 
 const fn not_quite_const<S: [  const  ]  T>() -> i32 { <S as T>::CONST }
 
-impl     const T for U {}
+const         impl      T for U {}
 
 fn apit(_: impl [   const ] T) {}
 
@@ -157,10 +157,4 @@ impl<T:   [  const] Trait> Foo<T> {
     fn new(t: T) -> Self {
         Self(t)
     }
-}
-
-// #4357
-type T = typeof(
-1);
-impl T for  .. {
 }

@@ -55,14 +55,17 @@ mod rng_protocol {
 /// Port from [getrandom](https://github.com/rust-random/getrandom/blob/master/src/backends/rdrand.rs)
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 mod rdrand {
-    cfg_if::cfg_if! {
-        if #[cfg(target_arch = "x86_64")] {
-            use crate::arch::x86_64 as arch;
+    cfg_select! {
+        target_arch = "x86_64" => {
             use arch::_rdrand64_step as rdrand_step;
+
+            use crate::arch::x86_64 as arch;
             type Word = u64;
-        } else if #[cfg(target_arch = "x86")] {
-            use crate::arch::x86 as arch;
+        }
+        target_arch = "x86" => {
             use arch::_rdrand32_step as rdrand_step;
+
+            use crate::arch::x86 as arch;
             type Word = u32;
         }
     }
@@ -106,11 +109,11 @@ mod rdrand {
         {
             // SAFETY: All Rust x86 targets are new enough to have CPUID, and we
             // check that leaf 1 is supported before using it.
-            let cpuid0 = unsafe { arch::__cpuid(0) };
+            let cpuid0 = arch::__cpuid(0);
             if cpuid0.eax < 1 {
                 return false;
             }
-            let cpuid1 = unsafe { arch::__cpuid(1) };
+            let cpuid1 = arch::__cpuid(1);
 
             let vendor_id =
                 [cpuid0.ebx.to_le_bytes(), cpuid0.edx.to_le_bytes(), cpuid0.ecx.to_le_bytes()];
@@ -138,12 +141,11 @@ mod rdrand {
     }
 
     unsafe fn rdrand_exact(dest: &mut [u8]) -> Option<()> {
-        let mut chunks = dest.array_chunks_mut();
-        for chunk in &mut chunks {
+        let (chunks, tail) = dest.as_chunks_mut();
+        for chunk in chunks {
             *chunk = unsafe { rdrand() }?.to_ne_bytes();
         }
 
-        let tail = chunks.into_remainder();
         let n = tail.len();
         if n > 0 {
             let src = unsafe { rdrand() }?.to_ne_bytes();

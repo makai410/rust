@@ -1,38 +1,21 @@
 //! Applies changes to the IDE state transactionally.
 
-use base_db::SourceRootId;
-use profile::Bytes;
-use rustc_hash::FxHashSet;
-use salsa::{Database as _, Durability};
-use triomphe::Arc;
+use std::time::{Duration, Instant};
 
-use crate::{ChangeWithProcMacros, RootDatabase, symbol_index::SymbolsDatabase};
+use profile::Bytes;
+use salsa::Database as _;
+
+use crate::{ChangeWithProcMacros, RootDatabase};
 
 impl RootDatabase {
-    pub fn request_cancellation(&mut self) {
-        let _p = tracing::info_span!("RootDatabase::request_cancellation").entered();
-        self.synthetic_write(Durability::LOW);
-    }
-
-    pub fn apply_change(&mut self, change: ChangeWithProcMacros) {
+    pub fn apply_change(&mut self, change: ChangeWithProcMacros) -> Duration {
         let _p = tracing::info_span!("RootDatabase::apply_change").entered();
-        self.request_cancellation();
+        let now = Instant::now();
+        self.trigger_cancellation();
+        let elapsed = now.elapsed();
         tracing::trace!("apply_change {:?}", change);
-        if let Some(roots) = &change.source_change.roots {
-            let mut local_roots = FxHashSet::default();
-            let mut library_roots = FxHashSet::default();
-            for (idx, root) in roots.iter().enumerate() {
-                let root_id = SourceRootId(idx as u32);
-                if root.is_library {
-                    library_roots.insert(root_id);
-                } else {
-                    local_roots.insert(root_id);
-                }
-            }
-            self.set_local_roots_with_durability(Arc::new(local_roots), Durability::MEDIUM);
-            self.set_library_roots_with_durability(Arc::new(library_roots), Durability::MEDIUM);
-        }
         change.apply(self);
+        elapsed
     }
 
     // Feature: Memory Usage
@@ -135,66 +118,6 @@ impl RootDatabase {
             // hir::db::TypeAliasImplTraitsQuery
             // hir::db::ValueTyQuery
 
-            // // DefDatabase
-            // hir::db::AttrsQuery
-            // hir::db::BlockDefMapQuery
-            // hir::db::BlockItemTreeQuery
-            // hir::db::BlockItemTreeWithSourceMapQuery
-            // hir::db::BodyQuery
-            // hir::db::BodyWithSourceMapQuery
-            // hir::db::ConstDataQuery
-            // hir::db::ConstVisibilityQuery
-            // hir::db::CrateDefMapQuery
-            // hir::db::CrateLangItemsQuery
-            // hir::db::CrateNotableTraitsQuery
-            // hir::db::CrateSupportsNoStdQuery
-            // hir::db::EnumDataQuery
-            // hir::db::ExpandProcAttrMacrosQuery
-            // hir::db::ExprScopesQuery
-            // hir::db::ExternCrateDeclDataQuery
-            // hir::db::FieldVisibilitiesQuery
-            // hir::db::FieldsAttrsQuery
-            // hir::db::FieldsAttrsSourceMapQuery
-            // hir::db::FileItemTreeQuery
-            // hir::db::FileItemTreeWithSourceMapQuery
-            // hir::db::FunctionDataQuery
-            // hir::db::FunctionVisibilityQuery
-            // hir::db::GenericParamsQuery
-            // hir::db::GenericParamsWithSourceMapQuery
-            // hir::db::ImplItemsWithDiagnosticsQuery
-            // hir::db::ImportMapQuery
-            // hir::db::IncludeMacroInvocQuery
-            // hir::db::InternAnonymousConstQuery
-            // hir::db::InternBlockQuery
-            // hir::db::InternConstQuery
-            // hir::db::InternEnumQuery
-            // hir::db::InternExternBlockQuery
-            // hir::db::InternExternCrateQuery
-            // hir::db::InternFunctionQuery
-            // hir::db::InternImplQuery
-            // hir::db::InternInTypeConstQuery
-            // hir::db::InternMacro2Query
-            // hir::db::InternMacroRulesQuery
-            // hir::db::InternProcMacroQuery
-            // hir::db::InternStaticQuery
-            // hir::db::InternStructQuery
-            // hir::db::InternTraitAliasQuery
-            // hir::db::InternTraitQuery
-            // hir::db::InternTypeAliasQuery
-            // hir::db::InternUnionQuery
-            // hir::db::InternUseQuery
-            // hir::db::LangItemQuery
-            // hir::db::Macro2DataQuery
-            // hir::db::MacroDefQuery
-            // hir::db::MacroRulesDataQuery
-            // hir::db::NotableTraitsInDepsQuery
-            // hir::db::ProcMacroDataQuery
-            // hir::db::StaticDataQuery
-            // hir::db::TraitAliasDataQuery
-            // hir::db::TraitItemsWithDiagnosticsQuery
-            // hir::db::TypeAliasDataQuery
-            // hir::db::VariantDataWithDiagnosticsQuery
-
             // // InternDatabase
             // hir::db::InternFunctionQuery
             // hir::db::InternStructQuery
@@ -211,19 +134,6 @@ impl RootDatabase {
             // hir::db::InternMacro2Query
             // hir::db::InternProcMacroQuery
             // hir::db::InternMacroRulesQuery
-
-            // // ExpandDatabase
-            // hir::db::AstIdMapQuery
-            // hir::db::DeclMacroExpanderQuery
-            // hir::db::ExpandProcMacroQuery
-            // hir::db::InternMacroCallQuery
-            // hir::db::InternSyntaxContextQuery
-            // hir::db::MacroArgQuery
-            // hir::db::ParseMacroExpansionErrorQuery
-            // hir::db::ParseMacroExpansionQuery
-            // hir::db::ProcMacroSpanQuery
-            // hir::db::ProcMacrosQuery
-            // hir::db::RealSpanMapQuery
 
             // // LineIndexDatabase
             // crate::LineIndexQuery

@@ -1,10 +1,12 @@
 use std::cell::RefCell;
+use std::panic::abort_on_unwind;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
-use ipc_channel::ipc;
-use nix::sys::{ptrace, signal};
+use ipc_channel::{TryRecvError, ipc};
+use nix::sys::{mman, ptrace, signal};
 use nix::unistd;
-use rustc_const_eval::interpret::InterpResult;
+use rustc_const_eval::interpret::{InterpResult, interp_ok};
 
 use super::CALLBACK_STACK_SIZE;
 use super::messages::{Confirmation, StartFfiInfo, TraceRequest};
@@ -30,7 +32,7 @@ pub struct Supervisor {
     /// Used for synchronisation, allowing us to receive confirmation that the
     /// parent process has handled the request from `message_tx`.
     confirm_rx: ipc::IpcReceiver<Confirmation>,
-    /// Receiver for memory acceses that ocurred during the FFI call.
+    /// Receiver for memory accesses that occurred during the FFI call.
     event_rx: ipc::IpcReceiver<MemEvents>,
 }
 
@@ -44,63 +46,89 @@ impl Supervisor {
         SUPERVISOR.lock().unwrap().is_some()
     }
 
+    unsafe fn protect_pages(
+        pages: impl Iterator<Item = (NonNull<u8>, usize)>,
+        prot: mman::ProtFlags,
+    ) -> Result<(), nix::errno::Errno> {
+        for (pg, sz) in pages {
+            unsafe { mman::mprotect(pg.cast(), sz, prot)? };
+        }
+        Ok(())
+    }
+
     /// Performs an arbitrary FFI call, enabling tracing from the supervisor.
     /// As this locks the supervisor via a mutex, no other threads may enter FFI
     /// until this function returns.
-    pub fn do_ffi<'tcx>(
+    pub fn do_ffi<'tcx, T>(
         alloc: &Rc<RefCell<IsolatedAlloc>>,
-        f: impl FnOnce() -> InterpResult<'tcx, crate::ImmTy<'tcx>>,
-    ) -> InterpResult<'tcx, (crate::ImmTy<'tcx>, Option<MemEvents>)> {
+        f: impl FnOnce() -> T,
+    ) -> InterpResult<'tcx, (T, Option<MemEvents>)> {
         let mut sv_guard = SUPERVISOR.lock().unwrap();
         // If the supervisor is not initialised for whatever reason, fast-return.
         // As a side-effect, even on platforms where ptracing
         // is not implemented, we enforce that only one FFI call
         // happens at a time.
-        let Some(sv) = sv_guard.as_mut() else { return f().map(|v| (v, None)) };
+        let Some(sv) = sv_guard.as_mut() else { return interp_ok((f(), None)) };
 
         // Get pointers to all the pages the supervisor must allow accesses in
         // and prepare the callback stack.
-        let page_ptrs = alloc.borrow().pages().collect();
+        let alloc = alloc.borrow();
+        let page_size = alloc.page_size();
+        let page_ptrs = alloc
+            .pages()
+            .flat_map(|(pg, sz)| {
+                // Convert (page, size) pair into list of pages.
+                let start = pg.expose_provenance().get();
+                (0..sz.strict_div(alloc.page_size()))
+                    .map(move |i| start.strict_add(i.strict_mul(page_size)))
+            })
+            .collect();
         let raw_stack_ptr: *mut [u8; CALLBACK_STACK_SIZE] =
             Box::leak(Box::new([0u8; CALLBACK_STACK_SIZE])).as_mut_ptr().cast();
         let stack_ptr = raw_stack_ptr.expose_provenance();
         let start_info = StartFfiInfo { page_ptrs, stack_ptr };
 
-        // SAFETY: We do not access machine memory past this point until the
-        // supervisor is ready to allow it.
-        unsafe {
-            if alloc.borrow_mut().start_ffi().is_err() {
-                // Don't mess up unwinding by maybe leaving the memory partly protected
-                alloc.borrow_mut().end_ffi();
-                panic!("Cannot protect memory for FFI call!");
+        // Unwinding might be messed up due to partly protected memory, so let's abort if something
+        // breaks inside here.
+        let res = abort_on_unwind(|| {
+            // Send over the info.
+            // NB: if we do not wait to receive a blank confirmation response, it is
+            // possible that the supervisor is alerted of the SIGSTOP *before* it has
+            // actually received the start_info, thus deadlocking! This way, we can
+            // enforce an ordering for these events.
+            sv.message_tx.send(TraceRequest::StartFfi(start_info)).unwrap();
+            sv.confirm_rx.recv().unwrap();
+            // We need to be stopped for the supervisor to be able to make certain
+            // modifications to our memory - simply waiting on the recv() doesn't
+            // count.
+            signal::raise(signal::SIGSTOP).unwrap();
+
+            // SAFETY: We have coordinated with the supervisor to ensure that this memory will keep
+            // working as normal, just with extra tracing. So even if the compiler moves memory
+            // accesses down to after the `mprotect`, they won't actually segfault.
+            unsafe {
+                Self::protect_pages(alloc.pages(), mman::ProtFlags::PROT_NONE).unwrap();
             }
-        }
 
-        // Send over the info.
-        // NB: if we do not wait to receive a blank confirmation response, it is
-        // possible that the supervisor is alerted of the SIGSTOP *before* it has
-        // actually received the start_info, thus deadlocking! This way, we can
-        // enforce an ordering for these events.
-        sv.message_tx.send(TraceRequest::StartFfi(start_info)).unwrap();
-        sv.confirm_rx.recv().unwrap();
-        // We need to be stopped for the supervisor to be able to make certain
-        // modifications to our memory - simply waiting on the recv() doesn't
-        // count.
-        signal::raise(signal::SIGSTOP).unwrap();
+            let res = f();
 
-        let res = f();
+            // SAFETY: We set memory back to normal, so this is safe.
+            unsafe {
+                Self::protect_pages(
+                    alloc.pages(),
+                    mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE,
+                )
+                .unwrap();
+            }
 
-        // We can't use IPC channels here to signal that FFI mode has ended,
-        // since they might allocate memory which could get us stuck in a SIGTRAP
-        // with no easy way out! While this could be worked around, it is much
-        // simpler and more robust to simply use the signals which are left for
-        // arbitrary usage. Since this will block until we are continued by the
-        // supervisor, we can assume past this point that everything is back to
-        // normal.
-        signal::raise(signal::SIGUSR1).unwrap();
+            // Signal the supervisor that we are done. Will block until the supervisor continues us.
+            // This will also shut down the segfault handler, so it's important that all memory is
+            // reset back to normal above. There must not be a window in time where accessing the
+            // pages we protected above actually causes the program to abort.
+            signal::raise(signal::SIGUSR1).unwrap();
 
-        // This is safe! It just sets memory to normal expected permissions.
-        alloc.borrow_mut().end_ffi();
+            res
+        });
 
         // SAFETY: Caller upholds that this pointer was allocated as a box with
         // this type.
@@ -113,14 +141,14 @@ impl Supervisor {
             .try_recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| {
                 match e {
-                    ipc::TryRecvError::IpcError(_) => (),
-                    ipc::TryRecvError::Empty =>
+                    TryRecvError::IpcError(_) => (),
+                    TryRecvError::Empty =>
                         panic!("Waiting for accesses from supervisor timed out!"),
                 }
             })
             .ok();
 
-        res.map(|v| (v, events))
+        interp_ok((res, events))
     }
 }
 
@@ -201,9 +229,10 @@ pub unsafe fn init_sv() -> Result<(), SvInitError> {
                 match init {
                     // The "Ok" case means that we couldn't ptrace.
                     Ok(e) => return Err(e),
-                    Err(p) => {
+                    Err(_p) => {
                         eprintln!(
-                            "Supervisor process panicked!\n{p:?}\n\nTry running again without using the native-lib tracer."
+                            "Supervisor process panicked!\n\"
+                            Try running again without `-Zmiri-native-lib-enable-tracing`."
                         );
                         std::process::exit(1);
                     }

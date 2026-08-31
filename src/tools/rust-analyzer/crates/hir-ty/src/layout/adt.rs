@@ -1,68 +1,74 @@
 //! Compute the binary representation of structs, unions and enums
 
-use std::{cmp, ops::Bound};
+use std::cmp;
 
 use hir_def::{
     AdtId, VariantId,
-    layout::{Integer, ReprOptions, TargetDataLayout},
-    signatures::{StructFlags, VariantFields},
+    attrs::AttrFlags,
+    signatures::{StructFlags, StructSignature, VariantFields},
 };
-use intern::sym;
+use rustc_abi::{Integer, ReprOptions, TargetDataLayout};
 use rustc_index::IndexVec;
 use smallvec::SmallVec;
 use triomphe::Arc;
 
 use crate::{
-    Substitution, TraitEnvironment,
     db::HirDatabase,
-    layout::{Layout, LayoutError, field_ty},
+    layout::{Layout, LayoutCx, LayoutError, field_ty},
+    next_solver::StoredGenericArgs,
+    representability::{Representability, representability},
+    traits::StoredParamEnvAndCrate,
 };
 
-use super::LayoutCx;
-
+#[salsa::tracked(cycle_result = layout_of_adt_cycle_result, returns(clone))]
 pub fn layout_of_adt_query(
     db: &dyn HirDatabase,
     def: AdtId,
-    subst: Substitution,
-    trait_env: Arc<TraitEnvironment>,
+    args: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
 ) -> Result<Arc<Layout>, LayoutError> {
     let krate = trait_env.krate;
     let Ok(target) = db.target_data_layout(krate) else {
         return Err(LayoutError::TargetLayoutNotAvailable);
     };
-    let dl = &*target;
+    if representability(db, def) == Representability::Infinite {
+        return Err(LayoutError::RecursiveTypeWithoutIndirection);
+    }
+    let dl = target;
     let cx = LayoutCx::new(dl);
     let handle_variant = |def: VariantId, var: &VariantFields| {
         var.fields()
             .iter()
-            .map(|(fd, _)| db.layout_of_ty(field_ty(db, def, fd, &subst), trait_env.clone()))
+            .map(|(fd, _)| {
+                db.layout_of_ty(field_ty(db, def, fd, args.as_ref()).store(), trait_env.clone())
+            })
             .collect::<Result<Vec<_>, _>>()
     };
     let (variants, repr, is_special_no_niche) = match def {
         AdtId::StructId(s) => {
-            let sig = db.struct_signature(s);
+            let sig = StructSignature::of(db, s);
             let mut r = SmallVec::<[_; 1]>::new();
             r.push(handle_variant(s.into(), s.fields(db))?);
             (
                 r,
-                sig.repr.unwrap_or_default(),
+                AttrFlags::repr(db, s.into()).unwrap_or_default(),
                 sig.flags.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED),
             )
         }
         AdtId::UnionId(id) => {
-            let data = db.union_signature(id);
+            let repr = AttrFlags::repr(db, id.into());
             let mut r = SmallVec::new();
             r.push(handle_variant(id.into(), id.fields(db))?);
-            (r, data.repr.unwrap_or_default(), false)
+            (r, repr.unwrap_or_default(), false)
         }
         AdtId::EnumId(e) => {
             let variants = e.enum_variants(db);
             let r = variants
                 .variants
-                .iter()
-                .map(|&(v, _, _)| handle_variant(v.into(), v.fields(db)))
+                .values()
+                .map(|&(v, _)| handle_variant(v.into(), v.fields(db)))
                 .collect::<Result<SmallVec<_>, _>>()?;
-            (r, db.enum_signature(e).repr.unwrap_or_default(), false)
+            (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), false)
         }
     };
     let variants = variants
@@ -78,23 +84,12 @@ pub fn layout_of_adt_query(
             &variants,
             matches!(def, AdtId::EnumId(..)),
             is_special_no_niche,
-            layout_scalar_valid_range(db, def),
             |min, max| repr_discr(dl, &repr, min, max).unwrap_or((Integer::I8, false)),
             variants.iter_enumerated().filter_map(|(id, _)| {
                 let AdtId::EnumId(e) = def else { return None };
                 let d = db.const_eval_discriminant(e.enum_variants(db).variants[id.0].0).ok()?;
                 Some((id, d))
             }),
-            // FIXME: The current code for niche-filling relies on variant indices
-            // instead of actual discriminants, so enums with
-            // explicit discriminants (RFC #2363) would misbehave and we should disable
-            // niche optimization for them.
-            // The code that do it in rustc:
-            // repr.inhibit_enum_layout_opt() || def
-            //     .variants()
-            //     .iter_enumerated()
-            //     .any(|(i, v)| v.discr != ty::VariantDiscr::Relative(i.as_u32()))
-            repr.inhibit_enum_layout_opt(),
             !matches!(def, AdtId::EnumId(..))
                 && variants
                     .iter()
@@ -106,35 +101,12 @@ pub fn layout_of_adt_query(
     Ok(Arc::new(result))
 }
 
-fn layout_scalar_valid_range(db: &dyn HirDatabase, def: AdtId) -> (Bound<u128>, Bound<u128>) {
-    let attrs = db.attrs(def.into());
-    let get = |name| {
-        let attr = attrs.by_key(name).tt_values();
-        for tree in attr {
-            if let Some(it) = tree.iter().next_as_view() {
-                let text = it.to_string().replace('_', "");
-                let (text, base) = match text.as_bytes() {
-                    [b'0', b'x', ..] => (&text[2..], 16),
-                    [b'0', b'o', ..] => (&text[2..], 8),
-                    [b'0', b'b', ..] => (&text[2..], 2),
-                    _ => (&*text, 10),
-                };
-
-                if let Ok(it) = u128::from_str_radix(text, base) {
-                    return Bound::Included(it);
-                }
-            }
-        }
-        Bound::Unbounded
-    };
-    (get(sym::rustc_layout_scalar_valid_range_start), get(sym::rustc_layout_scalar_valid_range_end))
-}
-
-pub(crate) fn layout_of_adt_cycle_result(
+fn layout_of_adt_cycle_result(
     _: &dyn HirDatabase,
-    _: AdtId,
-    _: Substitution,
-    _: Arc<TraitEnvironment>,
+    _: salsa::Id,
+    _def: AdtId,
+    _args: StoredGenericArgs,
+    _trait_env: StoredParamEnvAndCrate,
 ) -> Result<Arc<Layout>, LayoutError> {
     Err(LayoutError::RecursiveTypeWithoutIndirection)
 }
@@ -174,8 +146,8 @@ fn repr_discr(
         Integer::I8
     };
 
-    // If there are no negative values, we can use the unsigned fit.
-    Ok(if min >= 0 {
+    // `min` and `max` are the ends of a wrapping range, so their sign is not a usable test.
+    Ok(if unsigned_fit <= signed_fit {
         (cmp::max(unsigned_fit, at_least), false)
     } else {
         (cmp::max(signed_fit, at_least), true)

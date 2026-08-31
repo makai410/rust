@@ -8,6 +8,7 @@ use core::fmt;
 use std::{env, fs, ops::Not, path::Path, process::Command};
 
 use anyhow::{Result, format_err};
+use base_db::Env;
 use itertools::Itertools;
 use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use rustc_hash::FxHashMap;
@@ -16,7 +17,8 @@ use toolchain::{Tool, probe_for_binary};
 
 use crate::{
     CargoWorkspace, ManifestPath, ProjectJson, RustSourceWorkspaceConfig,
-    cargo_workspace::CargoMetadataConfig, utf8_stdout,
+    cargo_workspace::{CargoMetadataConfig, FetchMetadata},
+    utf8_stdout,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +31,7 @@ pub struct Sysroot {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum RustLibSrcWorkspace {
-    Workspace(CargoWorkspace),
+    Workspace { ws: CargoWorkspace, metadata_err: Option<String> },
     Json(ProjectJson),
     Stitched(stitched::Stitched),
     Empty,
@@ -38,7 +40,9 @@ pub enum RustLibSrcWorkspace {
 impl fmt::Display for RustLibSrcWorkspace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RustLibSrcWorkspace::Workspace(ws) => write!(f, "workspace {}", ws.workspace_root()),
+            RustLibSrcWorkspace::Workspace { ws, .. } => {
+                write!(f, "workspace {}", ws.workspace_root())
+            }
             RustLibSrcWorkspace::Json(json) => write!(f, "json {}", json.manifest_or_root()),
             RustLibSrcWorkspace::Stitched(stitched) => {
                 write!(f, "stitched with {} crates", stitched.crates.len())
@@ -73,7 +77,7 @@ impl Sysroot {
 
     pub fn is_rust_lib_src_empty(&self) -> bool {
         match &self.workspace {
-            RustLibSrcWorkspace::Workspace(ws) => ws.packages().next().is_none(),
+            RustLibSrcWorkspace::Workspace { ws, .. } => ws.packages().next().is_none(),
             RustLibSrcWorkspace::Json(project_json) => project_json.n_crates() == 0,
             RustLibSrcWorkspace::Stitched(stitched) => stitched.crates.is_empty(),
             RustLibSrcWorkspace::Empty => true,
@@ -84,9 +88,16 @@ impl Sysroot {
         self.error.as_deref()
     }
 
+    pub fn metadata_error(&self) -> Option<&str> {
+        match &self.workspace {
+            RustLibSrcWorkspace::Workspace { metadata_err, .. } => metadata_err.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn num_packages(&self) -> usize {
         match &self.workspace {
-            RustLibSrcWorkspace::Workspace(ws) => ws.packages().count(),
+            RustLibSrcWorkspace::Workspace { ws, .. } => ws.packages().count(),
             RustLibSrcWorkspace::Json(project_json) => project_json.n_crates(),
             RustLibSrcWorkspace::Stitched(stitched) => stitched.crates.len(),
             RustLibSrcWorkspace::Empty => 0,
@@ -142,12 +153,11 @@ impl Sysroot {
             Some(root) => {
                 // special case rustc, we can look that up directly in the sysroot's bin folder
                 // as it should never invoke another cargo binary
-                if let Tool::Rustc = tool {
-                    if let Some(path) =
+                if let Tool::Rustc = tool
+                    && let Some(path) =
                         probe_for_binary(root.join("bin").join(Tool::Rustc.name()).into())
-                    {
-                        return toolchain::command(path, current_dir, envs);
-                    }
+                {
+                    return toolchain::command(path, current_dir, envs);
                 }
 
                 let mut cmd = toolchain::command(tool.prefer_proxy(), current_dir, envs);
@@ -160,6 +170,36 @@ impl Sysroot {
                 cmd
             }
             _ => toolchain::command(tool.path(), current_dir, envs),
+        }
+    }
+
+    pub fn tool_path(&self, tool: Tool, current_dir: impl AsRef<Path>, envs: &Env) -> Utf8PathBuf {
+        match self.root() {
+            Some(root) => {
+                let mut cmd = toolchain::command(
+                    Tool::Rustup.path(),
+                    current_dir,
+                    &envs
+                        .into_iter()
+                        .map(|(k, v)| (k.clone(), Some(v.clone())))
+                        .collect::<FxHashMap<_, _>>(),
+                );
+                if !envs.contains_key("RUSTUP_TOOLCHAIN")
+                    && std::env::var_os("RUSTUP_TOOLCHAIN").is_none()
+                {
+                    cmd.env("RUSTUP_TOOLCHAIN", AsRef::<std::path::Path>::as_ref(root));
+                }
+
+                cmd.arg("which");
+                cmd.arg(tool.name());
+                (|| {
+                    Some(Utf8PathBuf::from(
+                        String::from_utf8(cmd.output().ok()?.stdout).ok()?.trim_end(),
+                    ))
+                })()
+                .unwrap_or_else(|| Utf8PathBuf::from(tool.name()))
+            }
+            _ => tool.path(),
         }
     }
 
@@ -210,7 +250,6 @@ impl Sysroot {
         &self,
         sysroot_source_config: &RustSourceWorkspaceConfig,
         no_deps: bool,
-        current_dir: &AbsPath,
         progress: &dyn Fn(String),
     ) -> Option<RustLibSrcWorkspace> {
         assert!(matches!(self.workspace, RustLibSrcWorkspace::Empty), "workspace already loaded");
@@ -223,7 +262,7 @@ impl Sysroot {
             if fs::metadata(&library_manifest).is_ok() {
                 match self.load_library_via_cargo(
                     &library_manifest,
-                    current_dir,
+                    src_root,
                     cargo_config,
                     no_deps,
                     progress,
@@ -236,7 +275,10 @@ impl Sysroot {
             }
             tracing::debug!("Stitching sysroot library: {src_root}");
 
-            let mut stitched = stitched::Stitched { crates: Default::default() };
+            let mut stitched = stitched::Stitched {
+                crates: Default::default(),
+                edition: span::Edition::Edition2024,
+            };
 
             for path in stitched::SYSROOT_CRATES.trim().lines() {
                 let name = path.split('/').next_back().unwrap();
@@ -288,29 +330,28 @@ impl Sysroot {
 
     pub fn set_workspace(&mut self, workspace: RustLibSrcWorkspace) {
         self.workspace = workspace;
-        if self.error.is_none() {
-            if let Some(src_root) = &self.rust_lib_src_root {
-                let has_core = match &self.workspace {
-                    RustLibSrcWorkspace::Workspace(ws) => {
-                        ws.packages().any(|p| ws[p].name == "core")
-                    }
-                    RustLibSrcWorkspace::Json(project_json) => project_json
-                        .crates()
-                        .filter_map(|(_, krate)| krate.display_name.clone())
-                        .any(|name| name.canonical_name().as_str() == "core"),
-                    RustLibSrcWorkspace::Stitched(stitched) => stitched.by_name("core").is_some(),
-                    RustLibSrcWorkspace::Empty => true,
-                };
-                if !has_core {
-                    let var_note = if env::var_os("RUST_SRC_PATH").is_some() {
-                        " (env var `RUST_SRC_PATH` is set and may be incorrect, try unsetting it)"
-                    } else {
-                        ", try running `rustup component add rust-src` to possibly fix this"
-                    };
-                    self.error = Some(format!(
-                        "sysroot at `{src_root}` is missing a `core` library{var_note}",
-                    ));
+        if self.error.is_none()
+            && let Some(src_root) = &self.rust_lib_src_root
+        {
+            let has_core = match &self.workspace {
+                RustLibSrcWorkspace::Workspace { ws: workspace, .. } => {
+                    workspace.packages().any(|p| workspace[p].name == "core")
                 }
+                RustLibSrcWorkspace::Json(project_json) => project_json
+                    .crates()
+                    .filter_map(|(_, krate)| krate.display_name.clone())
+                    .any(|name| name.canonical_name().as_str() == "core"),
+                RustLibSrcWorkspace::Stitched(stitched) => stitched.by_name("core").is_some(),
+                RustLibSrcWorkspace::Empty => true,
+            };
+            if !has_core {
+                let var_note = if env::var_os("RUST_SRC_PATH").is_some() {
+                    " (env var `RUST_SRC_PATH` is set and may be incorrect, try unsetting it)"
+                } else {
+                    ", try running `rustup component add rust-src` to possibly fix this"
+                };
+                self.error =
+                    Some(format!("sysroot at `{src_root}` is missing a `core` library{var_note}",));
             }
         }
     }
@@ -331,16 +372,11 @@ impl Sysroot {
             Some("nightly".to_owned()),
         );
 
-        let (mut res, _) = CargoWorkspace::fetch_metadata(
-            library_manifest,
-            current_dir,
-            &cargo_config,
-            self,
-            no_deps,
-            // Make sure we never attempt to write to the sysroot
-            true,
-            progress,
-        )?;
+        // Make sure we never attempt to write to the sysroot
+        let locked = true;
+        let (mut res, err) =
+            FetchMetadata::new(library_manifest, current_dir, &cargo_config, self, no_deps)
+                .exec(locked, progress)?;
 
         // Patch out `rustc-std-workspace-*` crates to point to the real crates.
         // This is done prior to `CrateGraph` construction to prevent de-duplication logic from failing.
@@ -393,7 +429,10 @@ impl Sysroot {
 
         let cargo_workspace =
             CargoWorkspace::new(res, library_manifest.clone(), Default::default(), true);
-        Ok(RustLibSrcWorkspace::Workspace(cargo_workspace))
+        Ok(RustLibSrcWorkspace::Workspace {
+            ws: cargo_workspace,
+            metadata_err: err.map(|e| format!("{e:#}")),
+        })
     }
 }
 
@@ -475,6 +514,7 @@ pub(crate) mod stitched {
     #[derive(Debug, Clone, Eq, PartialEq)]
     pub struct Stitched {
         pub(super) crates: Arena<RustLibSrcCrateData>,
+        pub(crate) edition: span::Edition,
     }
 
     impl ops::Index<RustLibSrcCrate> for Stitched {

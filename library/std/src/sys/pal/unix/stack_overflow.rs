@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(dead_code))]
 
-pub use self::imp::{cleanup, init};
+pub use self::imp::init;
 use self::imp::{drop_handler, make_handler};
 
 pub struct Handler {
@@ -69,11 +69,9 @@ mod imp {
     use super::Handler;
     use super::thread_info::{delete_current_info, set_current_info, with_current_info};
     use crate::ops::Range;
-    use crate::sync::OnceLock;
     use crate::sync::atomic::{Atomic, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-    use crate::sys::pal::unix::os;
-    use crate::thread::with_current_name;
-    use crate::{io, mem, panic, ptr};
+    use crate::sys::pal::unix::conf;
+    use crate::{io, mem, ptr};
 
     // Signal handler for the SIGSEGV and SIGBUS handlers. We've got guard pages
     // (unmapped pages) at the end of every thread's stack, so if a thread ends
@@ -119,8 +117,16 @@ mod imp {
                 if let Some(thread_info) = thread_info
                     && thread_info.guard_page_range.contains(&fault_addr)
                 {
-                    let name = thread_info.thread_name.as_deref().unwrap_or("<unknown>");
-                    rtprintpanic!("\nthread '{name}' has overflowed its stack\n");
+                    // Hey you! Yes, you modifying the stack overflow message!
+                    // Please make sure that all functions called here are
+                    // actually async-signal-safe. If they're not, try retrieving
+                    // the information beforehand and storing it in `ThreadInfo`.
+                    // Thank you!
+                    // - says Jonas after having had to watch his carefully
+                    //   written code get made unsound again.
+                    let tid = thread_info.tid;
+                    let name = thread_info.name.as_deref().unwrap_or("<unknown>");
+                    rtprintpanic!("\nthread '{name}' ({tid}) has overflowed its stack\n");
                     rtabort!("stack overflow");
                 }
             })
@@ -137,6 +143,12 @@ mod imp {
     }
 
     static PAGE_SIZE: Atomic<usize> = AtomicUsize::new(0);
+    // Store a pointer to the allocation for the main thread's altstack so that
+    // tools like valgrind don't complain about a leaked unreachable allocation.
+    //
+    // If the main thread exits, the process will terminate so there's no use in
+    // freeing resources. It also means that the altstack is still installed
+    // while TLS destructors are run on the main thread (c.f. #111272).
     static MAIN_ALTSTACK: Atomic<*mut libc::c_void> = AtomicPtr::new(ptr::null_mut());
     static NEED_ALTSTACK: Atomic<bool> = AtomicBool::new(false);
 
@@ -144,9 +156,16 @@ mod imp {
     /// Must be called only once
     #[forbid(unsafe_op_in_unsafe_fn)]
     pub unsafe fn init() {
-        PAGE_SIZE.store(os::page_size(), Ordering::Relaxed);
+        PAGE_SIZE.store(conf::page_size(), Ordering::Relaxed);
 
         let mut guard_page_range = unsafe { install_main_guard() };
+
+        // Even for panic=immediate-abort, installing the guard pages is important for soundness.
+        // That said, we do not care about giving nice stackoverflow messages via our custom
+        // signal handler, just exit early and let the user enjoy the segfault.
+        if cfg!(panic = "immediate-abort") {
+            return;
+        }
 
         // SAFETY: assuming all platforms define struct sigaction as "zero-initializable"
         let mut action: sigaction = unsafe { mem::zeroed() };
@@ -163,26 +182,18 @@ mod imp {
                     mem::forget(handler);
 
                     if let Some(guard_page_range) = guard_page_range.take() {
-                        let thread_name = with_current_name(|name| name.map(Box::from));
-                        set_current_info(guard_page_range, thread_name);
+                        set_current_info(guard_page_range);
                     }
                 }
 
                 action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-                action.sa_sigaction = signal_handler as sighandler_t;
+                action.sa_sigaction = signal_handler
+                    as unsafe extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void)
+                    as sighandler_t;
                 // SAFETY: only overriding signals if the default is set
                 unsafe { sigaction(signal, &action, ptr::null_mut()) };
             }
         }
-    }
-
-    /// # Safety
-    /// Must be called only once
-    #[forbid(unsafe_op_in_unsafe_fn)]
-    pub unsafe fn cleanup() {
-        // FIXME: I probably cause more bugs than I'm worth!
-        // see https://github.com/rust-lang/rust/issues/111272
-        unsafe { drop_handler(MAIN_ALTSTACK.load(Ordering::Relaxed)) };
     }
 
     unsafe fn get_stack() -> libc::stack_t {
@@ -231,14 +242,13 @@ mod imp {
     /// Mutates the alternate signal stack
     #[forbid(unsafe_op_in_unsafe_fn)]
     pub unsafe fn make_handler(main_thread: bool) -> Handler {
-        if !NEED_ALTSTACK.load(Ordering::Acquire) {
+        if cfg!(panic = "immediate-abort") || !NEED_ALTSTACK.load(Ordering::Acquire) {
             return Handler::null();
         }
 
         if !main_thread {
             if let Some(guard_page_range) = unsafe { current_guard() } {
-                let thread_name = with_current_name(|name| name.map(Box::from));
-                set_current_info(guard_page_range, thread_name);
+                set_current_info(guard_page_range);
             }
         }
 
@@ -289,7 +299,7 @@ mod imp {
     }
 
     /// Modern kernels on modern hardware can have dynamic signal stack sizes.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "uclibc")))]
     fn sigstack_size() -> usize {
         let dynamic_sigstksz = unsafe { libc::getauxval(libc::AT_MINSIGSTKSZ) };
         // If getauxval couldn't find the entry, it returns 0,
@@ -299,7 +309,7 @@ mod imp {
     }
 
     /// Not all OS support hardware where this is needed.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(all(any(target_os = "linux", target_os = "android"), not(target_env = "uclibc"))))]
     fn sigstack_size() -> usize {
         libc::SIGSTKSZ
     }
@@ -343,28 +353,32 @@ mod imp {
         target_os = "l4re"
     ))]
     unsafe fn get_stack_start() -> Option<*mut libc::c_void> {
+        use crate::pin::pin;
+        use crate::sys::helpers::COpaque;
+
         let mut ret = None;
-        let mut attr: mem::MaybeUninit<libc::pthread_attr_t> = mem::MaybeUninit::uninit();
+        let mut attr: COpaque<libc::pthread_attr_t> = COpaque::uninit();
         if !cfg!(target_os = "freebsd") {
-            attr = mem::MaybeUninit::zeroed();
+            attr = COpaque::zeroed();
         }
+        let attr = pin!(attr);
+        // FIXME(pin-ergonomics): remove the next line.
+        let attr = attr.into_ref();
+
         #[cfg(target_os = "freebsd")]
-        assert_eq!(libc::pthread_attr_init(attr.as_mut_ptr()), 0);
+        assert_eq!(libc::pthread_attr_init(attr.get()), 0);
         #[cfg(target_os = "freebsd")]
-        let e = libc::pthread_attr_get_np(libc::pthread_self(), attr.as_mut_ptr());
+        let e = libc::pthread_attr_get_np(libc::pthread_self(), attr.get());
         #[cfg(not(target_os = "freebsd"))]
-        let e = libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr());
+        let e = libc::pthread_getattr_np(libc::pthread_self(), attr.get());
         if e == 0 {
             let mut stackaddr = crate::ptr::null_mut();
             let mut stacksize = 0;
-            assert_eq!(
-                libc::pthread_attr_getstack(attr.as_ptr(), &mut stackaddr, &mut stacksize),
-                0
-            );
+            assert_eq!(libc::pthread_attr_getstack(attr.get(), &mut stackaddr, &mut stacksize), 0);
             ret = Some(stackaddr);
         }
         if e == 0 || cfg!(target_os = "freebsd") {
-            assert_eq!(libc::pthread_attr_destroy(attr.as_mut_ptr()), 0);
+            assert_eq!(libc::pthread_attr_destroy(attr.get()), 0);
         }
         ret
     }
@@ -398,6 +412,10 @@ mod imp {
             } else if cfg!(all(target_os = "linux", target_env = "musl")) {
                 install_main_guard_linux_musl(page_size)
             } else if cfg!(target_os = "freebsd") {
+                #[cfg(not(target_os = "freebsd"))]
+                return None;
+                // The FreeBSD code cannot be checked on non-BSDs.
+                #[cfg(target_os = "freebsd")]
                 install_main_guard_freebsd(page_size)
             } else if cfg!(any(target_os = "netbsd", target_os = "openbsd")) {
                 install_main_guard_bsds(page_size)
@@ -409,6 +427,11 @@ mod imp {
 
     #[forbid(unsafe_op_in_unsafe_fn)]
     unsafe fn install_main_guard_linux(page_size: usize) -> Option<Range<usize>> {
+        // See the corresponding conditional in init().
+        // Avoid stack_start_aligned, which makes slow syscalls to read /proc/self/maps
+        if cfg!(panic = "immediate-abort") {
+            return None;
+        }
         // Linux doesn't allocate the whole stack right away, and
         // the kernel has its own stack-guard mechanism to fault
         // when growing too close to an existing mapping. If we map
@@ -434,7 +457,12 @@ mod imp {
     }
 
     #[forbid(unsafe_op_in_unsafe_fn)]
+    #[cfg(target_os = "freebsd")]
     unsafe fn install_main_guard_freebsd(page_size: usize) -> Option<Range<usize>> {
+        // See the corresponding conditional in install_main_guard_linux().
+        if cfg!(panic = "immediate-abort") {
+            return None;
+        }
         // FreeBSD's stack autogrows, and optionally includes a guard page
         // at the bottom. If we try to remap the bottom of the stack
         // ourselves, FreeBSD's guard page moves upwards. So we'll just use
@@ -445,44 +473,33 @@ mod imp {
         // by the security.bsd.stack_guard_page sysctl.
         // By default it is 1, checking once is enough since it is
         // a boot time config value.
-        static PAGES: OnceLock<usize> = OnceLock::new();
+        static PAGES: crate::sync::OnceLock<usize> = crate::sync::OnceLock::new();
 
         let pages = PAGES.get_or_init(|| {
-            use crate::sys::weak::dlsym;
-            dlsym!(
-                fn sysctlbyname(
-                    name: *const libc::c_char,
-                    oldp: *mut libc::c_void,
-                    oldlenp: *mut libc::size_t,
-                    newp: *const libc::c_void,
-                    newlen: libc::size_t,
-                ) -> libc::c_int;
-            );
             let mut guard: usize = 0;
             let mut size = size_of_val(&guard);
             let oid = c"security.bsd.stack_guard_page";
-            match sysctlbyname.get() {
-                Some(fcn)
-                    if unsafe {
-                        fcn(
-                            oid.as_ptr(),
-                            (&raw mut guard).cast(),
-                            &raw mut size,
-                            ptr::null_mut(),
-                            0,
-                        ) == 0
-                    } =>
-                {
-                    guard
-                }
-                _ => 1,
-            }
+
+            let r = unsafe {
+                libc::sysctlbyname(
+                    oid.as_ptr(),
+                    (&raw mut guard).cast(),
+                    &raw mut size,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if r == 0 { guard } else { 1 }
         });
         Some(guardaddr..guardaddr + pages * page_size)
     }
 
     #[forbid(unsafe_op_in_unsafe_fn)]
     unsafe fn install_main_guard_bsds(page_size: usize) -> Option<Range<usize>> {
+        // See the corresponding conditional in install_main_guard_linux().
+        if cfg!(panic = "immediate-abort") {
+            return None;
+        }
         // OpenBSD stack already includes a guard page, and stack is
         // immutable.
         // NetBSD stack includes the guard page.
@@ -553,21 +570,28 @@ mod imp {
     ))]
     // FIXME: I am probably not unsafe.
     unsafe fn current_guard() -> Option<Range<usize>> {
+        use crate::pin::pin;
+        use crate::sys::helpers::COpaque;
+
         let mut ret = None;
 
-        let mut attr: mem::MaybeUninit<libc::pthread_attr_t> = mem::MaybeUninit::uninit();
+        let mut attr: COpaque<libc::pthread_attr_t> = COpaque::uninit();
         if !cfg!(target_os = "freebsd") {
-            attr = mem::MaybeUninit::zeroed();
+            attr = COpaque::zeroed();
         }
+        let attr = pin!(attr);
+        // FIXME(pin-ergonomics): remove the next line.
+        let attr = attr.into_ref();
+
         #[cfg(target_os = "freebsd")]
-        assert_eq!(libc::pthread_attr_init(attr.as_mut_ptr()), 0);
+        assert_eq!(libc::pthread_attr_init(attr.get()), 0);
         #[cfg(target_os = "freebsd")]
-        let e = libc::pthread_attr_get_np(libc::pthread_self(), attr.as_mut_ptr());
+        let e = libc::pthread_attr_get_np(libc::pthread_self(), attr.get());
         #[cfg(not(target_os = "freebsd"))]
-        let e = libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr());
+        let e = libc::pthread_getattr_np(libc::pthread_self(), attr.get());
         if e == 0 {
             let mut guardsize = 0;
-            assert_eq!(libc::pthread_attr_getguardsize(attr.as_ptr(), &mut guardsize), 0);
+            assert_eq!(libc::pthread_attr_getguardsize(attr.get(), &mut guardsize), 0);
             if guardsize == 0 {
                 if cfg!(all(target_os = "linux", target_env = "musl")) {
                     // musl versions before 1.1.19 always reported guard
@@ -580,7 +604,7 @@ mod imp {
             }
             let mut stackptr = crate::ptr::null_mut::<libc::c_void>();
             let mut size = 0;
-            assert_eq!(libc::pthread_attr_getstack(attr.as_ptr(), &mut stackptr, &mut size), 0);
+            assert_eq!(libc::pthread_attr_getstack(attr.get(), &mut stackptr, &mut size), 0);
 
             let stackaddr = stackptr.addr();
             ret = if cfg!(any(target_os = "freebsd", target_os = "netbsd", target_os = "hurd")) {
@@ -601,7 +625,7 @@ mod imp {
             };
         }
         if e == 0 || cfg!(target_os = "freebsd") {
-            assert_eq!(libc::pthread_attr_destroy(attr.as_mut_ptr()), 0);
+            assert_eq!(libc::pthread_attr_destroy(attr.get()), 0);
         }
         ret
     }
@@ -631,8 +655,6 @@ mod imp {
 ))]
 mod imp {
     pub unsafe fn init() {}
-
-    pub unsafe fn cleanup() {}
 
     pub unsafe fn make_handler(_main_thread: bool) -> super::Handler {
         super::Handler::null()
@@ -696,7 +718,8 @@ mod imp {
             if code == c::EXCEPTION_STACK_OVERFLOW {
                 crate::thread::with_current_name(|name| {
                     let name = name.unwrap_or("<unknown>");
-                    rtprintpanic!("\nthread '{name}' has overflowed its stack\n");
+                    let tid = crate::thread::current_os_id();
+                    rtprintpanic!("\nthread '{name}' ({tid}) has overflowed its stack\n");
                 });
             }
             c::EXCEPTION_CONTINUE_SEARCH
@@ -714,8 +737,6 @@ mod imp {
         // Set the thread stack guarantee for the main thread.
         reserve_stack();
     }
-
-    pub unsafe fn cleanup() {}
 
     pub unsafe fn make_handler(main_thread: bool) -> super::Handler {
         if !main_thread {

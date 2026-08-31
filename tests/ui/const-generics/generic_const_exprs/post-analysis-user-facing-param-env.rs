@@ -1,6 +1,5 @@
 // Regression test for #133271.
 #![feature(generic_const_exprs)]
-//~^ WARN the feature `generic_const_exprs` is incomplete
 
 struct Foo;
 impl<'a, const NUM: usize> std::ops::Add<&'a Foo> for Foo
@@ -11,7 +10,6 @@ where
 {
     fn unimplemented(self, _: &Foo) -> Self::Output {
         //~^ ERROR method `unimplemented` is not a member of trait `std::ops::Add`
-        //~| ERROR type annotations needed
         loop {}
     }
 }

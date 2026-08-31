@@ -12,16 +12,21 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use hir::ChangeWithProcMacros;
 use ide::{Analysis, AnalysisHost, Cancellable, FileId, SourceRootId};
-use ide_db::base_db::{Crate, ProcMacroPaths, SourceDatabase};
+use ide_db::{
+    MiniCore,
+    base_db::{Crate, ProcMacroPaths, SourceDatabase, all_crates, salsa::Revision},
+};
 use itertools::Itertools;
 use load_cargo::SourceRootConfig;
-use lsp_types::{SemanticTokens, Url};
+use lsp_types::{Notification, SemanticTokens, Uri};
 use parking_lot::{
     MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
     RwLockWriteGuard,
 };
 use proc_macro_api::ProcMacroClient;
-use project_model::{ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts};
+use project_model::{
+    ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, TargetKind, WorkspaceBuildScripts,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use stdx::thread;
 use tracing::{Level, span, trace};
@@ -32,16 +37,16 @@ use crate::{
     config::{Config, ConfigChange, ConfigErrors, RatomlFileKind},
     diagnostics::{CheckFixes, DiagnosticCollection},
     discover,
-    flycheck::{FlycheckHandle, FlycheckMessage},
+    flycheck::{FlycheckHandle, FlycheckMessage, PackageSpecifier},
     line_index::{LineEndings, LineIndex},
     lsp::{from_proto, to_proto::url_from_abs_path},
     lsp_ext,
     main_loop::Task,
     mem_docs::MemDocs,
     op_queue::{Cause, OpQueue},
-    reload,
+    priming_scope, reload,
     target_spec::{CargoTargetSpec, ProjectJsonTargetSpec, TargetSpec},
-    task_pool::{TaskPool, TaskQueue},
+    task_pool::{DeferredTaskQueue, TaskPool},
     test_runner::{CargoTestHandle, CargoTestMessage},
 };
 
@@ -94,14 +99,19 @@ pub(crate) struct GlobalState {
     pub(crate) source_root_config: SourceRootConfig,
     /// A mapping that maps a local source root's `SourceRootId` to it parent's `SourceRootId`, if it has one.
     pub(crate) local_roots_parent_map: Arc<FxHashMap<SourceRootId, SourceRootId>>,
-    pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Url, SemanticTokens>>>,
+    pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Uri, SemanticTokens>>>,
 
     // status
     pub(crate) shutdown_requested: bool,
     pub(crate) last_reported_status: lsp_ext::ServerStatusParams,
 
-    // proc macros
+    /// Clients of the proc-macro server.
+    ///
+    /// One client per workspace, in the same order as `self.workspaces`. We don't store
+    /// the client in `self.workspaces` so that we can reload workspaces without
+    /// restarting the proc-macro server.
     pub(crate) proc_macro_clients: Arc<[Option<anyhow::Result<ProcMacroClient>>]>,
+
     pub(crate) build_deps_changed: bool,
 
     // Flycheck
@@ -109,6 +119,7 @@ pub(crate) struct GlobalState {
     pub(crate) flycheck_sender: Sender<FlycheckMessage>,
     pub(crate) flycheck_receiver: Receiver<FlycheckMessage>,
     pub(crate) last_flycheck_error: Option<String>,
+    pub(crate) flycheck_formatted_commands: Vec<String>,
 
     // Test explorer
     pub(crate) test_run_session: Option<Vec<CargoTestHandle>>,
@@ -117,9 +128,10 @@ pub(crate) struct GlobalState {
     pub(crate) test_run_remaining_jobs: usize,
 
     // Project loading
-    pub(crate) discover_handle: Option<discover::DiscoverHandle>,
+    pub(crate) discover_handles: Vec<discover::DiscoverHandle>,
     pub(crate) discover_sender: Sender<discover::DiscoverProjectMessage>,
     pub(crate) discover_receiver: Receiver<discover::DiscoverProjectMessage>,
+    pub(crate) discover_jobs_active: u32,
 
     // Debouncing channel for fetching the workspace
     // we want to delay it until the VFS looks stable-ish (and thus is not currently in the middle
@@ -171,7 +183,6 @@ pub(crate) struct GlobalState {
     pub(crate) fetch_build_data_queue: OpQueue<(), FetchBuildDataResponse>,
     pub(crate) fetch_proc_macros_queue: OpQueue<(ChangeWithProcMacros, Vec<ProcMacroPaths>), bool>,
     pub(crate) prime_caches_queue: OpQueue,
-    pub(crate) discover_workspace_queue: OpQueue,
 
     /// A deferred task queue.
     ///
@@ -182,7 +193,21 @@ pub(crate) struct GlobalState {
     /// For certain features, such as [`GlobalState::handle_discover_msg`],
     /// this queue should run only *after* [`GlobalState::process_changes`] has
     /// been called.
-    pub(crate) deferred_task_queue: TaskQueue,
+    pub(crate) deferred_task_queue: DeferredTaskQueue,
+
+    /// HACK: Workaround for <https://github.com/rust-lang/rust-analyzer/issues/19709>
+    /// This is marked true if we failed to load a crate root file at crate graph creation,
+    /// which will usually end up causing a bunch of incorrect diagnostics on startup.
+    pub(crate) incomplete_crate_graph: bool,
+
+    pub(crate) minicore: MiniCoreRustAnalyzerInternalOnly,
+    pub(crate) last_gc_revision: Revision,
+}
+
+// FIXME: This should move to the VFS once the rewrite is done.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MiniCoreRustAnalyzerInternalOnly {
+    pub(crate) minicore_text: Option<Arc<str>>,
 }
 
 /// An immutable snapshot of the world's state at a point in time.
@@ -191,7 +216,7 @@ pub(crate) struct GlobalStateSnapshot {
     pub(crate) analysis: Analysis,
     pub(crate) check_fixes: CheckFixes,
     mem_docs: MemDocs,
-    pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Url, SemanticTokens>>>,
+    pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Uri, SemanticTokens>>>,
     vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,
     pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
     // used to signal semantic highlighting to fall back to syntax based highlighting until
@@ -199,6 +224,7 @@ pub(crate) struct GlobalStateSnapshot {
     // FIXME: Can we derive this from somewhere else?
     pub(crate) proc_macros_loaded: bool,
     pub(crate) flycheck: Arc<[FlycheckHandle]>,
+    minicore: MiniCoreRustAnalyzerInternalOnly,
 }
 
 impl std::panic::UnwindSafe for GlobalStateSnapshot {}
@@ -224,9 +250,9 @@ impl GlobalState {
         };
         let cancellation_pool = thread::Pool::new(1);
 
-        let task_queue = {
+        let deferred_task_queue = {
             let (sender, receiver) = unbounded();
-            TaskQueue { sender, receiver }
+            DeferredTaskQueue { sender, receiver }
         };
 
         let mut analysis_host = AnalysisHost::new(config.lru_parse_query_capacity());
@@ -237,6 +263,8 @@ impl GlobalState {
         let (test_run_sender, test_run_receiver) = unbounded();
 
         let (discover_sender, discover_receiver) = unbounded();
+
+        let last_gc_revision = analysis_host.raw_database().nonce_and_revision().1;
 
         let mut this = GlobalState {
             sender,
@@ -268,15 +296,17 @@ impl GlobalState {
             flycheck_sender,
             flycheck_receiver,
             last_flycheck_error: None,
+            flycheck_formatted_commands: vec![],
 
             test_run_session: None,
             test_run_sender,
             test_run_receiver,
             test_run_remaining_jobs: 0,
 
-            discover_handle: None,
+            discover_handles: vec![],
             discover_sender,
             discover_receiver,
+            discover_jobs_active: 0,
 
             fetch_ws_receiver: None,
 
@@ -295,16 +325,19 @@ impl GlobalState {
             fetch_proc_macros_queue: OpQueue::default(),
 
             prime_caches_queue: OpQueue::default(),
-            discover_workspace_queue: OpQueue::default(),
 
-            deferred_task_queue: task_queue,
+            deferred_task_queue,
+            incomplete_crate_graph: false,
+
+            minicore: MiniCoreRustAnalyzerInternalOnly::default(),
+            last_gc_revision,
         };
         // Apply any required database inputs from the config.
         this.update_configuration(config);
         this
     }
 
-    pub(crate) fn process_changes(&mut self) -> bool {
+    pub(crate) fn process_changes(&mut self) -> (bool, Option<Duration>) {
         let _p = span!(Level::INFO, "GlobalState::process_changes").entered();
         // We cannot directly resolve a change in a ratoml file to a format
         // that can be used by the config module because config talks
@@ -317,16 +350,16 @@ impl GlobalState {
         let mut guard = self.vfs.write();
         let changed_files = guard.0.take_changes();
         if changed_files.is_empty() {
-            return false;
+            return (false, None);
         }
 
         let (change, modified_rust_files, workspace_structure_change) =
             self.cancellation_pool.scoped(|s| {
-                // start cancellation in parallel, this will kick off lru eviction
+                // start cancellation in parallel,
                 // allowing us to do meaningful work while waiting
                 let analysis_host = AssertUnwindSafe(&mut self.analysis_host);
                 s.spawn(thread::ThreadIntent::LatencySensitive, || {
-                    { analysis_host }.0.request_cancellation()
+                    { analysis_host }.0.trigger_cancellation()
                 });
 
                 // downgrade to read lock to allow more readers while we are normalizing text
@@ -413,7 +446,8 @@ impl GlobalState {
                 (change, modified_rust_files, workspace_structure_change)
             });
 
-        self.analysis_host.apply_change(change);
+        let cancellation_time = self.analysis_host.apply_change(change);
+
         if !modified_ratoml_files.is_empty()
             || !self.config.same_source_root_parent_map(&self.local_roots_parent_map)
         {
@@ -448,7 +482,7 @@ impl GlobalState {
                     tracing::info!(%vfs_path, ?change_kind, "Processing rust-analyzer.toml changes");
                     if vfs_path.as_path() == user_config_abs_path {
                         tracing::info!(%vfs_path, ?change_kind, "Use config rust-analyzer.toml changes");
-                        change.change_user_config(Some(db.file_text(file_id).text(db)));
+                        change.change_user_config(Some(db.file_text(file_id).text(db).clone()));
                     }
 
                     // If change has been made to a ratoml file that
@@ -462,14 +496,14 @@ impl GlobalState {
                             change.change_workspace_ratoml(
                                 source_root_id,
                                 vfs_path.clone(),
-                                Some(db.file_text(file_id).text(db)),
+                                Some(db.file_text(file_id).text(db).clone()),
                             )
                         } else {
                             tracing::info!(%vfs_path, ?source_root_id, "crate rust-analyzer.toml changes");
                             change.change_ratoml(
                                 source_root_id,
                                 vfs_path.clone(),
-                                Some(db.file_text(file_id).text(db)),
+                                Some(db.file_text(file_id).text(db).clone()),
                             )
                         };
 
@@ -520,10 +554,9 @@ impl GlobalState {
         // didn't find anything (to make up for the lack of precision).
         {
             if !matches!(&workspace_structure_change, Some((.., true))) {
-                _ = self
-                    .deferred_task_queue
-                    .sender
-                    .send(crate::main_loop::QueuedTask::CheckProcMacroSources(modified_rust_files));
+                _ = self.deferred_task_queue.sender.send(
+                    crate::main_loop::DeferredTask::CheckProcMacroSources(modified_rust_files),
+                );
             }
             // FIXME: ideally we should only trigger a workspace fetch for non-library changes
             // but something's going wrong with the source root business when we add a new local
@@ -535,7 +568,7 @@ impl GlobalState {
             }
         }
 
-        true
+        (true, Some(cancellation_time))
     }
 
     pub(crate) fn snapshot(&self) -> GlobalStateSnapshot {
@@ -544,6 +577,7 @@ impl GlobalState {
             workspaces: Arc::clone(&self.workspaces),
             analysis: self.analysis_host.analysis(),
             vfs: Arc::clone(&self.vfs),
+            minicore: self.minicore.clone(),
             check_fixes: Arc::clone(&self.diagnostics.check_fixes),
             mem_docs: self.mem_docs.clone(),
             semantic_tokens_cache: Arc::clone(&self.semantic_tokens_cache),
@@ -553,12 +587,12 @@ impl GlobalState {
         }
     }
 
-    pub(crate) fn send_request<R: lsp_types::request::Request>(
+    pub(crate) fn send_request<R: lsp_types::Request>(
         &mut self,
         params: R::Params,
         handler: ReqHandler,
     ) {
-        let request = self.req_queue.outgoing.register(R::METHOD.to_owned(), params, handler);
+        let request = self.req_queue.outgoing.register(R::METHOD.into(), params, handler);
         self.send(request.into());
     }
 
@@ -571,11 +605,8 @@ impl GlobalState {
         handler(self, response)
     }
 
-    pub(crate) fn send_notification<N: lsp_types::notification::Notification>(
-        &self,
-        params: N::Params,
-    ) {
-        let not = lsp_server::Notification::new(N::METHOD.to_owned(), params);
+    pub(crate) fn send_notification<N: lsp_types::Notification>(&self, params: N::Params) {
+        let not = lsp_server::Notification::new(N::METHOD.into(), params);
         self.send(not.into());
     }
 
@@ -591,10 +622,10 @@ impl GlobalState {
 
     pub(crate) fn respond(&mut self, response: lsp_server::Response) {
         if let Some((method, start)) = self.req_queue.incoming.complete(&response.id) {
-            if let Some(err) = &response.error {
-                if err.message.starts_with("server panicked") {
-                    self.poke_rust_analyzer_developer(format!("{}, check the log", err.message));
-                }
+            if let Some(err) = &response.error
+                && err.message.starts_with("server panicked")
+            {
+                self.poke_rust_analyzer_developer(format!("{}, check the log", err.message));
             }
 
             let duration = start.elapsed();
@@ -620,7 +651,7 @@ impl GlobalState {
 
     pub(crate) fn publish_diagnostics(
         &mut self,
-        uri: Url,
+        uri: Uri,
         version: Option<i32>,
         mut diagnostics: Vec<lsp_types::Diagnostic>,
     ) {
@@ -637,23 +668,34 @@ impl GlobalState {
 
                 // See https://github.com/rust-lang/rust-analyzer/issues/11404
                 // See https://github.com/rust-lang/rust-analyzer/issues/13130
-                let patch_empty = |message: &mut String| {
-                    if message.is_empty() {
-                        " ".clone_into(message);
+                let patch_empty = |message: &mut lsp_types::Message| match message {
+                    lsp_types::Message::String(m) if m.is_empty() => {
+                        " ".clone_into(m);
                     }
+                    lsp_types::Message::MarkupContent(lsp_types::MarkupContent {
+                        value,
+                        kind: _,
+                    }) if value.is_empty() => {
+                        " ".clone_into(value);
+                    }
+                    _ => {}
                 };
 
                 for d in &mut diagnostics {
                     patch_empty(&mut d.message);
                     if let Some(dri) = &mut d.related_information {
                         for dri in dri {
-                            patch_empty(&mut dri.message);
+                            // The LSP does not (yet?) specify that related diagnostic messages can
+                            // be in Markdown format (in addition to plain text).
+                            if dri.message.is_empty() {
+                                " ".clone_into(&mut dri.message);
+                            }
                         }
                     }
                 }
 
                 let not = lsp_server::Notification::new(
-                    <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
+                    lsp_types::PublishDiagnosticsNotification::METHOD.into(),
                     lsp_types::PublishDiagnosticsParams { uri, diagnostics, version },
                 );
                 _ = sender.send(not.into());
@@ -663,18 +705,18 @@ impl GlobalState {
 
     pub(crate) fn check_workspaces_msrv(&self) -> impl Iterator<Item = String> + '_ {
         self.workspaces.iter().filter_map(|ws| {
-            if let Some(toolchain) = &ws.toolchain {
-                if *toolchain < crate::MINIMUM_SUPPORTED_TOOLCHAIN_VERSION {
-                    return Some(format!(
-                        "Workspace `{}` is using an outdated toolchain version `{}` but \
+            if let Some(toolchain) = &ws.toolchain
+                && *toolchain < crate::MINIMUM_SUPPORTED_TOOLCHAIN_VERSION
+            {
+                return Some(format!(
+                    "Workspace `{}` is using an outdated toolchain version `{}` but \
                         rust-analyzer only supports `{}` and higher.\n\
                         Consider using the rust-analyzer rustup component for your toolchain or
                         upgrade your toolchain to a supported version.\n\n",
-                        ws.manifest_or_root(),
-                        toolchain,
-                        crate::MINIMUM_SUPPORTED_TOOLCHAIN_VERSION,
-                    ));
-                }
+                    ws.manifest_or_root(),
+                    toolchain,
+                    crate::MINIMUM_SUPPORTED_TOOLCHAIN_VERSION,
+                ));
             }
             None
         })
@@ -703,11 +745,80 @@ impl GlobalState {
             *fetch_receiver = crossbeam_channel::after(Duration::from_millis(100));
         }
     }
+
+    /// Set of crates to prime: the transitive-dependency closure of every
+    /// local Cargo workspace `lib`/`bin` target, `rust-project.json` workspace
+    /// member, and detached file. Computed once when the server becomes
+    /// quiescent.
+    ///
+    /// Test, example, and benchmark members are deliberately excluded — they're
+    /// leaves, so not priming them costs no parallelism on dependency work.
+    /// `bin` targets are kept because they're the crate the user is most likely
+    /// editing.
+    pub(crate) fn compute_priming_scope(&self) -> Arc<[Crate]> {
+        let db = self.analysis_host.raw_database();
+        let all = all_crates(db);
+
+        // Map each crate-root path to its crate(s) so target roots resolve to
+        // `Crate` ids. The vfs read lock is held only for this build.
+        let root_to_crate: FxHashMap<AbsPathBuf, Vec<Crate>> = {
+            let vfs = self.vfs.read();
+            let mut root_to_crate: FxHashMap<AbsPathBuf, Vec<Crate>> = FxHashMap::default();
+            for &krate in &*all {
+                let root_file = krate.data(db).root_file_id;
+                let path = vfs.0.file_path(root_file);
+                let Some(path) = path.as_path() else {
+                    continue;
+                };
+                root_to_crate.entry(path.to_path_buf()).or_default().push(krate);
+            }
+            root_to_crate
+        };
+
+        let mut seed: FxHashSet<Crate> = FxHashSet::default();
+        for workspace in self.workspaces.iter() {
+            match &workspace.kind {
+                ProjectWorkspaceKind::Cargo { cargo, .. }
+                | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => {
+                    for pkg in cargo.packages() {
+                        if !cargo[pkg].is_local {
+                            continue;
+                        }
+                        for &target in &cargo[pkg].targets {
+                            if !matches!(
+                                cargo[target].kind,
+                                TargetKind::Lib { .. } | TargetKind::Bin
+                            ) {
+                                continue;
+                            }
+                            if let Some(krates) = root_to_crate.get(&*cargo[target].root) {
+                                seed.extend(krates.iter().copied());
+                            }
+                        }
+                    }
+                }
+                ProjectWorkspaceKind::Json(project_json) => seed.extend(
+                    project_json
+                        .crates()
+                        .filter(|(_, krate)| krate.is_workspace_member)
+                        .filter_map(|(_, krate)| root_to_crate.get(&krate.root_module))
+                        .flat_map(|it| it.iter().copied()),
+                ),
+                ProjectWorkspaceKind::DetachedFile { file, cargo: None } => {
+                    if let Some(krates) = root_to_crate.get(&**file) {
+                        seed.extend(krates.iter().copied());
+                    }
+                }
+            }
+        }
+
+        priming_scope::compute(db, seed)
+    }
 }
 
 impl Drop for GlobalState {
     fn drop(&mut self) {
-        self.analysis_host.request_cancellation();
+        self.analysis_host.trigger_cancellation();
     }
 }
 
@@ -717,11 +828,11 @@ impl GlobalStateSnapshot {
     }
 
     /// Returns `None` if the file was excluded.
-    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
+    pub(crate) fn url_to_file_id(&self, url: &Uri) -> anyhow::Result<Option<FileId>> {
         url_to_file_id(&self.vfs_read(), url)
     }
 
-    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {
+    pub(crate) fn file_id_to_url(&self, id: FileId) -> Uri {
         file_id_to_url(&self.vfs_read(), id)
     }
 
@@ -741,12 +852,12 @@ impl GlobalStateSnapshot {
         Some(self.mem_docs.get(self.vfs_read().file_path(file_id))?.version)
     }
 
-    pub(crate) fn url_file_version(&self, url: &Url) -> Option<i32> {
+    pub(crate) fn url_file_version(&self, url: &Uri) -> Option<i32> {
         let path = from_proto::vfs_path(url).ok()?;
         Some(self.mem_docs.get(&path)?.version)
     }
 
-    pub(crate) fn anchored_path(&self, path: &AnchoredPathBuf) -> Url {
+    pub(crate) fn anchored_path(&self, path: &AnchoredPathBuf) -> Uri {
         let mut base = self.vfs_read().file_path(path.anchor).clone();
         base.pop();
         let path = base.join(&path.path).unwrap();
@@ -760,6 +871,14 @@ impl GlobalStateSnapshot {
 
     pub(crate) fn target_spec_for_crate(&self, crate_id: Crate) -> Option<TargetSpec> {
         let file_id = self.analysis.crate_root(crate_id).ok()?;
+        self.target_spec_for_file(file_id, crate_id)
+    }
+
+    pub(crate) fn target_spec_for_file(
+        &self,
+        file_id: FileId,
+        crate_id: Crate,
+    ) -> Option<TargetSpec> {
         let path = self.vfs_read().file_path(file_id).clone();
         let path = path.as_path()?;
 
@@ -779,6 +898,7 @@ impl GlobalStateSnapshot {
                         cargo_toml: package_data.manifest.clone(),
                         crate_id,
                         package: cargo.package_flag(package_data),
+                        package_id: package_data.id.clone(),
                         target: target_data.name.clone(),
                         target_kind: target_data.kind,
                         required_features: target_data.required_features.clone(),
@@ -790,7 +910,7 @@ impl GlobalStateSnapshot {
                     let Some(krate) = project.crate_by_root(path) else {
                         continue;
                     };
-                    let Some(build) = krate.build else {
+                    let Some(build) = krate.build.clone() else {
                         continue;
                     };
 
@@ -798,6 +918,7 @@ impl GlobalStateSnapshot {
                         label: build.label,
                         target_kind: build.target_kind,
                         shell_runnables: project.runnables().to_owned(),
+                        project_root: project.project_root().to_owned(),
                     }));
                 }
                 ProjectWorkspaceKind::DetachedFile { .. } => {}
@@ -807,19 +928,68 @@ impl GlobalStateSnapshot {
         None
     }
 
+    pub(crate) fn all_workspace_dependencies_for_package(
+        &self,
+        package: &PackageSpecifier,
+    ) -> Option<FxHashSet<PackageSpecifier>> {
+        match package {
+            PackageSpecifier::Cargo { package_id } => {
+                self.workspaces.iter().find_map(|workspace| match &workspace.kind {
+                    ProjectWorkspaceKind::Cargo { cargo, .. }
+                    | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, _, _)), .. } => {
+                        let package = cargo.packages().find(|p| cargo[*p].id == *package_id)?;
+
+                        cargo[package].all_member_deps.as_ref().map(|deps| {
+                            deps.iter()
+                                .map(|dep| cargo[*dep].id.clone())
+                                .map(|p| PackageSpecifier::Cargo { package_id: p })
+                                .collect()
+                        })
+                    }
+                    _ => None,
+                })
+            }
+            PackageSpecifier::BuildInfo { label } => {
+                self.workspaces.iter().find_map(|workspace| match &workspace.kind {
+                    ProjectWorkspaceKind::Json(p) => {
+                        let krate = p.crate_by_label(label)?;
+                        Some(
+                            krate
+                                .iter_deps()
+                                .filter_map(|dep| p[dep].build.as_ref())
+                                .map(|build| PackageSpecifier::BuildInfo {
+                                    label: build.label.clone(),
+                                })
+                                .collect(),
+                        )
+                    }
+                    _ => None,
+                })
+            }
+        }
+    }
+
     pub(crate) fn file_exists(&self, file_id: FileId) -> bool {
         self.vfs.read().0.exists(file_id)
     }
+
+    #[inline]
+    pub(crate) fn minicore(&self) -> MiniCore<'_> {
+        match &self.minicore.minicore_text {
+            Some(minicore) => MiniCore::new(minicore),
+            None => MiniCore::default(),
+        }
+    }
 }
 
-pub(crate) fn file_id_to_url(vfs: &vfs::Vfs, id: FileId) -> Url {
+pub(crate) fn file_id_to_url(vfs: &vfs::Vfs, id: FileId) -> Uri {
     let path = vfs.file_path(id);
     let path = path.as_path().unwrap();
     url_from_abs_path(path)
 }
 
 /// Returns `None` if the file was excluded.
-pub(crate) fn url_to_file_id(vfs: &vfs::Vfs, url: &Url) -> anyhow::Result<Option<FileId>> {
+pub(crate) fn url_to_file_id(vfs: &vfs::Vfs, url: &Uri) -> anyhow::Result<Option<FileId>> {
     let path = from_proto::vfs_path(url)?;
     vfs_path_to_file_id(vfs, &path)
 }

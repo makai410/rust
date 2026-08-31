@@ -4,9 +4,8 @@ use clippy_utils::ty::implements_trait;
 use clippy_utils::{SpanlessEq, if_sequence, is_else_clause, is_in_const_context};
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
-use rustc_span::sym;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
+use rustc_span::{SyntaxContext, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -16,10 +15,6 @@ declare_clippy_lint! {
     /// ### Why is this bad?
     /// `if` is not guaranteed to be exhaustive and conditionals can get
     /// repetitive
-    ///
-    /// ### Known problems
-    /// The match statement may be slower due to the compiler
-    /// not inlining the call to cmp. See issue [#5354](https://github.com/rust-lang/rust-clippy/issues/5354)
     ///
     /// ### Example
     /// ```rust,ignore
@@ -94,8 +89,10 @@ impl<'tcx> LateLintPass<'tcx> for ComparisonChain {
 
                 // Check that both sets of operands are equal
                 let mut spanless_eq = SpanlessEq::new(cx);
-                let same_fixed_operands = spanless_eq.eq_expr(lhs1, lhs2) && spanless_eq.eq_expr(rhs1, rhs2);
-                let same_transposed_operands = spanless_eq.eq_expr(lhs1, rhs2) && spanless_eq.eq_expr(rhs1, lhs2);
+                let same_fixed_operands = spanless_eq.eq_expr(SyntaxContext::root(), lhs1, lhs2)
+                    && spanless_eq.eq_expr(SyntaxContext::root(), rhs1, rhs2);
+                let same_transposed_operands = spanless_eq.eq_expr(SyntaxContext::root(), lhs1, rhs2)
+                    && spanless_eq.eq_expr(SyntaxContext::root(), rhs1, lhs2);
 
                 if !same_fixed_operands && !same_transposed_operands {
                     return;

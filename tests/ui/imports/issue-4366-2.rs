@@ -1,3 +1,4 @@
+//@ edition:2015
 // ensures that 'use foo:*' doesn't import non-public item
 
 use m1::*;
@@ -22,5 +23,5 @@ mod m1 {
 }
 
 fn main() {
-    foo(); //~ ERROR expected function, found module `foo`
+    foo(); //~ ERROR cannot find function `foo` in this scope
 }

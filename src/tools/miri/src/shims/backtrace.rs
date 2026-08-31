@@ -15,7 +15,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-        let [flags] = this.check_shim(abi, CanonAbi::Rust, link_name, args)?;
+        let [flags] =
+            this.check_shim_sig(shim_sig!(extern "Rust" fn(u64) -> usize), (link_name, abi, args))?;
 
         let flags = this.read_scalar(flags)?.to_u64()?;
         if flags != 0 {
@@ -37,7 +38,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let ptr_ty = this.machine.layouts.mut_raw_ptr.ty;
         let ptr_layout = this.layout_of(ptr_ty)?;
 
-        let [flags, buf] = this.check_shim(abi, CanonAbi::Rust, link_name, args)?;
+        let [flags, buf] = this
+            .check_shim_sig(shim_sig!(extern "Rust" fn(u64, *_) -> ()), (link_name, abi, args))?;
 
         let flags = this.read_scalar(flags)?.to_u64()?;
         let buf_place = this.deref_pointer_as(buf, ptr_layout)?;
@@ -92,21 +94,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let (alloc_id, offset, _prov) = this.ptr_get_alloc_id(ptr, 0)?;
 
         // This has to be an actual global fn ptr, not a dlsym function.
-        let fn_instance = if let Some(GlobalAlloc::Function { instance, .. }) =
-            this.tcx.try_get_global_alloc(alloc_id)
-        {
-            instance
-        } else {
+        let Some(GlobalAlloc::Function { instance, .. }) = this.tcx.try_get_global_alloc(alloc_id)
+        else {
             throw_ub_format!("expected static function pointer, found {:?}", ptr);
         };
 
         let lo =
             this.tcx.sess.source_map().lookup_char_pos(BytePos(offset.bytes().try_into().unwrap()));
 
-        let name = fn_instance.to_string();
+        let name = instance.to_string();
         let filename = lo.file.name.prefer_remapped_unconditionally().to_string();
 
-        interp_ok((fn_instance, lo, name, filename))
+        interp_ok((instance, lo, name, filename))
     }
 
     fn handle_miri_resolve_frame(
@@ -117,7 +116,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-        let [ptr, flags] = this.check_shim(abi, CanonAbi::Rust, link_name, args)?;
+        let [ptr, flags] = this.check_shim_sig_deprecated(abi, CanonAbi::Rust, link_name, args)?;
 
         let flags = this.read_scalar(flags)?.to_u64()?;
 
@@ -194,8 +193,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        let [ptr, flags, name_ptr, filename_ptr] =
-            this.check_shim(abi, CanonAbi::Rust, link_name, args)?;
+        let [ptr, flags, name_ptr, filename_ptr] = this.check_shim_sig(
+            shim_sig!(extern "Rust" fn(*_, u64, *_, *_) -> ()),
+            (link_name, abi, args),
+        )?;
 
         let flags = this.read_scalar(flags)?.to_u64()?;
         if flags != 0 {

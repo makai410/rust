@@ -4,9 +4,11 @@ use std::slice;
 
 use rustc_ast::InlineAsmOptions;
 use rustc_data_structures::packed::Pu128;
-use rustc_hir::LangItem;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_hir::attrs::AttributeKind;
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use smallvec::{SmallVec, smallvec};
+use thin_vec::ThinVec;
 
 use super::*;
 
@@ -208,6 +210,7 @@ impl<O> AssertKind<O> {
                 LangItem::PanicGenFnNonePanic
             }
             NullPointerDereference => LangItem::PanicNullPointerDereference,
+            NullReferenceConstructed => LangItem::PanicNullReferenceConstructed,
             InvalidEnumConstruction(_) => LangItem::PanicInvalidEnumConstruction,
             ResumedAfterDrop(CoroutineKind::Coroutine(_)) => LangItem::PanicCoroutineResumedDrop,
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::Async, _)) => {
@@ -285,6 +288,7 @@ impl<O> AssertKind<O> {
                 )
             }
             NullPointerDereference => write!(f, "\"null pointer dereference occurred\""),
+            NullReferenceConstructed => write!(f, "\"null reference produced\""),
             InvalidEnumConstruction(source) => {
                 write!(f, "\"trying to construct an enum from an invalid value {{}}\", {source:?}")
             }
@@ -326,122 +330,109 @@ impl<O> AssertKind<O> {
             }
         }
     }
+}
 
-    /// Format the diagnostic message for use in a lint (e.g. when the assertion fails during const-eval).
-    ///
-    /// Needs to be kept in sync with the run-time behavior (which is defined by
-    /// `AssertKind::panic_function` and the lang items mentioned in its docs).
-    /// Note that we deliberately show more details here than we do at runtime, such as the actual
-    /// numbers that overflowed -- it is much easier to do so here than at runtime.
-    pub fn diagnostic_message(&self) -> DiagMessage {
+/// Format the diagnostic message for use in a lint (e.g. when the assertion fails during const-eval).
+///
+/// Needs to be kept in sync with the run-time behavior (which is defined by
+/// `AssertKind::panic_function` and the lang items mentioned in its docs).
+/// Note that we deliberately show more details here than we do at runtime, such as the actual
+/// numbers that overflowed -- it is much easier to do so here than at runtime.
+impl<O: fmt::Debug> fmt::Display for AssertKind<O> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         use AssertKind::*;
 
-        use crate::fluent_generated::*;
-
         match self {
-            BoundsCheck { .. } => middle_bounds_check,
-            Overflow(BinOp::Shl, _, _) => middle_assert_shl_overflow,
-            Overflow(BinOp::Shr, _, _) => middle_assert_shr_overflow,
-            Overflow(_, _, _) => middle_assert_op_overflow,
-            OverflowNeg(_) => middle_assert_overflow_neg,
-            DivisionByZero(_) => middle_assert_divide_by_zero,
-            RemainderByZero(_) => middle_assert_remainder_by_zero,
+            BoundsCheck { len, index } => {
+                write!(f, "index out of bounds: the length is {len:?} but the index is {index:?}")
+            }
+            Overflow(BinOp::Shl, _, val) => {
+                write!(f, "attempt to shift left by `{val:#?}`, which would overflow")
+            }
+            Overflow(BinOp::Shr, _, val) => {
+                write!(f, "attempt to shift right by `{val:#?}`, which would overflow")
+            }
+            Overflow(binop, left, right) => {
+                write!(
+                    f,
+                    "attempt to compute `{left:#?} {op} {right:#?}`, which would overflow",
+                    op = binop.to_hir_binop().as_str()
+                )
+            }
+            OverflowNeg(val) => write!(f, "attempt to negate `{val:#?}`, which would overflow"),
+            DivisionByZero(val) => write!(f, "attempt to divide `{val:#?}` by zero"),
+            RemainderByZero(val) => {
+                write!(f, "attempt to calculate the remainder of `{val:#?}` with a divisor of zero")
+            }
             ResumedAfterReturn(CoroutineKind::Desugared(CoroutineDesugaring::Async, _)) => {
-                middle_assert_async_resume_after_return
+                write!(f, "`async fn` resumed after completion")
             }
             ResumedAfterReturn(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterReturn(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
                 bug!("gen blocks can be resumed after they return and will keep returning `None`")
             }
             ResumedAfterReturn(CoroutineKind::Coroutine(_)) => {
-                middle_assert_coroutine_resume_after_return
+                write!(f, "coroutine resumed after completion")
             }
             ResumedAfterPanic(CoroutineKind::Desugared(CoroutineDesugaring::Async, _)) => {
-                middle_assert_async_resume_after_panic
+                write!(f, "`async fn` resumed after panicking")
             }
             ResumedAfterPanic(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterPanic(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
-                middle_assert_gen_resume_after_panic
+                write!(f, "`gen` fn or block cannot be further iterated on after it panicked")
             }
             ResumedAfterPanic(CoroutineKind::Coroutine(_)) => {
-                middle_assert_coroutine_resume_after_panic
+                write!(f, "coroutine resumed after panicking")
             }
-            NullPointerDereference => middle_assert_null_ptr_deref,
-            InvalidEnumConstruction(_) => middle_assert_invalid_enum_construction,
+            NullPointerDereference => write!(f, "null pointer dereference occurred"),
+            NullReferenceConstructed => write!(f, "null reference produced"),
+            InvalidEnumConstruction(source) => {
+                write!(f, "trying to construct an enum from an invalid value `{source:#?}`")
+            }
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::Async, _)) => {
-                middle_assert_async_resume_after_drop
+                write!(f, "`async fn` resumed after async drop")
             }
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
-                middle_assert_gen_resume_after_drop
+                write!(f, "`gen` fn or block cannot be further iterated on after it async dropped")
             }
             ResumedAfterDrop(CoroutineKind::Coroutine(_)) => {
-                middle_assert_coroutine_resume_after_drop
+                write!(f, "coroutine resumed after async drop")
             }
 
-            MisalignedPointerDereference { .. } => middle_assert_misaligned_ptr_deref,
-        }
-    }
-
-    pub fn add_args(self, adder: &mut dyn FnMut(DiagArgName, DiagArgValue))
-    where
-        O: fmt::Debug,
-    {
-        use AssertKind::*;
-
-        macro_rules! add {
-            ($name: expr, $value: expr) => {
-                adder($name.into(), $value.into_diag_arg(&mut None));
-            };
-        }
-
-        match self {
-            BoundsCheck { len, index } => {
-                add!("len", format!("{len:?}"));
-                add!("index", format!("{index:?}"));
-            }
-            Overflow(BinOp::Shl | BinOp::Shr, _, val)
-            | DivisionByZero(val)
-            | RemainderByZero(val)
-            | OverflowNeg(val) => {
-                add!("val", format!("{val:#?}"));
-            }
-            Overflow(binop, left, right) => {
-                add!("op", binop.to_hir_binop().as_str());
-                add!("left", format!("{left:#?}"));
-                add!("right", format!("{right:#?}"));
-            }
-            ResumedAfterReturn(_)
-            | ResumedAfterPanic(_)
-            | NullPointerDereference
-            | ResumedAfterDrop(_) => {}
-            MisalignedPointerDereference { required, found } => {
-                add!("required", format!("{required:#?}"));
-                add!("found", format!("{found:#?}"));
-            }
-            InvalidEnumConstruction(source) => {
-                add!("source", format!("{source:#?}"));
-            }
+            MisalignedPointerDereference { required, found } => write!(
+                f,
+                "misaligned pointer dereference: address must be a multiple of {required:#?} but is {found:#?}"
+            ),
         }
     }
 }
 
-#[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, TyEncodable, TyDecodable, StableHash, TypeFoldable, TypeVisitable)]
 pub struct Terminator<'tcx> {
     pub source_info: SourceInfo,
     pub kind: TerminatorKind<'tcx>,
+    pub attributes: ThinVec<AttributeKind>,
 }
 
 impl<'tcx> Terminator<'tcx> {
     #[inline]
     pub fn successors(&self) -> Successors<'_> {
         self.kind.successors()
+    }
+
+    /// Return `Some` if all successors are identical.
+    #[inline]
+    pub fn identical_successor(&self) -> Option<BasicBlock> {
+        let mut successors = self.successors();
+        let first_succ = successors.next()?;
+        if successors.all(|succ| first_succ == succ) { Some(first_succ) } else { None }
     }
 
     #[inline]
@@ -495,29 +486,35 @@ mod helper {
     use super::*;
     pub type Successors<'a> = impl DoubleEndedIterator<Item = BasicBlock> + 'a;
 
+    // Note: this method ensures all paths below produce an iterator with the same concrete type.
+    #[inline]
+    #[define_opaque(Successors)]
+    fn mk_successors(
+        slice: &[BasicBlock],
+        option1: Option<BasicBlock>,
+        option2: Option<BasicBlock>,
+    ) -> Successors<'_> {
+        slice.iter().copied().chain(option1.into_iter().chain(option2))
+    }
+
     impl SwitchTargets {
         /// Like [`SwitchTargets::target_for_value`], but returning the same type as
         /// [`Terminator::successors`].
         #[inline]
-        #[define_opaque(Successors)]
         pub fn successors_for_value(&self, value: u128) -> Successors<'_> {
             let target = self.target_for_value(value);
-            (&[]).into_iter().copied().chain(Some(target).into_iter().chain(None))
+            mk_successors(&[], Some(target), None)
         }
     }
 
     impl<'tcx> TerminatorKind<'tcx> {
         #[inline]
-        #[define_opaque(Successors)]
         pub fn successors(&self) -> Successors<'_> {
             use self::TerminatorKind::*;
             match *self {
                 // 3-successors for async drop: target, unwind, dropline (parent coroutine drop)
                 Drop { target: ref t, unwind: UnwindAction::Cleanup(u), drop: Some(d), .. } => {
-                    slice::from_ref(t)
-                        .into_iter()
-                        .copied()
-                        .chain(Some(u).into_iter().chain(Some(d)))
+                    mk_successors(slice::from_ref(t), Some(u), Some(d))
                 }
                 // 2-successors
                 Call { target: Some(ref t), unwind: UnwindAction::Cleanup(u), .. }
@@ -526,7 +523,7 @@ mod helper {
                 | Drop { target: ref t, unwind: _, drop: Some(u), .. }
                 | Assert { target: ref t, unwind: UnwindAction::Cleanup(u), .. }
                 | FalseUnwind { real_target: ref t, unwind: UnwindAction::Cleanup(u) } => {
-                    slice::from_ref(t).into_iter().copied().chain(Some(u).into_iter().chain(None))
+                    mk_successors(slice::from_ref(t), Some(u), None)
                 }
                 // single successor
                 Goto { target: ref t }
@@ -536,7 +533,7 @@ mod helper {
                 | Drop { target: ref t, unwind: _, .. }
                 | Assert { target: ref t, unwind: _, .. }
                 | FalseUnwind { real_target: ref t, unwind: _ } => {
-                    slice::from_ref(t).into_iter().copied().chain(None.into_iter().chain(None))
+                    mk_successors(slice::from_ref(t), None, None)
                 }
                 // No successors
                 UnwindResume
@@ -545,24 +542,17 @@ mod helper {
                 | Return
                 | Unreachable
                 | TailCall { .. }
-                | Call { target: None, unwind: _, .. } => {
-                    (&[]).into_iter().copied().chain(None.into_iter().chain(None))
-                }
+                | Call { target: None, unwind: _, .. } => mk_successors(&[], None, None),
                 // Multiple successors
                 InlineAsm { ref targets, unwind: UnwindAction::Cleanup(u), .. } => {
-                    targets.iter().copied().chain(Some(u).into_iter().chain(None))
+                    mk_successors(targets, Some(u), None)
                 }
-                InlineAsm { ref targets, unwind: _, .. } => {
-                    targets.iter().copied().chain(None.into_iter().chain(None))
-                }
-                SwitchInt { ref targets, .. } => {
-                    targets.targets.iter().copied().chain(None.into_iter().chain(None))
-                }
+                InlineAsm { ref targets, unwind: _, .. } => mk_successors(targets, None, None),
+                SwitchInt { ref targets, .. } => mk_successors(&targets.targets, None, None),
                 // FalseEdge
-                FalseEdge { ref real_target, imaginary_target } => slice::from_ref(real_target)
-                    .into_iter()
-                    .copied()
-                    .chain(Some(imaginary_target).into_iter().chain(None)),
+                FalseEdge { ref real_target, imaginary_target } => {
+                    mk_successors(slice::from_ref(real_target), Some(imaginary_target), None)
+                }
             }
         }
 
@@ -690,7 +680,7 @@ impl<'tcx> TerminatorKind<'tcx> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub enum TerminatorEdges<'mir, 'tcx> {
     /// For terminators that have no successor, like `return`.
     None,
@@ -702,7 +692,7 @@ pub enum TerminatorEdges<'mir, 'tcx> {
     Double(BasicBlock, BasicBlock),
     /// Special action for `Yield`, `Call` and `InlineAsm` terminators.
     AssignOnReturn {
-        return_: &'mir [BasicBlock],
+        return_: SmallVec<[BasicBlock; 1]>,
         /// The cleanup block, if it exists.
         cleanup: Option<BasicBlock>,
         place: CallReturnPlaces<'mir, 'tcx>,
@@ -759,7 +749,7 @@ impl<'tcx> TerminatorKind<'tcx> {
             // FIXME: Maybe we need also TerminatorEdges::Trio for async drop
             // (target + unwind + dropline)
             Assert { target, unwind, expected: _, msg: _, cond: _ }
-            | Drop { target, unwind, place: _, replace: _, drop: _, async_fut: _ }
+            | Drop { target, unwind, place: _, replace: _, drop: _ }
             | FalseUnwind { real_target: target, unwind } => match unwind {
                 UnwindAction::Cleanup(unwind) => TerminatorEdges::Double(target, unwind),
                 UnwindAction::Continue | UnwindAction::Terminate(_) | UnwindAction::Unreachable => {
@@ -771,27 +761,21 @@ impl<'tcx> TerminatorKind<'tcx> {
                 TerminatorEdges::Double(real_target, imaginary_target)
             }
 
-            Yield { resume: ref target, drop, resume_arg, value: _ } => {
+            Yield { resume: target, drop, resume_arg, value: _ } => {
                 TerminatorEdges::AssignOnReturn {
-                    return_: slice::from_ref(target),
-                    cleanup: drop,
+                    return_: [target].into_iter().chain(drop.into_iter()).collect(),
+                    cleanup: None,
                     place: CallReturnPlaces::Yield(resume_arg),
                 }
             }
 
-            Call {
-                unwind,
-                destination,
-                ref target,
-                func: _,
-                args: _,
-                fn_span: _,
-                call_source: _,
-            } => TerminatorEdges::AssignOnReturn {
-                return_: target.as_ref().map(slice::from_ref).unwrap_or_default(),
-                cleanup: unwind.cleanup_block(),
-                place: CallReturnPlaces::Call(destination),
-            },
+            Call { unwind, destination, target, func: _, args: _, fn_span: _, call_source: _ } => {
+                TerminatorEdges::AssignOnReturn {
+                    return_: target.into_iter().collect(),
+                    cleanup: unwind.cleanup_block(),
+                    place: CallReturnPlaces::Call(destination),
+                }
+            }
 
             InlineAsm {
                 asm_macro: _,
@@ -802,7 +786,7 @@ impl<'tcx> TerminatorKind<'tcx> {
                 ref targets,
                 unwind,
             } => TerminatorEdges::AssignOnReturn {
-                return_: targets,
+                return_: targets.iter().copied().collect(),
                 cleanup: unwind.cleanup_block(),
                 place: CallReturnPlaces::InlineAsm(operands),
             },

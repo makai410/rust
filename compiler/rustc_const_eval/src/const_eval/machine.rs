@@ -1,30 +1,32 @@
 use std::borrow::{Borrow, Cow};
-use std::fmt;
 use std::hash::Hash;
+use std::{fmt, mem};
 
-use rustc_abi::{Align, Size};
+use rustc_abi::{Align, FIRST_VARIANT, FieldIdx, Size, VariantIdx};
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, IndexEntry};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::{self as hir, CRATE_HIR_ID, LangItem};
+use rustc_hir::{self as hir, CRATE_HIR_ID, find_attr};
+use rustc_lint_defs::builtin::LONG_RUNNING_CONST_EVAL;
 use rustc_middle::mir::AssertMessage;
 use rustc_middle::mir::interpret::ReportedErrorInfo;
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::{HasTypingEnv, TyAndLayout, ValidityRequirement};
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_middle::{bug, mir};
+use rustc_middle::ty::{self, FieldInfo, ScalarInt, Ty, TyCtxt};
+use rustc_middle::{bug, mir, span_bug};
 use rustc_span::{Span, Symbol, sym};
 use rustc_target::callconv::FnAbi;
 use tracing::debug;
 
 use super::error::*;
-use crate::errors::{LongRunning, LongRunningWarn};
-use crate::fluent_generated as fluent;
+use crate::diagnostics::{LongRunning, LongRunningWarn};
 use crate::interpret::{
     self, AllocId, AllocInit, AllocRange, ConstAllocation, CtfeProvenance, FnArg, Frame,
-    GlobalAlloc, ImmTy, InterpCx, InterpResult, OpTy, PlaceTy, Pointer, RangeSet, Scalar,
-    compile_time_machine, err_inval, interp_ok, throw_exhaust, throw_inval, throw_ub,
-    throw_ub_custom, throw_unsup, throw_unsup_format,
+    GlobalAlloc, ImmTy, Immediate, InterpCx, InterpResult, OpTy, PlaceTy, Pointer, RangeSet,
+    RetagMode, Scalar, compile_time_machine, ensure_monomorphic_enough, err_inval, interp_ok,
+    throw_exhaust, throw_inval, throw_ub, throw_ub_format, throw_unsup, throw_unsup_format,
+    type_implements_dyn_trait,
 };
 
 /// When hitting this many interpreted terminators we emit a deny by default lint
@@ -67,6 +69,9 @@ pub struct CompileTimeMachine<'tcx> {
 
     /// A cache of "data range" computations for unions (i.e., the offsets of non-padding bytes).
     union_data_ranges: FxHashMap<Ty<'tcx>, RangeSet>,
+
+    /// The current retag mode.
+    retag_mode: RetagMode,
 }
 
 #[derive(Copy, Clone)]
@@ -102,6 +107,7 @@ impl<'tcx> CompileTimeMachine<'tcx> {
             check_alignment,
             static_root_ids: None,
             union_data_ranges: FxHashMap::default(),
+            retag_mode: RetagMode::Default,
         }
     }
 }
@@ -208,15 +214,10 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
         let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
         let caller = self.tcx.sess.source_map().lookup_char_pos(topmost.lo());
 
-        use rustc_session::RemapFileNameExt;
-        use rustc_session::config::RemapPathScopeComponents;
+        use rustc_span::RemapPathScopeComponents;
         (
             Symbol::intern(
-                &caller
-                    .file
-                    .name
-                    .for_scope(self.tcx.sess, RemapPathScopeComponents::DIAGNOSTICS)
-                    .to_string_lossy(),
+                &caller.file.name.display(RemapPathScopeComponents::DIAGNOSTICS).to_string_lossy(),
             ),
             u32::try_from(caller.line).unwrap(),
             u32::try_from(caller.col_display).unwrap().checked_add(1).unwrap(),
@@ -237,10 +238,10 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
         let def_id = instance.def_id();
 
-        if self.tcx.has_attr(def_id, sym::rustc_const_panic_str)
+        if self.tcx.is_lang_item(def_id, LangItem::PanicDisplay)
             || self.tcx.is_lang_item(def_id, LangItem::BeginPanic)
         {
-            let args = self.copy_fn_args(args);
+            let args = Self::copy_fn_args(args);
             // &str or &&str
             assert!(args.len() == 1);
 
@@ -279,31 +280,111 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
     fn guaranteed_cmp(&mut self, a: Scalar, b: Scalar) -> InterpResult<'tcx, u8> {
         interp_ok(match (a, b) {
             // Comparisons between integers are always known.
-            (Scalar::Int { .. }, Scalar::Int { .. }) => {
-                if a == b {
-                    1
-                } else {
+            (Scalar::Int(a), Scalar::Int(b)) => (a == b) as u8,
+            // Comparing a pointer `ptr` with an integer `int` is equivalent to comparing
+            // `ptr-int` with null, so we can reduce this case to a `scalar_may_be_null` test.
+            (Scalar::Int(int), Scalar::Ptr(ptr, _)) | (Scalar::Ptr(ptr, _), Scalar::Int(int)) => {
+                let int = int.to_target_usize(*self.tcx);
+                // The `wrapping_neg` here may produce a value that is not
+                // a valid target usize any more... but `wrapping_offset` handles that correctly.
+                let offset_ptr = ptr.wrapping_offset(Size::from_bytes(int.wrapping_neg()), self);
+                if !self.scalar_may_be_null(Scalar::from_pointer(offset_ptr, self))? {
+                    // `ptr.wrapping_sub(int)` is definitely not equal to `0`, so `ptr != int`
                     0
+                } else {
+                    // `ptr.wrapping_sub(int)` could be equal to `0`, but might not be,
+                    // so we cannot know for sure if `ptr == int` or not
+                    2
                 }
             }
-            // Comparisons of abstract pointers with null pointers are known if the pointer
-            // is in bounds, because if they are in bounds, the pointer can't be null.
-            // Inequality with integers other than null can never be known for sure.
-            (Scalar::Int(int), ptr @ Scalar::Ptr(..))
-            | (ptr @ Scalar::Ptr(..), Scalar::Int(int))
-                if int.is_null() && !self.scalar_may_be_null(ptr)? =>
-            {
-                0
+            (Scalar::Ptr(a, _), Scalar::Ptr(b, _)) => {
+                let (a_prov, a_offset) = a.prov_and_relative_offset();
+                let (b_prov, b_offset) = b.prov_and_relative_offset();
+                let a_allocid = a_prov.alloc_id();
+                let b_allocid = b_prov.alloc_id();
+                let a_info = self.get_alloc_info(a_allocid);
+                let b_info = self.get_alloc_info(b_allocid);
+
+                // Check if the pointers cannot be equal due to alignment
+                if a_info.align > Align::ONE && b_info.align > Align::ONE {
+                    let min_align = Ord::min(a_info.align.bytes(), b_info.align.bytes());
+                    let a_residue = a_offset.bytes() % min_align;
+                    let b_residue = b_offset.bytes() % min_align;
+                    if a_residue != b_residue {
+                        // If the two pointers have a different residue modulo their
+                        // common alignment, they cannot be equal.
+                        return interp_ok(0);
+                    }
+                    // The pointers have the same residue modulo their common alignment,
+                    // so they could be equal. Try the other checks.
+                }
+
+                if let (Some(GlobalAlloc::Static(a_did)), Some(GlobalAlloc::Static(b_did))) = (
+                    self.tcx.try_get_global_alloc(a_allocid),
+                    self.tcx.try_get_global_alloc(b_allocid),
+                ) {
+                    if a_allocid == b_allocid {
+                        debug_assert_eq!(
+                            a_did, b_did,
+                            "different static item DefIds had same AllocId? {a_allocid:?} == {b_allocid:?}, {a_did:?} != {b_did:?}"
+                        );
+                        // Comparing two pointers into the same static. As per
+                        // https://doc.rust-lang.org/nightly/reference/items/static-items.html#r-items.static.intro
+                        // a static cannot be duplicated, so if two pointers are into the same
+                        // static, they are equal if and only if their offsets are equal.
+                        (a_offset == b_offset) as u8
+                    } else {
+                        debug_assert_ne!(
+                            a_did, b_did,
+                            "same static item DefId had two different AllocIds? {a_allocid:?} != {b_allocid:?}, {a_did:?} == {b_did:?}"
+                        );
+                        // Comparing two pointers into the different statics.
+                        // We can never determine for sure that two pointers into different statics
+                        // are *equal*, but we can know that they are *inequal* if they are both
+                        // strictly in-bounds (i.e. in-bounds and not one-past-the-end) of
+                        // their respective static, as different non-zero-sized statics cannot
+                        // overlap or be deduplicated as per
+                        // https://doc.rust-lang.org/nightly/reference/items/static-items.html#r-items.static.intro
+                        // (non-deduplication), and
+                        // https://doc.rust-lang.org/nightly/reference/items/static-items.html#r-items.static.storage-disjointness
+                        // (non-overlapping).
+                        if a_offset < a_info.size && b_offset < b_info.size {
+                            0
+                        } else {
+                            // Otherwise, conservatively say we don't know.
+                            // There are some cases we could still return `0` for, e.g.
+                            // if the pointers being equal would require their statics to overlap
+                            // one or more bytes, but for simplicity we currently only check
+                            // strictly in-bounds pointers.
+                            2
+                        }
+                    }
+                } else {
+                    // All other cases we conservatively say we don't know.
+                    //
+                    // For comparing statics to non-statics, as per https://doc.rust-lang.org/nightly/reference/items/static-items.html#r-items.static.storage-disjointness
+                    // immutable statics can overlap with other kinds of allocations sometimes.
+                    //
+                    // FIXME: We could be more decisive for (non-zero-sized) mutable statics,
+                    // which cannot overlap with other kinds of allocations.
+                    //
+                    // Functions and vtables can be duplicated and deduplicated, so we
+                    // cannot be sure of runtime equality of pointers to the same one, or the
+                    // runtime inequality of pointers to different ones (see e.g. #73722),
+                    // so comparing those should return 2, whether they are the same allocation
+                    // or not.
+                    //
+                    // `GlobalAlloc::TypeId` exists mostly to prevent consteval from comparing
+                    // `TypeId`s, so comparing those should always return 2, whether they are the
+                    // same allocation or not.
+                    //
+                    // FIXME: We could revisit comparing pointers into the same
+                    // `GlobalAlloc::Memory` once https://github.com/rust-lang/rust/issues/128775
+                    // is fixed (but they can be deduplicated, so comparing pointers into different
+                    // ones should return 2).
+                    2
+                }
             }
-            // Equality with integers can never be known for sure.
-            (Scalar::Int { .. }, Scalar::Ptr(..)) | (Scalar::Ptr(..), Scalar::Int { .. }) => 2,
-            // FIXME: return a `1` for when both sides are the same pointer, *except* that
-            // some things (like functions and vtables) do not have stable addresses
-            // so we need to be careful around them (see e.g. #73722).
-            // FIXME: return `0` for at least some comparisons where we can reliably
-            // determine the result of runtime inequality tests at compile-time.
-            // Examples include comparison of addresses in different static items.
-            (Scalar::Ptr(..), Scalar::Ptr(..)) => 2,
         })
     }
 }
@@ -365,7 +446,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
             // sensitive check here. But we can at least rule out functions that are not const at
             // all. That said, we have to allow calling functions inside a `const trait`. These
             // *are* const-checked!
-            if !ecx.tcx.is_const_fn(def) || ecx.tcx.has_attr(def, sym::rustc_do_not_const_check) {
+            if !ecx.tcx.is_const_fn(def) || find_attr!(ecx.tcx, def, RustcDoNotConstCheck) {
                 // We certainly do *not* want to actually call the fn
                 // though, so be sure we return here.
                 throw_unsup_format!("calling non-const function `{}`", instance)
@@ -413,12 +494,9 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
 
                 let align = match Align::from_bytes(align) {
                     Ok(a) => a,
-                    Err(err) => throw_ub_custom!(
-                        fluent::const_eval_invalid_align_details,
-                        name = "const_allocate",
-                        err_kind = err.diag_ident(),
-                        align = err.align()
-                    ),
+                    Err(err) => {
+                        throw_ub_format!("invalid align passed to `const_allocate`: {err}")
+                    }
                 };
 
                 let ptr = ecx.allocate_ptr(
@@ -437,12 +515,9 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                 let size = Size::from_bytes(size);
                 let align = match Align::from_bytes(align) {
                     Ok(a) => a,
-                    Err(err) => throw_ub_custom!(
-                        fluent::const_eval_invalid_align_details,
-                        name = "const_deallocate",
-                        err_kind = err.diag_ident(),
-                        align = err.align()
-                    ),
+                    Err(err) => {
+                        throw_ub_format!("invalid align passed to `const_deallocate`: {err}")
+                    }
                 };
 
                 // If an allocation is created in an another const,
@@ -511,6 +586,261 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                 }
             }
 
+            sym::type_id_vtable => {
+                let tp_ty = ecx.read_type_id(&args[0])?;
+                let result_ty = ecx.read_type_id(&args[1])?;
+
+                let (implements_trait, preds) = type_implements_dyn_trait(ecx, tp_ty, result_ty)?;
+
+                if implements_trait {
+                    let vtable_ptr = ecx.get_vtable_ptr(tp_ty, preds)?;
+                    // Writing a non-null pointer into an `Option<NonNull>` will automatically make it `Some`.
+                    ecx.write_pointer(vtable_ptr, dest)?;
+                } else {
+                    // Write `None`
+                    ecx.write_discriminant(FIRST_VARIANT, dest)?;
+                }
+            }
+
+            sym::type_of => {
+                let ty = ecx.read_type_id(&args[0])?;
+                ecx.write_type_info(ty, dest)?;
+            }
+
+            sym::type_id_is_signed => {
+                let ty = ecx.read_type_id(&args[0])?;
+                ecx.write_scalar(Scalar::from_bool(ty.is_signed()), dest)?;
+            }
+
+            sym::size_of_type_id => {
+                let ty = ecx.read_type_id(&args[0])?;
+                let layout = ecx.layout_of(ty)?;
+                let variant_index = if layout.is_sized() {
+                    let (variant, variant_place) = ecx.project_downcast_named(dest, sym::Some)?;
+                    let size_field_place = ecx.project_field(&variant_place, FieldIdx::ZERO)?;
+                    ecx.write_scalar(
+                        ScalarInt::try_from_target_usize(layout.size.bytes(), ecx.tcx.tcx).unwrap(),
+                        &size_field_place,
+                    )?;
+                    variant
+                } else {
+                    ecx.project_downcast_named(dest, sym::None)?.0
+                };
+                ecx.write_discriminant(variant_index, dest)?;
+            }
+
+            sym::type_id_fields => {
+                let ty = ecx.read_type_id(&args[0])?;
+                let variant_idx = ecx.read_target_usize(&args[1])? as usize;
+
+                let variants_num =
+                    ty.ty_adt_def().map(|adt_def| adt_def.variants().len()).unwrap_or(1);
+                if variant_idx >= variants_num {
+                    throw_ub!(BoundsCheckFailed {
+                        len: variants_num as u64,
+                        index: variant_idx as u64
+                    });
+                }
+
+                let fields_num = match ty.kind() {
+                    ty::Adt(adt_def, _) => {
+                        let variant_def = &adt_def.variants()[VariantIdx::from_usize(variant_idx)];
+                        variant_def.fields.len()
+                    }
+                    ty::Tuple(fields) => fields.len(),
+                    _ => 0, // Other types have no fields
+                };
+
+                ecx.write_scalar(Scalar::from_target_usize(fields_num as u64, ecx), dest)?;
+            }
+
+            sym::type_id_field_representing_type => {
+                let ty = ecx.read_type_id(&args[0])?;
+                let variant_idx = ecx.read_target_usize(&args[1])? as usize;
+                let field_idx = ecx.read_target_usize(&args[2])? as usize;
+
+                let variants_num =
+                    ty.ty_adt_def().map(|adt_def| adt_def.variants().len()).unwrap_or(1);
+                if variant_idx >= variants_num {
+                    throw_ub!(BoundsCheckFailed {
+                        len: variants_num as u64,
+                        index: variant_idx as u64
+                    });
+                }
+
+                let fields_num = match ty.kind() {
+                    ty::Adt(adt_def, _) => {
+                        let variant_def = &adt_def.variants()[VariantIdx::from_usize(variant_idx)];
+                        variant_def.fields.len()
+                    }
+                    ty::Tuple(fields) => fields.len(),
+                    _ => 0, // Other types have no fields
+                };
+                if field_idx >= fields_num {
+                    throw_ub!(BoundsCheckFailed {
+                        len: fields_num as u64,
+                        index: field_idx as u64
+                    });
+                }
+
+                let frt = Ty::new_field_representing_type(
+                    *ecx.tcx,
+                    ty,
+                    VariantIdx::from_usize(variant_idx),
+                    FieldIdx::from_usize(field_idx),
+                );
+                ecx.write_type_id(frt, dest)?;
+            }
+
+            sym::type_id_variants => {
+                let ty = ecx.read_type_id(&args[0])?;
+                let variants_num = ty.ty_adt_def().map(|def| def.variants().len()).unwrap_or(1);
+                ecx.write_scalar(Scalar::from_target_usize(variants_num as u64, ecx), dest)?;
+            }
+
+            sym::variant_name => {
+                let base = ecx.read_type_id(&args[0])?;
+
+                let field_name = if let ty::Adt(def, _) = base.kind() {
+                    let variant_idx = ecx.read_target_usize(&args[1])? as usize;
+                    if variant_idx >= def.variants().len() {
+                        throw_ub!(BoundsCheckFailed {
+                            len: def.variants().len() as u64,
+                            index: variant_idx as u64
+                        });
+                    }
+                    let variant_idx = VariantIdx::from_usize(variant_idx);
+                    def.variant(variant_idx).name
+                } else {
+                    span_bug!(ecx.cur_span(), "expected enum type, got {base}")
+                };
+                let ptr = ecx.allocate_bytes_dedup(field_name.as_str().as_bytes())?;
+                ecx.write_immediate(
+                    Immediate::ScalarPair(
+                        Scalar::from_pointer(ptr, ecx),
+                        Scalar::from_target_usize(field_name.as_str().len() as u64, ecx),
+                    ),
+                    dest,
+                )?;
+            }
+
+            sym::variant_non_exhaustive => {
+                let base = ecx.read_type_id(&args[0])?;
+
+                let non_exhaustive = if let ty::Adt(def, _) = base.kind() {
+                    let variant_idx = ecx.read_target_usize(&args[1])? as usize;
+                    if variant_idx >= def.variants().len() {
+                        throw_ub!(BoundsCheckFailed {
+                            len: def.variants().len() as u64,
+                            index: variant_idx as u64
+                        });
+                    }
+                    let variant_idx = VariantIdx::from_usize(variant_idx);
+                    def.variant(variant_idx).is_field_list_non_exhaustive()
+                } else {
+                    span_bug!(ecx.cur_span(), "expected enum type, got {base}")
+                };
+                ecx.write_scalar(Scalar::from_bool(non_exhaustive), dest)?;
+            }
+
+            sym::field_offset => {
+                let frt_ty = instance.args.type_at(0);
+                ensure_monomorphic_enough(frt_ty)?;
+
+                let (ty, variant, field) = if let ty::Adt(def, args) = frt_ty.kind()
+                    && let Some(FieldInfo { base, variant_idx, field_idx, .. }) =
+                        def.field_representing_type_info(ecx.tcx.tcx, args)
+                {
+                    (base, variant_idx, field_idx)
+                } else {
+                    span_bug!(ecx.cur_span(), "expected field representing type, got {frt_ty}")
+                };
+                let layout = ecx.layout_of(ty)?;
+                let cx = ty::layout::LayoutCx::new(ecx.tcx.tcx, ecx.typing_env());
+
+                let layout = layout.for_variant(&cx, variant);
+                let offset = layout.fields.offset(field.index()).bytes();
+
+                ecx.write_scalar(Scalar::from_target_usize(offset, ecx), dest)?;
+            }
+
+            sym::field_representing_type_name => {
+                let frt_ty = ecx.read_type_id(&args[0])?;
+
+                let field_name = if let ty::Adt(def, args) = frt_ty.kind()
+                    && let Some(FieldInfo { name, .. }) =
+                        def.field_representing_type_info(ecx.tcx.tcx, args)
+                {
+                    name
+                } else {
+                    span_bug!(ecx.cur_span(), "expected field representing type, got {frt_ty}")
+                };
+                let ptr = ecx.allocate_bytes_dedup(field_name.as_str().as_bytes())?;
+                ecx.write_immediate(
+                    Immediate::ScalarPair(
+                        Scalar::from_pointer(ptr, ecx),
+                        Scalar::from_target_usize(field_name.as_str().len() as u64, ecx),
+                    ),
+                    dest,
+                )?;
+            }
+
+            sym::field_representing_type_offset => {
+                let frt_ty = ecx.read_type_id(&args[0])?;
+
+                let (ty, variant, field) = if let ty::Adt(def, args) = frt_ty.kind()
+                    && let Some(FieldInfo { base, variant_idx, field_idx, .. }) =
+                        def.field_representing_type_info(ecx.tcx.tcx, args)
+                {
+                    (base, variant_idx, field_idx)
+                } else {
+                    span_bug!(ecx.cur_span(), "expected field representing type, got {frt_ty}")
+                };
+                let layout = ecx.layout_of(ty)?;
+                let cx = ty::layout::LayoutCx::new(ecx.tcx.tcx, ecx.typing_env());
+
+                let layout = layout.for_variant(&cx, variant);
+                let offset = layout.fields.offset(field.index()).bytes();
+
+                ecx.write_scalar(Scalar::from_target_usize(offset, ecx), dest)?;
+            }
+
+            sym::field_representing_type_actual_type_id => {
+                let frt_ty = ecx.read_type_id(&args[0])?;
+
+                let field_ty = if let ty::Adt(def, args) = frt_ty.kind()
+                    && let Some(FieldInfo { ty, .. }) =
+                        def.field_representing_type_info(ecx.tcx.tcx, args)
+                {
+                    ecx.tcx.erase_and_anonymize_regions(ty)
+                } else {
+                    span_bug!(ecx.cur_span(), "expected field representing type, got {frt_ty}")
+                };
+                ecx.write_type_id(field_ty, dest)?;
+            }
+
+            sym::type_id_generics => {
+                let ty = ecx.read_type_id(&args[0])?;
+                ecx.write_type_id_generics(dest, ty)?;
+            }
+
+            sym::non_exhaustive => {
+                let ty = ecx.read_type_id(&args[0])?;
+
+                // FIXME(reflection): need a way to obtain non-exhaustiveness of a variant's fields.
+                let non_exhaustive = if let ty::Adt(def, _) = ty.kind() {
+                    if def.is_enum() {
+                        def.is_variant_list_non_exhaustive()
+                    } else {
+                        def.non_enum_variant().is_field_list_non_exhaustive()
+                    }
+                } else {
+                    false
+                };
+
+                ecx.write_scalar(Scalar::from_bool(non_exhaustive), dest)?;
+            }
+
             _ => {
                 // We haven't handled the intrinsic, let's see if we can use a fallback body.
                 if ecx.tcx.intrinsic(instance.def_id()).unwrap().must_be_overridden {
@@ -528,6 +858,18 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
         // Intrinsic is done, jump to next block.
         ecx.return_to_block(target)?;
         interp_ok(None)
+    }
+
+    fn call_llvm_intrinsic(
+        ecx: &mut InterpCx<'tcx, Self>,
+        instance: ty::Instance<'tcx>,
+        _args: &[OpTy<'tcx>],
+        _dest: &PlaceTy<'tcx, Self::Provenance>,
+        _target: Option<mir::BasicBlock>,
+    ) -> InterpResult<'tcx> {
+        let intrinsic_name = ecx.tcx.codegen_fn_attrs(instance.def_id()).symbol_name.unwrap();
+
+        throw_unsup_format!("LLVM intrinsic `{intrinsic_name}` is not supported at compile-time");
     }
 
     fn assert_panic(
@@ -557,9 +899,20 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                 found: eval_to_int(found)?,
             },
             NullPointerDereference => NullPointerDereference,
+            NullReferenceConstructed => NullReferenceConstructed,
             InvalidEnumConstruction(source) => InvalidEnumConstruction(eval_to_int(source)?),
         };
         Err(ConstEvalErrKind::AssertFailure(err)).into()
+    }
+
+    #[inline(always)]
+    fn runtime_checks(
+        _ecx: &InterpCx<'tcx, Self>,
+        _r: mir::RuntimeChecks,
+    ) -> InterpResult<'tcx, bool> {
+        // We can't look at `tcx.sess` here as that can differ across crates, which can lead to
+        // unsound differences in evaluating the same constant at different instantiation sites.
+        interp_ok(true)
     }
 
     fn binary_ptr_op(
@@ -593,15 +946,12 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                 let hir_id = ecx.machine.best_lint_scope(*ecx.tcx);
                 let is_error = ecx
                     .tcx
-                    .lint_level_at_node(
-                        rustc_session::lint::builtin::LONG_RUNNING_CONST_EVAL,
-                        hir_id,
-                    )
-                    .level
+                    .lint_level_spec_at_node(LONG_RUNNING_CONST_EVAL, hir_id)
+                    .level()
                     .is_error();
                 let span = ecx.cur_span();
                 ecx.tcx.emit_node_span_lint(
-                    rustc_session::lint::builtin::LONG_RUNNING_CONST_EVAL,
+                    LONG_RUNNING_CONST_EVAL,
                     hir_id,
                     span,
                     LongRunning { item_span: ecx.tcx.span },
@@ -619,14 +969,13 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                 // current number of evaluated terminators is a power of 2. The latter gives us a cheap
                 // way to implement exponential backoff.
                 let span = ecx.cur_span();
+                let mut warn =
+                    ecx.tcx.dcx().create_warn(LongRunningWarn { span, item_span: ecx.tcx.span });
                 // We store a unique number in `force_duplicate` to evade `-Z deduplicate-diagnostics`.
                 // `new_steps` is guaranteed to be unique because `ecx.machine.num_evaluated_steps` is
                 // always increasing.
-                ecx.tcx.dcx().emit_warn(LongRunningWarn {
-                    span,
-                    item_span: ecx.tcx.span,
-                    force_duplicate: new_steps,
-                });
+                warn.arg("force_duplicate", new_steps);
+                warn.emit();
             }
         }
 
@@ -703,23 +1052,21 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
 
     fn retag_ptr_value(
         ecx: &mut InterpCx<'tcx, Self>,
-        _kind: mir::RetagKind,
         val: &ImmTy<'tcx, CtfeProvenance>,
-    ) -> InterpResult<'tcx, ImmTy<'tcx, CtfeProvenance>> {
+        _ty: Ty<'tcx>,
+    ) -> InterpResult<'tcx, Option<ImmTy<'tcx, CtfeProvenance>>> {
+        if matches!(ecx.machine.retag_mode, RetagMode::None | RetagMode::Raw) {
+            return interp_ok(None);
+        }
         // If it's a frozen shared reference that's not already immutable, potentially make it immutable.
         // (Do nothing on `None` provenance, that cannot store immutability anyway.)
         if let ty::Ref(_, ty, mutbl) = val.layout.ty.kind()
             && *mutbl == Mutability::Not
-            && val
-                .to_scalar_and_meta()
-                .0
-                .to_pointer(ecx)?
-                .provenance
-                .is_some_and(|p| !p.immutable())
+            && val.to_scalar_and_meta().0.to_pointer(ecx).provenance.is_some_and(|p| !p.immutable())
         {
             // That next check is expensive, that's why we have all the guards above.
             let is_immutable = ty.is_freeze(*ecx.tcx, ecx.typing_env());
-            let place = ecx.ref_to_mplace(val)?;
+            let place = ecx.imm_ptr_to_mplace(val)?;
             let new_place = if is_immutable {
                 place.map_provenance(CtfeProvenance::as_immutable)
             } else {
@@ -729,10 +1076,21 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                 // even when there is interior mutability.)
                 place.map_provenance(CtfeProvenance::as_shared_ref)
             };
-            interp_ok(ImmTy::from_immediate(new_place.to_ref(ecx), val.layout))
+            interp_ok(Some(ImmTy::from_immediate(new_place.to_ref(ecx), val.layout)))
         } else {
-            interp_ok(val.clone())
+            interp_ok(None)
         }
+    }
+
+    fn with_retag_mode<T>(
+        ecx: &mut InterpCx<'tcx, Self>,
+        mode: RetagMode,
+        f: impl FnOnce(&mut InterpCx<'tcx, Self>) -> InterpResult<'tcx, T>,
+    ) -> InterpResult<'tcx, T> {
+        let old_mode = mem::replace(&mut ecx.machine.retag_mode, mode);
+        let ret = f(ecx);
+        ecx.machine.retag_mode = old_mode;
+        ret
     }
 
     fn before_memory_write(

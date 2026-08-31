@@ -6,40 +6,45 @@
 //! and rustc) libtest doesn't include the rendered human-readable output as a JSON field. We had
 //! to reimplement all the rendering logic in this module because of that.
 
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ChildStdout;
 use std::time::Duration;
 
 use termcolor::{Color, ColorSpec, WriteColor};
 
+use crate::core::build_steps::test::failed_tests::RecordFailedTests;
 use crate::core::builder::Builder;
 use crate::utils::exec::BootstrapCommand;
+use crate::utils::helpers;
 
 const TERSE_TESTS_PER_LINE: usize = 88;
 
 pub(crate) fn add_flags_and_try_run_tests(
     builder: &Builder<'_>,
     cmd: &mut BootstrapCommand,
+    record_failed_tests: RecordFailedTests,
 ) -> bool {
     if !cmd.get_args().any(|arg| arg == "--") {
         cmd.arg("--");
     }
     cmd.args(["-Z", "unstable-options", "--format", "json"]);
 
-    try_run_tests(builder, cmd, false)
+    try_run_tests(builder, cmd, false, record_failed_tests)
 }
 
 pub(crate) fn try_run_tests(
     builder: &Builder<'_>,
     cmd: &mut BootstrapCommand,
     stream: bool,
+    record_failed_tests: RecordFailedTests,
 ) -> bool {
-    if run_tests(builder, cmd, stream) {
+    if run_tests(builder, cmd, stream, record_failed_tests) {
         return true;
     }
 
     if builder.fail_fast {
-        crate::exit!(1);
+        helpers::exit_process(1);
     }
 
     builder.config.exec_ctx().add_to_delay_failure(format!("{cmd:?}"));
@@ -47,8 +52,13 @@ pub(crate) fn try_run_tests(
     false
 }
 
-fn run_tests(builder: &Builder<'_>, cmd: &mut BootstrapCommand, stream: bool) -> bool {
-    builder.verbose(|| println!("running: {cmd:?}"));
+fn run_tests(
+    builder: &Builder<'_>,
+    cmd: &mut BootstrapCommand,
+    stream: bool,
+    record_failed_tests: RecordFailedTests,
+) -> bool {
+    builder.do_if_verbose(|| println!("running: {cmd:?}"));
 
     let Some(mut streaming_command) = cmd.stream_capture_stdout(&builder.config.exec_ctx) else {
         return true;
@@ -56,7 +66,8 @@ fn run_tests(builder: &Builder<'_>, cmd: &mut BootstrapCommand, stream: bool) ->
 
     // This runs until the stdout of the child is closed, which means the child exited. We don't
     // run this on another thread since the builder is not Sync.
-    let renderer = Renderer::new(streaming_command.stdout.take().unwrap(), builder);
+    let renderer =
+        Renderer::new(streaming_command.stdout.take().unwrap(), builder, record_failed_tests);
     if stream {
         renderer.stream_all();
     } else {
@@ -87,10 +98,30 @@ struct Renderer<'a> {
     ignored_tests: usize,
     terse_tests_in_line: usize,
     ci_latest_logged_percentage: f64,
+
+    failed_tests: Option<File>,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(stdout: ChildStdout, builder: &'a Builder<'a>) -> Self {
+    fn new(
+        stdout: ChildStdout,
+        builder: &'a Builder<'a>,
+        record_failed_tests: RecordFailedTests,
+    ) -> Self {
+        let failed_tests = record_failed_tests.path().and_then(|path| {
+            // create the file (overwriting any previous) to get ready to record new failed tests
+            match File::options().create(true).append(true).truncate(false).open(path) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    println!(
+                        "Couldn't open file {} to write test failures to: {e}. (attempted because `--record` was passed). Test failures will not be recorded.",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        });
+
         Self {
             stdout: BufReader::new(stdout),
             benches: Vec::new(),
@@ -102,6 +133,7 @@ impl<'a> Renderer<'a> {
             ignored_tests: 0,
             terse_tests_in_line: 0,
             ci_latest_logged_percentage: 0.0,
+            failed_tests,
         }
     }
 
@@ -179,7 +211,7 @@ impl<'a> Renderer<'a> {
 
         if self.builder.config.verbose_tests {
             self.render_test_outcome_verbose(outcome, test);
-        } else if self.builder.config.is_running_on_ci {
+        } else if self.builder.config.is_running_on_ci() {
             self.render_test_outcome_ci(outcome, test);
         } else {
             self.render_test_outcome_terse(outcome, test);
@@ -250,8 +282,14 @@ impl<'a> Renderer<'a> {
                 if failure.stdout.is_some() || failure.message.is_some() {
                     println!("---- {} stdout ----", failure.name);
                     if let Some(stdout) = &failure.stdout {
-                        println!("{stdout}");
+                        // Captured test output normally ends with a newline,
+                        // so only use `println!` if it doesn't.
+                        print!("{stdout}");
+                        if !stdout.ends_with('\n') {
+                            println!("\n\\ (no newline at end of output)");
+                        }
                     }
+                    println!("---- {} stdout end ----", failure.name);
                     if let Some(message) = &failure.message {
                         println!("NOTE: {message}");
                     }
@@ -261,6 +299,13 @@ impl<'a> Renderer<'a> {
             println!("\nfailures:");
             for failure in &self.failures {
                 println!("    {}", failure.name);
+            }
+
+            if self.failed_tests.is_some() {
+                println!(
+                    "This list of test failures was recorded.\nUse `x test --rerun` to retry just these {} failed tests.",
+                    self.failures.len(),
+                )
             }
         }
 
@@ -300,6 +345,14 @@ impl<'a> Renderer<'a> {
         );
     }
 
+    fn render_report(&self, report: &Report) {
+        let &Report { total_time, compilation_time } = report;
+        // Should match `write_merged_doctest_times` in `library/test/src/formatters/pretty.rs`.
+        println!(
+            "all doctests ran in {total_time:.2}s; merged doctests compilation took {compilation_time:.2}s"
+        );
+    }
+
     fn render_message(&mut self, message: Message) {
         match message {
             Message::Suite(SuiteMessage::Started { test_count }) => {
@@ -316,6 +369,9 @@ impl<'a> Renderer<'a> {
             }
             Message::Suite(SuiteMessage::Failed(outcome)) => {
                 self.render_suite_outcome(Outcome::Failed, &outcome);
+            }
+            Message::Report(report) => {
+                self.render_report(&report);
             }
             Message::Bench(outcome) => {
                 // The formatting for benchmarks doesn't replicate 1:1 the formatting libtest
@@ -343,6 +399,13 @@ impl<'a> Renderer<'a> {
             }
             Message::Test(TestMessage::Failed(outcome)) => {
                 self.render_test_outcome(Outcome::Failed, &outcome);
+                if let Some(failed_tests) = &mut self.failed_tests
+                    && let Err(e) = writeln!(failed_tests, "{}", outcome.name)
+                {
+                    eprintln!(
+                        "failed to write test failure to file: {e} (attempted because `--record` was passed)"
+                    );
+                }
                 self.failures.push(outcome);
             }
             Message::Test(TestMessage::Timeout { name }) => {
@@ -429,6 +492,7 @@ enum Message {
     Suite(SuiteMessage),
     Test(TestMessage),
     Bench(BenchOutcome),
+    Report(Report),
 }
 
 #[derive(serde_derive::Deserialize)]
@@ -474,4 +538,11 @@ struct TestOutcome {
     exec_time: Option<f64>,
     stdout: Option<String>,
     message: Option<String>,
+}
+
+/// Emitted when running doctests.
+#[derive(serde_derive::Deserialize)]
+struct Report {
+    total_time: f64,
+    compilation_time: f64,
 }

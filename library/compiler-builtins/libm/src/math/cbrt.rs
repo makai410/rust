@@ -8,7 +8,7 @@ use super::Float;
 use super::support::{FpResult, Round, cold_path};
 
 /// Compute the cube root of the argument.
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn cbrt(x: f64) -> f64 {
     cbrt_round(x, Round::Nearest).val
 }
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn spot_checks() {
-        if !cfg!(x86_no_sse) {
+        if !cfg!(x86_no_sse2) {
             // Exposes a rounding mode problem. Ignored on i586 because of inaccurate FMA.
             assert_biteq!(
                 cbrt(f64::from_bits(0xf7f792b28f600000)),

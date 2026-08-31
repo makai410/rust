@@ -11,17 +11,19 @@ use rustc_hir::{MatchSource, Node};
 use rustc_middle::traits::{MatchExpressionArmCause, ObligationCause, ObligationCauseCode};
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self as ty, GenericArgKind, IsSuggestable, Ty, TypeVisitableExt};
+use rustc_middle::ty::{
+    self as ty, GenericArgKind, IsSuggestable, Ty, TypeVisitableExt, Unnormalized,
+};
 use rustc_span::{Span, sym};
 use tracing::debug;
 
-use crate::error_reporting::TypeErrCtxt;
-use crate::error_reporting::infer::hir::Path;
-use crate::errors::{
+use crate::diagnostics::{
     ConsiderAddingAwait, FnConsiderCasting, FnConsiderCastingBoth, FnItemsAreDistinct, FnUniqTypes,
     FunctionPointerSuggestion, SuggestAccessingField, SuggestRemoveSemiOrReturnBinding,
     SuggestTuplePatternMany, SuggestTuplePatternOne, TypeErrorAdditionalDiags,
 };
+use crate::error_reporting::TypeErrCtxt;
+use crate::error_reporting::infer::hir::Path;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum StatementAsExpression {
@@ -91,51 +93,51 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
     ) {
         // Heavily inspired by `FnCtxt::suggest_compatible_variants`, with
         // some modifications due to that being in typeck and this being in infer.
-        if let ObligationCauseCode::Pattern { .. } = cause.code() {
-            if let ty::Adt(expected_adt, args) = exp_found.expected.kind() {
-                let compatible_variants: Vec<_> = expected_adt
-                    .variants()
-                    .iter()
-                    .filter(|variant| {
-                        variant.fields.len() == 1 && variant.ctor_kind() == Some(CtorKind::Fn)
-                    })
-                    .filter_map(|variant| {
-                        let sole_field = &variant.single_field();
-                        let sole_field_ty = sole_field.ty(self.tcx, args);
-                        if self.same_type_modulo_infer(sole_field_ty, exp_found.found) {
-                            let variant_path =
-                                with_no_trimmed_paths!(self.tcx.def_path_str(variant.def_id));
-                            // FIXME #56861: DRYer prelude filtering
-                            if let Some(path) = variant_path.strip_prefix("std::prelude::") {
-                                if let Some((_, path)) = path.split_once("::") {
-                                    return Some(path.to_string());
-                                }
-                            }
-                            Some(variant_path)
-                        } else {
-                            None
+        if let ObligationCauseCode::Pattern { .. } = cause.code()
+            && let ty::Adt(expected_adt, args) = exp_found.expected.kind()
+        {
+            let compatible_variants: Vec<_> = expected_adt
+                .variants()
+                .iter()
+                .filter(|variant| {
+                    variant.fields.len() == 1 && variant.ctor_kind() == Some(CtorKind::Fn)
+                })
+                .filter_map(|variant| {
+                    let sole_field = &variant.single_field();
+                    let sole_field_ty = sole_field.ty(self.tcx, args).skip_norm_wip();
+                    if self.same_type_modulo_infer(sole_field_ty, exp_found.found) {
+                        let variant_path =
+                            with_no_trimmed_paths!(self.tcx.def_path_str(variant.def_id));
+                        // FIXME #56861: DRYer prelude filtering
+                        if let Some(path) = variant_path.strip_prefix("std::prelude::")
+                            && let Some((_, path)) = path.split_once("::")
+                        {
+                            return Some(path.to_string());
                         }
-                    })
-                    .collect();
-                match &compatible_variants[..] {
-                    [] => {}
-                    [variant] => {
-                        let sugg = SuggestTuplePatternOne {
-                            variant: variant.to_owned(),
-                            span_low: cause.span.shrink_to_lo(),
-                            span_high: cause.span.shrink_to_hi(),
-                        };
-                        diag.subdiagnostic(sugg);
+                        Some(variant_path)
+                    } else {
+                        None
                     }
-                    _ => {
-                        // More than one matching variant.
-                        let sugg = SuggestTuplePatternMany {
-                            path: self.tcx.def_path_str(expected_adt.did()),
-                            cause_span: cause.span,
-                            compatible_variants,
-                        };
-                        diag.subdiagnostic(sugg);
-                    }
+                })
+                .collect();
+            match &compatible_variants[..] {
+                [] => {}
+                [variant] => {
+                    let sugg = SuggestTuplePatternOne {
+                        variant: variant.to_owned(),
+                        span_low: cause.span.shrink_to_lo(),
+                        span_high: cause.span.shrink_to_hi(),
+                    };
+                    diag.subdiagnostic(sugg);
+                }
+                _ => {
+                    // More than one matching variant.
+                    let sugg = SuggestTuplePatternMany {
+                        path: self.tcx.def_path_str(expected_adt.did()),
+                        cause_span: cause.span,
+                        compatible_variants,
+                    };
+                    diag.subdiagnostic(sugg);
                 }
             }
         }
@@ -157,8 +159,9 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
     /// ```
     ///
     /// This routine checks if the found type `T` implements `Future<Output=U>` where `U` is the
-    /// expected type. If this is the case, and we are inside of an async body, it suggests adding
-    /// `.await` to the tail of the expression.
+    /// expected type. In an async body, it suggests adding `.await` to the expression. For a
+    /// return expression in a synchronous function, it suggests making the function async and
+    /// awaiting the expression together.
     pub(super) fn suggest_await_on_expect_found(
         &self,
         cause: &ObligationCause<'tcx>,
@@ -171,16 +174,19 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             exp_span, exp_found.expected, exp_found.found,
         );
 
-        match self.tcx.coroutine_kind(cause.body_id) {
+        match self.tcx.coroutine_kind(cause.body_def_id) {
             Some(hir::CoroutineKind::Desugared(
                 hir::CoroutineDesugaring::Async | hir::CoroutineDesugaring::AsyncGen,
                 _,
             )) => (),
-            None
-            | Some(
+            Some(
                 hir::CoroutineKind::Coroutine(_)
                 | hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Gen, _),
             ) => return,
+            None => {
+                self.suggest_add_async_for_tail_return_expr(cause, exp_span, exp_found, diag);
+                return;
+            }
         }
 
         if let ObligationCauseCode::CompareImplItem { .. } = cause.code() {
@@ -188,8 +194,8 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         }
 
         let subdiag = match (
-            self.get_impl_future_output_ty(exp_found.expected),
-            self.get_impl_future_output_ty(exp_found.found),
+            self.tcx.get_impl_future_output_ty(exp_found.expected),
+            self.tcx.get_impl_future_output_ty(exp_found.found),
         ) {
             (Some(exp), Some(found)) if self.same_type_modulo_infer(exp, found) => match cause
                 .code()
@@ -207,7 +213,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                         second: exp_span.shrink_to_hi(),
                     })
                 }
-                ObligationCauseCode::MatchExpressionArm(box MatchExpressionArmCause {
+                ObligationCauseCode::MatchExpressionArm(MatchExpressionArmCause {
                     prior_non_diverging_arms,
                     ..
                 }) => {
@@ -246,7 +252,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     let then_span = self.find_block_span_from_hir_id(then_expr.hir_id);
                     Some(ConsiderAddingAwait::FutureSugg { span: then_span.shrink_to_hi() })
                 }
-                ObligationCauseCode::MatchExpressionArm(box MatchExpressionArmCause {
+                ObligationCauseCode::MatchExpressionArm(MatchExpressionArmCause {
                     prior_non_diverging_arms,
                     ..
                 }) => Some({
@@ -263,6 +269,64 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         };
         if let Some(subdiag) = subdiag {
             diag.subdiagnostic(subdiag);
+        }
+    }
+
+    fn suggest_add_async_for_tail_return_expr(
+        &self,
+        cause: &ObligationCause<'tcx>,
+        exp_span: Span,
+        exp_found: &ty::error::ExpectedFound<Ty<'tcx>>,
+        diag: &mut Diag<'_>,
+    ) {
+        let (ObligationCauseCode::BlockTailExpression(return_hir_id, ..)
+        | ObligationCauseCode::ReturnValue(return_hir_id)) = cause.code()
+        else {
+            return;
+        };
+
+        let body_def_id = cause.body_def_id;
+        if !self.tcx.sess.at_least_rust_2018() || self.tcx.is_entrypoint(body_def_id.to_def_id()) {
+            return;
+        }
+
+        let node = self.tcx.hir_node_by_def_id(body_def_id);
+        let (item_span, vis_span) = match node {
+            Node::Item(item) if matches!(item.kind, hir::ItemKind::Fn { .. }) => {
+                (item.span, item.vis_span)
+            }
+            Node::ImplItem(item) if matches!(item.kind, hir::ImplItemKind::Fn(..)) => {
+                let Some(vis_span) = item.vis_span() else { return };
+                (item.span, vis_span)
+            }
+            _ => return,
+        };
+        let Some(sig) = node.fn_sig() else {
+            return;
+        };
+        if sig.header.asyncness.is_async()
+            || sig.header.constness != hir::Constness::NotConst
+            || item_span.from_expansion()
+        {
+            return;
+        }
+
+        let (async_span, async_prefix) = if vis_span.is_empty() {
+            (item_span.shrink_to_lo(), "async ".to_string())
+        } else {
+            (vis_span.shrink_to_hi(), " async".to_string())
+        };
+        let body_hir_id = self.tcx.local_def_id_to_hir_id(body_def_id);
+        if self.tcx.hir_get_fn_id_for_return_block(*return_hir_id) == Some(body_hir_id)
+            && let Some(found) = self.tcx.get_impl_future_output_ty(exp_found.found)
+            && self.same_type_modulo_infer(exp_found.expected, found)
+            && exp_span.can_be_used_for_suggestions()
+        {
+            diag.subdiagnostic(ConsiderAddingAwait::MakeFunctionAsync {
+                async_span,
+                async_prefix,
+                await_span: exp_span.shrink_to_hi(),
+            });
         }
     }
 
@@ -286,21 +350,19 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 .fields
                 .iter()
                 .filter(|field| field.vis.is_accessible_from(field.did, self.tcx))
-                .map(|field| (field.name, field.ty(self.tcx, expected_args)))
+                .map(|field| (field.name, field.ty(self.tcx, expected_args).skip_norm_wip()))
                 .find(|(_, ty)| self.same_type_modulo_infer(*ty, exp_found.found))
+                && let ObligationCauseCode::Pattern { span: Some(span), .. } = *cause.code()
+                && let Ok(snippet) = self.tcx.sess.source_map().span_to_snippet(span)
             {
-                if let ObligationCauseCode::Pattern { span: Some(span), .. } = *cause.code() {
-                    if let Ok(snippet) = self.tcx.sess.source_map().span_to_snippet(span) {
-                        let suggestion = if expected_def.is_struct() {
-                            SuggestAccessingField::Safe { span, snippet, name, ty }
-                        } else if expected_def.is_union() {
-                            SuggestAccessingField::Unsafe { span, snippet, name, ty }
-                        } else {
-                            return;
-                        };
-                        diag.subdiagnostic(suggestion);
-                    }
-                }
+                let suggestion = if expected_def.is_struct() {
+                    SuggestAccessingField::Safe { span, snippet, name, ty }
+                } else if expected_def.is_union() {
+                    SuggestAccessingField::Unsafe { span, snippet, name, ty }
+                } else {
+                    return;
+                };
+                diag.subdiagnostic(suggestion);
             }
         }
     }
@@ -411,14 +473,16 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         }
         match (expected_inner.kind(), found_inner.kind()) {
             (ty::FnPtr(sig_tys, hdr), ty::FnDef(did, args)) => {
+                let args = args.no_bound_vars().unwrap();
+
                 let sig = sig_tys.with(*hdr);
-                let expected_sig = &(self.normalize_fn_sig)(sig);
+                let expected_sig = self.normalize_fn_sig(Unnormalized::new_wip(sig));
                 let found_sig =
-                    &(self.normalize_fn_sig)(self.tcx.fn_sig(*did).instantiate(self.tcx, args));
+                    self.normalize_fn_sig(self.tcx.fn_sig(*did).instantiate(self.tcx, args));
 
                 let fn_name = self.tcx.def_path_str_with_args(*did, args);
 
-                if !self.same_type_modulo_infer(*found_sig, *expected_sig)
+                if !self.same_type_modulo_infer(found_sig, expected_sig)
                     || !sig.is_suggestable(self.tcx, true)
                     || self.tcx.intrinsic(*did).is_some()
                 {
@@ -449,16 +513,19 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 diag.subdiagnostic(sugg);
             }
             (ty::FnDef(did1, args1), ty::FnDef(did2, args2)) => {
-                let expected_sig =
-                    &(self.normalize_fn_sig)(self.tcx.fn_sig(*did1).instantiate(self.tcx, args1));
-                let found_sig =
-                    &(self.normalize_fn_sig)(self.tcx.fn_sig(*did2).instantiate(self.tcx, args2));
+                let args1 = args1.no_bound_vars().unwrap();
+                let args2 = args2.no_bound_vars().unwrap();
 
-                if self.same_type_modulo_infer(*expected_sig, *found_sig) {
+                let expected_sig =
+                    self.normalize_fn_sig(self.tcx.fn_sig(*did1).instantiate(self.tcx, args1));
+                let found_sig =
+                    self.normalize_fn_sig(self.tcx.fn_sig(*did2).instantiate(self.tcx, args2));
+
+                if self.same_type_modulo_infer(expected_sig, found_sig) {
                     diag.subdiagnostic(FnUniqTypes);
                 }
 
-                if !self.same_type_modulo_infer(*found_sig, *expected_sig)
+                if !self.same_type_modulo_infer(found_sig, expected_sig)
                     || !found_sig.is_suggestable(self.tcx, true)
                     || !expected_sig.is_suggestable(self.tcx, true)
                     || self.tcx.intrinsic(*did1).is_some()
@@ -470,7 +537,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 let fn_name = self.tcx.def_path_str_with_args(*did2, args2);
 
                 let Some(span) = span else {
-                    diag.subdiagnostic(FnConsiderCastingBoth { sig: *expected_sig });
+                    diag.subdiagnostic(FnConsiderCastingBoth { sig: expected_sig });
                     return;
                 };
 
@@ -478,25 +545,27 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     FunctionPointerSuggestion::CastBothRef {
                         span,
                         fn_name,
-                        found_sig: *found_sig,
-                        expected_sig: *expected_sig,
+                        found_sig,
+                        expected_sig,
                     }
                 } else {
                     FunctionPointerSuggestion::CastBoth {
                         span: span.shrink_to_hi(),
-                        found_sig: *found_sig,
-                        expected_sig: *expected_sig,
+                        found_sig,
+                        expected_sig,
                     }
                 };
 
                 diag.subdiagnostic(sug);
             }
             (ty::FnDef(did, args), ty::FnPtr(sig_tys, hdr)) => {
-                let expected_sig =
-                    &(self.normalize_fn_sig)(self.tcx.fn_sig(*did).instantiate(self.tcx, args));
-                let found_sig = &(self.normalize_fn_sig)(sig_tys.with(*hdr));
+                let args = args.no_bound_vars().unwrap();
 
-                if !self.same_type_modulo_infer(*found_sig, *expected_sig) {
+                let expected_sig =
+                    self.normalize_fn_sig(self.tcx.fn_sig(*did).instantiate(self.tcx, args));
+                let found_sig = self.normalize_fn_sig(Unnormalized::new_wip(sig_tys.with(*hdr)));
+
+                if !self.same_type_modulo_infer(found_sig, expected_sig) {
                     return;
                 }
 
@@ -540,38 +609,35 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
     ) -> Option<SuggestAsRefKind> {
         if let (ty::Adt(exp_def, exp_args), ty::Ref(_, found_ty, _)) =
             (expected.kind(), found.kind())
+            && let ty::Adt(found_def, found_args) = *found_ty.kind()
         {
-            if let ty::Adt(found_def, found_args) = *found_ty.kind() {
-                if exp_def == &found_def {
-                    let have_as_ref = &[
-                        (sym::Option, SuggestAsRefKind::Option),
-                        (sym::Result, SuggestAsRefKind::Result),
-                    ];
-                    if let Some(msg) = have_as_ref.iter().find_map(|(name, msg)| {
-                        self.tcx.is_diagnostic_item(*name, exp_def.did()).then_some(msg)
-                    }) {
-                        let mut show_suggestion = true;
-                        for (exp_ty, found_ty) in
-                            std::iter::zip(exp_args.types(), found_args.types())
-                        {
-                            match *exp_ty.kind() {
-                                ty::Ref(_, exp_ty, _) => {
-                                    match (exp_ty.kind(), found_ty.kind()) {
-                                        (_, ty::Param(_))
-                                        | (_, ty::Infer(_))
-                                        | (ty::Param(_), _)
-                                        | (ty::Infer(_), _) => {}
-                                        _ if self.same_type_modulo_infer(exp_ty, found_ty) => {}
-                                        _ => show_suggestion = false,
-                                    };
-                                }
-                                ty::Param(_) | ty::Infer(_) => {}
-                                _ => show_suggestion = false,
+            if exp_def == &found_def {
+                let have_as_ref = &[
+                    (sym::Option, SuggestAsRefKind::Option),
+                    (sym::Result, SuggestAsRefKind::Result),
+                ];
+                if let Some(msg) = have_as_ref.iter().find_map(|(name, msg)| {
+                    self.tcx.is_diagnostic_item(*name, exp_def.did()).then_some(msg)
+                }) {
+                    let mut show_suggestion = true;
+                    for (exp_ty, found_ty) in std::iter::zip(exp_args.types(), found_args.types()) {
+                        match *exp_ty.kind() {
+                            ty::Ref(_, exp_ty, _) => {
+                                match (exp_ty.kind(), found_ty.kind()) {
+                                    (_, ty::Param(_))
+                                    | (_, ty::Infer(_))
+                                    | (ty::Param(_), _)
+                                    | (ty::Infer(_), _) => {}
+                                    _ if self.same_type_modulo_infer(exp_ty, found_ty) => {}
+                                    _ => show_suggestion = false,
+                                };
                             }
+                            ty::Param(_) | ty::Infer(_) => {}
+                            _ => show_suggestion = false,
                         }
-                        if show_suggestion {
-                            return Some(*msg);
-                        }
+                    }
+                    if show_suggestion {
+                        return Some(*msg);
                     }
                 }
             }
@@ -639,7 +705,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             }
         }
 
-        self.tcx.hir_maybe_body_owned_by(cause.body_id).and_then(|body| {
+        self.tcx.hir_maybe_body_owned_by(cause.body_def_id).and_then(|body| {
             IfVisitor { err_span: span, found_if: false }
                 .visit_body(&body)
                 .is_break()
@@ -772,12 +838,22 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 StatementAsExpression::CorrectType
             }
             (
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: last_def_id, .. }),
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: exp_def_id, .. }),
+                ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: last_def_id }, .. }),
+                ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: exp_def_id }, .. }),
             ) if last_def_id == exp_def_id => StatementAsExpression::CorrectType,
             (
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: last_def_id, args: last_bounds, .. }),
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: exp_def_id, args: exp_bounds, .. }),
+                ty::Alias(
+                    _,
+                    ty::AliasTy {
+                        kind: ty::Opaque { def_id: last_def_id }, args: last_bounds, ..
+                    },
+                ),
+                ty::Alias(
+                    _,
+                    ty::AliasTy {
+                        kind: ty::Opaque { def_id: exp_def_id }, args: exp_bounds, ..
+                    },
+                ),
             ) => {
                 debug!(
                     "both opaque, likely future {:?} {:?} {:?} {:?}",

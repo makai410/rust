@@ -26,10 +26,13 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 mod bytewise;
+mod clamp;
 pub(crate) use bytewise::BytewiseEq;
+#[unstable(feature = "clamp_bounds", issue = "147781")]
+pub use clamp::ClampBounds;
 
 use self::Ordering::*;
-use crate::marker::PointeeSized;
+use crate::marker::{Destruct, PointeeSized};
 use crate::ops::ControlFlow;
 
 /// Trait for comparisons using the equality operator.
@@ -241,23 +244,33 @@ use crate::ops::ControlFlow;
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(alias = "==")]
 #[doc(alias = "!=")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "can't compare `{Self}` with `{Rhs}`",
-    label = "no implementation for `{Self} == {Rhs}`",
-    append_const_msg
+    label = "no implementation for `{Self} == {Rhs}`"
 )]
 #[rustc_diagnostic_item = "PartialEq"]
-#[const_trait]
 #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
-pub trait PartialEq<Rhs: PointeeSized = Self>: PointeeSized {
-    /// Tests for `self` and `other` values to be equal, and is used by `==`.
+pub const trait PartialEq<Rhs: PointeeSized = Self>: PointeeSized {
+    /// Equality operator `==`.
+    ///
+    /// Implementation of the "is equal to" operator `==`:
+    /// tests whether its arguments are equal.
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_diagnostic_item = "cmp_partialeq_eq"]
     fn eq(&self, other: &Rhs) -> bool;
 
-    /// Tests for `!=`. The default implementation is almost always sufficient,
-    /// and should not be overridden without very good reason.
+    /// Inequality operator `!=`.
+    ///
+    /// Implementation of the "is not equal to" or "is different from" operator `!=`:
+    /// tests whether its arguments are different.
+    ///
+    /// # Default implementation
+    /// The default implementation of the inequality operator simply calls
+    /// the implementation of the equality operator and negates the result.
+    ///
+    /// This default shouldn't be overridden without good reason,
+    /// such as when forwarding to another PartialEq implementation.
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -282,8 +295,9 @@ pub macro PartialEq($item:item) {
 /// The primary difference to [`PartialEq`] is the additional requirement for reflexivity. A type
 /// that implements [`PartialEq`] guarantees that for all `a`, `b` and `c`:
 ///
-/// - symmetric: `a == b` implies `b == a` and `a != b` implies `!(a == b)`
+/// - symmetric: `a == b` implies `b == a`
 /// - transitive: `a == b` and `b == c` implies `a == c`
+/// - consistent: `a != b` if and only if `!(a == b)`
 ///
 /// `Eq`, which builds on top of [`PartialEq`] also implies:
 ///
@@ -335,23 +349,33 @@ pub macro PartialEq($item:item) {
 #[doc(alias = "!=")]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "Eq"]
-pub trait Eq: PartialEq<Self> + PointeeSized {
-    // this method is used solely by `impl Eq or #[derive(Eq)]` to assert that every component of a
-    // type implements `Eq` itself. The current deriving infrastructure means doing this assertion
-    // without using a method on this trait is nearly impossible.
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const trait Eq: [const] PartialEq<Self> + PointeeSized {
+    // This method was used solely by `#[derive(Eq)]` to assert that every component of a
+    // type implements `Eq` itself.
     //
     // This should never be implemented by hand.
     #[doc(hidden)]
     #[coverage(off)]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_diagnostic_item = "assert_receiver_is_total_eq"]
+    #[deprecated(since = "1.95.0", note = "implementation detail of `#[derive(Eq)]`")]
     fn assert_receiver_is_total_eq(&self) {}
+
+    // FIXME (#152504): this method is used solely by `#[derive(Eq)]` to assert that
+    // every component of a type implements `Eq` itself. It will be removed again soon.
+    #[doc(hidden)]
+    #[coverage(off)]
+    #[unstable(feature = "derive_eq_internals", issue = "none")]
+    fn assert_fields_are_eq(&self) {}
 }
 
 /// Derive macro generating an impl of the trait [`Eq`].
+/// The behavior of this macro is described in detail [here](Eq#derivable).
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
-#[allow_internal_unstable(core_intrinsics, derive_eq, structural_match)]
+#[allow_internal_unstable(core_intrinsics, derive_eq_internals, structural_match)]
 #[allow_internal_unstable(coverage_attribute)]
 pub macro Eq($item:item) {
     /* compiler built-in */
@@ -363,7 +387,11 @@ pub macro Eq($item:item) {
 // This struct should never appear in user code.
 #[doc(hidden)]
 #[allow(missing_debug_implementations)]
-#[unstable(feature = "derive_eq", reason = "deriving hack, should not be public", issue = "none")]
+#[unstable(
+    feature = "derive_eq_internals",
+    reason = "deriving hack, should not be public",
+    issue = "none"
+)]
 pub struct AssertParamIsEq<T: Eq + PointeeSized> {
     _field: crate::marker::PhantomData<T>,
 }
@@ -381,7 +409,8 @@ pub struct AssertParamIsEq<T: Eq + PointeeSized> {
 ///
 /// assert_eq!(2.cmp(&1), Ordering::Greater);
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[derive(Copy, Debug, Hash)]
+#[derive_const(Clone, Eq, PartialOrd, Ord, PartialEq)]
 #[stable(feature = "rust1", since = "1.0.0")]
 // This is a lang item only so that `BinOp::Cmp` in MIR can return it.
 // It has no special behavior, but does require that the three variants
@@ -635,7 +664,11 @@ impl Ordering {
     #[inline]
     #[must_use]
     #[stable(feature = "ordering_chaining", since = "1.17.0")]
-    pub fn then_with<F: FnOnce() -> Ordering>(self, f: F) -> Ordering {
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    pub const fn then_with<F>(self, f: F) -> Ordering
+    where
+        F: [const] FnOnce() -> Ordering + [const] Destruct,
+    {
         match self {
             Equal => f(),
             _ => self,
@@ -659,13 +692,15 @@ impl Ordering {
 /// v.sort_by_key(|&num| (num > 3, Reverse(num)));
 /// assert_eq!(v, vec![3, 2, 1, 6, 5, 4]);
 /// ```
-#[derive(PartialEq, Eq, Debug, Copy, Default, Hash)]
+#[derive(Copy, Debug, Hash)]
+#[derive_const(PartialEq, Eq, Default)]
 #[stable(feature = "reverse_cmp_key", since = "1.19.0")]
 #[repr(transparent)]
 pub struct Reverse<T>(#[stable(feature = "reverse_cmp_key", since = "1.19.0")] pub T);
 
 #[stable(feature = "reverse_cmp_key", since = "1.19.0")]
-impl<T: PartialOrd> PartialOrd for Reverse<T> {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+const impl<T: [const] PartialOrd> PartialOrd for Reverse<T> {
     #[inline]
     fn partial_cmp(&self, other: &Reverse<T>) -> Option<Ordering> {
         other.0.partial_cmp(&self.0)
@@ -690,7 +725,8 @@ impl<T: PartialOrd> PartialOrd for Reverse<T> {
 }
 
 #[stable(feature = "reverse_cmp_key", since = "1.19.0")]
-impl<T: Ord> Ord for Reverse<T> {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+const impl<T: [const] Ord> Ord for Reverse<T> {
     #[inline]
     fn cmp(&self, other: &Reverse<T>) -> Ordering {
         other.0.cmp(&self.0)
@@ -707,6 +743,54 @@ impl<T: Clone> Clone for Reverse<T> {
     #[inline]
     fn clone_from(&mut self, source: &Self) {
         self.0.clone_from(&source.0)
+    }
+}
+
+/// A pair where ordering and equality work on only the `key`, ignoring the `value`.
+///
+/// Used to implement `Iterator::min_by_key` as `map`+`min`, for example.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct KeyAndValue<K, V> {
+    pub key: K,
+    pub value: V,
+}
+impl<K: PartialEq, V> PartialEq for KeyAndValue<K, V> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+    #[inline]
+    fn ne(&self, other: &Self) -> bool {
+        self.key != other.key
+    }
+}
+impl<K: Eq, V> Eq for KeyAndValue<K, V> {}
+impl<K: PartialOrd, V> PartialOrd for KeyAndValue<K, V> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        PartialOrd::partial_cmp(&self.key, &other.key)
+    }
+    #[inline]
+    fn lt(&self, other: &Self) -> bool {
+        self.key < other.key
+    }
+    #[inline]
+    fn le(&self, other: &Self) -> bool {
+        self.key <= other.key
+    }
+    #[inline]
+    fn gt(&self, other: &Self) -> bool {
+        self.key > other.key
+    }
+    #[inline]
+    fn ge(&self, other: &Self) -> bool {
+        self.key >= other.key
+    }
+}
+impl<K: Ord, V> Ord for KeyAndValue<K, V> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        Ord::cmp(&self.key, &other.key)
     }
 }
 
@@ -957,7 +1041,8 @@ impl<T: Clone> Clone for Reverse<T> {
 #[doc(alias = ">=")]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "Ord"]
-pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const trait Ord: [const] Eq + [const] PartialOrd<Self> + PointeeSized {
     /// This method returns an [`Ordering`] between `self` and `other`.
     ///
     /// By convention, `self.cmp(&other)` returns the ordering matching the expression
@@ -1011,7 +1096,7 @@ pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
     #[rustc_diagnostic_item = "cmp_ord_max"]
     fn max(self, other: Self) -> Self
     where
-        Self: Sized,
+        Self: Sized + [const] Destruct,
     {
         if other < self { self } else { other }
     }
@@ -1050,7 +1135,7 @@ pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
     #[rustc_diagnostic_item = "cmp_ord_min"]
     fn min(self, other: Self) -> Self
     where
-        Self: Sized,
+        Self: Sized + [const] Destruct,
     {
         if other < self { other } else { self }
     }
@@ -1076,7 +1161,7 @@ pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
     #[stable(feature = "clamp", since = "1.50.0")]
     fn clamp(self, min: Self, max: Self) -> Self
     where
-        Self: Sized,
+        Self: Sized + [const] Destruct,
     {
         assert!(min <= max);
         if self < min {
@@ -1086,6 +1171,35 @@ pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
         } else {
             self
         }
+    }
+
+    /// Restrict a value to a certain range.
+    ///
+    /// This is equal to `max`, `min`, or `clamp`, depending on whether the range is `min..`,
+    /// `..=max`, or `min..=max`, respectively. Exclusive ranges are not permitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `min..=max` if `min > max`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(clamp_to)]
+    /// assert_eq!((-3).clamp_to(-2..=1), -2);
+    /// assert_eq!(0.clamp_to(-2..=1), 0);
+    /// assert_eq!(2.clamp_to(..=1), 1);
+    /// assert_eq!(5.clamp_to(7..), 7);
+    /// ```
+    #[must_use]
+    #[inline]
+    #[unstable(feature = "clamp_to", issue = "147781")]
+    fn clamp_to<R>(self, range: R) -> Self
+    where
+        Self: Sized + [const] Destruct,
+        R: [const] ClampBounds<Self>,
+    {
+        range.clamp(self)
     }
 }
 
@@ -1177,7 +1291,7 @@ pub macro Ord($item:item) {
 /// every `a`. This isn't always the case for types that implement `PartialOrd`, for example:
 ///
 /// ```
-/// let a = f64::sqrt(-1.0);
+/// let a = f64::NAN;
 /// assert_eq!(a <= a, false);
 /// ```
 ///
@@ -1334,14 +1448,16 @@ pub macro Ord($item:item) {
 #[doc(alias = "<")]
 #[doc(alias = "<=")]
 #[doc(alias = ">=")]
-#[rustc_on_unimplemented(
+#[diagnostic::on_unimplemented(
     message = "can't compare `{Self}` with `{Rhs}`",
-    label = "no implementation for `{Self} < {Rhs}` and `{Self} > {Rhs}`",
-    append_const_msg
+    label = "no implementation for `{Self} < {Rhs}` and `{Self} > {Rhs}`"
 )]
 #[rustc_diagnostic_item = "PartialOrd"]
 #[allow(multiple_supertrait_upcastable)] // FIXME(sized_hierarchy): remove this
-pub trait PartialOrd<Rhs: PointeeSized = Self>: PartialEq<Rhs> + PointeeSized {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const trait PartialOrd<Rhs: PointeeSized = Self>:
+    [const] PartialEq<Rhs> + PointeeSized
+{
     /// This method returns an ordering between `self` and `other` values if one exists.
     ///
     /// # Examples
@@ -1481,13 +1597,15 @@ pub trait PartialOrd<Rhs: PointeeSized = Self>: PartialEq<Rhs> + PointeeSized {
     }
 }
 
-fn default_chaining_impl<T: PointeeSized, U: PointeeSized>(
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+const fn default_chaining_impl<T, U>(
     lhs: &T,
     rhs: &U,
-    p: impl FnOnce(Ordering) -> bool,
+    p: impl [const] FnOnce(Ordering) -> bool + [const] Destruct,
 ) -> ControlFlow<bool>
 where
-    T: PartialOrd<U>,
+    T: [const] PartialOrd<U> + PointeeSized,
+    U: PointeeSized,
 {
     // It's important that this only call `partial_cmp` once, not call `eq` then
     // one of the relational operators.  We don't want to `bcmp`-then-`memcp` a
@@ -1544,13 +1662,17 @@ pub macro PartialOrd($item:item) {
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "cmp_min"]
-pub fn min<T: Ord>(v1: T, v2: T) -> T {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn min<T: [const] Ord + [const] Destruct>(v1: T, v2: T) -> T {
     v1.min(v2)
 }
 
 /// Returns the minimum of two values with respect to the specified comparison function.
 ///
 /// Returns the first argument if the comparison determines them to be equal.
+///
+/// The parameter order is preserved when calling the `compare` function, i.e. `v1` is
+/// always passed as the first argument and `v2` as the second.
 ///
 /// # Examples
 ///
@@ -1571,8 +1693,13 @@ pub fn min<T: Ord>(v1: T, v2: T) -> T {
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
-pub fn min_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
-    if compare(&v2, &v1).is_lt() { v2 } else { v1 }
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn min_by<T: [const] Destruct, F: [const] FnOnce(&T, &T) -> Ordering>(
+    v1: T,
+    v2: T,
+    compare: F,
+) -> T {
+    if compare(&v1, &v2).is_le() { v1 } else { v2 }
 }
 
 /// Returns the element that gives the minimum value from the specified function.
@@ -1596,7 +1723,13 @@ pub fn min_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
-pub fn min_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn min_by_key<T, F, K>(v1: T, v2: T, mut f: F) -> T
+where
+    T: [const] Destruct,
+    F: [const] FnMut(&T) -> K + [const] Destruct,
+    K: [const] Ord + [const] Destruct,
+{
     if f(&v2) < f(&v1) { v2 } else { v1 }
 }
 
@@ -1636,13 +1769,17 @@ pub fn min_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "cmp_max"]
-pub fn max<T: Ord>(v1: T, v2: T) -> T {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn max<T: [const] Ord + [const] Destruct>(v1: T, v2: T) -> T {
     v1.max(v2)
 }
 
 /// Returns the maximum of two values with respect to the specified comparison function.
 ///
 /// Returns the second argument if the comparison determines them to be equal.
+///
+/// The parameter order is preserved when calling the `compare` function, i.e. `v1` is
+/// always passed as the first argument and `v2` as the second.
 ///
 /// # Examples
 ///
@@ -1663,8 +1800,13 @@ pub fn max<T: Ord>(v1: T, v2: T) -> T {
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
-pub fn max_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
-    if compare(&v2, &v1).is_lt() { v1 } else { v2 }
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn max_by<T: [const] Destruct, F: [const] FnOnce(&T, &T) -> Ordering>(
+    v1: T,
+    v2: T,
+    compare: F,
+) -> T {
+    if compare(&v1, &v2).is_gt() { v1 } else { v2 }
 }
 
 /// Returns the element that gives the maximum value from the specified function.
@@ -1688,7 +1830,13 @@ pub fn max_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
-pub fn max_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn max_by_key<T, F, K>(v1: T, v2: T, mut f: F) -> T
+where
+    T: [const] Destruct,
+    F: [const] FnMut(&T) -> K + [const] Destruct,
+    K: [const] Ord + [const] Destruct,
+{
     if f(&v2) < f(&v1) { v1 } else { v2 }
 }
 
@@ -1732,9 +1880,10 @@ pub fn max_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
 #[inline]
 #[must_use]
 #[unstable(feature = "cmp_minmax", issue = "115939")]
-pub fn minmax<T>(v1: T, v2: T) -> [T; 2]
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn minmax<T>(v1: T, v2: T) -> [T; 2]
 where
-    T: Ord,
+    T: [const] Ord,
 {
     if v2 < v1 { [v2, v1] } else { [v1, v2] }
 }
@@ -1742,6 +1891,9 @@ where
 /// Returns minimum and maximum values with respect to the specified comparison function.
 ///
 /// Returns `[v1, v2]` if the comparison determines them to be equal.
+///
+/// The parameter order is preserved when calling the `compare` function, i.e. `v1` is
+/// always passed as the first argument and `v2` as the second.
 ///
 /// # Examples
 ///
@@ -1763,11 +1915,12 @@ where
 #[inline]
 #[must_use]
 #[unstable(feature = "cmp_minmax", issue = "115939")]
-pub fn minmax_by<T, F>(v1: T, v2: T, compare: F) -> [T; 2]
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn minmax_by<T, F>(v1: T, v2: T, compare: F) -> [T; 2]
 where
-    F: FnOnce(&T, &T) -> Ordering,
+    F: [const] FnOnce(&T, &T) -> Ordering,
 {
-    if compare(&v2, &v1).is_lt() { [v2, v1] } else { [v1, v2] }
+    if compare(&v1, &v2).is_le() { [v1, v2] } else { [v2, v1] }
 }
 
 /// Returns minimum and maximum values with respect to the specified key function.
@@ -1791,12 +1944,221 @@ where
 #[inline]
 #[must_use]
 #[unstable(feature = "cmp_minmax", issue = "115939")]
-pub fn minmax_by_key<T, F, K>(v1: T, v2: T, mut f: F) -> [T; 2]
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+pub const fn minmax_by_key<T, F, K>(v1: T, v2: T, mut f: F) -> [T; 2]
 where
-    F: FnMut(&T) -> K,
-    K: Ord,
+    F: [const] FnMut(&T) -> K + [const] Destruct,
+    K: [const] Ord + [const] Destruct,
 {
     if f(&v2) < f(&v1) { [v2, v1] } else { [v1, v2] }
+}
+
+/// Calls `mac` on lists of arguments from size `0` to `1 + count($y)`.
+macro impl_for_tuples_up_to($mac:ident! { $($x:ident, $($y:ident,)*)? }) {
+    $(impl_for_tuples_up_to! {
+        $mac! { $($y,)* }
+    })?
+    $mac! { $($x, $($y,)*)? }
+}
+
+/// Calls each `mac` on lists of arguments from size zero to twelve.
+macro impl_tuples($($mac:ident,)+) {
+    $(impl_for_tuples_up_to! { $mac! { x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, } })+
+}
+
+/// Implementation detail for [`smallest`] and [`largest`].
+/// Marker indicating that `Self` is a tuple where all members are of the same type.
+#[diagnostic::on_unimplemented(message = "`{Self}` is not a homogeneous tuple")]
+#[unstable(feature = "cmp_splat_internals", issue = "160728")]
+#[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+const trait HomogeneousTuple: crate::marker::Tuple {
+    /// The type of each item in this tuple.
+    type Item;
+}
+
+/// Implements [`HomogeneousTuple`] for a provided tuple.
+macro impl_homogeneous_tuple($($($x:ident,)+)?) {
+    $(
+        #[unstable(feature = "cmp_splat_internals", issue = "160728")]
+        #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+        const impl<T> HomogeneousTuple for ($(${ignore($x)}T,)+) {
+            type Item = T;
+        }
+    )?
+}
+
+impl_tuples! {
+    impl_homogeneous_tuple,
+}
+
+/// Compares and returns the minimum of the provided values.
+///
+/// Returns the first argument if the comparison determines them to be equal.
+///
+/// Internally uses [`Ord::min`].
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_splat)]
+/// use std::cmp;
+///
+/// assert_eq!(cmp::smallest(1), 1);
+/// assert_eq!(cmp::smallest(1, 2), 1);
+/// assert_eq!(cmp::smallest(3, 2, 1), 1);
+/// assert_eq!(cmp::smallest(1, 2, 3, 4), 1);
+/// ```
+/// ```
+/// #![feature(cmp_splat)]
+/// use std::cmp::{self, Ordering};
+///
+/// #[derive(Eq)]
+/// struct Equal(&'static str);
+///
+/// impl PartialEq for Equal {
+///     fn eq(&self, other: &Self) -> bool { true }
+/// }
+/// impl PartialOrd for Equal {
+///     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(Ordering::Equal) }
+/// }
+/// impl Ord for Equal {
+///     fn cmp(&self, other: &Self) -> Ordering { Ordering::Equal }
+/// }
+///
+/// assert_eq!(cmp::smallest(Equal("v1"), Equal("v2")).0, "v1");
+/// ```
+///
+/// # Stability
+///
+/// This function is added in its current form as an experiment in variadic functions.
+/// In a future iteration of the feature, this function may be removed in favour of
+/// making [`min`] itself variadic instead.
+#[inline]
+#[must_use]
+#[unstable(feature = "cmp_splat", issue = "160728")]
+#[rustc_const_unstable(feature = "cmp_splat", issue = "160728")]
+#[expect(private_bounds, reason = "`SmallestArgs` is an internal implementation detail")]
+#[cfg(not(test))] // FIXME: splat interacts poorly with the double linking of `core` in tests
+pub const fn smallest<T: [const] Ord + [const] Destruct>(
+    #[rustc_splat] args: impl [const] SmallestArgs<Item = T>,
+) -> T {
+    SmallestArgs::smallest(args)
+}
+
+/// Implementation detail for [`smallest`].
+#[diagnostic::on_unimplemented(message = "`{Self}` is not a valid set of arguments for `smallest`")]
+#[unstable(feature = "cmp_splat_internals", issue = "160728")]
+#[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+const trait SmallestArgs: HomogeneousTuple {
+    /// Reduces all elements of a homogeneous tuple to its smallest value.
+    fn smallest(self) -> Self::Item;
+}
+
+/// Implements [`SmallestArgs`] for a provided tuple if applicable.
+macro impl_smallest_args($($x:ident, $($($y:ident,)+)?)?) {
+    $(
+        #[unstable(feature = "cmp_splat_internals", issue = "160728")]
+        #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+        const impl<T> SmallestArgs for (T, $($(${ignore($y)}T,)+)?)
+        $(where T: [const] Destruct + [const] Ord, $(${ignore($y)})+)?
+        {
+            #[inline]
+            fn smallest(self) -> Self::Item {
+                let ($x, $($($y,)+)?) = self;
+                $($(let $x = $x.min($y);)+)?
+                $x
+            }
+        }
+    )?
+}
+
+impl_tuples! {
+    impl_smallest_args,
+}
+
+/// Compares and returns the maximum of the provided values.
+///
+/// Returns the last argument if the comparison determines them to be equal.
+///
+/// Internally uses [`Ord::max`].
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_splat)]
+/// use std::cmp;
+///
+/// assert_eq!(cmp::largest(1), 1);
+/// assert_eq!(cmp::largest(1, 2), 2);
+/// assert_eq!(cmp::largest(3, 2, 1), 3);
+/// assert_eq!(cmp::largest(1, 2, 3, 4), 4);
+/// ```
+/// ```
+/// #![feature(cmp_splat)]
+/// use std::cmp::{self, Ordering};
+///
+/// #[derive(Eq)]
+/// struct Equal(&'static str);
+///
+/// impl PartialEq for Equal {
+///     fn eq(&self, other: &Self) -> bool { true }
+/// }
+/// impl PartialOrd for Equal {
+///     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(Ordering::Equal) }
+/// }
+/// impl Ord for Equal {
+///     fn cmp(&self, other: &Self) -> Ordering { Ordering::Equal }
+/// }
+///
+/// assert_eq!(cmp::largest(Equal("v1"), Equal("v2")).0, "v2");
+/// ```
+///
+/// # Stability
+///
+/// This function is added in its current form as an experiment in variadic functions.
+/// In a future iteration of the feature, this function may be removed in favour of
+/// making [`max`] itself variadic instead.
+#[inline]
+#[must_use]
+#[unstable(feature = "cmp_splat", issue = "160728")]
+#[rustc_const_unstable(feature = "cmp_splat", issue = "160728")]
+#[expect(private_bounds, reason = "`LargestArgs` is an internal implementation detail")]
+#[cfg(not(test))] // FIXME: splat interacts poorly with the double linking of `core` in tests
+pub const fn largest<T: [const] Ord + [const] Destruct>(
+    #[rustc_splat] args: impl [const] LargestArgs<Item = T>,
+) -> T {
+    LargestArgs::largest(args)
+}
+
+/// Implementation detail for [`largest`].
+#[diagnostic::on_unimplemented(message = "`{Self}` is not a valid set of arguments for `largest`")]
+#[unstable(feature = "cmp_splat_internals", issue = "160728")]
+#[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+const trait LargestArgs: HomogeneousTuple {
+    /// Reduces all elements of a homogeneous tuple to its largest value.
+    fn largest(self) -> Self::Item;
+}
+
+/// Implements [`LargestArgs`] for a provided tuple if applicable.
+macro impl_largest_args($($x:ident, $($($y:ident,)+)?)?) {
+    $(
+        #[unstable(feature = "cmp_splat_internals", issue = "160728")]
+        #[rustc_const_unstable(feature = "cmp_splat_internals", issue = "160728")]
+        const impl<T> LargestArgs for (T, $($(${ignore($y)}T,)+)?)
+        $(where T: [const] Destruct + [const] Ord, $(${ignore($y)})+)?
+        {
+            #[inline]
+            fn largest(self) -> Self::Item {
+                let ($x, $($($y,)+)?) = self;
+                $($(let $x = $x.max($y);)+)?
+                $x
+            }
+        }
+    )?
+}
+
+impl_tuples! {
+    impl_largest_args,
 }
 
 // Implementation of PartialEq, Eq, PartialOrd and Ord for primitive types
@@ -1805,22 +2167,36 @@ mod impls {
     use crate::hint::unreachable_unchecked;
     use crate::marker::PointeeSized;
     use crate::ops::ControlFlow::{self, Break, Continue};
+    use crate::panic::const_assert;
 
-    macro_rules! partial_eq_impl {
+    /// Implements `PartialEq` for primitive types.
+    ///
+    /// Primitive types have a compiler-defined primitive implementation of `==` and `!=`.
+    /// This implements the `PartialEq` trait in terms of those primitive implementations.
+    ///
+    /// NOTE: Calling this on a non-primitive type (such as `()`)
+    /// leads to an infinitely-looping self-recursive implementation.
+    macro_rules! impl_partial_eq_for_primitive {
         ($($t:ty)*) => ($(
             #[stable(feature = "rust1", since = "1.0.0")]
             #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
-            impl const PartialEq for $t {
+            const impl PartialEq for $t {
                 #[inline]
                 fn eq(&self, other: &Self) -> bool { *self == *other }
+                // Override the default to use the primitive implementation for `!=`.
                 #[inline]
                 fn ne(&self, other: &Self) -> bool { *self != *other }
             }
         )*)
     }
 
+    impl_partial_eq_for_primitive! {
+        bool char usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128
+    }
+
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl PartialEq for () {
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl PartialEq for () {
         #[inline]
         fn eq(&self, _other: &()) -> bool {
             true
@@ -1831,14 +2207,11 @@ mod impls {
         }
     }
 
-    partial_eq_impl! {
-        bool char usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128
-    }
-
     macro_rules! eq_impl {
         ($($t:ty)*) => ($(
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl Eq for $t {}
+            #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+            const impl Eq for $t {}
         )*)
     }
 
@@ -1886,7 +2259,8 @@ mod impls {
     macro_rules! partial_ord_impl {
         ($($t:ty)*) => ($(
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl PartialOrd for $t {
+            #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+            const impl PartialOrd for $t {
                 #[inline]
                 fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
                     match (*self <= *other, *self >= *other) {
@@ -1903,7 +2277,8 @@ mod impls {
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl PartialOrd for () {
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl PartialOrd for () {
         #[inline]
         fn partial_cmp(&self, _: &()) -> Option<Ordering> {
             Some(Equal)
@@ -1911,7 +2286,8 @@ mod impls {
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl PartialOrd for bool {
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl PartialOrd for bool {
         #[inline]
         fn partial_cmp(&self, other: &bool) -> Option<Ordering> {
             Some(self.cmp(other))
@@ -1925,7 +2301,8 @@ mod impls {
     macro_rules! ord_impl {
         ($($t:ty)*) => ($(
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl PartialOrd for $t {
+            #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+            const impl PartialOrd for $t {
                 #[inline]
                 fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
                     Some(crate::intrinsics::three_way_compare(*self, *other))
@@ -1935,17 +2312,39 @@ mod impls {
             }
 
             #[stable(feature = "rust1", since = "1.0.0")]
-            impl Ord for $t {
+            #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+            const impl Ord for $t {
                 #[inline]
                 fn cmp(&self, other: &Self) -> Ordering {
                     crate::intrinsics::three_way_compare(*self, *other)
+                }
+
+                #[inline]
+                #[track_caller]
+                fn clamp(self, min: Self, max: Self) -> Self
+                {
+                    const_assert!(
+                        min <= max,
+                        "min > max",
+                        "min > max. min = {min:?}, max = {max:?}",
+                        min: $t,
+                        max: $t,
+                    );
+                    if self < min {
+                        min
+                    } else if self > max {
+                        max
+                    } else {
+                        self
+                    }
                 }
             }
         )*)
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl Ord for () {
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl Ord for () {
         #[inline]
         fn cmp(&self, _other: &()) -> Ordering {
             Equal
@@ -1953,7 +2352,8 @@ mod impls {
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl Ord for bool {
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl Ord for bool {
         #[inline]
         fn cmp(&self, other: &bool) -> Ordering {
             // Casting to i8's and converting the difference to an Ordering generates
@@ -1987,27 +2387,31 @@ mod impls {
 
     ord_impl! { char usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 
-    #[unstable(feature = "never_type", issue = "35121")]
-    impl PartialEq for ! {
+    #[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl PartialEq for ! {
         #[inline]
         fn eq(&self, _: &!) -> bool {
             *self
         }
     }
 
-    #[unstable(feature = "never_type", issue = "35121")]
-    impl Eq for ! {}
+    #[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl Eq for ! {}
 
-    #[unstable(feature = "never_type", issue = "35121")]
-    impl PartialOrd for ! {
+    #[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl PartialOrd for ! {
         #[inline]
         fn partial_cmp(&self, _: &!) -> Option<Ordering> {
             *self
         }
     }
 
-    #[unstable(feature = "never_type", issue = "35121")]
-    impl Ord for ! {
+    #[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl Ord for ! {
         #[inline]
         fn cmp(&self, _: &!) -> Ordering {
             *self
@@ -2018,9 +2422,9 @@ mod impls {
 
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
-    impl<A: PointeeSized, B: PointeeSized> const PartialEq<&B> for &A
+    const impl<A: PointeeSized, B: PointeeSized> PartialEq<&B> for &A
     where
-        A: ~const PartialEq<B>,
+        A: [const] PartialEq<B>,
     {
         #[inline]
         fn eq(&self, other: &&B) -> bool {
@@ -2032,9 +2436,10 @@ mod impls {
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A: PointeeSized, B: PointeeSized> PartialOrd<&B> for &A
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl<A: PointeeSized, B: PointeeSized> PartialOrd<&B> for &A
     where
-        A: PartialOrd<B>,
+        A: [const] PartialOrd<B>,
     {
         #[inline]
         fn partial_cmp(&self, other: &&B) -> Option<Ordering> {
@@ -2074,9 +2479,10 @@ mod impls {
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A: PointeeSized> Ord for &A
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl<A: PointeeSized> Ord for &A
     where
-        A: Ord,
+        A: [const] Ord,
     {
         #[inline]
         fn cmp(&self, other: &Self) -> Ordering {
@@ -2084,15 +2490,16 @@ mod impls {
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A: PointeeSized> Eq for &A where A: Eq {}
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl<A: PointeeSized> Eq for &A where A: [const] Eq {}
 
     // &mut pointers
 
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
-    impl<A: PointeeSized, B: PointeeSized> const PartialEq<&mut B> for &mut A
+    const impl<A: PointeeSized, B: PointeeSized> PartialEq<&mut B> for &mut A
     where
-        A: ~const PartialEq<B>,
+        A: [const] PartialEq<B>,
     {
         #[inline]
         fn eq(&self, other: &&mut B) -> bool {
@@ -2104,9 +2511,10 @@ mod impls {
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A: PointeeSized, B: PointeeSized> PartialOrd<&mut B> for &mut A
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl<A: PointeeSized, B: PointeeSized> PartialOrd<&mut B> for &mut A
     where
-        A: PartialOrd<B>,
+        A: [const] PartialOrd<B>,
     {
         #[inline]
         fn partial_cmp(&self, other: &&mut B) -> Option<Ordering> {
@@ -2146,9 +2554,10 @@ mod impls {
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A: PointeeSized> Ord for &mut A
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl<A: PointeeSized> Ord for &mut A
     where
-        A: Ord,
+        A: [const] Ord,
     {
         #[inline]
         fn cmp(&self, other: &Self) -> Ordering {
@@ -2156,13 +2565,14 @@ mod impls {
         }
     }
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A: PointeeSized> Eq for &mut A where A: Eq {}
+    #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+    const impl<A: PointeeSized> Eq for &mut A where A: [const] Eq {}
 
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
-    impl<A: PointeeSized, B: PointeeSized> const PartialEq<&mut B> for &A
+    const impl<A: PointeeSized, B: PointeeSized> PartialEq<&mut B> for &A
     where
-        A: ~const PartialEq<B>,
+        A: [const] PartialEq<B>,
     {
         #[inline]
         fn eq(&self, other: &&mut B) -> bool {
@@ -2176,9 +2586,9 @@ mod impls {
 
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
-    impl<A: PointeeSized, B: PointeeSized> const PartialEq<&B> for &mut A
+    const impl<A: PointeeSized, B: PointeeSized> PartialEq<&B> for &mut A
     where
-        A: ~const PartialEq<B>,
+        A: [const] PartialEq<B>,
     {
         #[inline]
         fn eq(&self, other: &&B) -> bool {

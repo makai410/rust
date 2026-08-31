@@ -1,6 +1,6 @@
 //! Infrastructure for lazy project discovery. Currently only support rust-project.json discovery
 //! via a custom discover command.
-use std::{io, path::Path};
+use std::path::Path;
 
 use crossbeam_channel::Sender;
 use ide_db::FxHashMap;
@@ -9,7 +9,7 @@ use project_model::ProjectJsonData;
 use serde::{Deserialize, Serialize};
 use tracing::{info_span, span::EnteredSpan};
 
-use crate::command::{CargoParser, CommandHandle};
+use crate::command::{CommandHandle, JsonLinesParser};
 
 pub(crate) const ARG_PLACEHOLDER: &str = "{arg}";
 
@@ -42,12 +42,12 @@ impl DiscoverCommand {
         Self { sender, command }
     }
 
-    /// Spawn the command inside [Discover] and report progress, if any.
+    /// Spawn the command inside `DiscoverCommand` and report progress, if any.
     pub(crate) fn spawn(
         &self,
         discover_arg: DiscoverArgument,
         current_dir: &Path,
-    ) -> io::Result<DiscoverHandle> {
+    ) -> anyhow::Result<DiscoverHandle> {
         let command = &self.command[0];
         let args = &self.command[1..];
 
@@ -67,16 +67,16 @@ impl DiscoverCommand {
         cmd.args(args);
 
         Ok(DiscoverHandle {
-            _handle: CommandHandle::spawn(cmd, DiscoverProjectParser, self.sender.clone())?,
+            handle: CommandHandle::spawn(cmd, DiscoverProjectParser, self.sender.clone(), None)?,
             span: info_span!("discover_command").entered(),
         })
     }
 }
 
-/// A handle to a spawned [Discover].
+/// A handle to a spawned `DiscoverCommand`.
 #[derive(Debug)]
 pub(crate) struct DiscoverHandle {
-    _handle: CommandHandle<DiscoverProjectMessage>,
+    pub(crate) handle: CommandHandle<DiscoverProjectMessage>,
     #[allow(dead_code)] // not accessed, but used to log on drop.
     span: EnteredSpan,
 }
@@ -118,7 +118,7 @@ impl DiscoverProjectMessage {
 
 struct DiscoverProjectParser;
 
-impl CargoParser<DiscoverProjectMessage> for DiscoverProjectParser {
+impl JsonLinesParser<DiscoverProjectMessage> for DiscoverProjectParser {
     fn from_line(&self, line: &str, _error: &mut String) -> Option<DiscoverProjectMessage> {
         match serde_json::from_str::<DiscoverProjectData>(line) {
             Ok(data) => {
@@ -134,6 +134,11 @@ impl CargoParser<DiscoverProjectMessage> for DiscoverProjectParser {
     }
 
     fn from_eof(&self) -> Option<DiscoverProjectMessage> {
+        None
+    }
+
+    fn from_stderr_line(&self, line: &str, _error: &mut String) -> Option<DiscoverProjectMessage> {
+        tracing::info!(%line, "discover command stderr");
         None
     }
 }

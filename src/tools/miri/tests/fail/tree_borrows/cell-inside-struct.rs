@@ -1,4 +1,6 @@
 //! A version of `cell_inside_struct` that dumps the tree so that we can see what is happening.
+//@revisions: tree tree_implicit_writes
+//@[tree_implicit_writes]compile-flags: -Zmiri-tree-borrows-implicit-writes
 //@compile-flags: -Zmiri-tree-borrows
 #[path = "../../utils/mod.rs"]
 #[macro_use]
@@ -11,7 +13,7 @@ struct Foo {
     field2: Cell<u32>,
 }
 
-pub fn main() {
+fn main() {
     let root = Foo { field1: 42, field2: Cell::new(88) };
     unsafe {
         let a = &root;

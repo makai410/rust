@@ -1,11 +1,12 @@
 [workspace]
-resolver = "1"
+resolver = "3"
 members = [
   "crates/*",
   "examples",
 ]
 exclude = [
-  "crates/wasm-assert-instr-tests"
+  "crates/wasm-assert-instr-tests",
+  "rust_programs",
 ]
 
 [profile.release]

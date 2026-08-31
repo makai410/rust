@@ -1,33 +1,47 @@
 use std::ops::Range;
 
-use rustc_abi::{Align, HasDataLayout, Primitive, Scalar, Size, WrappingRange};
+use rustc_abi::{Align, ExternAbi, HasDataLayout, Primitive, Scalar, Size, WrappingRange};
 use rustc_codegen_ssa::common;
 use rustc_codegen_ssa::traits::*;
-use rustc_hir::LangItem;
+use rustc_hir::attrs::Linkage;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::interpret::{
     Allocation, ConstAllocation, ErrorHandled, InitChunk, Pointer, Scalar as InterpScalar,
     read_target_uint,
 };
-use rustc_middle::mir::mono::{Linkage, MonoItem};
+use rustc_middle::mono::MonoItem;
 use rustc_middle::ty::layout::{HasTypingEnv, LayoutOf};
 use rustc_middle::ty::{self, Instance};
 use rustc_middle::{bug, span_bug};
+use rustc_span::Symbol;
+use rustc_target::spec::Arch;
 use tracing::{debug, instrument, trace};
 
 use crate::common::CodegenCx;
-use crate::errors::SymbolAlreadyDefined;
-use crate::type_::Type;
+use crate::diagnostics::SymbolAlreadyDefined;
+use crate::llvm::{self, Type, Value, const_ptr_auth};
 use crate::type_of::LayoutLlvmExt;
-use crate::value::Value;
-use crate::{base, debuginfo, llvm};
+use crate::{base, debuginfo};
 
+/// Indicates whether a value originates from a `static`.
+pub(crate) enum IsStatic {
+    Yes,
+    No,
+}
+/// Indicates whether a symbol is part of `.init_array` or `.fini_array`.
+#[derive(PartialEq)]
+pub(crate) enum IsInitOrFini {
+    Yes,
+    No,
+}
 pub(crate) fn const_alloc_to_llvm<'ll>(
     cx: &CodegenCx<'ll, '_>,
     alloc: &Allocation,
-    is_static: bool,
+    is_static: IsStatic,
+    is_init_fini: IsInitOrFini,
 ) -> &'ll Value {
     // We expect that callers of const_alloc_to_llvm will instead directly codegen a pointer or
     // integer for any &ZST where the ZST is a constant (i.e. not a static). We should never be
@@ -36,7 +50,7 @@ pub(crate) fn const_alloc_to_llvm<'ll>(
     //
     // Statics have a guaranteed meaningful address so it's less clear that we want to do
     // something like this; it's also harder.
-    if !is_static {
+    if matches!(is_static, IsStatic::No) {
         assert!(alloc.len() != 0);
     }
     let mut llvals = Vec::with_capacity(alloc.provenance().ptrs().len() + 1);
@@ -107,14 +121,22 @@ pub(crate) fn const_alloc_to_llvm<'ll>(
             as u64;
 
         let address_space = cx.tcx.global_alloc(prov.alloc_id()).address_space(cx);
-
-        llvals.push(cx.scalar_to_backend(
+        let schema = if cx.sess().pointer_authentication() {
+            match is_init_fini {
+                IsInitOrFini::Yes => cx.sess().pointer_authentication_init_fini(),
+                IsInitOrFini::No => cx.sess().pointer_authentication_functions(),
+            }
+        } else {
+            None
+        };
+        llvals.push(cx.scalar_to_backend_with_pac(
             InterpScalar::from_pointer(Pointer::new(prov, Size::from_bytes(ptr_offset)), &cx.tcx),
             Scalar::Initialized {
                 value: Primitive::Pointer(address_space),
                 valid_range: WrappingRange::full(pointer_size),
             },
             cx.type_ptr_ext(address_space),
+            schema,
         ));
         next_offset = offset + pointer_size_bytes;
     }
@@ -139,7 +161,21 @@ fn codegen_static_initializer<'ll, 'tcx>(
     def_id: DefId,
 ) -> Result<(&'ll Value, ConstAllocation<'tcx>), ErrorHandled> {
     let alloc = cx.tcx.eval_static_initializer(def_id)?;
-    Ok((const_alloc_to_llvm(cx, alloc.inner(), /*static*/ true), alloc))
+    let attrs = cx.tcx.codegen_fn_attrs(def_id);
+    // FIXME(jchlanda) Decide if this could be better served by `ctor` crate. See the discussion
+    // here: <https://github.com/rust-lang/rust/pull/155722#discussion_r3320477047>
+    let is_in_init_fini: IsInitOrFini = attrs
+        .link_section
+        .map(|link_section| {
+            let s = link_section.as_str();
+            if s.starts_with(".init_array") || s.starts_with(".fini_array") {
+                IsInitOrFini::Yes
+            } else {
+                IsInitOrFini::No
+            }
+        })
+        .unwrap_or(IsInitOrFini::No);
+    Ok((const_alloc_to_llvm(cx, alloc.inner(), IsStatic::Yes, is_in_init_fini), alloc))
 }
 
 fn set_global_alignment<'ll>(cx: &CodegenCx<'ll, '_>, gv: &'ll Value, mut align: Align) {
@@ -162,6 +198,7 @@ fn check_and_apply_linkage<'ll, 'tcx>(
     if let Some(linkage) = attrs.import_linkage {
         debug!("get_static: sym={} linkage={:?}", sym, linkage);
 
+        let mut should_sign = false;
         // Declare a symbol `foo`. If `foo` is an extern_weak symbol, we declare
         // an extern_weak function, otherwise a global with the desired linkage.
         let g1 = if matches!(attrs.import_linkage, Some(Linkage::ExternalWeak)) {
@@ -174,8 +211,13 @@ fn check_and_apply_linkage<'ll, 'tcx>(
                 && let ty::FnPtr(sig, header) = args.type_at(0).kind()
             {
                 let fn_sig = sig.with(*header);
-
                 let fn_abi = cx.fn_abi_of_fn_ptr(fn_sig, ty::List::empty());
+                // Decide if the initializer needs to be signed
+                if cx.sess().pointer_authentication()
+                    && matches!(fn_sig.abi(), ExternAbi::C { .. } | ExternAbi::System { .. })
+                {
+                    should_sign = true;
+                }
                 cx.declare_fn(sym, &fn_abi, None)
             } else {
                 cx.declare_global(sym, cx.type_i8())
@@ -185,14 +227,18 @@ fn check_and_apply_linkage<'ll, 'tcx>(
         };
         llvm::set_linkage(g1, base::linkage_to_llvm(linkage));
 
+        // Normally this is done in `get_static_inner`, but when as we generate an internal global,
+        // it will apply the dso_local to the internal global instead, so do it here, too.
+        cx.assume_dso_local(g1, true);
+
         // Declare an internal global `extern_with_linkage_foo` which
         // is initialized with the address of `foo`. If `foo` is
         // discarded during linking (for example, if `foo` has weak
         // linkage and there are no definitions), then
         // `extern_with_linkage_foo` will instead be initialized to
         // zero.
-        let mut real_name = "_rust_extern_with_linkage_".to_string();
-        real_name.push_str(sym);
+        let real_name =
+            format!("_rust_extern_with_linkage_{:016x}_{sym}", cx.tcx.stable_crate_id(LOCAL_CRATE));
         let g2 = cx.define_global(&real_name, llty).unwrap_or_else(|| {
             cx.sess().dcx().emit_fatal(SymbolAlreadyDefined {
                 span: cx.tcx.def_span(def_id),
@@ -200,10 +246,28 @@ fn check_and_apply_linkage<'ll, 'tcx>(
             })
         });
         llvm::set_linkage(g2, llvm::Linkage::InternalLinkage);
-        llvm::set_initializer(g2, g1);
+        llvm::set_unnamed_address(g2, llvm::UnnamedAddr::Global);
+
+        // Sign the function pointer that is used to initialize the global
+        let initializer = if should_sign {
+            let key: u32 = 0;
+            let discriminator: u64 = 0;
+
+            const_ptr_auth(
+                cx.const_bitcast(g1, llty),
+                key,
+                discriminator,
+                None, /* address_diversity */
+            )
+        } else {
+            g1
+        };
+
+        llvm::set_initializer(g2, initializer);
+
         g2
-    } else if cx.tcx.sess.target.arch == "x86"
-        && common::is_mingw_gnu_toolchain(&cx.tcx.sess.target)
+    } else if cx.tcx.sess.target.arch == Arch::X86
+        && common::is_using_dlltool(&cx.tcx.sess.target)
         && let Some(dllimport) = crate::common::get_dllimport(cx.tcx, def_id, sym)
     {
         cx.declare_global(&common::i686_decorated_name(dllimport, true, true, false), llty)
@@ -239,11 +303,13 @@ impl<'ll> CodegenCx<'ll, '_> {
                 let gv = self.define_global(&name, self.val_ty(cv)).unwrap_or_else(|| {
                     bug!("symbol `{}` is already defined", name);
                 });
-                llvm::set_linkage(gv, llvm::Linkage::PrivateLinkage);
                 gv
             }
-            _ => self.define_private_global(self.val_ty(cv)),
+            _ => self.define_global("", self.val_ty(cv)).unwrap_or_else(|| {
+                bug!("anonymous global symbol is already defined");
+            }),
         };
+        llvm::set_linkage(gv, llvm::Linkage::PrivateLinkage);
         llvm::set_initializer(gv, cv);
         set_global_alignment(self, gv, align);
         llvm::set_unnamed_address(gv, llvm::UnnamedAddr::Global);
@@ -330,6 +396,10 @@ impl<'ll> CodegenCx<'ll, '_> {
             }
 
             g
+        } else if let Some(classname) = fn_attrs.objc_class {
+            self.get_objc_classref(classname)
+        } else if let Some(methname) = fn_attrs.objc_selector {
+            self.get_objc_selref(methname)
         } else {
             check_and_apply_linkage(self, fn_attrs, llty, sym, def_id)
         };
@@ -347,8 +417,11 @@ impl<'ll> CodegenCx<'ll, '_> {
         let dso_local = self.assume_dso_local(g, true);
 
         if !def_id.is_local() {
+            let is_eii = fn_attrs.flags.contains(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM);
             let needs_dll_storage_attr = self.use_dll_storage_attrs
-                && !self.tcx.is_foreign_item(def_id)
+                // EII static declarations are encoded as foreign items, but their symbols are
+                // resolved by Rust crates, not native libraries.
+                && (!self.tcx.is_foreign_item(def_id) || is_eii)
                 // Local definitions can never be imported, so we must not apply
                 // the DLLImport annotation.
                 && !dso_local
@@ -368,10 +441,11 @@ impl<'ll> CodegenCx<'ll, '_> {
 
             if needs_dll_storage_attr {
                 // This item is external but not foreign, i.e., it originates from an external Rust
-                // crate. Since we don't know whether this crate will be linked dynamically or
-                // statically in the final application, we always mark such symbols as 'dllimport'.
-                // If final linkage happens to be static, we rely on compiler-emitted __imp_ stubs
-                // to make things work.
+                // crate. EII static declarations are handled the same way, even though they are
+                // represented as foreign items. Since we don't know whether this crate will be
+                // linked dynamically or statically in the final application, we always mark such
+                // symbols as 'dllimport'. If final linkage happens to be static, we rely on
+                // compiler-emitted __imp_ stubs to make things work.
                 //
                 // However, in some scenarios we defer emission of statics to downstream
                 // crates, so there are cases where a static with an upstream DefId
@@ -451,6 +525,8 @@ impl<'ll> CodegenCx<'ll, '_> {
             self.statics_to_rauw.borrow_mut().push((g, new_g));
             new_g
         };
+
+        // NOTE: Alignment from attributes has already been applied to the allocation.
         set_global_alignment(self, g, alloc.align);
         llvm::set_initializer(g, v);
 
@@ -468,8 +544,9 @@ impl<'ll> CodegenCx<'ll, '_> {
         }
 
         // Wasm statics with custom link sections get special treatment as they
-        // go into custom sections of the wasm executable. The exception to this
-        // is the `.init_array` section which are treated specially by the wasm linker.
+        // also go into custom sections of the wasm executable. The exception to
+        // this is the `.init_array` section for which we can't emit a custom
+        // section as it contains relocations.
         if self.tcx.sess.target.is_like_wasm
             && attrs
                 .link_section
@@ -486,21 +563,11 @@ impl<'ll> CodegenCx<'ll, '_> {
                 let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(0..alloc.len());
                 let alloc = self.create_metadata(bytes);
                 let data = [section, alloc];
-                let meta =
-                    unsafe { llvm::LLVMMDNodeInContext2(self.llcx, data.as_ptr(), data.len()) };
-                let val = self.get_metadata_value(meta);
-                unsafe {
-                    llvm::LLVMAddNamedMetadataOperand(
-                        self.llmod,
-                        c"wasm.custom_sections".as_ptr(),
-                        val,
-                    )
-                };
+                self.module_add_named_metadata_node(self.llmod(), c"wasm.custom_sections", &data);
             }
-        } else {
-            base::set_link_section(g, attrs);
         }
 
+        base::set_link_section(g, attrs);
         base::set_variable_sanitizer_attrs(g, attrs);
 
         if attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER) {
@@ -540,8 +607,225 @@ impl<'ll> CodegenCx<'ll, '_> {
 
     /// Add a global value to a list to be stored in the `llvm.compiler.used` variable,
     /// an array of ptr.
-    pub(crate) fn add_compiler_used_global(&mut self, global: &'ll Value) {
-        self.compiler_used_statics.push(global);
+    pub(crate) fn add_compiler_used_global(&self, global: &'ll Value) {
+        self.compiler_used_statics.borrow_mut().push(global);
+    }
+
+    // We do our best here to match what Clang does when compiling Objective-C natively.
+    // See Clang's `CGObjCCommonMac::CreateCStringLiteral`:
+    // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L4134
+    fn define_objc_classname(&self, classname: &str) -> &'ll Value {
+        assert_eq!(self.objc_abi_version(), 1);
+
+        let llval = self.null_terminate_const_bytes(classname.as_bytes());
+        let llty = self.val_ty(llval);
+        let sym = self.generate_local_symbol_name("OBJC_CLASS_NAME_");
+        let g = self.define_global(&sym, llty).unwrap_or_else(|| {
+            bug!("symbol `{}` is already defined", sym);
+        });
+        set_global_alignment(self, g, self.tcx.data_layout.i8_align);
+        llvm::set_initializer(g, llval);
+        llvm::set_linkage(g, llvm::Linkage::PrivateLinkage);
+        llvm::set_section(g, c"__TEXT,__cstring,cstring_literals");
+        llvm::LLVMSetGlobalConstant(g, llvm::TRUE);
+        llvm::LLVMSetUnnamedAddress(g, llvm::UnnamedAddr::Global);
+        self.add_compiler_used_global(g);
+
+        g
+    }
+
+    // We do our best here to match what Clang does when compiling Objective-C natively.
+    // See Clang's `ObjCNonFragileABITypesHelper`:
+    // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L6052
+    fn get_objc_class_t(&self) -> &'ll Type {
+        if let Some(class_t) = self.objc_class_t.get() {
+            return class_t;
+        }
+
+        assert_eq!(self.objc_abi_version(), 2);
+
+        // struct _class_t {
+        //     struct _class_t* isa;
+        //     struct _class_t* const superclass;
+        //     void* cache;
+        //     IMP* vtable;
+        //     struct class_ro_t* ro;
+        // }
+
+        let class_t = self.type_named_struct("struct._class_t");
+        let els = [self.type_ptr(); 5];
+        let packed = false;
+        self.set_struct_body(class_t, &els, packed);
+
+        self.objc_class_t.set(Some(class_t));
+        class_t
+    }
+
+    // We do our best here to match what Clang does when compiling Objective-C natively. We
+    // deduplicate references within a CGU, but we need a reference definition in each referencing
+    // CGU. All attempts at using external references to a single reference definition result in
+    // linker errors.
+    fn get_objc_classref(&self, classname: Symbol) -> &'ll Value {
+        let mut classrefs = self.objc_classrefs.borrow_mut();
+        if let Some(classref) = classrefs.get(&classname).copied() {
+            return classref;
+        }
+
+        let g = match self.objc_abi_version() {
+            1 => {
+                // See Clang's `CGObjCMac::EmitClassRefFromId`:
+                // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L5205
+                let llval = self.define_objc_classname(classname.as_str());
+                let llty = self.type_ptr();
+                let sym = self.generate_local_symbol_name("OBJC_CLASS_REFERENCES_");
+                let g = self.define_global(&sym, llty).unwrap_or_else(|| {
+                    bug!("symbol `{}` is already defined", sym);
+                });
+                set_global_alignment(self, g, self.tcx.data_layout.pointer_align().abi);
+                llvm::set_initializer(g, llval);
+                llvm::set_linkage(g, llvm::Linkage::PrivateLinkage);
+                llvm::set_section(g, c"__OBJC,__cls_refs,literal_pointers,no_dead_strip");
+                self.add_compiler_used_global(g);
+                g
+            }
+            2 => {
+                // See Clang's `CGObjCNonFragileABIMac::EmitClassRefFromId`:
+                // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L7423
+                let llval = {
+                    let extern_sym = format!("OBJC_CLASS_$_{}", classname.as_str());
+                    let extern_llty = self.get_objc_class_t();
+                    self.declare_global(&extern_sym, extern_llty)
+                };
+                let llty = self.type_ptr();
+                let sym = self.generate_local_symbol_name("OBJC_CLASSLIST_REFERENCES_$_");
+                let g = self.define_global(&sym, llty).unwrap_or_else(|| {
+                    bug!("symbol `{}` is already defined", sym);
+                });
+                set_global_alignment(self, g, self.tcx.data_layout.pointer_align().abi);
+                llvm::set_initializer(g, llval);
+                llvm::set_linkage(g, llvm::Linkage::InternalLinkage);
+                llvm::set_section(g, c"__DATA,__objc_classrefs,regular,no_dead_strip");
+                self.add_compiler_used_global(g);
+                g
+            }
+            _ => unreachable!(),
+        };
+
+        classrefs.insert(classname, g);
+        g
+    }
+
+    // We do our best here to match what Clang does when compiling Objective-C natively. We
+    // deduplicate references within a CGU, but we need a reference definition in each referencing
+    // CGU. All attempts at using external references to a single reference definition result in
+    // linker errors.
+    //
+    // Newer versions of Apple Clang generate calls to `@"objc_msgSend$methname"` selector stub
+    // functions. We don't currently do that. The code we generate is closer to what Apple Clang
+    // generates with the `-fno-objc-msgsend-selector-stubs` option.
+    fn get_objc_selref(&self, methname: Symbol) -> &'ll Value {
+        let mut selrefs = self.objc_selrefs.borrow_mut();
+        if let Some(selref) = selrefs.get(&methname).copied() {
+            return selref;
+        }
+
+        let abi_version = self.objc_abi_version();
+
+        // See Clang's `CGObjCCommonMac::CreateCStringLiteral`:
+        // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L4134
+        let methname_llval = self.null_terminate_const_bytes(methname.as_str().as_bytes());
+        let methname_llty = self.val_ty(methname_llval);
+        let methname_sym = self.generate_local_symbol_name("OBJC_METH_VAR_NAME_");
+        let methname_g = self.define_global(&methname_sym, methname_llty).unwrap_or_else(|| {
+            bug!("symbol `{}` is already defined", methname_sym);
+        });
+        set_global_alignment(self, methname_g, self.tcx.data_layout.i8_align);
+        llvm::set_initializer(methname_g, methname_llval);
+        llvm::set_linkage(methname_g, llvm::Linkage::PrivateLinkage);
+        llvm::set_section(
+            methname_g,
+            match abi_version {
+                1 => c"__TEXT,__cstring,cstring_literals",
+                2 => c"__TEXT,__objc_methname,cstring_literals",
+                _ => unreachable!(),
+            },
+        );
+        llvm::LLVMSetGlobalConstant(methname_g, llvm::TRUE);
+        llvm::LLVMSetUnnamedAddress(methname_g, llvm::UnnamedAddr::Global);
+        self.add_compiler_used_global(methname_g);
+
+        // See Clang's `CGObjCMac::EmitSelectorAddr`:
+        // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L5243
+        // And Clang's `CGObjCNonFragileABIMac::EmitSelectorAddr`:
+        // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L7586
+        let selref_llval = methname_g;
+        let selref_llty = self.type_ptr();
+        let selref_sym = self.generate_local_symbol_name("OBJC_SELECTOR_REFERENCES_");
+        let selref_g = self.define_global(&selref_sym, selref_llty).unwrap_or_else(|| {
+            bug!("symbol `{}` is already defined", selref_sym);
+        });
+        set_global_alignment(self, selref_g, self.tcx.data_layout.pointer_align().abi);
+        llvm::set_initializer(selref_g, selref_llval);
+        llvm::set_externally_initialized(selref_g, true);
+        llvm::set_linkage(
+            selref_g,
+            match abi_version {
+                1 => llvm::Linkage::PrivateLinkage,
+                2 => llvm::Linkage::InternalLinkage,
+                _ => unreachable!(),
+            },
+        );
+        llvm::set_section(
+            selref_g,
+            match abi_version {
+                1 => c"__OBJC,__message_refs,literal_pointers,no_dead_strip",
+                2 => c"__DATA,__objc_selrefs,literal_pointers,no_dead_strip",
+                _ => unreachable!(),
+            },
+        );
+        self.add_compiler_used_global(selref_g);
+
+        selrefs.insert(methname, selref_g);
+        selref_g
+    }
+
+    // We do our best here to match what Clang does when compiling Objective-C natively.
+    // See Clang's `ObjCTypesHelper`:
+    // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L5936
+    // And Clang's `CGObjCMac::EmitModuleInfo`:
+    // https://github.com/llvm/llvm-project/blob/llvmorg-20.1.8/clang/lib/CodeGen/CGObjCMac.cpp#L5151
+    pub(crate) fn define_objc_module_info(&mut self) {
+        assert_eq!(self.objc_abi_version(), 1);
+
+        // struct _objc_module {
+        //     long version;                // Hardcoded to 7 in Clang.
+        //     long size;                   // sizeof(struct _objc_module)
+        //     char* name;                  // Hardcoded to classname "" in Clang.
+        //     struct _objc_symtab* symtab; // Null without class or category definitions.
+        //  }
+
+        let llty = self.type_named_struct("struct._objc_module");
+        let i32_llty = self.type_i32();
+        let ptr_llty = self.type_ptr();
+        let packed = false;
+        self.set_struct_body(llty, &[i32_llty, i32_llty, ptr_llty, ptr_llty], packed);
+
+        let version = self.const_uint(i32_llty, 7);
+        let size = self.const_uint(i32_llty, 16);
+        let name = self.define_objc_classname("");
+        let symtab = self.const_null(ptr_llty);
+        let llval = crate::common::named_struct(llty, &[version, size, name, symtab]);
+
+        let sym = "OBJC_MODULES";
+        let g = self.define_global(&sym, llty).unwrap_or_else(|| {
+            bug!("symbol `{}` is already defined", sym);
+        });
+        set_global_alignment(self, g, self.tcx.data_layout.pointer_align().abi);
+        llvm::set_initializer(g, llval);
+        llvm::set_linkage(g, llvm::Linkage::PrivateLinkage);
+        llvm::set_section(g, c"__OBJC,__module_info,regular,no_dead_strip");
+
+        self.add_compiler_used_global(g);
     }
 }
 
@@ -550,8 +834,12 @@ impl<'ll> StaticCodegenMethods for CodegenCx<'ll, '_> {
     ///
     /// The pointer will always be in the default address space. If global variables default to a
     /// different address space, an addrspacecast is inserted.
-    fn static_addr_of(&self, cv: &'ll Value, align: Align, kind: Option<&str>) -> &'ll Value {
-        let gv = self.static_addr_of_impl(cv, align, kind);
+    fn static_addr_of(&self, alloc: ConstAllocation<'_>, kind: Option<&str>) -> &'ll Value {
+        // FIXME: should we cache `const_alloc_to_llvm` to avoid repeating this for the
+        // same `ConstAllocation`?
+        let cv = const_alloc_to_llvm(self, alloc.inner(), IsStatic::No, IsInitOrFini::No);
+
+        let gv = self.static_addr_of_impl(cv, alloc.inner().align, kind);
         // static_addr_of_impl returns the bare global variable, which might not be in the default
         // address space. Cast to the default address space if necessary.
         self.const_pointercast(gv, self.type_ptr())

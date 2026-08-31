@@ -1,6 +1,5 @@
 #![warn(clippy::unnecessary_literal_unwrap)]
-#![allow(unreachable_code)]
-#![allow(clippy::unnecessary_lazy_evaluations, clippy::let_unit_value)]
+#![expect(clippy::let_unit_value, clippy::unnecessary_lazy_evaluations)]
 //@no-rustfix
 fn unwrap_option_some() {
     let val = Some(1);
@@ -191,16 +190,4 @@ fn unwrap_methods_result_context() {
     //~^ unnecessary_literal_unwrap
 }
 
-fn main() {
-    unwrap_option_some();
-    unwrap_option_some_context();
-    unwrap_option_none();
-    unwrap_result_ok();
-    unwrap_result_ok_context();
-    unwrap_result_err();
-    unwrap_result_err_context();
-    unwrap_methods_option();
-    unwrap_methods_option_context();
-    unwrap_methods_result();
-    unwrap_methods_result_context();
-}
+fn main() {}

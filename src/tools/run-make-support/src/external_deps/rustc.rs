@@ -4,7 +4,7 @@ use std::str::FromStr as _;
 
 use crate::command::Command;
 use crate::env::env_var;
-use crate::path_helpers::cwd;
+use crate::path_helpers::{cwd, source_root};
 use crate::util::set_host_compiler_dylib_path;
 use crate::{is_aix, is_darwin, is_windows, is_windows_msvc, target, uname};
 
@@ -20,6 +20,37 @@ pub fn rustc() -> Rustc {
 #[track_caller]
 pub fn bare_rustc() -> Rustc {
     Rustc::bare()
+}
+
+/// Construct a `rustc` invocation for building `minicore`.
+///
+/// This function:
+///
+/// - adds `tests/auxiliary/minicore.rs` as an input
+/// - sets the crate name to `"minicore"`
+/// - sets the crate type to `rlib`
+///
+/// # Example
+///
+/// ```ignore (illustrative)
+/// rustc_minicore().target("wasm32-wasip1").target_cpu("mvp").output("libminicore.rlib").run();
+///
+/// rustc()
+///     .input("foo.rs")
+///     .target("wasm32-wasip1")
+///     .target_cpu("mvp")
+///     .extern_("minicore", path("libminicore.rlib"))
+///     // ...
+///     .run()
+/// ```
+#[track_caller]
+pub fn rustc_minicore() -> Rustc {
+    let mut builder = rustc();
+
+    let minicore_path = source_root().join("tests/auxiliary/minicore.rs");
+    builder.input(minicore_path).crate_name("minicore").crate_type("rlib");
+
+    builder
 }
 
 /// A `rustc` invocation builder.
@@ -52,12 +83,19 @@ impl Rustc {
     // `rustc` invocation constructor methods
 
     /// Construct a new `rustc` invocation. This will automatically set the library
-    /// search path as `-L cwd()` and also the compilation target.
+    /// search path as `-L cwd()`, configure the compilation target and enable
+    /// dynamic linkage by default on musl hosts.
     /// Use [`bare_rustc`] to avoid this.
     #[track_caller]
     pub fn new() -> Self {
         let mut cmd = setup_common();
         cmd.arg("-L").arg(cwd());
+
+        // FIXME: On musl hosts, we currently default to static linkage, while
+        // for running run-make tests, we rely on dynamic linkage by default
+        if std::env::var("IS_MUSL_HOST").is_ok_and(|i| i == "1") {
+            cmd.arg("-Ctarget-feature=-crt-static");
+        }
 
         // Automatically default to cross-compilation
         Self { cmd, target: Some(target()) }
@@ -152,17 +190,23 @@ impl Rustc {
         self
     }
 
-    /// Specify path to the output file. Equivalent to `-o`` in rustc.
+    /// Specify path to the output file. Equivalent to `-o` in rustc.
     pub fn output<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
         self.cmd.arg("-o");
         self.cmd.arg(path.as_ref());
         self
     }
 
-    /// Specify path to the output directory. Equivalent to `--out-dir`` in rustc.
+    /// Specify path to the output directory. Equivalent to `--out-dir` in rustc.
     pub fn out_dir<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
         self.cmd.arg("--out-dir");
         self.cmd.arg(path.as_ref());
+        self
+    }
+
+    /// This flag enables LTO in the specified form.
+    pub fn lto(&mut self, option: &str) -> &mut Self {
+        self.cmd.arg(format!("-Clto={option}"));
         self
     }
 
@@ -353,6 +397,20 @@ impl Rustc {
         self
     }
 
+    /// Specify `-C link-self-contained={y,n}`.
+    pub fn link_self_contained(&mut self, enabled: bool) -> &mut Self {
+        let enabled = if enabled { "y" } else { "n" };
+        self.cmd.arg(format!("-Clink-self-contained={enabled}"));
+        self
+    }
+
+    pub fn split_dwarf_out_dir(&mut self, out_dir: Option<&str>) -> &mut Self {
+        if let Some(out_dir) = out_dir {
+            self.cmd.arg(format!("-Zsplit-dwarf-out-dir={out_dir}"));
+        }
+        self
+    }
+
     /// Pass the `--verbose` flag.
     pub fn verbose(&mut self) -> &mut Self {
         self.cmd.arg("--verbose");
@@ -390,6 +448,22 @@ impl Rustc {
                 self.cmd.arg("-lstdc++");
             };
         };
+        self
+    }
+
+    /// Make that the generated LLVM IR is in source order.
+    pub fn codegen_source_order(&mut self) -> &mut Self {
+        self.cmd.arg("-Zcodegen-source-order");
+        self
+    }
+
+    /// Specify `-Z function-sections={yes, no}`.
+    pub fn function_sections(&mut self, enable: bool) -> &mut Self {
+        let flag = match enable {
+            true => "-Zfunction-sections=yes",
+            false => "-Zfunction-sections=no",
+        };
+        self.cmd.arg(flag);
         self
     }
 }

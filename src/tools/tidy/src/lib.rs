@@ -6,15 +6,11 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
-use build_helper::ci::CiEnv;
-use build_helper::git::{GitConfig, get_closest_upstream_commit};
-use build_helper::stage0_parser::{Stage0Config, parse_stage0_file};
-use termcolor::WriteColor;
-
 macro_rules! static_regex {
     ($re:literal) => {{
-        static RE: ::std::sync::OnceLock<::regex::Regex> = ::std::sync::OnceLock::new();
-        RE.get_or_init(|| ::regex::Regex::new($re).unwrap())
+        static RE: ::std::sync::LazyLock<::regex::Regex> =
+            ::std::sync::LazyLock::new(|| ::regex::Regex::new($re).unwrap());
+        &*RE
     }};
 }
 
@@ -40,137 +36,84 @@ macro_rules! t {
     };
 }
 
-macro_rules! tidy_error {
-    ($bad:expr, $($fmt:tt)*) => ({
-        $crate::tidy_error(&format_args!($($fmt)*).to_string()).expect("failed to output error");
-        *$bad = true;
-    });
-}
-
-macro_rules! tidy_error_ext {
-    ($tidy_error:path, $bad:expr, $($fmt:tt)*) => ({
-        $tidy_error(&format_args!($($fmt)*).to_string()).expect("failed to output error");
-        *$bad = true;
-    });
-}
-
-fn tidy_error(args: &str) -> std::io::Result<()> {
-    use std::io::Write;
-
-    use termcolor::{Color, ColorChoice, ColorSpec, StandardStream};
-
-    let mut stderr = StandardStream::stdout(ColorChoice::Auto);
-    stderr.set_color(ColorSpec::new().set_fg(Some(Color::Red)))?;
-
-    write!(&mut stderr, "tidy error")?;
-    stderr.set_color(&ColorSpec::new())?;
-
-    writeln!(&mut stderr, ": {args}")?;
-    Ok(())
-}
-
-pub struct CiInfo {
-    pub git_merge_commit_email: String,
-    pub nightly_branch: String,
-    pub base_commit: Option<String>,
-    pub ci_env: CiEnv,
-}
-
-impl CiInfo {
-    pub fn new(bad: &mut bool) -> Self {
-        let stage0 = parse_stage0_file();
-        let Stage0Config { nightly_branch, git_merge_commit_email, .. } = stage0.config;
-
-        let mut info = Self {
-            nightly_branch,
-            git_merge_commit_email,
-            ci_env: CiEnv::current(),
-            base_commit: None,
-        };
-        let base_commit = match get_closest_upstream_commit(None, &info.git_config(), info.ci_env) {
-            Ok(Some(commit)) => Some(commit),
-            Ok(None) => {
-                info.error_if_in_ci("no base commit found", bad);
-                None
-            }
-            Err(error) => {
-                info.error_if_in_ci(&format!("failed to retrieve base commit: {error}"), bad);
-                None
-            }
-        };
-        info.base_commit = base_commit;
-        info
-    }
-
-    pub fn git_config(&self) -> GitConfig<'_> {
-        GitConfig {
-            nightly_branch: &self.nightly_branch,
-            git_merge_commit_email: &self.git_merge_commit_email,
-        }
-    }
-
-    pub fn error_if_in_ci(&self, msg: &str, bad: &mut bool) {
-        if self.ci_env.is_running_in_ci() {
-            *bad = true;
-            eprintln!("tidy check error: {msg}");
-        } else {
-            eprintln!("tidy check warning: {msg}. Some checks will be skipped.");
-        }
-    }
-}
-
 pub fn git_diff<S: AsRef<OsStr>>(base_commit: &str, extra_arg: S) -> Option<String> {
     let output = Command::new("git").arg("diff").arg(base_commit).arg(extra_arg).output().ok()?;
     Some(String::from_utf8_lossy(&output.stdout).into())
 }
 
-/// Returns true if any modified file matches the predicate, if we are in CI, or if unable to list modified files.
-pub fn files_modified(ci_info: &CiInfo, pred: impl Fn(&str) -> bool) -> bool {
-    if CiEnv::is_ci() {
+/// Similar to `files_modified`, but only involves a single call to `git`.
+///
+/// removes all elements from `items` that do not cause any match when `pred` is called with the list of modifed files.
+///
+/// if in CI, no elements will be removed.
+pub fn files_modified_batch_filter<T>(
+    base_commit: &Option<String>,
+    is_ci: bool,
+    items: &mut Vec<T>,
+    pred: impl Fn(&T, &str) -> bool,
+) {
+    if is_ci {
         // assume everything is modified on CI because we really don't want false positives there.
-        return true;
+        return;
     }
-    let Some(base_commit) = &ci_info.base_commit else {
+    let Some(base_commit) = base_commit else {
         eprintln!("No base commit, assuming all files are modified");
-        return true;
+        return;
     };
-    match crate::git_diff(&base_commit, "--name-status") {
+    match crate::git_diff(base_commit, "--name-status") {
         Some(output) => {
-            let modified_files = output.lines().filter_map(|ln| {
-                let (status, name) = ln
-                    .trim_end()
-                    .split_once('\t')
-                    .expect("bad format from `git diff --name-status`");
-                if status == "M" { Some(name) } else { None }
-            });
-            for modified_file in modified_files {
-                if pred(modified_file) {
-                    return true;
+            let modified_files: Vec<_> = output
+                .lines()
+                .filter_map(|ln| {
+                    let (status, name) = ln
+                        .trim_end()
+                        .split_once('\t')
+                        .expect("bad format from `git diff --name-status`");
+                    if status == "M" { Some(name) } else { None }
+                })
+                .collect();
+            items.retain(|item| {
+                for modified_file in &modified_files {
+                    if pred(item, modified_file) {
+                        // at least one predicate matches, keep this item.
+                        return true;
+                    }
                 }
-            }
-            false
+                // no predicates matched, remove this item.
+                false
+            });
         }
         None => {
             eprintln!("warning: failed to run `git diff` to check for changes");
             eprintln!("warning: assuming all files are modified");
-            true
         }
     }
 }
 
+/// Returns true if any modified file matches the predicate, if we are in CI, or if unable to list modified files.
+pub fn files_modified(
+    base_commit: &Option<String>,
+    is_ci: bool,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
+    let mut v = vec![()];
+    files_modified_batch_filter(base_commit, is_ci, &mut v, |_, p| pred(p));
+    !v.is_empty()
+}
+
 pub mod alphabetical;
+pub mod arg_parser;
 pub mod bins;
+pub mod codegen;
 pub mod debug_artifacts;
 pub mod deps;
+pub mod diagnostics;
 pub mod edition;
 pub mod error_codes;
-pub mod ext_tool_checks;
 pub mod extdeps;
+pub mod extra_checks;
 pub mod features;
 pub mod filenames;
-pub mod fluent_alphabetical;
-pub mod fluent_period;
-mod fluent_used;
 pub mod gcc_submodule;
 pub(crate) mod iter_header;
 pub mod known_bug;
@@ -178,7 +121,6 @@ pub mod mir_opt_tests;
 pub mod pal;
 pub mod rustdoc_css_themes;
 pub mod rustdoc_gui_tests;
-pub mod rustdoc_js;
 pub mod rustdoc_json;
 pub mod rustdoc_templates;
 pub mod style;

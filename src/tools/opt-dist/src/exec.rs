@@ -7,7 +7,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::environment::Environment;
 use crate::metrics::{load_metrics, record_metrics};
 use crate::timer::TimerSection;
-use crate::training::{BoltProfile, LlvmPGOProfile, RustcPGOProfile};
+use crate::training::{
+    BoltProfile, ClippyPGOProfile, LlvmPGOProfile, RustcPGOProfile, RustdocPGOProfile,
+};
+use crate::utils::io::normalize_path;
 
 #[derive(Default)]
 pub struct CmdBuilder {
@@ -99,7 +102,7 @@ pub struct Bootstrap {
 
 impl Bootstrap {
     pub fn build(env: &Environment) -> Self {
-        let metrics_path = env.build_root().join("build").join("metrics.json");
+        let metrics_path = env.build_root().join("metrics.json");
         let cmd = cmd(&[
             env.python_binary(),
             env.checkout_path().join("x.py").as_str(),
@@ -118,8 +121,23 @@ impl Bootstrap {
         Self { cmd, metrics_path }
     }
 
+    pub fn with_rustdoc(mut self) -> Self {
+        self.cmd = self.cmd.arg("rustdoc");
+        self
+    }
+
+    pub fn with_cargo(mut self) -> Self {
+        self.cmd = self.cmd.arg("cargo");
+        self
+    }
+
+    pub fn with_clippy(mut self) -> Self {
+        self.cmd = self.cmd.arg("clippy");
+        self
+    }
+
     pub fn dist(env: &Environment, dist_args: &[String]) -> Self {
-        let metrics_path = env.build_root().join("build").join("metrics.json");
+        let metrics_path = env.build_root().join("metrics.json");
         let args = dist_args.iter().map(|arg| arg.as_str()).collect::<Vec<_>>();
         let cmd = cmd(&args).env("RUST_BACKTRACE", "full");
         let mut cmd = add_shared_x_flags(env, cmd);
@@ -132,20 +150,20 @@ impl Bootstrap {
     }
 
     pub fn llvm_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
-        self.cmd = self
-            .cmd
-            .arg("--llvm-profile-generate")
-            .env("LLVM_PROFILE_DIR", profile_dir.join("prof-%p").as_str());
+        self.cmd = self.cmd.arg("--set").arg(format!(
+            r#"pgo.llvm.generate="{}""#,
+            normalize_path(&profile_dir.join("prof-%p")).as_str()
+        ));
         self
     }
 
-    pub fn llvm_pgo_optimize(mut self, profile: &LlvmPGOProfile) -> Self {
-        self.cmd = self.cmd.arg("--llvm-profile-use").arg(profile.0.as_str());
-        self
-    }
-
-    pub fn rustc_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
-        self.cmd = self.cmd.arg("--rust-profile-generate").arg(profile_dir.as_str());
+    pub fn llvm_pgo_optimize(mut self, profile: Option<&LlvmPGOProfile>) -> Self {
+        if let Some(prof) = profile {
+            self.cmd = self
+                .cmd
+                .arg("--set")
+                .arg(format!(r#"pgo.llvm.use="{}""#, normalize_path(&prof.0).as_str()));
+        }
         self
     }
 
@@ -159,8 +177,67 @@ impl Bootstrap {
         self
     }
 
+    pub fn rustc_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.rustc.generate="{}""#, normalize_path(profile_dir).as_str()));
+        self
+    }
+
     pub fn rustc_pgo_optimize(mut self, profile: &RustcPGOProfile) -> Self {
-        self.cmd = self.cmd.arg("--rust-profile-use").arg(profile.0.as_str());
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.rustc.use="{}""#, normalize_path(&profile.0).as_str()));
+        self
+    }
+
+    pub fn rustdoc_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.rustdoc.generate="{}""#, normalize_path(profile_dir).as_str()));
+        self
+    }
+
+    pub fn rustdoc_pgo_optimize(mut self, profile: &RustdocPGOProfile) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.rustdoc.use="{}""#, normalize_path(&profile.0).as_str()));
+        self
+    }
+
+    pub fn cargo_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.cargo.generate="{}""#, normalize_path(profile_dir).as_str()));
+        self
+    }
+
+    pub fn cargo_pgo_optimize(mut self, profile: &RustcPGOProfile) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.cargo.use="{}""#, normalize_path(&profile.0).as_str()));
+        self
+    }
+
+    pub fn clippy_pgo_instrument(mut self, profile_dir: &Utf8Path) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.clippy.generate="{}""#, normalize_path(profile_dir).as_str()));
+        self
+    }
+
+    pub fn clippy_pgo_optimize(mut self, profile: &ClippyPGOProfile) -> Self {
+        self.cmd = self
+            .cmd
+            .arg("--set")
+            .arg(format!(r#"pgo.clippy.use="{}""#, normalize_path(&profile.0).as_str()));
         self
     }
 
@@ -174,14 +251,22 @@ impl Bootstrap {
         self
     }
 
-    pub fn with_bolt_profile(mut self, profile: BoltProfile) -> Self {
-        self.cmd = self.cmd.arg("--reproducible-artifact").arg(profile.0.as_str());
+    pub fn with_bolt_profile(mut self, profile: Option<BoltProfile>) -> Self {
+        if let Some(prof) = profile {
+            self.cmd = self.cmd.arg("--reproducible-artifact").arg(prof.0.as_str());
+        }
         self
     }
 
     /// Do not rebuild rustc, and use a previously built rustc sysroot instead.
     pub fn avoid_rustc_rebuild(mut self) -> Self {
         self.cmd = self.cmd.arg("--keep-stage").arg("0").arg("--keep-stage").arg("1");
+        self
+    }
+
+    /// Rebuild rustc in case of statically linked LLVM
+    pub fn rustc_rebuild(mut self) -> Self {
+        self.cmd = self.cmd.arg("--keep-stage").arg("0");
         self
     }
 

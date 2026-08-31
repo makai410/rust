@@ -1,14 +1,14 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::higher::{VecInitKind, get_vec_init_kind};
+use clippy_utils::res::MaybeResPath as _;
 use clippy_utils::source::snippet;
 use clippy_utils::visitors::for_each_local_use_after_expr;
-use clippy_utils::{get_parent_expr, path_to_local_id, sym};
+use clippy_utils::{get_parent_expr, sym};
 use core::ops::ControlFlow;
 use rustc_errors::Applicability;
 use rustc_hir::def::Res;
 use rustc_hir::{BindingMode, Block, Expr, ExprKind, HirId, LetStmt, Mutability, PatKind, QPath, Stmt, StmtKind, UnOp};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
 use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
@@ -200,8 +200,9 @@ impl<'tcx> LateLintPass<'tcx> for VecInitThenPush {
     fn check_stmt(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'_>) {
         if let Some(searcher) = self.searcher.take() {
             if let StmtKind::Expr(expr) | StmtKind::Semi(expr) = stmt.kind
+                && !stmt.span.from_expansion()
                 && let ExprKind::MethodCall(name, self_arg, [_], _) = expr.kind
-                && path_to_local_id(self_arg, searcher.local_id)
+                && self_arg.res_local_id() == Some(searcher.local_id)
                 && name.ident.name == sym::push
             {
                 self.searcher = Some(VecPushSearcher {

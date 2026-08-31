@@ -9,10 +9,35 @@
     transparent_unions,
     auto_traits,
     freeze_impls,
+    pattern_types,
     thread_local
 )]
 #![no_core]
 #![allow(dead_code, internal_features, ambiguous_wide_pointer_comparisons)]
+
+#[lang = "pointee_trait"]
+pub trait Pointee: PointeeSized {
+    #[lang = "metadata_type"]
+    // needed so that layout_of will return `TooGeneric` instead of `Unknown`
+    // when asked for the layout of `*const T`. Which is important for making
+    // transmutes between raw pointers (and especially pattern types of raw pointers)
+    // work.
+    type Metadata: Copy + Sync + Unpin + Freeze;
+}
+
+#[lang = "dyn_metadata"]
+pub struct DynMetadata<Dyn: PointeeSized> {
+    _vtable_ptr: NonNull<VTable>,
+    _phantom: PhantomData<Dyn>,
+}
+
+unsafe extern "C" {
+    /// Opaque type for accessing vtables.
+    ///
+    /// Private implementation detail of `DynMetadata::size_of` etc.
+    /// There is conceptually not actually any Abstract Machine memory behind this pointer.
+    type VTable;
+}
 
 #[no_mangle]
 unsafe extern "C" fn _Unwind_Resume() {
@@ -112,7 +137,7 @@ unsafe impl<'a, T: PointeeSized> Sync for &'a T {}
 unsafe impl Sync for [u8; 16] {}
 
 #[lang = "freeze"]
-unsafe auto trait Freeze {}
+pub unsafe auto trait Freeze {}
 
 unsafe impl<T: PointeeSized> Freeze for PhantomData<T> {}
 unsafe impl<T: PointeeSized> Freeze for *const T {}
@@ -552,12 +577,10 @@ fn eh_personality() -> ! {
     loop {}
 }
 
-#[lang = "drop_in_place"]
-#[allow(unconditional_recursion)]
-pub unsafe fn drop_in_place<T: ?Sized>(to_drop: *mut T) {
+#[lang = "drop_glue"]
+pub unsafe fn drop_glue<T: ?Sized>(_to_drop: &mut T) {
     // Code here does not matter - this is replaced by the
     // real drop glue by the compiler.
-    drop_in_place(to_drop);
 }
 
 #[lang = "unpin"]
@@ -580,9 +603,23 @@ pub struct Global;
 impl Allocator for Global {}
 
 #[repr(transparent)]
-#[rustc_layout_scalar_valid_range_start(1)]
 #[rustc_nonnull_optimization_guaranteed]
-pub struct NonNull<T: PointeeSized>(pub *const T);
+pub struct NonNull<T: PointeeSized>(pub pattern_type!(*const T is !null));
+
+#[rustc_builtin_macro(pattern_type)]
+#[macro_export]
+macro_rules! pattern_type {
+    ($($arg:tt)*) => {
+        /* compiler built-in */
+    };
+}
+
+impl<T: PointeeSized, U: PointeeSized> CoerceUnsized<pattern_type!(*const U is !null)> for pattern_type!(*const T is !null) where
+    T: Unsize<U>
+{
+}
+
+impl<T: DispatchFromDyn<U>, U> DispatchFromDyn<pattern_type!(U is !null)> for pattern_type!(T is !null) {}
 
 impl<T: PointeeSized, U: PointeeSized> CoerceUnsized<NonNull<U>> for NonNull<T> where T: Unsize<U> {}
 impl<T: PointeeSized, U: PointeeSized> DispatchFromDyn<NonNull<U>> for NonNull<T> where T: Unsize<U> {}
@@ -596,26 +633,37 @@ impl<T: PointeeSized, U: PointeeSized> CoerceUnsized<Unique<U>> for Unique<T> wh
 impl<T: PointeeSized, U: PointeeSized> DispatchFromDyn<Unique<U>> for Unique<T> where T: Unsize<U> {}
 
 #[lang = "owned_box"]
-pub struct Box<T: ?Sized, A: Allocator = Global>(Unique<T>, A);
+pub struct Box<T: ?Sized, A = Global>(Unique<T>, A);
 
-impl<T: ?Sized + Unsize<U>, U: ?Sized, A: Allocator> CoerceUnsized<Box<U, A>> for Box<T, A> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Box<U>> for Box<T> {}
 
 impl<T> Box<T> {
     pub fn new(val: T) -> Box<T> {
         unsafe {
-            let size = intrinsics::size_of::<T>();
+            let size = size_of::<T>();
             let ptr = libc::malloc(size);
             intrinsics::copy(&val as *const T as *const u8, ptr, size);
-            Box(Unique { pointer: NonNull(ptr as *const T), _marker: PhantomData }, Global)
+            Box(
+                Unique {
+                    pointer: NonNull(intrinsics::transmute::<
+                        *mut u8,
+                        pattern_type!(*const T is !null),
+                    >(ptr)),
+                    _marker: PhantomData,
+                },
+                Global,
+            )
         }
     }
 }
 
-impl<T: ?Sized, A: Allocator> Drop for Box<T, A> {
+impl<T: ?Sized, A> Drop for Box<T, A> {
     fn drop(&mut self) {
-        // inner value is dropped by compiler.
+        // inner value is dropped by compiler
         unsafe {
-            libc::free(self.0.pointer.0 as *mut u8);
+            libc::free(intrinsics::transmute::<pattern_type!(*const T is !null), *const T>(
+                self.0.pointer.0,
+            ) as *mut u8);
         }
     }
 }
@@ -626,11 +674,6 @@ impl<T: ?Sized, A: Allocator> Deref for Box<T, A> {
     fn deref(&self) -> &Self::Target {
         &**self
     }
-}
-
-#[lang = "exchange_malloc"]
-unsafe fn allocate(size: usize, _align: usize) -> *mut u8 {
-    libc::malloc(size)
 }
 
 #[lang = "drop"]
@@ -657,11 +700,11 @@ pub mod intrinsics {
     #[rustc_intrinsic]
     pub fn abort() -> !;
     #[rustc_intrinsic]
-    pub fn size_of<T>() -> usize;
+    pub const fn size_of<T>() -> usize;
     #[rustc_intrinsic]
     pub unsafe fn size_of_val<T: ?::Sized>(val: *const T) -> usize;
     #[rustc_intrinsic]
-    pub fn align_of<T>() -> usize;
+    pub const fn align_of<T>() -> usize;
     #[rustc_intrinsic]
     pub unsafe fn align_of_val<T: ?::Sized>(val: *const T) -> usize;
     #[rustc_intrinsic]
@@ -671,7 +714,7 @@ pub mod intrinsics {
     #[rustc_intrinsic]
     pub unsafe fn ctlz_nonzero<T>(x: T) -> u32;
     #[rustc_intrinsic]
-    pub fn needs_drop<T: ?::Sized>() -> bool;
+    pub const fn needs_drop<T: ?::Sized>() -> bool;
     #[rustc_intrinsic]
     pub fn bitreverse<T>(x: T) -> T;
     #[rustc_intrinsic]
@@ -698,6 +741,24 @@ pub mod libc {
         pub static stdout: *mut i32;
     }
 }
+
+pub const fn size_of<T>() -> usize {
+    <T as SizedTypeProperties>::SIZE
+}
+
+pub const fn align_of<T>() -> usize {
+    <T as SizedTypeProperties>::ALIGN
+}
+
+trait SizedTypeProperties: Sized {
+    #[lang = "mem_size_const"]
+    const SIZE: usize = intrinsics::size_of::<Self>();
+
+    #[lang = "mem_align_const"]
+    const ALIGN: usize = intrinsics::align_of::<Self>();
+}
+
+impl<T> SizedTypeProperties for T {}
 
 #[lang = "index"]
 pub trait Index<Idx: ?Sized> {
@@ -730,25 +791,25 @@ extern "C" {
 pub struct VaList<'a>(&'a mut VaListImpl);
 
 #[rustc_builtin_macro]
-#[rustc_macro_transparency = "semitransparent"]
+#[rustc_macro_transparency = "semiopaque"]
 pub macro stringify($($t:tt)*) {
     /* compiler built-in */
 }
 
 #[rustc_builtin_macro]
-#[rustc_macro_transparency = "semitransparent"]
+#[rustc_macro_transparency = "semiopaque"]
 pub macro file() {
     /* compiler built-in */
 }
 
 #[rustc_builtin_macro]
-#[rustc_macro_transparency = "semitransparent"]
+#[rustc_macro_transparency = "semiopaque"]
 pub macro line() {
     /* compiler built-in */
 }
 
 #[rustc_builtin_macro]
-#[rustc_macro_transparency = "semitransparent"]
+#[rustc_macro_transparency = "semiopaque"]
 pub macro cfg() {
     /* compiler built-in */
 }
