@@ -1,5 +1,10 @@
 //! cfg defines conditional compiling options, `cfg` attribute parser and evaluator
 
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
 mod cfg_expr;
 mod dnf;
 #[cfg(test)]
@@ -115,6 +120,13 @@ impl CfgOptions {
     pub fn shrink_to_fit(&mut self) {
         self.enabled.shrink_to_fit();
     }
+
+    pub fn append(&mut self, other: CfgOptions) {
+        // Do not call `insert_any_atom()`, as it'll check for `true` and `false`, but this is not
+        // needed since we already checked for that when constructing `other`. Furthermore, this
+        // will always err, as `other` inevitably contains `true` (just as we do).
+        self.enabled.extend(other.enabled);
+    }
 }
 
 impl Extend<CfgAtom> for CfgOptions {
@@ -210,7 +222,7 @@ impl fmt::Display for CfgDiff {
             for (i, atom) in self.disable.iter().enumerate() {
                 let sep = match i {
                     0 => "",
-                    _ if i == self.enable.len() - 1 => " and ",
+                    _ if i == self.disable.len() - 1 => " and ",
                     _ => ", ",
                 };
                 f.write_str(sep)?;

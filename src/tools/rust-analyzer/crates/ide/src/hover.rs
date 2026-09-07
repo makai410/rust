@@ -6,34 +6,34 @@ mod tests;
 use std::{iter, ops::Not};
 
 use either::Either;
-use hir::{
-    DisplayTarget, GenericDef, GenericSubstitution, HasCrate, HasSource, LangItem, Semantics,
-    db::DefDatabase,
-};
+use hir::{DisplayTarget, GenericDef, GenericSubstitution, HasCrate, HasSource, Semantics};
 use ide_db::{
     FileRange, FxIndexSet, Ranker, RootDatabase,
     defs::{Definition, IdentClass, NameRefClass, OperatorClass},
     famous_defs::FamousDefs,
     helpers::pick_best_token,
+    ra_fixture::{RaFixtureConfig, UpmapFromRaFixture},
 };
 use itertools::{Itertools, multizip};
-use span::Edition;
+use macros::UpmapFromRaFixture;
+use span::{Edition, TextRange};
 use syntax::{
-    AstNode,
+    AstNode, AstToken,
     SyntaxKind::{self, *},
     SyntaxNode, T, ast,
 };
 
 use crate::{
-    FileId, FilePosition, NavigationTarget, RangeInfo, Runnable, TryToNav,
+    Analysis, FileId, FilePosition, NavigationTarget, RangeInfo, Runnable, TryToNav,
     doc_links::token_as_doc_comment,
     markdown_remove::remove_markdown,
     markup::Markup,
     navigation_target::UpmappingResult,
     runnables::{runnable_fn, runnable_mod},
 };
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HoverConfig {
+
+#[derive(Clone, Debug)]
+pub struct HoverConfig<'a> {
     pub links_in_hover: bool,
     pub memory_layout: Option<MemoryLayoutHoverConfig>,
     pub documentation: bool,
@@ -44,6 +44,7 @@ pub struct HoverConfig {
     pub max_enum_variants_count: Option<usize>,
     pub max_subst_ty_len: SubstTyLen,
     pub show_drop_glue: bool,
+    pub ra_fixture: RaFixtureConfig<'a>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +76,7 @@ pub enum HoverDocFormat {
     PlainText,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, UpmapFromRaFixture)]
 pub enum HoverAction {
     Runnable(Runnable),
     Implementation(FilePosition),
@@ -85,10 +86,11 @@ pub enum HoverAction {
 
 impl HoverAction {
     fn goto_type_from_targets(
-        db: &RootDatabase,
+        sema: &Semantics<'_, RootDatabase>,
         targets: Vec<hir::ModuleDef>,
         edition: Edition,
     ) -> Option<Self> {
+        let db = sema.db;
         let targets = targets
             .into_iter()
             .filter_map(|it| {
@@ -99,7 +101,7 @@ impl HoverAction {
                         it.name(db).map(|name| name.display(db, edition).to_string()),
                         edition,
                     ),
-                    nav: it.try_to_nav(db)?.call_site(),
+                    nav: it.try_to_nav(sema)?.call_site(),
                 })
             })
             .collect::<Vec<_>>();
@@ -107,14 +109,14 @@ impl HoverAction {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, UpmapFromRaFixture)]
 pub struct HoverGotoTypeData {
     pub mod_path: String,
     pub nav: NavigationTarget,
 }
 
 /// Contains the results when hovering over an item
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, UpmapFromRaFixture)]
 pub struct HoverResult {
     pub markup: Markup,
     pub actions: Vec<HoverAction>,
@@ -129,12 +131,11 @@ pub struct HoverResult {
 pub(crate) fn hover(
     db: &RootDatabase,
     frange @ FileRange { file_id, range }: FileRange,
-    config: &HoverConfig,
+    config: &HoverConfig<'_>,
 ) -> Option<RangeInfo<HoverResult>> {
     let sema = &hir::Semantics::new(db);
     let file = sema.parse_guess_edition(file_id).syntax().clone();
-    let edition =
-        sema.attach_first_edition(file_id).map(|it| it.edition(db)).unwrap_or(Edition::CURRENT);
+    let edition = sema.attach_first_edition(file_id).edition(db);
     let display_target = sema.first_crate(file_id)?.to_display_target(db);
     let mut res = if range.is_empty() {
         hover_offset(
@@ -160,7 +161,7 @@ fn hover_offset(
     sema: &Semantics<'_, RootDatabase>,
     FilePosition { file_id, offset }: FilePosition,
     file: SyntaxNode,
-    config: &HoverConfig,
+    config: &HoverConfig<'_>,
     edition: Edition,
     display_target: DisplayTarget,
 ) -> Option<RangeInfo<HoverResult>> {
@@ -181,8 +182,12 @@ fn hover_offset(
         _ => 1,
     })?;
 
-    if let Some(doc_comment) = token_as_doc_comment(&original_token) {
+    if ast::Comment::can_cast(original_token.kind()) {
         cov_mark::hit!(no_highlight_on_comment_hover);
+        return None;
+    }
+
+    if let Some(doc_comment) = token_as_doc_comment(&original_token) {
         return doc_comment.get_definition_with_descend_at(sema, offset, |def, node, range| {
             let res = hover_for_definition(
                 sema,
@@ -218,6 +223,21 @@ fn hover_offset(
         return Some(RangeInfo::new(range, res));
     }
 
+    if let Some(literal) = ast::String::cast(original_token.clone())
+        && let Some((analysis, fixture_analysis)) =
+            Analysis::from_ra_fixture(sema, literal.clone(), &literal, &config.ra_fixture)
+    {
+        let (virtual_file_id, virtual_offset) = fixture_analysis.map_offset_down(offset)?;
+        return analysis
+            .hover(
+                config,
+                FileRange { file_id: virtual_file_id, range: TextRange::empty(virtual_offset) },
+            )
+            .ok()??
+            .upmap_from_ra_fixture(&fixture_analysis, virtual_file_id, file_id)
+            .ok();
+    }
+
     // prefer descending the same token kind in attribute expansions, in normal macros text
     // equivalency is more important
     let mut descended = sema.descend_into_macros(original_token.clone());
@@ -244,17 +264,15 @@ fn hover_offset(
                     let node = token.parent()?;
 
                     // special case macro calls, we wanna render the invoked arm index
-                    if let Some(name) = ast::NameRef::cast(node.clone()) {
-                        if let Some(path_seg) =
+                    if let Some(name) = ast::NameRef::cast(node.clone())
+                        && let Some(path_seg) =
                             name.syntax().parent().and_then(ast::PathSegment::cast)
-                        {
-                            if let Some(macro_call) = path_seg
+                            && let Some(macro_call) = path_seg
                                 .parent_path()
                                 .syntax()
                                 .parent()
                                 .and_then(ast::MacroCall::cast)
-                            {
-                                if let Some(macro_) = sema.resolve_macro_call(&macro_call) {
+                                && let Some(macro_) = sema.resolve_macro_call(&macro_call) {
                                     break 'a vec![(
                                         (Definition::Macro(macro_), None),
                                         sema.resolve_macro_call_arm(&macro_call),
@@ -262,9 +280,6 @@ fn hover_offset(
                                         node,
                                     )];
                                 }
-                            }
-                        }
-                    }
 
                     match IdentClass::classify_node(sema, &node)? {
                         // It's better for us to fall back to the keyword hover here,
@@ -387,9 +402,9 @@ fn hover_offset(
 
 fn hover_ranged(
     sema: &Semantics<'_, RootDatabase>,
-    FileRange { range, .. }: FileRange,
+    FileRange { file_id, range }: FileRange,
     file: SyntaxNode,
-    config: &HoverConfig,
+    config: &HoverConfig<'_>,
     edition: Edition,
     display_target: DisplayTarget,
 ) -> Option<RangeInfo<HoverResult>> {
@@ -408,6 +423,20 @@ fn hover_ranged(
         {
             render::deref_expr(sema, config, prefix_expr, edition, display_target)
         }
+        Either::Left(ast::Expr::Literal(literal)) => {
+            if let Some(literal) = ast::String::cast(literal.token())
+                && let Some((analysis, fixture_analysis)) =
+                    Analysis::from_ra_fixture(sema, literal.clone(), &literal, &config.ra_fixture)
+            {
+                let (virtual_file_id, virtual_range) = fixture_analysis.map_range_down(range)?;
+                return analysis
+                    .hover(config, FileRange { file_id: virtual_file_id, range: virtual_range })
+                    .ok()??
+                    .upmap_from_ra_fixture(&fixture_analysis, virtual_file_id, file_id)
+                    .ok();
+            }
+            None
+        }
         _ => None,
     };
     let res =
@@ -425,12 +454,12 @@ fn hover_ranged(
 pub(crate) fn hover_for_definition(
     sema: &Semantics<'_, RootDatabase>,
     file_id: FileId,
-    def: Definition,
+    def: Definition<'_>,
     subst: Option<GenericSubstitution<'_>>,
     scope_node: &SyntaxNode,
     macro_arm: Option<u32>,
     render_extras: bool,
-    config: &HoverConfig,
+    config: &HoverConfig<'_>,
     edition: Edition,
     display_target: DisplayTarget,
 ) -> HoverResult {
@@ -456,6 +485,10 @@ pub(crate) fn hover_for_definition(
     };
     let notable_traits = def_ty.map(|ty| notable_traits(db, &ty)).unwrap_or_default();
     let subst_types = subst.map(|subst| subst.types(db));
+    let render_private_fields = sema.scope(scope_node).is_some_and(|scope| {
+        def.krate(db)
+            .is_some_and(|def_crate| should_render_private_fields(db, def_crate, scope.krate()))
+    });
 
     let (markup, range_map) = render::definition(
         sema.db,
@@ -464,6 +497,7 @@ pub(crate) fn hover_for_definition(
         &notable_traits,
         macro_arm,
         render_extras,
+        render_private_fields,
         subst_types.as_ref(),
         config,
         edition,
@@ -472,10 +506,10 @@ pub(crate) fn hover_for_definition(
     HoverResult {
         markup: render::process_markup(sema.db, def, &markup, range_map, config),
         actions: [
-            show_fn_references_action(sema.db, def),
-            show_implementations_action(sema.db, def),
+            show_fn_references_action(sema, def),
+            show_implementations_action(sema, def),
             runnable_action(sema, def, file_id),
-            goto_type_action_for_def(sema.db, def, &notable_traits, subst_types, edition),
+            goto_type_action_for_def(sema, def, &notable_traits, subst_types, edition),
         ]
         .into_iter()
         .flatten()
@@ -483,13 +517,39 @@ pub(crate) fn hover_for_definition(
     }
 }
 
+/// | Hover location | Definition location | Render private fields? |
+/// |---|---:|---:|
+/// | Workspace crate | Workspace crate | Yes |
+/// | Workspace crate | External/library crate | No |
+/// | External/library crate | Same external/library crate | Yes |
+/// | External/library crate | Different external/library crate | No |
+/// | Anywhere | Same crate as definition | Yes |
+fn should_render_private_fields(
+    db: &RootDatabase,
+    def_crate: hir::Crate,
+    hover_crate: hir::Crate,
+) -> bool {
+    let is_workspace_crate = |db: &RootDatabase, krate: hir::Crate| {
+        let origin = krate.origin(db);
+        !origin.is_lib() && !origin.is_lang()
+    };
+
+    def_crate == hover_crate
+        || is_workspace_crate(db, def_crate) && is_workspace_crate(db, hover_crate)
+}
+
 fn notable_traits<'db>(
     db: &'db RootDatabase,
     ty: &hir::Type<'db>,
 ) -> Vec<(hir::Trait, Vec<(Option<hir::Type<'db>>, hir::Name)>)> {
-    db.notable_traits_in_deps(ty.krate(db).into())
-        .iter()
-        .flat_map(|it| &**it)
+    if ty.is_unknown() {
+        // The trait solver returns "yes" to the question whether the error type
+        // impls any trait, and we don't want to show it as having any notable trait.
+        return Vec::new();
+    }
+
+    ty.krate(db)
+        .notable_traits_in_deps(db)
         .filter_map(move |&trait_| {
             let trait_ = trait_.into();
             ty.impls_trait(db, trait_, &[]).then(|| {
@@ -510,7 +570,10 @@ fn notable_traits<'db>(
         .collect::<Vec<_>>()
 }
 
-fn show_implementations_action(db: &RootDatabase, def: Definition) -> Option<HoverAction> {
+fn show_implementations_action(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition<'_>,
+) -> Option<HoverAction> {
     fn to_action(nav_target: NavigationTarget) -> HoverAction {
         HoverAction::Implementation(FilePosition {
             file_id: nav_target.file_id,
@@ -520,19 +583,22 @@ fn show_implementations_action(db: &RootDatabase, def: Definition) -> Option<Hov
 
     let adt = match def {
         Definition::Trait(it) => {
-            return it.try_to_nav(db).map(UpmappingResult::call_site).map(to_action);
+            return it.try_to_nav(sema).map(UpmappingResult::call_site).map(to_action);
         }
         Definition::Adt(it) => Some(it),
-        Definition::SelfType(it) => it.self_ty(db).as_adt(),
+        Definition::SelfType(it) => it.self_ty(sema.db).as_adt(),
         _ => None,
     }?;
-    adt.try_to_nav(db).map(UpmappingResult::call_site).map(to_action)
+    adt.try_to_nav(sema).map(UpmappingResult::call_site).map(to_action)
 }
 
-fn show_fn_references_action(db: &RootDatabase, def: Definition) -> Option<HoverAction> {
+fn show_fn_references_action(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition<'_>,
+) -> Option<HoverAction> {
     match def {
         Definition::Function(it) => {
-            it.try_to_nav(db).map(UpmappingResult::call_site).map(|nav_target| {
+            it.try_to_nav(sema).map(UpmappingResult::call_site).map(|nav_target| {
                 HoverAction::Reference(FilePosition {
                     file_id: nav_target.file_id,
                     offset: nav_target.focus_or_full_range().start(),
@@ -545,7 +611,7 @@ fn show_fn_references_action(db: &RootDatabase, def: Definition) -> Option<Hover
 
 fn runnable_action(
     sema: &hir::Semantics<'_, RootDatabase>,
-    def: Definition,
+    def: Definition<'_>,
     file_id: FileId,
 ) -> Option<HoverAction> {
     match def {
@@ -565,12 +631,13 @@ fn runnable_action(
 }
 
 fn goto_type_action_for_def(
-    db: &RootDatabase,
-    def: Definition,
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition<'_>,
     notable_traits: &[(hir::Trait, Vec<(Option<hir::Type<'_>>, hir::Name)>)],
     subst_types: Option<Vec<(hir::Symbol, hir::Type<'_>)>>,
     edition: Edition,
 ) -> Option<HoverAction> {
+    let db = sema.db;
     let mut targets: Vec<hir::ModuleDef> = Vec::new();
     let mut push_new_def = |item: hir::ModuleDef| {
         if !targets.contains(&item) {
@@ -617,7 +684,7 @@ fn goto_type_action_for_def(
         }
     }
 
-    HoverAction::goto_type_from_targets(db, targets, edition)
+    HoverAction::goto_type_from_targets(sema, targets, edition)
 }
 
 fn walk_and_push_ty(
@@ -635,10 +702,10 @@ fn walk_and_push_ty(
         } else if let Some(trait_) = t.as_associated_type_parent_trait(db) {
             push_new_def(trait_.into());
         } else if let Some(tp) = t.as_type_param(db) {
-            let sized_trait = LangItem::Sized.resolve_trait(db, t.krate(db).into());
+            let sized_trait = hir::Trait::lang(db, t.krate(db), hir::LangItem::Sized);
             tp.trait_bounds(db)
                 .into_iter()
-                .filter(|&it| Some(it.into()) != sized_trait)
+                .filter(|&it| Some(it) != sized_trait)
                 .for_each(|it| push_new_def(it.into()));
         }
     });

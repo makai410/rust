@@ -1,5 +1,7 @@
+use crate::cmp::Ordering;
 use crate::ffi::CStr;
 use crate::fmt;
+use crate::hash::{Hash, Hasher};
 use crate::marker::PhantomData;
 use crate::ptr::NonNull;
 
@@ -32,16 +34,54 @@ use crate::ptr::NonNull;
 /// Files are compared as strings, not `Path`, which could be unexpected.
 /// See [`Location::file`]'s documentation for more discussion.
 #[lang = "panic_location"]
-#[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Copy, Clone)]
 #[stable(feature = "panic_hooks", since = "1.10.0")]
 pub struct Location<'a> {
     // A raw pointer is used rather than a reference because the pointer is valid for one more byte
     // than the length stored in this pointer; the additional byte is the NUL-terminator used by
-    // `Location::file_with_nul`.
+    // `Location::file_as_c_str`.
     filename: NonNull<str>,
     line: u32,
     col: u32,
     _filename: PhantomData<&'a str>,
+}
+
+#[stable(feature = "panic_hooks", since = "1.10.0")]
+impl PartialEq for Location<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare col / line first as they're cheaper to compare and more likely to differ,
+        // while not impacting the result.
+        self.col == other.col && self.line == other.line && self.file() == other.file()
+    }
+}
+
+#[stable(feature = "panic_hooks", since = "1.10.0")]
+impl Eq for Location<'_> {}
+
+#[stable(feature = "panic_hooks", since = "1.10.0")]
+impl Ord for Location<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.file()
+            .cmp(other.file())
+            .then_with(|| self.line.cmp(&other.line))
+            .then_with(|| self.col.cmp(&other.col))
+    }
+}
+
+#[stable(feature = "panic_hooks", since = "1.10.0")]
+impl PartialOrd for Location<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[stable(feature = "panic_hooks", since = "1.10.0")]
+impl Hash for Location<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.file().hash(state);
+        self.line.hash(state);
+        self.col.hash(state);
+    }
 }
 
 #[stable(feature = "panic_hooks", since = "1.10.0")]
@@ -65,38 +105,72 @@ impl<'a> Location<'a> {
     /// ```standalone_crate
     /// use std::panic::Location;
     ///
-    /// /// Returns the [`Location`] at which it is called.
+    /// /// ```
+    /// ///      |1        |11       |21       |31       |41
+    /// ///    +-|---------|---------|---------|---------|--------
+    /// /// 15 | #[track_caller]
+    /// /// 16 | fn new_location() -> &'static Location<'static> {
+    /// /// 17 |     Location::caller()
+    /// ///    |     ------------------| the value of this expression depends on the caller,
+    /// ///    |                       | since the function is marked #[track_caller]
+    /// /// 18 | }
+    /// /// ```
     /// #[track_caller]
-    /// fn get_caller_location() -> &'static Location<'static> {
+    /// fn new_location() -> &'static Location<'static> {
     ///     Location::caller()
     /// }
     ///
-    /// /// Returns a [`Location`] from within this function's definition.
-    /// fn get_just_one_location() -> &'static Location<'static> {
-    ///     get_caller_location()
+    /// /// ```
+    /// ///      |1  |5    |11       |21       |31       |41       |51
+    /// ///    +-|---|-----|---------|---------|---------|---------|---
+    /// /// 29 | fn constant_location() -> &'static Location<'static> {
+    /// /// 30 |     new_location()
+    /// ///    |     ^ any invocation of constant_location() points here,
+    /// ///    |       no matter the location it is called from
+    /// /// 31 | }
+    /// /// ```
+    /// fn constant_location() -> &'static Location<'static> {
+    ///     new_location()
     /// }
     ///
-    /// let fixed_location = get_just_one_location();
-    /// assert_eq!(fixed_location.file(), file!());
-    /// assert_eq!(fixed_location.line(), 14);
-    /// assert_eq!(fixed_location.column(), 5);
+    /// fn main() {
+    ///     //      |1  |5    |11       |21       |31       |41       |51
+    ///     //    +-|---|-----|---------|---------|---------|---------|---
+    ///     // 29 | fn constant_location() -> &'static Location<'static> {
+    ///     // 30 |     new_location()
+    ///     //    |     ^ `let constant` points here
+    ///     // 31 | }
+    ///     let constant = constant_location();
+    ///     assert_eq!(constant.file(), file!());
+    ///     assert_eq!((constant.line(), constant.column()), (30, 5));
     ///
-    /// // running the same untracked function in a different location gives us the same result
-    /// let second_fixed_location = get_just_one_location();
-    /// assert_eq!(fixed_location.file(), second_fixed_location.file());
-    /// assert_eq!(fixed_location.line(), second_fixed_location.line());
-    /// assert_eq!(fixed_location.column(), second_fixed_location.column());
+    ///     let constant_2 = constant_location();
+    ///     assert_eq!(
+    ///         (constant.file(), constant.line(), constant.column()),
+    ///         (constant_2.file(), constant_2.line(), constant_2.column())
+    ///     );
     ///
-    /// let this_location = get_caller_location();
-    /// assert_eq!(this_location.file(), file!());
-    /// assert_eq!(this_location.line(), 28);
-    /// assert_eq!(this_location.column(), 21);
+    ///     //      |1        |11  |16  |21       |31
+    ///     //    +-|---------|----|----|---------|------
+    ///     // 55 |     let here = new_location();
+    ///     //    |                ^ `let here` points here, as `new_location()` is the callsite
+    ///     // 56 |     assert_eq!(here.file(), file!());
+    ///     let here = new_location();
+    ///     assert_eq!(here.file(), file!());
+    ///     assert_eq!((here.line(), here.column()), (55, 16));
     ///
-    /// // running the tracked function in a different location produces a different value
-    /// let another_location = get_caller_location();
-    /// assert_eq!(this_location.file(), another_location.file());
-    /// assert_ne!(this_location.line(), another_location.line());
-    /// assert_ne!(this_location.column(), another_location.column());
+    ///     //      |1        |11       |21       ||32      |41       |51
+    ///     //    +-|---------|---------|---------||--------|---------|------
+    ///     // 64 |     let yet_another_location = new_location();
+    ///     //    |                                ^ `let yet_another_location` points here
+    ///     // 65 |     assert_eq!(here.file(), yet_another_location.file());
+    ///     let yet_another_location = new_location();
+    ///     assert_eq!(here.file(), yet_another_location.file());
+    ///     assert_ne!(
+    ///         (here.line(), here.column()),
+    ///         (yet_another_location.line(), yet_another_location.column())
+    ///     );
+    /// }
     /// ```
     #[must_use]
     #[stable(feature = "track_caller", since = "1.46.0")]
@@ -143,7 +217,7 @@ impl<'a> Location<'a> {
     #[must_use]
     #[stable(feature = "panic_hooks", since = "1.10.0")]
     #[rustc_const_stable(feature = "const_location_fields", since = "1.79.0")]
-    pub const fn file(&self) -> &str {
+    pub const fn file(&self) -> &'a str {
         // SAFETY: The filename is valid.
         unsafe { self.filename.as_ref() }
     }
@@ -153,9 +227,10 @@ impl<'a> Location<'a> {
     /// This is useful for interop with APIs that expect C/C++ `__FILE__` or
     /// `std::source_location::file_name`, both of which return a nul-terminated `const char*`.
     #[must_use]
-    #[unstable(feature = "file_with_nul", issue = "141727")]
     #[inline]
-    pub const fn file_with_nul(&self) -> &CStr {
+    #[stable(feature = "file_with_nul", since = "1.92.0")]
+    #[rustc_const_stable(feature = "file_with_nul", since = "1.92.0")]
+    pub const fn file_as_c_str(&self) -> &'a CStr {
         let filename = self.filename.as_ptr();
 
         // SAFETY: The filename is valid for `filename_len+1` bytes, so this addition can't

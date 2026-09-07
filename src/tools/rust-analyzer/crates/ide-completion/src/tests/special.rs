@@ -65,7 +65,7 @@ pub mod prelude {
 }
 "#,
         expect![[r#"
-            md std
+            md std::
             st Option Option
             bt u32       u32
         "#]],
@@ -95,7 +95,7 @@ mod macros {
         expect![[r#"
             fn f()                       fn()
             ma concat!(…) macro_rules! concat
-            md std
+            md std::
             bt u32                        u32
         "#]],
     );
@@ -123,8 +123,8 @@ pub mod prelude {
 }
 "#,
         expect![[r#"
-            md core
-            md std
+            md core::
+            md std::
             st String String
             bt u32       u32
         "#]],
@@ -153,7 +153,7 @@ pub mod prelude {
             "#,
         expect![[r#"
             fn f() fn()
-            md std
+            md std::
             bt u32  u32
         "#]],
     );
@@ -181,8 +181,8 @@ pub mod prelude {
 }
             "#,
         expect![[r#"
-                md std
-            "#]],
+            md std::
+        "#]],
     );
 }
 
@@ -206,9 +206,9 @@ impl S {
 fn foo() { let _ = lib::S::$0 }
 "#,
         expect![[r#"
-            ct PUBLIC_CONST pub const PUBLIC_CONST: u32
-            fn public_method()                     fn()
-            ta PublicType     pub type PublicType = u32
+            ct PUBLIC_CONST  = 1 pub const PUBLIC_CONST: u32
+            fn public_method()                          fn()
+            ta PublicType          pub type PublicType = u32
         "#]],
     );
 }
@@ -337,14 +337,14 @@ impl<T> Sub for Wrap<T> {
 }
 "#,
         expect![[r#"
-            ct C2 (as Sub)         const C2: ()
-            ct CONST (as Super) const CONST: u8
-            fn func() (as Super)           fn()
-            fn subfunc() (as Sub)          fn()
-            me method(…) (as Super)   fn(&self)
-            me submethod(…) (as Sub)  fn(&self)
-            ta SubTy (as Sub)        type SubTy
-            ta Ty (as Super)            type Ty
+            ct C2  = () (as Sub)        const C2: ()
+            ct CONST  = 0 (as Super) const CONST: u8
+            fn func() (as Super)                fn()
+            fn subfunc() (as Sub)               fn()
+            me method(…) (as Super)        fn(&self)
+            me submethod(…) (as Sub)       fn(&self)
+            ta SubTy (as Sub)             type SubTy
+            ta Ty (as Super)                 type Ty
         "#]],
     );
 }
@@ -427,9 +427,9 @@ mod p {
 }
 "#,
         expect![[r#"
-            ct RIGHT_CONST     u32
-            fn right_fn()     fn()
-            st RightType WrongType
+            ct RIGHT_CONST  = 1 u32
+            fn right_fn()      fn()
+            st RightType  WrongType
         "#]],
     );
 
@@ -482,6 +482,226 @@ fn foo() {}
 }
 
 #[test]
+fn completes_macro_segment() {
+    check(
+        r#"
+macro_rules! foo {
+    ($x:e$0) => ();
+}
+"#,
+        expect![[r#"
+            ba block
+            ba expr
+            ba expr_2021
+            ba ident
+            ba item
+            ba lifetime
+            ba literal
+            ba meta
+            ba pat
+            ba pat_param
+            ba path
+            ba stmt
+            ba tt
+            ba ty
+            ba vis
+        "#]],
+    );
+
+    check(
+        r#"
+macro_rules! foo {
+    ($x:$0) => ();
+}
+"#,
+        expect![[r#"
+            ba block
+            ba expr
+            ba expr_2021
+            ba ident
+            ba item
+            ba lifetime
+            ba literal
+            ba meta
+            ba pat
+            ba pat_param
+            ba path
+            ba stmt
+            ba tt
+            ba ty
+            ba vis
+        "#]],
+    );
+
+    check(
+        r#"
+macro_rules! foo {
+    ($($x:$0)*) => ();
+}
+"#,
+        expect![[r#"
+            ba block
+            ba expr
+            ba expr_2021
+            ba ident
+            ba item
+            ba lifetime
+            ba literal
+            ba meta
+            ba pat
+            ba pat_param
+            ba path
+            ba stmt
+            ba tt
+            ba ty
+            ba vis
+        "#]],
+    );
+
+    check(
+        r#"
+macro foo {
+    ($($x:$0)*) => ();
+}
+"#,
+        expect![[r#"
+            ba block
+            ba expr
+            ba expr_2021
+            ba ident
+            ba item
+            ba lifetime
+            ba literal
+            ba meta
+            ba pat
+            ba pat_param
+            ba path
+            ba stmt
+            ba tt
+            ba ty
+            ba vis
+        "#]],
+    );
+
+    check(
+        r#"
+macro foo($($x:$0)*) {
+    xxx;
+}
+"#,
+        expect![[r#"
+            ba block
+            ba expr
+            ba expr_2021
+            ba ident
+            ba item
+            ba lifetime
+            ba literal
+            ba meta
+            ba pat
+            ba pat_param
+            ba path
+            ba stmt
+            ba tt
+            ba ty
+            ba vis
+        "#]],
+    );
+
+    check_edit(
+        "expr",
+        r#"
+macro foo($($x:$0)*) {
+    xxx;
+}
+"#,
+        r#"
+macro foo($($x:expr)*) {
+    xxx;
+}
+"#,
+    );
+
+    check(
+        r#"
+macro_rules! foo {
+    ($fn : e$0) => ();
+}
+"#,
+        expect![[r#"
+            ba block
+            ba expr
+            ba expr_2021
+            ba ident
+            ba item
+            ba lifetime
+            ba literal
+            ba meta
+            ba pat
+            ba pat_param
+            ba path
+            ba stmt
+            ba tt
+            ba ty
+            ba vis
+        "#]],
+    );
+
+    check_edit(
+        "expr",
+        r#"
+macro foo($($x:ex$0)*) {
+    xxx;
+}
+"#,
+        r#"
+macro foo($($x:expr)*) {
+    xxx;
+}
+"#,
+    );
+}
+
+#[test]
+fn completes_in_macro_body() {
+    check(
+        r#"
+macro_rules! foo {
+    ($x:expr) => ($y:$0);
+}
+"#,
+        expect![[r#""#]],
+    );
+
+    check(
+        r#"
+macro_rules! foo {
+    ($x:expr) => ({$y:$0});
+}
+"#,
+        expect![[r#""#]],
+    );
+
+    check(
+        r#"
+macro foo {
+    ($x:expr) => ($y:$0);
+}
+"#,
+        expect![[r#""#]],
+    );
+
+    check(
+        r#"
+macro foo($x:expr) {
+    $y:$0
+}
+"#,
+        expect![[r#""#]],
+    );
+}
+
+#[test]
 fn function_mod_share_name() {
     check_no_kw(
         r#"
@@ -494,7 +714,7 @@ mod m {
 "#,
         expect![[r#"
             fn z() fn()
-            md z
+            md z::
         "#]],
     );
 }
@@ -603,8 +823,8 @@ impl u8 {
 }
 "#,
         expect![[r#"
-            ct MAX pub const MAX: Self
-            me func(…)        fn(self)
+            ct MAX  = 255 pub const MAX: Self
+            me func(…)               fn(self)
         "#]],
     );
 }
@@ -676,8 +896,6 @@ fn bar() -> Bar {
 "#,
         expect![[r#"
             fn foo() (as Foo) fn() -> Self
-            ex Bar
-            ex bar()
         "#]],
     );
 }
@@ -705,8 +923,6 @@ fn bar() -> Bar {
         expect![[r#"
             fn bar()                  fn()
             fn foo() (as Foo) fn() -> Self
-            ex Bar
-            ex bar()
         "#]],
     );
 }
@@ -733,8 +949,6 @@ fn bar() -> Bar {
 "#,
         expect![[r#"
             fn foo() (as Foo) fn() -> Self
-            ex Bar
-            ex bar()
         "#]],
     );
 }
@@ -840,7 +1054,7 @@ fn main() {
 }
 "#,
         expect![[r#"
-            ct by_macro (as MyTrait) pub const by_macro: u8
+            ct by_macro  = 1 (as MyTrait) pub const by_macro: u8
         "#]],
     )
 }
@@ -912,7 +1126,7 @@ fn foo { ::$0 }
 "#,
         Some(':'),
         expect![[r#"
-            md core
+            md core::
         "#]],
     );
     check_with_trigger_character(
@@ -922,7 +1136,7 @@ fn foo { /* test */::$0 }
 "#,
         Some(':'),
         expect![[r#"
-            md core
+            md core::
         "#]],
     );
 
@@ -939,6 +1153,15 @@ fn foo { crate::$0 }
     check_with_trigger_character(
         r#"
 fn foo { crate:$0 }
+"#,
+        Some(':'),
+        expect![""],
+    );
+
+    check_with_trigger_character(
+        r#"
+macro_rules! bar { ($($x:tt)*) => ($($x)*); }
+fn foo { bar!(crate:$0) }
 "#,
         Some(':'),
         expect![""],
@@ -1265,7 +1488,7 @@ fn here_we_go() {
 "#,
         expect![[r#"
             fn here_we_go()                  fn()
-            md foo
+            md foo::
             st Bar (alias Qux) (use foo::Bar) Bar
             bt u32                            u32
             kw const
@@ -1358,7 +1581,7 @@ pub fn foo<'x, T>(x: &'x mut T) -> u8 where T: Clone, { 0u8 }
 fn main() { fo$0 }
 "#,
         CompletionItemKind::SymbolKind(ide_db::SymbolKind::Function),
-        expect!("fn(&'x mut T) -> u8"),
+        expect!("fn(&mut T) -> u8"),
         expect!("pub fn foo<'x, T>(x: &'x mut T) -> u8 where T: Clone,"),
     );
 
@@ -1391,8 +1614,21 @@ fn main() {
 }
 "#,
         CompletionItemKind::SymbolKind(SymbolKind::Method),
-        expect!("const fn(&'foo mut self, &'foo Foo) -> !"),
+        expect!("const fn(&'foo mut self, &Foo) -> !"),
         expect!("pub const fn baz<'foo>(&'foo mut self, x: &'foo Foo) -> !"),
+    );
+
+    check_signatures(
+        r#"
+struct Foo;
+impl Foo {
+    pub fn method(&self, first: bool, second: bool, third: bool, fourth: bool) {}
+}
+fn main() { Foo.m$0 }
+"#,
+        CompletionItemKind::SymbolKind(SymbolKind::Method),
+        expect!("fn(&self, bool, bool, bool, bool)"),
+        expect!("pub fn method(&self, first: bool, second: bool, third: bool, fourth: bool)"),
     );
 }
 
@@ -1489,6 +1725,10 @@ fn foo(_: a_$0) { }
         expect![[r#"
             bt u32 u32
             kw crate::
+            kw dyn
+            kw fn
+            kw for
+            kw impl
             kw self::
         "#]],
     );
@@ -1503,6 +1743,39 @@ fn foo<T>() {
             tp T
             bt u32 u32
             kw crate::
+            kw dyn
+            kw fn
+            kw for
+            kw impl
+            kw self::
+        "#]],
+    );
+}
+
+#[test]
+fn fn_generic_params_const_param_snippet() {
+    check_edit("const", "fn foo<c$0>() {}", "fn foo<const $1: $0>() {}");
+    check_edit("const", "fn foo<T, c$0>() {}", "fn foo<T, const $1: $0>() {}");
+    check(
+        r#"
+fn foo<T: $0>() {}
+"#,
+        expect![[r#"
+            kw crate::
+            kw self::
+        "#]],
+    );
+    check(
+        r#"
+fn foo<const N: $0>() {}
+"#,
+        expect![[r#"
+            bt u32 u32
+            kw crate::
+            kw dyn
+            kw fn
+            kw for
+            kw impl
             kw self::
         "#]],
     );

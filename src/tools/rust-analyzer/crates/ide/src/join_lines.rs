@@ -144,15 +144,15 @@ fn remove_newline(
         }
     }
 
-    if config.join_else_if {
-        if let (Some(prev), Some(_next)) = (as_if_expr(&prev), as_if_expr(&next)) {
-            match prev.else_token() {
-                Some(_) => cov_mark::hit!(join_two_ifs_with_existing_else),
-                None => {
-                    cov_mark::hit!(join_two_ifs);
-                    edit.replace(token.text_range(), " else ".to_owned());
-                    return;
-                }
+    if config.join_else_if
+        && let (Some(prev), Some(_next)) = (as_if_expr(&prev), as_if_expr(&next))
+    {
+        match prev.else_token() {
+            Some(_) => cov_mark::hit!(join_two_ifs_with_existing_else),
+            None => {
+                cov_mark::hit!(join_two_ifs);
+                edit.replace(token.text_range(), " else ".to_owned());
+                return;
             }
         }
     }
@@ -186,9 +186,10 @@ fn remove_newline(
         }
     }
 
+    // We can't use `prev` and `next`, since `DOC_COMMENT` has only one token, so `token` has no siblings.
     if let (Some(_), Some(next)) = (
-        prev.as_token().cloned().and_then(ast::Comment::cast),
-        next.as_token().cloned().and_then(ast::Comment::cast),
+        token.prev_token().and_then(ast::AnyComment::cast),
+        token.next_token().and_then(ast::AnyComment::cast),
     ) {
         // Removes: newline (incl. surrounding whitespace), start of the next comment
         edit.delete(TextRange::new(
@@ -213,10 +214,10 @@ fn join_single_expr_block(edit: &mut TextEditBuilder, token: &SyntaxToken) -> Op
     let mut buf = expr.syntax().text().to_string();
 
     // Match block needs to have a comma after the block
-    if let Some(match_arm) = block_expr.syntax().parent().and_then(ast::MatchArm::cast) {
-        if match_arm.comma_token().is_none() {
-            buf.push(',');
-        }
+    if let Some(match_arm) = block_expr.syntax().parent().and_then(ast::MatchArm::cast)
+        && match_arm.comma_token().is_none()
+    {
+        buf.push(',');
     }
 
     edit.replace(block_range, buf);
@@ -674,14 +675,14 @@ fn foo() {
     fn test_join_lines_doc_comments() {
         check_join_lines(
             r"
+/// Hello$0
+/// world!
 fn foo() {
-    /// Hello$0
-    /// world!
 }
 ",
             r"
+/// Hello$0 world!
 fn foo() {
-    /// Hello$0 world!
 }
 ",
         );

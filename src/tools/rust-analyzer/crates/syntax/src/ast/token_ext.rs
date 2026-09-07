@@ -3,6 +3,7 @@
 use std::ops::Range;
 use std::{borrow::Cow, num::ParseIntError};
 
+use parser::SyntaxKind;
 use rustc_literal_escaper::{
     EscapeError, MixedUnit, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char,
     unescape_str,
@@ -10,51 +11,23 @@ use rustc_literal_escaper::{
 use stdx::always;
 
 use crate::{
-    TextRange, TextSize,
-    ast::{self, AstToken},
+    SyntaxToken, TextRange, TextSize,
+    ast::{self, AstToken, AttrKind},
 };
 
 impl ast::Comment {
-    pub fn kind(&self) -> CommentKind {
-        CommentKind::from_text(self.text())
+    pub fn shape(&self) -> CommentShape {
+        CommentShape::from_text(self.text())
     }
 
-    pub fn is_doc(&self) -> bool {
-        self.kind().doc.is_some()
-    }
-
-    pub fn is_inner(&self) -> bool {
-        self.kind().doc == Some(CommentPlacement::Inner)
-    }
-
-    pub fn is_outer(&self) -> bool {
-        self.kind().doc == Some(CommentPlacement::Outer)
-    }
-
-    pub fn prefix(&self) -> &'static str {
-        let &(prefix, _kind) = CommentKind::BY_PREFIX
-            .iter()
-            .find(|&(prefix, kind)| self.kind() == *kind && self.text().starts_with(prefix))
-            .unwrap();
-        prefix
-    }
-
-    /// Returns the textual content of a doc comment node as a single string with prefix and suffix
-    /// removed.
-    pub fn doc_comment(&self) -> Option<&str> {
-        let kind = self.kind();
-        match kind {
-            CommentKind { shape, doc: Some(_) } => {
-                let prefix = kind.prefix();
-                let text = &self.text()[prefix.len()..];
-                let text = if shape == CommentShape::Block {
-                    text.strip_suffix("*/").unwrap_or(text)
-                } else {
-                    text
-                };
-                Some(text)
-            }
-            _ => None,
+    /// Returns the text without the `//` or `/*...*/` markers.
+    pub fn text_without_markers(&self) -> &str {
+        let text = self.text();
+        let shape = CommentShape::from_text(text);
+        let text = &text[2..];
+        match shape {
+            CommentShape::Block => text.strip_suffix("*/").unwrap_or(text),
+            CommentShape::Line => text,
         }
     }
 }
@@ -62,7 +35,20 @@ impl ast::Comment {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct CommentKind {
     pub shape: CommentShape,
-    pub doc: Option<CommentPlacement>,
+    pub doc: Option<AttrKind>,
+}
+
+impl CommentKind {
+    pub fn prefix(&self) -> &'static str {
+        match (self.shape, self.doc) {
+            (CommentShape::Line, None) => "//",
+            (CommentShape::Line, Some(AttrKind::Inner)) => "//!",
+            (CommentShape::Line, Some(AttrKind::Outer)) => "///",
+            (CommentShape::Block, None) => "/*",
+            (CommentShape::Block, Some(AttrKind::Inner)) => "/*!",
+            (CommentShape::Block, Some(AttrKind::Outer)) => "/**",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -72,6 +58,11 @@ pub enum CommentShape {
 }
 
 impl CommentShape {
+    #[inline]
+    pub fn from_text(text: &str) -> CommentShape {
+        if text.starts_with("/*") { CommentShape::Block } else { CommentShape::Line }
+    }
+
     pub fn is_line(self) -> bool {
         self == CommentShape::Line
     }
@@ -81,37 +72,80 @@ impl CommentShape {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum CommentPlacement {
-    Inner,
-    Outer,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AnyComment {
+    syntax: SyntaxToken,
 }
 
-impl CommentKind {
-    const BY_PREFIX: [(&'static str, CommentKind); 9] = [
-        ("/**/", CommentKind { shape: CommentShape::Block, doc: None }),
-        ("/***", CommentKind { shape: CommentShape::Block, doc: None }),
-        ("////", CommentKind { shape: CommentShape::Line, doc: None }),
-        ("///", CommentKind { shape: CommentShape::Line, doc: Some(CommentPlacement::Outer) }),
-        ("//!", CommentKind { shape: CommentShape::Line, doc: Some(CommentPlacement::Inner) }),
-        ("/**", CommentKind { shape: CommentShape::Block, doc: Some(CommentPlacement::Outer) }),
-        ("/*!", CommentKind { shape: CommentShape::Block, doc: Some(CommentPlacement::Inner) }),
-        ("//", CommentKind { shape: CommentShape::Line, doc: None }),
-        ("/*", CommentKind { shape: CommentShape::Block, doc: None }),
-    ];
+impl AstToken for AnyComment {
+    fn can_cast(kind: SyntaxKind) -> bool
+    where
+        Self: Sized,
+    {
+        matches!(
+            kind,
+            SyntaxKind::COMMENT | SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT
+        )
+    }
 
-    pub(crate) fn from_text(text: &str) -> CommentKind {
-        let &(_prefix, kind) = CommentKind::BY_PREFIX
-            .iter()
-            .find(|&(prefix, _kind)| text.starts_with(prefix))
-            .unwrap();
-        kind
+    fn cast(syntax: SyntaxToken) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+
+    fn syntax(&self) -> &SyntaxToken {
+        &self.syntax
+    }
+}
+
+impl AnyComment {
+    pub fn shape(&self) -> CommentShape {
+        CommentShape::from_text(self.text_with_markers())
+    }
+
+    pub fn doc_kind(&self) -> Option<AttrKind> {
+        match self.syntax.kind() {
+            SyntaxKind::COMMENT => None,
+            SyntaxKind::INNER_DOC_COMMENT => Some(AttrKind::Inner),
+            SyntaxKind::OUTER_DOC_COMMENT => Some(AttrKind::Outer),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn kind(&self) -> CommentKind {
+        CommentKind { shape: self.shape(), doc: self.doc_kind() }
     }
 
     pub fn prefix(&self) -> &'static str {
-        let &(prefix, _) =
-            CommentKind::BY_PREFIX.iter().rev().find(|(_, kind)| kind == self).unwrap();
-        prefix
+        self.kind().prefix()
+    }
+
+    pub fn is_inner(&self) -> bool {
+        self.doc_kind() == Some(AttrKind::Inner)
+    }
+
+    pub fn is_outer(&self) -> bool {
+        self.doc_kind() == Some(AttrKind::Outer)
+    }
+
+    /// Returns the text with the `/*...*/` or `//...` or `/**...*/` or `/*!...*/` or `///...` or `//!...` markers.
+    pub fn text_with_markers(&self) -> &str {
+        self.syntax.text()
+    }
+
+    /// Returns the textual content of a doc comment node as a single string with prefix and suffix removed.
+    pub fn text(&self) -> &str {
+        let shape = self.shape();
+        let prefix_len = if self.doc_kind().is_some() { 3 } else { 2 };
+        let text = &self.text_with_markers()[prefix_len..];
+        if shape == CommentShape::Block {
+            // The `*/` may not exist because of recovery.
+            text.strip_suffix("*/").unwrap_or(text)
+        } else {
+            text
+        }
     }
 }
 
@@ -151,10 +185,10 @@ impl QuoteOffsets {
 }
 
 pub trait IsString: AstToken {
-    const RAW_PREFIX: &'static str;
-    fn unescape(s: &str, callback: impl FnMut(Range<usize>, Result<char, EscapeError>));
+    fn raw_prefix(&self) -> &'static str;
+    fn unescape(&self, s: &str, callback: impl FnMut(Range<usize>, Result<char, EscapeError>));
     fn is_raw(&self) -> bool {
-        self.text().starts_with(Self::RAW_PREFIX)
+        self.text().starts_with(self.raw_prefix())
     }
     fn quote_offsets(&self) -> Option<QuoteOffsets> {
         let text = self.text();
@@ -187,7 +221,17 @@ pub trait IsString: AstToken {
         let text = &self.text()[text_range_no_quotes - start];
         let offset = text_range_no_quotes.start() - start;
 
-        Self::unescape(text, &mut |range: Range<usize>, unescaped_char| {
+        if self.is_raw() {
+            let mut pos = offset;
+            for c in text.chars() {
+                let len = TextSize::of(c);
+                cb(TextRange::at(pos, len), Ok(c));
+                pos += len;
+            }
+            return;
+        }
+
+        self.unescape(text, &mut |range: Range<usize>, unescaped_char| {
             if let Some((s, e)) = range.start.try_into().ok().zip(range.end.try_into().ok()) {
                 cb(TextRange::new(s, e) + offset, unescaped_char);
             }
@@ -201,11 +245,17 @@ pub trait IsString: AstToken {
             None
         }
     }
+    fn map_offset_down(&self, offset: TextSize) -> Option<TextSize> {
+        let contents_range = self.text_range_between_quotes()?;
+        offset.checked_sub(contents_range.start())
+    }
 }
 
 impl IsString for ast::String {
-    const RAW_PREFIX: &'static str = "r";
-    fn unescape(s: &str, cb: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
+    fn raw_prefix(&self) -> &'static str {
+        "r"
+    }
+    fn unescape(&self, s: &str, cb: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
         unescape_str(s, cb)
     }
 }
@@ -246,8 +296,10 @@ impl ast::String {
 }
 
 impl IsString for ast::ByteString {
-    const RAW_PREFIX: &'static str = "br";
-    fn unescape(s: &str, mut callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
+    fn raw_prefix(&self) -> &'static str {
+        "br"
+    }
+    fn unescape(&self, s: &str, mut callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
         unescape_byte_str(s, |range, res| callback(range, res.map(char::from)))
     }
 }
@@ -281,17 +333,19 @@ impl ast::ByteString {
 
         match (has_error, buf.capacity() == 0) {
             (Some(e), _) => Err(e),
-            (None, true) => Ok(Cow::Borrowed(text.as_bytes())),
+            (None, true) => Ok(Cow::Borrowed(&text.as_bytes()[..prev_end])),
             (None, false) => Ok(Cow::Owned(buf)),
         }
     }
 }
 
 impl IsString for ast::CString {
-    const RAW_PREFIX: &'static str = "cr";
+    fn raw_prefix(&self) -> &'static str {
+        "cr"
+    }
     // NOTE: This method should only be used for highlighting ranges. The unescaped
     // char/byte is not used. For simplicity, we return an arbitrary placeholder char.
-    fn unescape(s: &str, mut callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
+    fn unescape(&self, s: &str, mut callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
         unescape_c_str(s, |range, _res| callback(range, Ok('_')))
     }
 }
@@ -309,8 +363,8 @@ impl ast::CString {
         let mut prev_end = 0;
         let mut has_error = None;
         let extend_unit = |buf: &mut Vec<u8>, unit: MixedUnit| match unit {
-            MixedUnit::Char(c) => buf.extend(c.encode_utf8(&mut [0; 4]).as_bytes()),
-            MixedUnit::HighByte(b) => buf.push(b),
+            MixedUnit::Char(c) => buf.extend(c.get().encode_utf8(&mut [0; 4]).as_bytes()),
+            MixedUnit::HighByte(b) => buf.push(b.get()),
         };
         unescape_c_str(text, |char_range, unescaped| match (unescaped, buf.capacity() == 0) {
             (Ok(u), false) => extend_unit(&mut buf, u),
@@ -465,6 +519,74 @@ impl ast::Byte {
     }
 }
 
+pub enum AnyString {
+    ByteString(ast::ByteString),
+    CString(ast::CString),
+    String(ast::String),
+}
+
+impl AnyString {
+    pub fn value(&self) -> Result<Cow<'_, str>, EscapeError> {
+        fn from_utf8(s: Cow<'_, [u8]>) -> Result<Cow<'_, str>, EscapeError> {
+            match s {
+                Cow::Borrowed(s) => str::from_utf8(s)
+                    .map_err(|_| EscapeError::NonAsciiCharInByte)
+                    .map(Cow::Borrowed),
+                Cow::Owned(s) => String::from_utf8(s)
+                    .map_err(|_| EscapeError::NonAsciiCharInByte)
+                    .map(Cow::Owned),
+            }
+        }
+
+        match self {
+            AnyString::String(s) => s.value(),
+            AnyString::ByteString(s) => s.value().and_then(from_utf8),
+            AnyString::CString(s) => s.value().and_then(from_utf8),
+        }
+    }
+}
+
+impl ast::AstToken for AnyString {
+    fn can_cast(kind: crate::SyntaxKind) -> bool {
+        ast::String::can_cast(kind)
+            || ast::ByteString::can_cast(kind)
+            || ast::CString::can_cast(kind)
+    }
+
+    fn cast(syntax: crate::SyntaxToken) -> Option<Self> {
+        ast::String::cast(syntax.clone())
+            .map(Self::String)
+            .or_else(|| ast::ByteString::cast(syntax.clone()).map(Self::ByteString))
+            .or_else(|| ast::CString::cast(syntax).map(Self::CString))
+    }
+
+    fn syntax(&self) -> &crate::SyntaxToken {
+        match self {
+            Self::ByteString(it) => it.syntax(),
+            Self::CString(it) => it.syntax(),
+            Self::String(it) => it.syntax(),
+        }
+    }
+}
+
+impl IsString for AnyString {
+    fn raw_prefix(&self) -> &'static str {
+        match self {
+            AnyString::ByteString(s) => s.raw_prefix(),
+            AnyString::CString(s) => s.raw_prefix(),
+            AnyString::String(s) => s.raw_prefix(),
+        }
+    }
+
+    fn unescape(&self, s: &str, callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
+        match self {
+            AnyString::ByteString(it) => it.unescape(s, callback),
+            AnyString::CString(it) => it.unescape(s, callback),
+            AnyString::String(it) => it.unescape(s, callback),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rustc_apfloat::ieee::Quad as f128;
@@ -566,6 +688,10 @@ bcde", "abcde",
         check_byte_string_value(
             r"a\
 bcde", b"abcde",
+        );
+        check_byte_string_value(
+            r"\
+    ", b"",
         );
     }
 

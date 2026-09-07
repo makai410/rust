@@ -6,8 +6,8 @@ The rust analyzer manual uses [mdbook](https://rust-lang.github.io/mdBook/).
 
 To run the documentation site locally:
 
-```shell
-cargo install mdbook
+```bash
+cargo install --locked mdbook
 cargo xtask codegen
 cd docs/book
 mdbook serve

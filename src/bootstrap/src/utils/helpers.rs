@@ -10,13 +10,14 @@ use std::thread::panicking;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, io, panic, str};
 
+use build_helper::ci::CiEnv;
 use object::read::archive::ArchiveFile;
+pub(crate) use shim_utils::{dylib_path, dylib_path_var};
 
-use crate::LldMode;
-use crate::core::builder::Builder;
-use crate::core::config::{Config, TargetSelection};
+pub(crate) use self::macros::t;
+use crate::core::builder::{Builder, StepStack};
+use crate::core::config::{BootstrapOverrideLld, Config, TargetSelection};
 use crate::utils::exec::{BootstrapCommand, command};
-pub use crate::utils::shared_helpers::{dylib_path, dylib_path_var};
 
 #[cfg(test)]
 mod tests;
@@ -38,36 +39,38 @@ impl Drop for PanicTracker<'_> {
     }
 }
 
-/// A helper macro to `unwrap` a result except also print out details like:
-///
-/// * The file/line of the panic
-/// * The expression that failed
-/// * The error itself
-///
-/// This is currently used judiciously throughout the build system rather than
-/// using a `Result` with `try!`, but this may change one day...
-#[macro_export]
-macro_rules! t {
-    ($e:expr) => {{
-        let _panic_guard = $crate::PanicTracker(std::panic::Location::caller());
-        match $e {
-            Ok(e) => e,
-            Err(e) => panic!("{} failed with {}", stringify!($e), e),
-        }
-    }};
-    // it can show extra info in the second parameter
-    ($e:expr, $extra:expr) => {{
-        let _panic_guard = $crate::PanicTracker(std::panic::Location::caller());
-        match $e {
-            Ok(e) => e,
-            Err(e) => panic!("{} failed with {} ({:?})", stringify!($e), e, $extra),
-        }
-    }};
+mod macros {
+    /// A helper macro to `unwrap` a result except also print out details like:
+    ///
+    /// * The file/line of the panic
+    /// * The expression that failed
+    /// * The error itself
+    ///
+    /// This is currently used judiciously throughout the build system rather than
+    /// using a `Result` with `try!`, but this may change one day...
+    macro_rules! t {
+        ($e:expr) => {{
+            let _panic_guard = $crate::utils::helpers::PanicTracker(std::panic::Location::caller());
+            match $e {
+                Ok(e) => e,
+                Err(e) => panic!("{} failed with {}", stringify!($e), e),
+            }
+        }};
+        // it can show extra info in the second parameter
+        ($e:expr, $extra:expr) => {{
+            let _panic_guard = $crate::utils::helpers::PanicTracker(std::panic::Location::caller());
+            match $e {
+                Ok(e) => e,
+                Err(e) => panic!("{} failed with {} ({:?})", stringify!($e), e, $extra),
+            }
+        }};
+    }
+
+    pub(crate) use t;
 }
 
-pub use t;
 pub fn exe(name: &str, target: TargetSelection) -> String {
-    crate::utils::shared_helpers::exe(name, &target.triple)
+    shim_utils::exe(name, &target.triple)
 }
 
 /// Returns the path to the split debug info for the specified file if it exists.
@@ -96,7 +99,11 @@ pub fn is_dylib(path: &Path) -> bool {
 
 /// Return the path to the containing submodule if available.
 pub fn submodule_path_of(builder: &Builder<'_>, path: &str) -> Option<String> {
-    let submodule_paths = builder.submodule_paths();
+    submodule_path_of_paths(builder.submodule_paths(), path)
+}
+
+fn submodule_path_of_paths(submodule_paths: &[String], path: &str) -> Option<String> {
+    let path = Path::new(path);
     submodule_paths.iter().find_map(|submodule_path| {
         if path.starts_with(submodule_path) { Some(submodule_path.to_string()) } else { None }
     })
@@ -134,11 +141,8 @@ pub fn libdir(target: TargetSelection) -> &'static str {
 /// Adds a list of lookup paths to `cmd`'s dynamic library lookup path.
 /// If the dylib_path_var is already set for this cmd, the old value will be overwritten!
 pub fn add_dylib_path(path: Vec<PathBuf>, cmd: &mut BootstrapCommand) {
-    let mut list = dylib_path();
-    for path in path {
-        list.insert(0, path);
-    }
-    cmd.env(dylib_path_var(), t!(env::join_paths(list)));
+    let paths = path.into_iter().chain(dylib_path());
+    cmd.env(dylib_path_var(), t!(env::join_paths(paths)));
 }
 
 pub struct TimeIt(bool, Instant);
@@ -176,6 +180,17 @@ pub fn symlink_dir(config: &Config, original: &Path, link: &Path) -> io::Result<
     fn symlink_dir_inner(target: &Path, junction: &Path) -> io::Result<()> {
         junction::create(target, junction)
     }
+}
+
+/// Detects a symlink or a junction on Windows
+pub fn is_symlink_dir(_metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        _metadata.file_type().is_symlink_dir()
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 /// Return the host target on which we are currently running.
@@ -222,7 +237,8 @@ pub fn use_host_linker(target: TargetSelection) -> bool {
         || target.contains("fortanix")
         || target.contains("fuchsia")
         || target.contains("bpf")
-        || target.contains("switch"))
+        || target.contains("switch")
+        || target.contains("l4re"))
 }
 
 pub fn target_supports_cranelift_backend(target: TargetSelection) -> bool {
@@ -240,18 +256,30 @@ pub fn target_supports_cranelift_backend(target: TargetSelection) -> bool {
     }
 }
 
+/// Value returned from [`is_valid_test_suite_arg`], which figures out which paths start with the
+/// suite name (and therefore which should be run).
+pub enum TestFilterCategory<'a> {
+    /// If a path is equal to the name of the suite, this is returned.
+    Fullsuite,
+    /// If a path starts with the suite, the suite prefix is stripped and the rest is returned as
+    /// this variant.
+    Arg(&'a str),
+    /// For paths that don't start with the suite.
+    Uninteresting,
+}
+
 pub fn is_valid_test_suite_arg<'a, P: AsRef<Path>>(
     path: &'a Path,
     suite_path: P,
     builder: &Builder<'_>,
-) -> Option<&'a str> {
+) -> TestFilterCategory<'a> {
     let suite_path = suite_path.as_ref();
     let path = match path.strip_prefix(".") {
         Ok(p) => p,
         Err(_) => path,
     };
     if !path.starts_with(suite_path) {
-        return None;
+        return TestFilterCategory::Uninteresting;
     }
     let abs_path = builder.src.join(path);
     let exists = abs_path.is_dir() || abs_path.is_file();
@@ -268,8 +296,8 @@ pub fn is_valid_test_suite_arg<'a, P: AsRef<Path>>(
     // flag is respected, so providing an empty --test-args conflicts with
     // any following it.
     match path.strip_prefix(suite_path).ok().and_then(|p| p.to_str()) {
-        Some(s) if !s.is_empty() => Some(s),
-        _ => None,
+        Some(s) if !s.is_empty() => TestFilterCategory::Arg(s),
+        _ => TestFilterCategory::Fullsuite,
     }
 }
 
@@ -357,15 +385,19 @@ pub fn get_clang_cl_resource_dir(builder: &Builder<'_>, clang_cl_path: &str) -> 
 /// Returns a flag that configures LLD to use only a single thread.
 /// If we use an external LLD, we need to find out which version is it to know which flag should we
 /// pass to it (LLD older than version 10 had a different flag).
-fn lld_flag_no_threads(builder: &Builder<'_>, lld_mode: LldMode, is_windows: bool) -> &'static str {
+fn lld_flag_no_threads(
+    builder: &Builder<'_>,
+    bootstrap_override_lld: BootstrapOverrideLld,
+    is_windows: bool,
+) -> &'static str {
     static LLD_NO_THREADS: OnceLock<(&'static str, &'static str)> = OnceLock::new();
 
     let new_flags = ("/threads:1", "--threads=1");
     let old_flags = ("/no-threads", "--no-threads");
 
     let (windows_flag, other_flag) = LLD_NO_THREADS.get_or_init(|| {
-        let newer_version = match lld_mode {
-            LldMode::External => {
+        let newer_version = match bootstrap_override_lld {
+            BootstrapOverrideLld::External => {
                 let mut cmd = command("lld");
                 cmd.arg("-flavor").arg("ld").arg("--version");
                 let out = cmd.run_capture_stdout(builder).stdout();
@@ -404,9 +436,8 @@ pub fn linker_args(
     builder: &Builder<'_>,
     target: TargetSelection,
     lld_threads: LldThreads,
-    stage: u32,
 ) -> Vec<String> {
-    let mut args = linker_flags(builder, target, lld_threads, stage);
+    let mut args = linker_flags(builder, target, lld_threads);
 
     if let Some(linker) = builder.linker(target) {
         args.push(format!("-Clinker={}", linker.display()));
@@ -421,39 +452,31 @@ pub fn linker_flags(
     builder: &Builder<'_>,
     target: TargetSelection,
     lld_threads: LldThreads,
-    stage: u32,
 ) -> Vec<String> {
     let mut args = vec![];
-    if !builder.is_lld_direct_linker(target) && builder.config.lld_mode.is_used() {
-        match builder.config.lld_mode {
-            LldMode::External => {
-                // cfg(bootstrap) - remove the stage 0 check after updating the bootstrap compiler:
-                // `-Clinker-features` has been stabilized.
-                if stage == 0 {
-                    args.push("-Zlinker-features=+lld".to_string());
-                } else {
-                    args.push("-Clinker-features=+lld".to_string());
-                }
+    if !builder.is_lld_direct_linker(target) && builder.config.bootstrap_override_lld.is_used() {
+        match builder.config.bootstrap_override_lld {
+            BootstrapOverrideLld::External => {
+                args.push("-Clinker-features=+lld".to_string());
+                args.push("-Clink-self-contained=-linker".to_string());
                 args.push("-Zunstable-options".to_string());
             }
-            LldMode::SelfContained => {
-                // cfg(bootstrap) - remove the stage 0 check after updating the bootstrap compiler:
-                // `-Clinker-features` has been stabilized.
-                if stage == 0 {
-                    args.push("-Zlinker-features=+lld".to_string());
-                } else {
-                    args.push("-Clinker-features=+lld".to_string());
-                }
+            BootstrapOverrideLld::SelfContained => {
+                args.push("-Clinker-features=+lld".to_string());
                 args.push("-Clink-self-contained=+linker".to_string());
                 args.push("-Zunstable-options".to_string());
             }
-            LldMode::Unused => unreachable!(),
+            BootstrapOverrideLld::None => unreachable!(),
         };
 
         if matches!(lld_threads, LldThreads::No) {
             args.push(format!(
                 "-Clink-arg=-Wl,{}",
-                lld_flag_no_threads(builder, builder.config.lld_mode, target.is_windows())
+                lld_flag_no_threads(
+                    builder,
+                    builder.config.bootstrap_override_lld,
+                    target.is_windows()
+                )
             ));
         }
     }
@@ -465,9 +488,8 @@ pub fn add_rustdoc_cargo_linker_args(
     builder: &Builder<'_>,
     target: TargetSelection,
     lld_threads: LldThreads,
-    stage: u32,
 ) {
-    let args = linker_args(builder, target, lld_threads, stage);
+    let args = linker_args(builder, target, lld_threads);
     let mut flags = cmd
         .get_envs()
         .find_map(|(k, v)| if k == OsStr::new("RUSTDOCFLAGS") { v } else { None })
@@ -525,6 +547,8 @@ pub fn check_cfg_arg(name: &str, values: Option<&[&str]>) -> String {
 #[track_caller]
 pub fn git(source_dir: Option<&Path>) -> BootstrapCommand {
     let mut git = command("git");
+    // git commands are almost always read-only, so cache them by default
+    git.cached();
 
     if let Some(source_dir) = source_dir {
         git.current_dir(source_dir);
@@ -553,4 +577,60 @@ pub fn set_file_times<P: AsRef<Path>>(path: P, times: fs::FileTimes) -> io::Resu
         fs::File::open(path)?
     };
     f.set_times(times)
+}
+
+/// Converts a target-tuple or other string into
+/// [the form expected by cargo environment variable names][cargo-env].
+///
+/// For example:
+/// - `x86_64-unknown-linux-gnu` => `X86_64_UNKNOWN_LINUX_GNU`.
+///
+/// [cargo-env]: https://doc.rust-lang.org/cargo/reference/config.html#environment-variables
+pub(crate) fn envify(s: &str) -> String {
+    // Converting foo-bar to FOO_BAR is a fairly idomatic mapping to an environment variable name.
+    // We also convert '.' to '_' to fix https://github.com/rust-lang/rust/issues/158090
+    s.chars()
+        .map(|c| match c {
+            '-' | '.' => '_',
+            c => c,
+        })
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
+/// Exits the process by calling [`std::process::exit`].
+///
+/// In CI, extra information will be printed to make failures easier to investigate.
+///
+/// If `cfg!(test)` is true, this will panic instead of exiting the process.
+/// Doing so avoids disturbing other tests in the process, and allows `#[should_panic]`
+/// to detect expected failures.
+pub(crate) fn exit_process(code: i32) -> ! {
+    // In bootstrap unit tests, panic instead of killing the whole test process.
+    if cfg!(test) {
+        panic!("status code: {code}");
+    } else {
+        // If we're in CI, print the current bootstrap invocation command, to make it easier to
+        // figure out what exactly has failed.
+        if CiEnv::is_ci() {
+            // Skip the first argument, as it will be some absolute path to the bootstrap binary.
+            let bootstrap_args =
+                std::env::args().skip(1).map(|a| a.to_string()).collect::<Vec<_>>().join(" ");
+            eprintln!("Bootstrap failed while executing `{bootstrap_args}`");
+            eprintln!("Currently active steps:");
+            StepStack::with_current(|stack| {
+                for step in stack.get_active_steps() {
+                    eprintln!("{} at {}", step.info, step.location);
+                }
+            });
+        }
+
+        // otherwise, exit with provided status code
+        std::process::exit(code);
+    }
+}
+
+pub fn fail(s: &str) -> ! {
+    eprintln!("\n\n{s}\n\n");
+    exit_process(1);
 }

@@ -1,10 +1,9 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::path_def_id;
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::source::snippet_with_context;
 use rustc_errors::Applicability;
 use rustc_hir::{BorrowKind, Expr, ExprKind, Mutability, UnOp};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_span::{Span, SyntaxContext, sym};
 
 declare_clippy_lint! {
@@ -36,13 +35,13 @@ declare_clippy_lint! {
     suspicious,
     "call to `mem::swap` using pointer derived references"
 }
+
 declare_lint_pass!(SwapPtrToRef => [SWAP_PTR_TO_REF]);
 
 impl LateLintPass<'_> for SwapPtrToRef {
     fn check_expr(&mut self, cx: &LateContext<'_>, e: &Expr<'_>) {
         if let ExprKind::Call(fn_expr, [arg1, arg2]) = e.kind
-            && let Some(fn_id) = path_def_id(cx, fn_expr)
-            && cx.tcx.is_diagnostic_item(sym::mem_swap, fn_id)
+            && fn_expr.basic_res().is_diag_item(cx, sym::mem_swap)
             && let ctxt = e.span.ctxt()
             && let (from_ptr1, arg1_span) = is_ptr_to_ref(cx, arg1, ctxt)
             && let (from_ptr2, arg2_span) = is_ptr_to_ref(cx, arg2, ctxt)

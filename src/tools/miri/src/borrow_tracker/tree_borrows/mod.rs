@@ -1,19 +1,22 @@
-use rustc_abi::{BackendRepr, Size};
-use rustc_middle::mir::{Mutability, RetagKind};
+use rustc_abi::Size;
+use rustc_hir::find_attr;
+use rustc_middle::mir::Mutability;
 use rustc_middle::ty::layout::HasTypingEnv;
 use rustc_middle::ty::{self, Ty};
 
 use self::foreign_access_skipping::IdempotentForeignAccess;
 use self::tree::LocationState;
-use crate::borrow_tracker::{GlobalState, GlobalStateInner, ProtectorKind};
-use crate::concurrency::data_race::NaReadType;
+use crate::borrow_tracker::{AccessKind, GlobalState, GlobalStateInner, ProtectorKind};
+use crate::concurrency::data_race::{NaReadType, NaWriteType};
 use crate::*;
 
 pub mod diagnostics;
 mod foreign_access_skipping;
 mod perms;
 mod tree;
+mod tree_visitor;
 mod unimap;
+mod wildcard;
 
 #[cfg(test)]
 mod exhaustive;
@@ -33,7 +36,7 @@ impl<'tcx> Tree {
         machine: &MiriMachine<'tcx>,
     ) -> Self {
         let tag = state.root_ptr_tag(id, machine); // Fresh tag for the root
-        let span = machine.current_span();
+        let span = machine.current_user_relevant_span();
         Tree::new(tag, size, span)
     }
 
@@ -54,17 +57,13 @@ impl<'tcx> Tree {
             interpret::Pointer::new(alloc_id, range.start),
             range.size.bytes(),
         );
-        // TODO: for now we bail out on wildcard pointers. Eventually we should
-        // handle them as much as we can.
-        let tag = match prov {
-            ProvenanceExtra::Concrete(tag) => tag,
-            ProvenanceExtra::Wildcard => return interp_ok(()),
-        };
         let global = machine.borrow_tracker.as_ref().unwrap();
-        let span = machine.current_span();
+        let span = machine.current_user_relevant_span();
         self.perform_access(
-            tag,
-            Some((range, access_kind, diagnostics::AccessCause::Explicit(access_kind))),
+            prov,
+            range,
+            access_kind,
+            diagnostics::AccessCause::Explicit(access_kind),
             global,
             alloc_id,
             span,
@@ -79,19 +78,9 @@ impl<'tcx> Tree {
         size: Size,
         machine: &MiriMachine<'tcx>,
     ) -> InterpResult<'tcx> {
-        // TODO: for now we bail out on wildcard pointers. Eventually we should
-        // handle them as much as we can.
-        let tag = match prov {
-            ProvenanceExtra::Concrete(tag) => tag,
-            ProvenanceExtra::Wildcard => return interp_ok(()),
-        };
         let global = machine.borrow_tracker.as_ref().unwrap();
-        let span = machine.current_span();
-        self.dealloc(tag, alloc_range(Size::ZERO, size), global, alloc_id, span)
-    }
-
-    pub fn expose_tag(&mut self, _tag: BorTag) {
-        // TODO
+        let span = machine.current_user_relevant_span();
+        self.dealloc(prov, alloc_range(Size::ZERO, size), global, alloc_id, span)
     }
 
     /// A tag just lost its protector.
@@ -107,9 +96,12 @@ impl<'tcx> Tree {
         tag: BorTag,
         alloc_id: AllocId, // diagnostics
     ) -> InterpResult<'tcx> {
-        let span = machine.current_span();
-        // `None` makes it the magic on-protector-end operation
-        self.perform_access(tag, None, global, alloc_id, span)
+        let span = machine.current_user_relevant_span();
+        self.perform_protector_end_access(tag, global, alloc_id, span)?;
+
+        self.update_exposure_for_protector_release(tag);
+
+        interp_ok(())
     }
 }
 
@@ -118,88 +110,113 @@ impl<'tcx> Tree {
 pub struct NewPermission {
     /// Permission for the frozen part of the range.
     freeze_perm: Permission,
-    /// Whether a read access should be performed on the frozen part on a retag.
-    freeze_access: bool,
     /// Permission for the non-frozen part of the range.
     nonfreeze_perm: Permission,
-    /// Whether a read access should be performed on the non-frozen
-    /// part on a retag.
-    nonfreeze_access: bool,
+    /// Permission for memory outside the range.
+    outside_perm: Permission,
     /// Whether this pointer is part of the arguments of a function call.
     /// `protector` is `Some(_)` for all pointers marked `noalias`.
     protector: Option<ProtectorKind>,
 }
 
 impl<'tcx> NewPermission {
-    /// Determine NewPermission of the reference from the type of the pointee.
-    fn from_ref_ty(
+    /// Determine NewPermission of the reference/Box from the type of the pointee.
+    ///
+    /// A `ref_mutability` of `None` indicates a `Box` type.
+    fn new(
         pointee: Ty<'tcx>,
-        mutability: Mutability,
-        kind: RetagKind,
-        cx: &crate::MiriInterpCx<'tcx>,
+        ref_mutability: Option<Mutability>,
+        mode: RetagMode,
+        cx: &MiriInterpCx<'tcx>,
     ) -> Option<Self> {
-        let ty_is_unpin = pointee.is_unpin(*cx.tcx, cx.typing_env());
-        let is_protected = kind == RetagKind::FnEntry;
-        let protector = is_protected.then_some(ProtectorKind::StrongProtector);
+        if mode == RetagMode::None {
+            return None;
+        }
 
-        Some(match mutability {
-            Mutability::Mut if ty_is_unpin =>
-                NewPermission {
-                    freeze_perm: Permission::new_reserved(
-                        /* ty_is_freeze */ true,
-                        is_protected,
-                    ),
-                    freeze_access: true,
-                    nonfreeze_perm: Permission::new_reserved(
-                        /* ty_is_freeze */ false,
-                        is_protected,
-                    ),
-                    // If we have a mutable reference, then the non-frozen part will
-                    // have state `ReservedIM` or `Reserved`, which can have an initial read access
-                    // performed on it because you cannot have multiple mutable borrows.
-                    nonfreeze_access: true,
-                    protector,
-                },
-            Mutability::Not =>
-                NewPermission {
-                    freeze_perm: Permission::new_frozen(),
-                    freeze_access: true,
-                    nonfreeze_perm: Permission::new_cell(),
-                    // If it is a shared reference, then the non-frozen
-                    // part will have state `Cell`, which should not have an initial access,
-                    // as this can cause data races when using thread-safe data types like
-                    // `Mutex<T>`.
-                    nonfreeze_access: false,
-                    protector,
-                },
-            _ => return None,
-        })
-    }
+        let ty_is_unpin = pointee.is_unpin(*cx.tcx, cx.typing_env())
+            && pointee.is_unsafe_unpin(*cx.tcx, cx.typing_env());
+        let ty_is_freeze = pointee.is_freeze(*cx.tcx, cx.typing_env());
+        let is_protected = mode == RetagMode::FnEntry;
 
-    /// Compute permission for `Box`-like type (`Box` always, and also `Unique` if enabled).
-    /// These pointers allow deallocation so need a different kind of protector not handled
-    /// by `from_ref_ty`.
-    fn from_unique_ty(
-        ty: Ty<'tcx>,
-        kind: RetagKind,
-        cx: &crate::MiriInterpCx<'tcx>,
-    ) -> Option<Self> {
-        let pointee = ty.builtin_deref(true).unwrap();
-        pointee.is_unpin(*cx.tcx, cx.typing_env()).then_some(()).map(|()| {
-            // Regular `Unpin` box, give it `noalias` but only a weak protector
-            // because it is valid to deallocate it within the function.
-            let is_protected = kind == RetagKind::FnEntry;
-            let protector = is_protected.then_some(ProtectorKind::WeakProtector);
-            NewPermission {
-                freeze_perm: Permission::new_reserved(/* ty_is_freeze */ true, is_protected),
-                freeze_access: true,
-                nonfreeze_perm: Permission::new_reserved(
-                    /* ty_is_freeze */ false,
-                    is_protected,
-                ),
-                nonfreeze_access: true,
-                protector,
+        // Check if the implicit writes feature is globally enabled, using the
+        // `-Zmiri-tree-borrows-implicit-writes` flag, and not locally disabled using the
+        // `#[rustc_no_writable]` attribute. For performance reasons, only performs the lookup if
+        // is_protected is true as implicit writes are only performed for protected references.
+        let implicit_writes_enabled = is_protected && {
+            let implicit_writes = cx.get_tree_borrows_params().implicit_writes;
+            let def_id = cx.frame().instance().def_id();
+            implicit_writes && !find_attr!(cx.tcx, def_id, RustcNoWritable)
+        };
+
+        if matches!(ref_mutability, Some(Mutability::Mut) | None if !ty_is_unpin) {
+            // Mutable reference / Box to pinning type: retagging is a NOP.
+            // FIXME: with `UnsafePinned`, this should do proper per-byte tracking.
+            return None;
+        }
+
+        enum Part {
+            InsideFrozen,
+            InsideUnsafeCell,
+            Outside,
+        }
+        use Part::*;
+
+        let perm = |part: Part| {
+            // Whether we should consider this byte to be frozen.
+            // Outside bytes are frozen only if the entire type is frozen.
+            let frozen = match part {
+                InsideFrozen => true,
+                InsideUnsafeCell => false,
+                Outside => ty_is_freeze,
+            };
+            match ref_mutability {
+                // Shared references
+                Some(Mutability::Not) =>
+                    if frozen {
+                        Permission::new_frozen()
+                    } else {
+                        Permission::new_cell()
+                    },
+                // Mutable references
+                Some(Mutability::Mut) => {
+                    if implicit_writes_enabled && !matches!(part, Outside) {
+                        // We cannot use `Unique` for the outside part.
+                        Permission::new_unique()
+                    } else if is_protected || frozen {
+                        // We also use this for protected `&mut UnsafeCell` as otherwise adding
+                        // `noalias` would not be sound.
+                        Permission::new_reserved_frz()
+                    } else {
+                        Permission::new_reserved_im()
+                    }
+                }
+                // Boxes
+                None => {
+                    if implicit_writes_enabled && !matches!(part, Outside) {
+                        // Boxes are treated the same as mutable references.
+                        Permission::new_unique()
+                    } else if is_protected || frozen {
+                        // We also use this for protected `Box<UnsafeCell>` as otherwise adding
+                        // `noalias` would not be sound.
+                        Permission::new_reserved_frz()
+                    } else {
+                        Permission::new_reserved_im()
+                    }
+                }
             }
+        };
+
+        Some(NewPermission {
+            freeze_perm: perm(InsideFrozen),
+            nonfreeze_perm: perm(InsideUnsafeCell),
+            outside_perm: perm(Outside),
+            protector: is_protected.then_some(if ref_mutability.is_some() {
+                // Strong protector for references
+                ProtectorKind::StrongProtector
+            } else {
+                // Weak protector for boxes
+                ProtectorKind::WeakProtector
+            }),
         })
     }
 }
@@ -209,6 +226,14 @@ impl<'tcx> NewPermission {
 /// the implementation of NewPermission.
 impl<'tcx> EvalContextPrivExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    #[track_caller]
+    #[inline]
+    fn get_tree_borrows_params(&self) -> TreeBorrowsParams {
+        let this = self.eval_context_ref();
+        let borrow_tracker = this.machine.borrow_tracker.as_ref().unwrap().borrow();
+        borrow_tracker.borrow_tracker_method.get_tree_borrows_params()
+    }
+
     /// Returns the provenance that should be used henceforth.
     fn tb_reborrow(
         &mut self,
@@ -219,7 +244,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Option<Provenance>> {
         let this = self.eval_context_mut();
         // Ensure we bail out if the pointer goes out-of-bounds (see miri#1050).
-        this.check_ptr_access(place.ptr(), ptr_size, CheckInAllocMsg::Dereferenceable)?;
+        this.check_ptr_access(place.ptr(), ptr_size, CheckInAllocMsg::Dereferenceable("pointer"))?;
 
         // It is crucial that this gets called on all code paths, to ensure we track tag creation.
         let log_creation = |this: &MiriInterpCx<'tcx>,
@@ -246,38 +271,27 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         };
 
         trace!("Reborrow of size {:?}", ptr_size);
-        let (alloc_id, base_offset, parent_prov) = match this.ptr_try_get_alloc_id(place.ptr(), 0) {
-            Ok(data) => {
-                // Unlike SB, we *do* a proper retag for size 0 if can identify the allocation.
-                // After all, the pointer may be lazily initialized outside this initial range.
-                data
-            }
-            Err(_) => {
-                assert_eq!(ptr_size, Size::ZERO); // we did the deref check above, size has to be 0 here
-                // This pointer doesn't come with an AllocId, so there's no
-                // memory to do retagging in.
-                trace!(
-                    "reborrow of size 0: reference {:?} derived from {:?} (pointee {})",
-                    new_tag,
-                    place.ptr(),
-                    place.layout.ty,
-                );
-                log_creation(this, None)?;
-                // Keep original provenance.
-                return interp_ok(place.ptr().provenance);
-            }
+        // Unlike SB, we *do* a proper retag for size 0 if can identify the allocation.
+        // After all, the pointer may be lazily initialized outside this initial range.
+        let Ok((alloc_id, base_offset, parent_prov)) = this.ptr_try_get_alloc_id(place.ptr(), 0)
+        else {
+            assert_eq!(ptr_size, Size::ZERO); // we did the deref check above, size has to be 0 here
+            // This pointer doesn't come with an AllocId, so there's no
+            // memory to do retagging in.
+            let new_prov = place.ptr().provenance;
+            trace!("reborrow of size 0: reusing {:?} (pointee {})", place.ptr(), place.layout.ty,);
+            log_creation(this, None)?;
+            // Keep original provenance.
+            return interp_ok(new_prov);
         };
-        log_creation(this, Some((alloc_id, base_offset, parent_prov)))?;
+        let new_prov = Provenance::Concrete { alloc_id, tag: new_tag };
 
-        let orig_tag = match parent_prov {
-            ProvenanceExtra::Wildcard => return interp_ok(place.ptr().provenance), // TODO: handle wildcard pointers
-            ProvenanceExtra::Concrete(tag) => tag,
-        };
+        log_creation(this, Some((alloc_id, base_offset, parent_prov)))?;
 
         trace!(
             "reborrow: reference {:?} derived from {:?} (pointee {}): {:?}, size {}",
             new_tag,
-            orig_tag,
+            parent_prov,
             place.layout.ty,
             interpret::Pointer::new(alloc_id, base_offset),
             ptr_size.bytes()
@@ -308,110 +322,61 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             assert_eq!(ptr_size, Size::ZERO); // we did the deref check above, size has to be 0 here
             // There's not actually any bytes here where accesses could even be tracked.
             // Just produce the new provenance, nothing else to do.
-            return interp_ok(Some(Provenance::Concrete { alloc_id, tag: new_tag }));
+            return interp_ok(Some(new_prov));
         }
 
-        let span = this.machine.current_span();
-
-        // Store initial permissions and their corresponding range.
-        let mut perms_map: DedupRangeMap<LocationState> = DedupRangeMap::new(
-            ptr_size,
-            LocationState::new_accessed(Permission::new_disabled(), IdempotentForeignAccess::None), // this will be overwritten
-        );
-        // Keep track of whether the node has any part that allows for interior mutability.
-        // FIXME: This misses `PhantomData<UnsafeCell<T>>` which could be considered a marker
-        // for requesting interior mutability.
-        let mut has_unsafe_cell = false;
-
-        // When adding a new node, the SIFA of its parents needs to be updated, potentially across
-        // the entire memory range. For the parts that are being accessed below, the access itself
-        // trivially takes care of that. However, we have to do some more work to also deal with
-        // the parts that are not being accessed. Specifically what we do is that we
-        // call `update_last_accessed_after_retag` on the SIFA of the permission set for the part of
-        // memory outside `perm_map` -- so that part is definitely taken care of. The remaining concern
-        // is the part of memory that is in the range of `perms_map`, but not accessed below.
-        // There we have two cases:
-        // * If we do have an `UnsafeCell` (`has_unsafe_cell` becomes true), then the non-accessed part
-        //   uses `nonfreeze_perm`, so the `nonfreeze_perm` initialized parts are also fine. We enforce
-        //   the `freeze_perm` parts to be accessed, and thus everything is taken care of.
-        // * If there is no `UnsafeCell`, then `freeze_perm` is used everywhere (both inside and outside the initial range),
-        //   and we update everything to have the `freeze_perm`'s SIFA, so there are no issues. (And this assert below is not
-        //   actually needed in this case).
-        assert!(new_perm.freeze_access);
-
         let protected = new_perm.protector.is_some();
-        let precise_interior_mut = this
-            .machine
-            .borrow_tracker
-            .as_mut()
-            .unwrap()
-            .get_mut()
-            .borrow_tracker_method
-            .get_tree_borrows_params()
-            .precise_interior_mut;
+        let precise_interior_mut = this.get_tree_borrows_params().precise_interior_mut;
 
-        let default_perm = if !precise_interior_mut {
-            // NOTE: Using `ty_is_freeze` doesn't give the same result as going through the range
-            // and computing `has_unsafe_cell`.  This is because of zero-sized `UnsafeCell`, for which
-            // `has_unsafe_cell` is false, but `!ty_is_freeze` is true.
-            let ty_is_freeze = place.layout.ty.is_freeze(*this.tcx, this.typing_env());
-            let (perm, access) = if ty_is_freeze {
-                (new_perm.freeze_perm, new_perm.freeze_access)
-            } else {
-                (new_perm.nonfreeze_perm, new_perm.nonfreeze_access)
-            };
+        // Compute initial "inside" permissions.
+        let loc_state = |frozen: bool| -> LocationState {
+            let perm = if frozen { new_perm.freeze_perm } else { new_perm.nonfreeze_perm };
             let sifa = perm.strongest_idempotent_foreign_access(protected);
-            let new_loc = if access {
+
+            if perm.associated_access().is_some() {
                 LocationState::new_accessed(perm, sifa)
             } else {
                 LocationState::new_non_accessed(perm, sifa)
-            };
-
-            for (_loc_range, loc) in perms_map.iter_mut_all() {
-                *loc = new_loc;
             }
-
-            perm
+        };
+        let inside_perms = if !precise_interior_mut {
+            // For `!Freeze` types, just pretend the entire thing is an `UnsafeCell`.
+            let ty_is_freeze = place.layout.ty.is_freeze(*this.tcx, this.typing_env());
+            DedupRangeMap::new(ptr_size, loc_state(ty_is_freeze))
         } else {
+            // The initial state will be overwritten by the visitor below.
+            let mut perms_map = DedupRangeMap::new(
+                ptr_size,
+                LocationState::new_accessed(
+                    Permission::new_disabled(),
+                    IdempotentForeignAccess::None,
+                ),
+            );
             this.visit_freeze_sensitive(place, ptr_size, |range, frozen| {
-                has_unsafe_cell = has_unsafe_cell || !frozen;
-
-                // We are only ever `Frozen` inside the frozen bits.
-                let (perm, access) = if frozen {
-                    (new_perm.freeze_perm, new_perm.freeze_access)
-                } else {
-                    (new_perm.nonfreeze_perm, new_perm.nonfreeze_access)
-                };
-                let sifa = perm.strongest_idempotent_foreign_access(protected);
-                // NOTE: Currently, `access` is false if and only if `perm` is Cell, so this `if`
-                // doesn't not change whether any code is UB or not. We could just always use
-                // `new_accessed` and everything would stay the same. But that seems conceptually
-                // odd, so we keep the initial "accessed" bit of the `LocationState` in sync with whether
-                // a read access is performed below.
-                let new_loc = if access {
-                    LocationState::new_accessed(perm, sifa)
-                } else {
-                    LocationState::new_non_accessed(perm, sifa)
-                };
-
-                // Store initial permissions.
+                let state = loc_state(frozen);
                 for (_loc_range, loc) in perms_map.iter_mut(range.start, range.size) {
-                    *loc = new_loc;
+                    *loc = state;
                 }
-
                 interp_ok(())
             })?;
-
-            // Allow lazily writing to surrounding data if we found an `UnsafeCell`.
-            if has_unsafe_cell { new_perm.nonfreeze_perm } else { new_perm.freeze_perm }
+            perms_map
         };
 
         let alloc_extra = this.get_alloc_extra(alloc_id)?;
         let mut tree_borrows = alloc_extra.borrow_tracker_tb().borrow_mut();
 
-        for (perm_range, perm) in perms_map.iter_mut_all() {
-            if perm.is_accessed() {
-                // Some reborrows incur a read access to the parent.
+        for (perm_range, loc_state) in inside_perms.iter_all() {
+            if let Some(access) = loc_state.permission().associated_access() {
+                // Some reborrows incur a read/write access to the parent.
+                // As a write also implies a read, a single write is performed instead of a read and a write.
+
+                // writing to an immutable allocation (static variables) is UB, check this here
+                if access == AccessKind::Write
+                    && this.get_alloc_mutability(alloc_id).unwrap().is_not()
+                {
+                    throw_ub!(WriteToReadOnly(alloc_id))
+                }
+
                 // Adjust range to be relative to allocation start (rather than to `place`).
                 let range_in_alloc = AllocRange {
                     start: Size::from_bytes(perm_range.start) + base_offset,
@@ -419,23 +384,36 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 };
 
                 tree_borrows.perform_access(
-                    orig_tag,
-                    Some((range_in_alloc, AccessKind::Read, diagnostics::AccessCause::Reborrow)),
+                    parent_prov,
+                    range_in_alloc,
+                    access,
+                    diagnostics::AccessCause::Reborrow(access),
                     this.machine.borrow_tracker.as_ref().unwrap(),
                     alloc_id,
-                    this.machine.current_span(),
+                    this.machine.current_user_relevant_span(),
                 )?;
 
                 // Also inform the data race model (but only if any bytes are actually affected).
                 if range_in_alloc.size.bytes() > 0 {
                     if let Some(data_race) = alloc_extra.data_race.as_vclocks_ref() {
-                        data_race.read(
-                            alloc_id,
-                            range_in_alloc,
-                            NaReadType::Retag,
-                            Some(place.layout.ty),
-                            &this.machine,
-                        )?
+                        match access {
+                            AccessKind::Read =>
+                                data_race.read_non_atomic(
+                                    alloc_id,
+                                    range_in_alloc,
+                                    NaReadType::Retag,
+                                    Some(place.layout.ty),
+                                    &this.machine,
+                                )?,
+                            AccessKind::Write =>
+                                data_race.write_non_atomic(
+                                    alloc_id,
+                                    range_in_alloc,
+                                    NaWriteType::Retag,
+                                    Some(place.layout.ty),
+                                    &this.machine,
+                                )?,
+                        };
                     }
                 }
             }
@@ -444,16 +422,15 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Record the parent-child pair in the tree.
         tree_borrows.new_child(
             base_offset,
-            orig_tag,
+            parent_prov,
             new_tag,
-            perms_map,
-            default_perm,
+            inside_perms,
+            new_perm.outside_perm,
             protected,
-            span,
+            this.machine.current_user_relevant_span(),
         )?;
-        drop(tree_borrows);
 
-        interp_ok(Some(Provenance::Concrete { alloc_id, tag: new_tag }))
+        interp_ok(Some(new_prov))
     }
 
     fn tb_retag_place(
@@ -488,18 +465,6 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // one must also be `Some`.)
         interp_ok(place.clone().map_provenance(|_| new_prov.unwrap()))
     }
-
-    /// Retags an individual pointer, returning the retagged version.
-    fn tb_retag_reference(
-        &mut self,
-        val: &ImmTy<'tcx>,
-        new_perm: NewPermission,
-    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
-        let this = self.eval_context_mut();
-        let place = this.ref_to_mplace(val)?;
-        let new_place = this.tb_retag_place(&place, new_perm)?;
-        interp_ok(ImmTy::from_immediate(new_place.to_ref(this), val.layout))
-    }
 }
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
@@ -508,125 +473,36 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// raw pointers are never reborrowed.
     fn tb_retag_ptr_value(
         &mut self,
-        kind: RetagKind,
         val: &ImmTy<'tcx>,
-    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
+        ty: Ty<'tcx>,
+        mode: RetagMode,
+    ) -> InterpResult<'tcx, Option<ImmTy<'tcx>>> {
         let this = self.eval_context_mut();
-        let new_perm = match val.layout.ty.kind() {
-            &ty::Ref(_, pointee, mutability) =>
-                NewPermission::from_ref_ty(pointee, mutability, kind, this),
-            _ => None,
+        let new_perm = match *ty.kind() {
+            _ if ty.is_box_global(*this.tcx) => {
+                // The `None` marks this as a Box.
+                NewPermission::new(ty.builtin_deref(true).unwrap(), None, mode, this)
+            }
+            ty::Ref(_, pointee, mutability) =>
+                NewPermission::new(pointee, Some(mutability), mode, this),
+
+            ty::RawPtr(..) => {
+                assert!(mode == RetagMode::Raw);
+                // We don't give new tags to raw pointers.
+                None
+            }
+            _ if ty.is_box() => {
+                // No retagging for boxes with custom allocators.
+                None
+            }
+            _ => panic!("tb_retag_ptr_value: invalid type {ty}"),
         };
         if let Some(new_perm) = new_perm {
-            this.tb_retag_reference(val, new_perm)
+            let place = this.imm_ptr_to_mplace(val)?;
+            let new_place = this.tb_retag_place(&place, new_perm)?;
+            interp_ok(Some(ImmTy::from_immediate(new_place.to_ref(this), val.layout)))
         } else {
-            interp_ok(val.clone())
-        }
-    }
-
-    /// Retag all pointers that are stored in this place.
-    fn tb_retag_place_contents(
-        &mut self,
-        kind: RetagKind,
-        place: &PlaceTy<'tcx>,
-    ) -> InterpResult<'tcx> {
-        let this = self.eval_context_mut();
-        let options = this.machine.borrow_tracker.as_mut().unwrap().get_mut();
-        let retag_fields = options.retag_fields;
-        let mut visitor = RetagVisitor { ecx: this, kind, retag_fields };
-        return visitor.visit_value(place);
-
-        // The actual visitor.
-        struct RetagVisitor<'ecx, 'tcx> {
-            ecx: &'ecx mut MiriInterpCx<'tcx>,
-            kind: RetagKind,
-            retag_fields: RetagFields,
-        }
-        impl<'ecx, 'tcx> RetagVisitor<'ecx, 'tcx> {
-            #[inline(always)] // yes this helps in our benchmarks
-            fn retag_ptr_inplace(
-                &mut self,
-                place: &PlaceTy<'tcx>,
-                new_perm: Option<NewPermission>,
-            ) -> InterpResult<'tcx> {
-                if let Some(new_perm) = new_perm {
-                    let val = self.ecx.read_immediate(&self.ecx.place_to_op(place)?)?;
-                    let val = self.ecx.tb_retag_reference(&val, new_perm)?;
-                    self.ecx.write_immediate(*val, place)?;
-                }
-                interp_ok(())
-            }
-        }
-        impl<'ecx, 'tcx> ValueVisitor<'tcx, MiriMachine<'tcx>> for RetagVisitor<'ecx, 'tcx> {
-            type V = PlaceTy<'tcx>;
-
-            #[inline(always)]
-            fn ecx(&self) -> &MiriInterpCx<'tcx> {
-                self.ecx
-            }
-
-            /// Regardless of how `Unique` is handled, Boxes are always reborrowed.
-            /// When `Unique` is also reborrowed, then it behaves exactly like `Box`
-            /// except for the fact that `Box` has a non-zero-sized reborrow.
-            fn visit_box(&mut self, box_ty: Ty<'tcx>, place: &PlaceTy<'tcx>) -> InterpResult<'tcx> {
-                // Only boxes for the global allocator get any special treatment.
-                if box_ty.is_box_global(*self.ecx.tcx) {
-                    let new_perm =
-                        NewPermission::from_unique_ty(place.layout.ty, self.kind, self.ecx);
-                    self.retag_ptr_inplace(place, new_perm)?;
-                }
-                interp_ok(())
-            }
-
-            fn visit_value(&mut self, place: &PlaceTy<'tcx>) -> InterpResult<'tcx> {
-                // If this place is smaller than a pointer, we know that it can't contain any
-                // pointers we need to retag, so we can stop recursion early.
-                // This optimization is crucial for ZSTs, because they can contain way more fields
-                // than we can ever visit.
-                if place.layout.is_sized() && place.layout.size < self.ecx.pointer_size() {
-                    return interp_ok(());
-                }
-
-                // Check the type of this value to see what to do with it (retag, or recurse).
-                match place.layout.ty.kind() {
-                    &ty::Ref(_, pointee, mutability) => {
-                        let new_perm =
-                            NewPermission::from_ref_ty(pointee, mutability, self.kind, self.ecx);
-                        self.retag_ptr_inplace(place, new_perm)?;
-                    }
-                    ty::RawPtr(_, _) => {
-                        // We definitely do *not* want to recurse into raw pointers -- wide raw
-                        // pointers have fields, and for dyn Trait pointees those can have reference
-                        // type!
-                        // We also do not want to reborrow them.
-                    }
-                    ty::Adt(adt, _) if adt.is_box() => {
-                        // Recurse for boxes, they require some tricky handling and will end up in `visit_box` above.
-                        // (Yes this means we technically also recursively retag the allocator itself
-                        // even if field retagging is not enabled. *shrug*)
-                        self.walk_value(place)?;
-                    }
-                    _ => {
-                        // Not a reference/pointer/box. Only recurse if configured appropriately.
-                        let recurse = match self.retag_fields {
-                            RetagFields::No => false,
-                            RetagFields::Yes => true,
-                            RetagFields::OnlyScalar => {
-                                // Matching `ArgAbi::new` at the time of writing, only fields of
-                                // `Scalar` and `ScalarPair` ABI are considered.
-                                matches!(
-                                    place.layout.backend_repr,
-                                    BackendRepr::Scalar(..) | BackendRepr::ScalarPair(..)
-                                )
-                            }
-                        };
-                        if recurse {
-                            self.walk_value(place)?;
-                        }
-                    }
-                }
-                interp_ok(())
-            }
+            interp_ok(None)
         }
     }
 
@@ -643,14 +519,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // never be ReservedIM, the value of the `ty_is_freeze`
             // argument doesn't matter
             // (`ty_is_freeze || true` in `new_reserved` will always be `true`).
-            freeze_perm: Permission::new_reserved(
-                /* ty_is_freeze */ true, /* protected */ true,
-            ),
-            freeze_access: true,
-            nonfreeze_perm: Permission::new_reserved(
-                /* ty_is_freeze */ false, /* protected */ true,
-            ),
-            nonfreeze_access: true,
+            freeze_perm: Permission::new_reserved_frz(),
+            nonfreeze_perm: Permission::new_reserved_frz(),
+            outside_perm: Permission::new_reserved_frz(),
             protector: Some(ProtectorKind::StrongProtector),
         };
         this.tb_retag_place(place, new_perm)
@@ -671,9 +542,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // uncovers a non-supported `extern static`.
                 let alloc_extra = this.get_alloc_extra(alloc_id)?;
                 trace!("Tree Borrows tag {tag:?} exposed in {alloc_id:?}");
-                alloc_extra.borrow_tracker_tb().borrow_mut().expose_tag(tag);
+
+                let global = this.machine.borrow_tracker.as_ref().unwrap();
+                let protected_tags = &global.borrow().protected_tags;
+                let protected = protected_tags.contains_key(&tag);
+                alloc_extra.borrow_tracker_tb().borrow_mut().expose_tag(tag, protected);
             }
-            AllocKind::Function | AllocKind::VTable | AllocKind::Dead => {
+            AllocKind::Function
+            | AllocKind::VTable
+            | AllocKind::TypeId
+            | AllocKind::Dead
+            | AllocKind::VaList => {
                 // No tree borrows on these allocations.
             }
         }
@@ -701,8 +580,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
         let (tag, alloc_id) = match ptr.provenance {
             Some(Provenance::Concrete { tag, alloc_id }) => (tag, alloc_id),
-            _ => {
-                eprintln!("Can't give the name {name} to Wildcard pointer");
+            Some(Provenance::Wildcard) => {
+                eprintln!("Can't give the name {name} to wildcard pointer");
+                return interp_ok(());
+            }
+            None => {
+                eprintln!("Can't give the name {name} to pointer without provenance");
                 return interp_ok(());
             }
         };

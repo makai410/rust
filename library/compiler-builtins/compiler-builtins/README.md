@@ -10,9 +10,19 @@ to be added as an explicit dependency in `Cargo.toml`.
 
 [`compiler-rt`]: https://github.com/llvm/llvm-project/tree/1b1dc505057322f4fa1110ef4f53c44347f52986/compiler-rt
 
+## Configuration
+
+`compiler-builtins` can be configured with the following environment variables when the `c` feature
+is enabled:
+
+- `LLVM_COMPILER_RT_LIB`
+- `RUST_COMPILER_RT_ROOT`
+
+See `build.rs` for details.
+
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Progress
 
@@ -164,6 +174,15 @@ of being added to Rust.
 - [x] trunctfhf2.c
 - [x] trunctfsf2.c
 
+These builtins involve complex floating-point types that are in the process of
+being added to Rust.
+
+- [x] divdc3.c
+- [x] divsc3.c
+- [x] divtc3.c
+- [x] muldc3.c
+- [x] mulsc3.c
+- [x] multc3.c
 
 These builtins are used by the Hexagon DSP
 
@@ -213,6 +232,12 @@ by Rust.
 - ~~i386/floatundixf.S~~
 - ~~x86_64/floatdixf.c~~
 - ~~x86_64/floatundixf.S~~
+- ~~powixf2.c~~
+
+These builtins are for complex X87 `f80` floating-point numbers.
+
+- ~~divxc3.c~~
+- ~~mulxc3.c~~
 
 These builtins are for IBM "extended double" non-IEEE 128-bit floating-point
 numbers.
@@ -237,19 +262,6 @@ supported by Rust.
 - ~~truncdfbf2.c~~
 - ~~truncsfbf2.c~~
 - ~~trunctfxf2.c~~
-
-These builtins involve complex floating-point types that are not supported by
-Rust.
-
-- ~~divdc3.c~~
-- ~~divsc3.c~~
-- ~~divtc3.c~~
-- ~~divxc3.c~~
-- ~~muldc3.c~~
-- ~~mulsc3.c~~
-- ~~multc3.c~~
-- ~~mulxc3.c~~
-- ~~powixf2.c~~
 
 These builtins are never called by LLVM.
 
@@ -364,7 +376,7 @@ Miscellaneous functionality that is not used by Rust.
 - ~~i386/fp_mode.c~~
 - ~~int_util.c~~
 - ~~loongarch/fp_mode.c~~
-- ~~os_version_check.c~~
+- ~~os_version_check.c~~ (implemented in `std` instead)
 - ~~riscv/fp_mode.c~~
 - ~~riscv/restore.S~~ (callee-saved registers)
 - ~~riscv/save.S~~ (callee-saved registers)

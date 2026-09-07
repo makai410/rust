@@ -1,7 +1,7 @@
-#![warn(clippy::result_map_unit_fn)]
-#![feature(never_type)]
-#![allow(unused, clippy::unnecessary_map_on_constructor)]
 //@no-rustfix
+#![warn(clippy::result_map_unit_fn)]
+#![expect(clippy::unnecessary_map_on_constructor)]
+
 struct HasResult {
     field: Result<usize, usize>,
 }

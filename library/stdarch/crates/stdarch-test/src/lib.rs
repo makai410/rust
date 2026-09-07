@@ -6,28 +6,22 @@
 #![deny(rust_2018_idioms)]
 #![allow(clippy::missing_docs_in_private_items, clippy::print_stdout)]
 
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate cfg_if;
-
 pub use assert_instr_macro::*;
 pub use simd_test_macro::*;
-use std::{cmp, collections::HashSet, env, hash, hint::black_box, str};
+use std::{cmp, collections::HashSet, env, hash, hint::black_box, str, sync::LazyLock};
 
-cfg_if! {
-    if #[cfg(target_arch = "wasm32")] {
+cfg_select! {
+    target_arch = "wasm32" => {
         pub mod wasm;
         use wasm::disassemble_myself;
-    } else {
+    }
+    _ => {
         mod disassembly;
         use crate::disassembly::disassemble_myself;
     }
 }
 
-lazy_static! {
-    static ref DISASSEMBLY: HashSet<Function> = disassemble_myself();
-}
+static DISASSEMBLY: LazyLock<HashSet<Function>> = LazyLock::new(disassemble_myself);
 
 #[derive(Debug)]
 struct Function {
@@ -65,11 +59,12 @@ pub fn assert(shim_addr: usize, fnname: &str, expected: &str) {
     black_box(shim_addr);
 
     //eprintln!("shim name: {fnname}");
-    let function = &DISASSEMBLY
-        .get(&Function::new(fnname))
-        .unwrap_or_else(|| panic!("function \"{fnname}\" not found in the disassembly"));
+    let Some(function) = &DISASSEMBLY.get(&Function::new(fnname)) else {
+        panic!("function `{fnname}` not found in the disassembly")
+    };
     //eprintln!("  function: {:?}", function);
 
+    // Trim any filler instructions.
     let mut instrs = &function.instrs[..];
     while instrs.last().is_some_and(|s| s == "nop" || s == "int3") {
         instrs = &instrs[..instrs.len() - 1];
@@ -84,12 +79,26 @@ pub fn assert(shim_addr: usize, fnname: &str, expected: &str) {
     // 2. It is a mark, indicating that the instruction will be
     // compiled into other instructions - mainly because of llvm
     // optimization.
-    let expected = if expected == "unknown" {
-        "<unknown>" // Workaround for rust-lang/stdarch#1674, todo: remove when the issue is fixed
-    } else {
-        expected
+    let expected = match expected {
+        // `<unknown>` is what LLVM will generate for unknown instructions. We use this to fail
+        // loudly when LLVM does start supporting these instructions.
+        //
+        // This was introduced in https://github.com/rust-lang/stdarch/pull/1674 to work around the
+        // RISC-V P extension not yet being supported.
+        "unknown" => "<unknown>",
+        _ => expected,
     };
-    let found = expected == "nop" || instrs.iter().any(|s| s.starts_with(expected));
+
+    // Check whether the given instruction is part of the disassemblied body.
+    let found = expected == "nop"
+        || instrs.iter().any(|instruction| {
+            instruction.starts_with(expected)
+            // Check that the next character is non-alphanumeric. This prevents false negatives
+            // when e.g. `fminnm` was used but `fmin` was expected.
+            //
+            // TODO: resolve the conflicts (x86_64 and aarch64 have a bunch, probably others)
+            // && !instruction[expected.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
+        });
 
     // Look for subroutine call instructions in the disassembly to detect whether
     // inlining failed: all intrinsics are `#[inline(always)]`, so calling one
@@ -160,6 +169,10 @@ pub fn assert(shim_addr: usize, fnname: &str, expected: &str) {
                 // core_arch/src/arm_shared/simd32
                 // vst1q_p64_x4_nop : #instructions = 33 >= 22 (limit)
                 "nop" if fnname.contains("vst1q_p64") => 34,
+
+                // AMX intrinsics generate a lot of move instructions to load/store the tile registers
+                // due to Rust ABI
+                _ if fnname.contains("___tile") => 165,
 
                 // Original limit was 20 instructions, but ARM DSP Intrinsics
                 // are exactly 20 instructions long. So, bump the limit to 22

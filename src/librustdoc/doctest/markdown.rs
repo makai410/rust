@@ -3,15 +3,19 @@
 use std::fs::read_to_string;
 use std::sync::{Arc, Mutex};
 
+use rustc_errors::DiagCtxtHandle;
 use rustc_session::config::Input;
-use rustc_span::{DUMMY_SP, FileName};
+use rustc_span::source_map::FilePathMapping;
+use rustc_span::{DUMMY_SP, FileName, RealFileName};
 use tempfile::tempdir;
 
 use super::{
     CreateRunnableDocTests, DocTestVisitor, GlobalTestOptions, ScrapedDocTest, generate_args_file,
 };
 use crate::config::Options;
-use crate::html::markdown::{ErrorCodes, LangString, MdRelLine, find_testable_code};
+use crate::html::markdown::{
+    CodeLineMapping, ErrorCodes, LangString, MdRelLine, find_testable_code,
+};
 
 struct MdCollector {
     tests: Vec<ScrapedDocTest>,
@@ -20,7 +24,13 @@ struct MdCollector {
 }
 
 impl DocTestVisitor for MdCollector {
-    fn visit_test(&mut self, test: String, config: LangString, rel_line: MdRelLine) {
+    fn visit_test(
+        &mut self,
+        test: String,
+        config: LangString,
+        rel_line: MdRelLine,
+        code_mappings: Vec<CodeLineMapping>,
+    ) {
         let filename = self.filename.clone();
         // First line of Markdown is line 1.
         let line = 1 + rel_line.offset();
@@ -31,6 +41,7 @@ impl DocTestVisitor for MdCollector {
             config,
             test,
             DUMMY_SP,
+            code_mappings,
             Vec::new(),
         ));
     }
@@ -78,7 +89,7 @@ impl DocTestVisitor for MdCollector {
 }
 
 /// Runs any tests/code examples in the markdown file `options.input`.
-pub(crate) fn test(input: &Input, options: Options) -> Result<(), String> {
+pub(crate) fn test(input: &Input, options: Options, dcx: DiagCtxtHandle<'_>) -> Result<(), String> {
     let input_str = match input {
         Input::File(path) => {
             read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?
@@ -105,8 +116,12 @@ pub(crate) fn test(input: &Input, options: Options) -> Result<(), String> {
         cur_path: vec![],
         filename: input
             .opt_path()
-            .map(ToOwned::to_owned)
-            .map(FileName::from)
+            .map(|f| {
+                // We don't have access to a rustc Session so let's just use a dummy
+                // filepath mapping to create a real filename.
+                let file_mapping = FilePathMapping::empty();
+                FileName::Real(file_mapping.to_real_filename(&RealFileName::empty(), f))
+            })
             .unwrap_or(FileName::Custom("input".to_owned())),
     };
     let codes = ErrorCodes::from(options.unstable_features.is_nightly_build());
@@ -118,6 +133,7 @@ pub(crate) fn test(input: &Input, options: Options) -> Result<(), String> {
     let CreateRunnableDocTests { opts, rustdoc_options, standalone_tests, mergeable_tests, .. } =
         collector;
     crate::doctest::run_tests(
+        dcx,
         opts,
         &rustdoc_options,
         &Arc::new(Mutex::new(Vec::new())),

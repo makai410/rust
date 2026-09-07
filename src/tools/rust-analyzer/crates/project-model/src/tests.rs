@@ -9,7 +9,6 @@ use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 use rustc_hash::FxHashMap;
 use serde::de::DeserializeOwned;
 use span::FileId;
-use triomphe::Arc;
 
 use crate::{
     CargoWorkspace, CfgOverrides, ManifestPath, ProjectJson, ProjectJsonData, ProjectWorkspace,
@@ -47,7 +46,7 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
         sysroot: Sysroot::empty(),
         rustc_cfg: Vec::new(),
         toolchain: None,
-        target_layout: Err("target_data_layout not loaded".into()),
+        target: Err("target_data_layout not loaded".into()),
         extra_includes: Vec::new(),
         set_test: true,
     }
@@ -62,7 +61,7 @@ fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
         sysroot,
         rustc_cfg: Vec::new(),
         toolchain: None,
-        target_layout: Err(Arc::from("test has no data layout")),
+        target: Err("test has no target data".into()),
         cfg_overrides: Default::default(),
         extra_includes: Vec::new(),
         set_test: true,
@@ -194,9 +193,24 @@ fn rust_project_hello_world_project_model() {
 }
 
 #[test]
+fn rust_project_labeled_project_model() {
+    // This just needs to parse.
+    _ = load_rust_project("labeled-project.json");
+}
+
+#[test]
 fn rust_project_cfg_groups() {
     let (crate_graph, _proc_macros) = load_rust_project("cfg-groups.json");
     check_crate_graph(crate_graph, expect_file!["../test_data/output/rust_project_cfg_groups.txt"]);
+}
+
+#[test]
+fn rust_project_crate_attrs() {
+    let (crate_graph, _proc_macros) = load_rust_project("crate-attrs.json");
+    check_crate_graph(
+        crate_graph,
+        expect_file!["../test_data/output/rust_project_crate_attrs.txt"],
+    );
 }
 
 #[test]
@@ -240,12 +254,12 @@ fn smoke_test_real_sysroot_cargo() {
     let cwd = AbsPathBuf::assert_utf8(temp_dir().join("smoke_test_real_sysroot_cargo"));
     std::fs::create_dir_all(&cwd).unwrap();
     let loaded_sysroot =
-        sysroot.load_workspace(&RustSourceWorkspaceConfig::default_cargo(), false, &cwd, &|_| ());
+        sysroot.load_workspace(&RustSourceWorkspaceConfig::default_cargo(), false, &|_| ());
     if let Some(loaded_sysroot) = loaded_sysroot {
         sysroot.set_workspace(loaded_sysroot);
     }
     assert!(
-        matches!(sysroot.workspace(), RustLibSrcWorkspace::Workspace(_)),
+        matches!(sysroot.workspace(), RustLibSrcWorkspace::Workspace { .. }),
         "got {}",
         sysroot.workspace()
     );
@@ -260,7 +274,7 @@ fn smoke_test_real_sysroot_cargo() {
         rustc_cfg: Vec::new(),
         cfg_overrides: Default::default(),
         toolchain: None,
-        target_layout: Err("target_data_layout not loaded".into()),
+        target: Err("target_data_layout not loaded".into()),
         extra_includes: Vec::new(),
         set_test: true,
     };

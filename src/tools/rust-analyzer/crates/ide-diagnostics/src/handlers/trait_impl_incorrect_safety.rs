@@ -7,7 +7,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Severity, adjusted_d
 //
 // Diagnoses incorrect safety annotations of trait impls.
 pub(crate) fn trait_impl_incorrect_safety(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TraitImplIncorrectSafety,
 ) -> Diagnostic {
     Diagnostic::new(
@@ -64,6 +64,7 @@ unsafe trait Unsafe {}
     fn drop_may_dangle() {
         check_diagnostics(
             r#"
+#![feature(lang_items)]
 #[lang = "drop"]
 trait Drop {}
 struct S<T>;
@@ -125,6 +126,15 @@ struct S;
   unsafe impl S {}
 //^^^^^^^^^^^ error: unsafe impl for safe trait
 "#,
+        );
+    }
+
+    #[test]
+    fn unsafe_unresolved_trait() {
+        check_diagnostics(
+            r#"
+unsafe impl TestTrait for u32 {}
+        "#,
         );
     }
 }

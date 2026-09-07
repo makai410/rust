@@ -44,7 +44,7 @@ impl SleepData {
 /// jobs are published, and it either blocks threads or wakes them in response to these
 /// events. See the [`README.md`] in this module for more details.
 ///
-/// [`README.md`] README.md
+/// [`README.md`]: README.md
 pub(super) struct Sleep {
     /// One "sleep state" per worker. Used to track if a worker is sleeping and to have
     /// them block.
@@ -106,7 +106,6 @@ impl Sleep {
         let mut data = self.data.lock().unwrap();
         debug_assert!(data.active_threads > 0);
         debug_assert!(data.blocked_threads < data.worker_count);
-        debug_assert!(data.active_threads > 0);
         data.active_threads -= 1;
         data.blocked_threads += 1;
 

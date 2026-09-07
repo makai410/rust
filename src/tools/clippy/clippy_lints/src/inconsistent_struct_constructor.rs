@@ -5,9 +5,8 @@ use clippy_utils::source::snippet;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::Applicability;
 use rustc_hir::{self as hir, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 use rustc_span::symbol::Symbol;
 
@@ -64,6 +63,10 @@ declare_clippy_lint! {
     "the order of the field init is inconsistent with the order in the struct definition"
 }
 
+impl_lint_pass!(InconsistentStructConstructor => [
+    INCONSISTENT_STRUCT_CONSTRUCTOR,
+]);
+
 pub struct InconsistentStructConstructor {
     check_inconsistent_struct_field_initializers: bool,
 }
@@ -75,8 +78,6 @@ impl InconsistentStructConstructor {
         }
     }
 }
-
-impl_lint_pass!(InconsistentStructConstructor => [INCONSISTENT_STRUCT_CONSTRUCTOR]);
 
 impl<'tcx> LateLintPass<'tcx> for InconsistentStructConstructor {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'_>) {

@@ -60,7 +60,11 @@ pub(crate) fn write_struct_like<'tcx>(
             {
                 variant.name.to_string()
             } else {
-                format!("{}::{}", tcx.def_path_str(adt_def.did()), variant.name)
+                ty::print::with_types_for_suggestion!(format!(
+                    "{}::{}",
+                    tcx.def_path_str(adt_def.did()),
+                    variant.name
+                ))
             };
             Some((variant, name))
         }
@@ -101,23 +105,11 @@ pub(crate) fn write_struct_like<'tcx>(
     let num_fields = variant_and_name.as_ref().map_or(subpatterns.len(), |(v, _)| v.fields.len());
     if num_fields != 0 || variant_and_name.is_none() {
         write!(f, "(")?;
-        for i in 0..num_fields {
-            write!(f, "{}", start_or_comma())?;
-
-            // Common case: the field is where we expect it.
-            if let Some(p) = subpatterns.get(i) {
-                if p.field.index() == i {
-                    write!(f, "{}", p.pattern)?;
-                    continue;
-                }
-            }
-
-            // Otherwise, we have to go looking for it.
-            if let Some(p) = subpatterns.iter().find(|p| p.field.index() == i) {
-                write!(f, "{}", p.pattern)?;
-            } else {
-                write!(f, "_")?;
-            }
+        for FieldPat { pattern, .. } in subpatterns {
+            write!(f, "{}{pattern}", start_or_comma())?;
+        }
+        if matches!(ty.kind(), ty::Tuple(..)) && num_fields == 1 {
+            write!(f, ",")?;
         }
         write!(f, ")")?;
     }

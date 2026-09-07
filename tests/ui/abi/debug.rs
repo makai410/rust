@@ -1,17 +1,21 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ normalize-stderr: "(abi|pref|unadjusted_abi_align): Align\([1-8] bytes\)" -> "$1: $$SOME_ALIGN"
 //@ normalize-stderr: "randomization_seed: \d+" -> "randomization_seed: $$SEED"
 //@ normalize-stderr: "(size): Size\([48] bytes\)" -> "$1: $$SOME_SIZE"
 //@ normalize-stderr: "(can_unwind): (true|false)" -> "$1: $$SOME_BOOL"
-//@ normalize-stderr: "(valid_range): 0\.\.=(4294967295|18446744073709551615)" -> "$1: $$FULL"
+//@ normalize-stderr: "(pointer is|valid_range:) 0\.\.=(4294967295|18446744073709551615)" -> "$1 $$FULL"
 // This pattern is prepared for when we account for alignment in the niche.
-//@ normalize-stderr: "(valid_range): [1-9]\.\.=(429496729[0-9]|1844674407370955161[0-9])" -> "$1: $$NON_NULL"
+//@ normalize-stderr: "(pointer is|valid_range:) [1-9]\.\.=(429496729[0-9]|1844674407370955161[0-9])" -> "$1 $$NON_NULL"
 // Some attributes are only computed for release builds:
 //@ compile-flags: -O
-//@ revisions: generic riscv64
+//@ revisions: generic riscv64 loongarch64
 //@ [riscv64] compile-flags: --target riscv64gc-unknown-linux-gnu
 //@ [riscv64] needs-llvm-components: riscv
+//@ [loongarch64] compile-flags: --target loongarch64-unknown-linux-gnu
+//@ [loongarch64] needs-llvm-components: loongarch
 //@ [generic] ignore-riscv64
+//@ [generic] ignore-loongarch64
+//@ ignore-backends: gcc
 #![feature(rustc_attrs)]
 #![crate_type = "lib"]
 #![feature(no_core)]
@@ -35,12 +39,12 @@ type TestFnPtr = fn(bool) -> u8; //~ ERROR: fn_abi
 #[rustc_abi(debug)]
 fn test_generic<T>(_x: *const T) {} //~ ERROR: fn_abi
 
-#[rustc_abi(debug)]
-const C: () = (); //~ ERROR: can only be applied to
+#[rustc_abi(debug)] //~ ERROR: the `rustc_abi` attribute cannot be used on constants
+const C: () = (); //~ ERROR: the `rustc_abi` attribute can only be applied to
 
 impl S {
-    #[rustc_abi(debug)]
-    const C: () = (); //~ ERROR: can only be applied to
+    #[rustc_abi(debug)] //~ ERROR: the `rustc_abi` attribute cannot be used on assoc
+    const C: () = (); //~ ERROR: the `rustc_abi` attribute can only be applied to
 }
 
 impl S {
@@ -67,5 +71,5 @@ type TestAbiNeSign = (fn(i32), fn(u32)); //~ ERROR: ABIs are not compatible
 #[rustc_abi(assert_eq)]
 type TestAbiEqNonsense = (fn((str, str)), fn((str, str))); //~ ERROR: cannot be known at compilation time
 
-#[rustc_abi("assert_eq")] //~ ERROR unrecognized argument
+#[rustc_abi("assert_eq")] //~ ERROR malformed `rustc_abi` attribute input
 type Bad = u32;

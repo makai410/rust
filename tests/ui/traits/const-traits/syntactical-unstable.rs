@@ -9,8 +9,7 @@ use std::ops::Deref;
 extern crate staged_api;
 use staged_api::MyTrait;
 
-#[const_trait]
-trait Foo: [const] MyTrait {
+const trait Foo: [const] MyTrait {
     //~^ ERROR use of unstable const library feature `unstable`
     type Item: [const] MyTrait;
     //~^ ERROR use of unstable const library feature `unstable`
@@ -26,7 +25,7 @@ const fn rpit() -> impl [const] MyTrait { Local }
 //~^ ERROR use of unstable const library feature `unstable`
 
 struct Local;
-impl const MyTrait for Local {
+const impl MyTrait for Local {
 //~^ ERROR use of unstable const library feature `unstable`
     fn func() {}
 }

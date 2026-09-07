@@ -7,6 +7,8 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+#[cfg(not(no_global_oom_handling))]
+use core::clone::TrivialClone;
 use core::cmp::{self, Ordering};
 use core::hash::{Hash, Hasher};
 use core::iter::{ByRefSized, repeat_n, repeat_with};
@@ -32,6 +34,11 @@ pub use self::drain::Drain;
 
 mod drain;
 
+#[unstable(feature = "vec_deque_extract_if", issue = "147750")]
+pub use self::extract_if::ExtractIf;
+
+mod extract_if;
+
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::iter_mut::IterMut;
 
@@ -47,13 +54,20 @@ pub use self::iter::Iter;
 
 mod iter;
 
-use self::spec_extend::SpecExtend;
+use self::spec_extend::{SpecExtend, SpecExtendFront};
 
 mod spec_extend;
 
 use self::spec_from_iter::SpecFromIter;
 
 mod spec_from_iter;
+
+#[cfg(not(no_global_oom_handling))]
+#[unstable(feature = "deque_extend_front", issue = "146975")]
+pub use self::splice::Splice;
+
+#[cfg(not(no_global_oom_handling))]
+mod splice;
 
 #[cfg(test)]
 mod tests;
@@ -93,7 +107,7 @@ pub struct VecDeque<
 > {
     // `self[0]`, if it exists, is `buf[head]`.
     // `head < buf.capacity()`, unless `buf.capacity() == 0` when `head == 0`.
-    head: usize,
+    head: WrappedIndex,
     // the number of initialized elements, starting from the one at `head` and potentially wrapping around.
     // if `len == 0`, the exact value of `head` is unimportant.
     // if `T` is zero-Sized, then `self.len <= usize::MAX`, otherwise `self.len <= isize::MAX as usize`.
@@ -103,7 +117,6 @@ pub struct VecDeque<
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Clone, A: Allocator + Clone> Clone for VecDeque<T, A> {
-    #[track_caller]
     fn clone(&self) -> Self {
         let mut deq = Self::with_capacity_in(self.len(), self.allocator().clone());
         deq.extend(self.iter().cloned());
@@ -114,29 +127,30 @@ impl<T: Clone, A: Allocator + Clone> Clone for VecDeque<T, A> {
     ///
     /// This method is preferred over simply assigning `source.clone()` to `self`,
     /// as it avoids reallocation if possible.
-    #[track_caller]
     fn clone_from(&mut self, source: &Self) {
         self.clear();
         self.extend(source.iter().cloned());
     }
 }
 
+/// Runs the destructor for all items in the slice when it gets dropped (normally or
+/// during unwinding).
+struct Dropper<'a, T>(&'a mut [T]);
+
+impl<T> Drop for Dropper<'_, T> {
+    fn drop(&mut self) {
+        // ignore-tidy-undocumented-unsafe
+        unsafe {
+            ptr::drop_in_place(self.0);
+        }
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 unsafe impl<#[may_dangle] T, A: Allocator> Drop for VecDeque<T, A> {
     fn drop(&mut self) {
-        /// Runs the destructor for all items in the slice when it gets dropped (normally or
-        /// during unwinding).
-        struct Dropper<'a, T>(&'a mut [T]);
-
-        impl<'a, T> Drop for Dropper<'a, T> {
-            fn drop(&mut self) {
-                unsafe {
-                    ptr::drop_in_place(self.0);
-                }
-            }
-        }
-
         let (front, back) = self.as_mut_slices();
+        // ignore-tidy-undocumented-unsafe
         unsafe {
             let _back_dropper = Dropper(back);
             // use drop for [T]
@@ -171,22 +185,44 @@ impl<T, A: Allocator> VecDeque<T, A> {
     unsafe fn push_unchecked(&mut self, element: T) {
         // SAFETY: Because of the precondition, it's guaranteed that there is space
         // in the logical array after the last element.
-        unsafe { self.buffer_write(self.to_physical_idx(self.len), element) };
+        unsafe { self.buffer_write(self.to_wrapped_index(self.len), element) };
+        // This can't overflow because `deque.len() < deque.capacity() <= usize::MAX`.
+        self.len += 1;
+    }
+
+    /// Prepends an element to the buffer.
+    ///
+    /// # Safety
+    ///
+    /// May only be called if `deque.len() < deque.capacity()`
+    #[inline]
+    unsafe fn push_front_unchecked(&mut self, element: T) {
+        self.head = self.wrap_sub(self.head, 1);
+        // SAFETY: Because of the precondition, it's guaranteed that there is space
+        // in the logical array before the first element (where self.head is now).
+        unsafe { self.buffer_write(self.head, element) };
         // This can't overflow because `deque.len() < deque.capacity() <= usize::MAX`.
         self.len += 1;
     }
 
     /// Moves an element out of the buffer
     #[inline]
-    unsafe fn buffer_read(&mut self, off: usize) -> T {
-        unsafe { ptr::read(self.ptr().add(off)) }
+    unsafe fn buffer_read(&mut self, off: WrappedIndex) -> T {
+        // SAFETY: Upheld by caller.
+        unsafe { ptr::read(self.ptr().add(off.as_index())) }
     }
 
-    /// Writes an element into the buffer, moving it.
+    /// Writes an element into the buffer, moving it and returning a pointer to it.
+    /// # Safety
+    ///
+    /// May only be called if `off < self.capacity()`.
     #[inline]
-    unsafe fn buffer_write(&mut self, off: usize, value: T) {
+    unsafe fn buffer_write(&mut self, off: WrappedIndex, value: T) -> &mut T {
+        // SAFETY: Upheld by caller.
         unsafe {
-            ptr::write(self.ptr().add(off), value);
+            let ptr = self.ptr().add(off.as_index());
+            ptr::write(ptr, value);
+            &mut *ptr
         }
     }
 
@@ -194,9 +230,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// `range` must lie inside `0..self.capacity()`.
     #[inline]
     unsafe fn buffer_range(&self, range: Range<usize>) -> *mut [T] {
-        unsafe {
-            ptr::slice_from_raw_parts_mut(self.ptr().add(range.start), range.end - range.start)
-        }
+        // SAFETY: Upheld by caller.
+        unsafe { self.ptr().add(range.start).cast_slice(range.end - range.start) }
     }
 
     /// Returns `true` if the buffer is at full capacity.
@@ -208,49 +243,126 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// Returns the index in the underlying buffer for a given logical element
     /// index + addend.
     #[inline]
-    fn wrap_add(&self, idx: usize, addend: usize) -> usize {
-        wrap_index(idx.wrapping_add(addend), self.capacity())
+    fn wrap_add(&self, idx: WrappedIndex, addend: usize) -> WrappedIndex {
+        wrap_index(idx.as_index().wrapping_add(addend), self.capacity())
     }
 
     #[inline]
-    fn to_physical_idx(&self, idx: usize) -> usize {
+    fn to_wrapped_index(&self, idx: usize) -> WrappedIndex {
         self.wrap_add(self.head, idx)
     }
 
     /// Returns the index in the underlying buffer for a given logical element
     /// index - subtrahend.
     #[inline]
-    fn wrap_sub(&self, idx: usize, subtrahend: usize) -> usize {
-        wrap_index(idx.wrapping_sub(subtrahend).wrapping_add(self.capacity()), self.capacity())
+    fn wrap_sub(&self, idx: WrappedIndex, subtrahend: usize) -> WrappedIndex {
+        wrap_index(
+            idx.as_index().wrapping_sub(subtrahend).wrapping_add(self.capacity()),
+            self.capacity(),
+        )
     }
 
-    /// Copies a contiguous block of memory len long from src to dst
-    #[inline]
-    unsafe fn copy(&mut self, src: usize, dst: usize, len: usize) {
+    /// Get source, destination and count (like the arguments to [`ptr::copy_nonoverlapping`])
+    /// for copying `count` values from index `src` to index `dst`.
+    /// One of the ranges can wrap around the physical buffer, for this reason 2 triples are returned.
+    ///
+    /// Use of the word "ranges" specifically refers to `src..src + count` and `dst..dst + count`.
+    ///
+    /// # Safety
+    ///
+    /// - Ranges must not overlap: `src.abs_diff(dst) >= count`.
+    /// - Ranges must be in bounds of the logical buffer: `src + count <= self.capacity()` and `dst + count <= self.capacity()`.
+    /// - `head` must be in bounds: `head < self.capacity()`, unless `self.capacity() == 0`, in which case `head == 0`.
+    #[cfg(not(no_global_oom_handling))]
+    unsafe fn nonoverlapping_ranges(
+        &mut self,
+        src: usize,
+        dst: usize,
+        count: usize,
+        head: WrappedIndex,
+    ) -> [(*const T, *mut T, usize); 2] {
+        // "`src` and `dst` must be at least as far apart as `count`"
         debug_assert!(
-            dst + len <= self.capacity(),
-            "cpy dst={} src={} len={} cap={}",
-            dst,
-            src,
-            len,
-            self.capacity()
+            src.abs_diff(dst) >= count,
+            "`src` and `dst` must not overlap. src={src} dst={dst} count={count}",
         );
         debug_assert!(
-            src + len <= self.capacity(),
-            "cpy dst={} src={} len={} cap={}",
-            dst,
-            src,
-            len,
-            self.capacity()
+            src.max(dst) + count <= self.capacity(),
+            "ranges must be in bounds. src={src} dst={dst} count={count} cap={}",
+            self.capacity(),
         );
+
+        let wrapped_src = self.wrap_add(head, src);
+        let wrapped_dst = self.wrap_add(head, dst);
+
+        let room_after_src = self.capacity() - wrapped_src.as_index();
+        let room_after_dst = self.capacity() - wrapped_dst.as_index();
+
+        let src_wraps = room_after_src < count;
+        let dst_wraps = room_after_dst < count;
+
+        // Wrapping occurs if `capacity` is contained within `wrapped_src..wrapped_src + count` or `wrapped_dst..wrapped_dst + count`.
+        // Since these two ranges must not overlap as per the safety invariants of this function, only one range can wrap.
+        debug_assert!(
+            !(src_wraps && dst_wraps),
+            "BUG: at most one of src and dst can wrap. src={src} dst={dst} count={count} cap={}",
+            self.capacity(),
+        );
+
+        // ignore-tidy-undocumented-unsafe
         unsafe {
-            ptr::copy(self.ptr().add(src), self.ptr().add(dst), len);
+            let ptr = self.ptr();
+            let src_ptr = ptr.add(wrapped_src.as_index());
+            let dst_ptr = ptr.add(wrapped_dst.as_index());
+
+            if src_wraps {
+                [
+                    (src_ptr, dst_ptr, room_after_src),
+                    (ptr, dst_ptr.add(room_after_src), count - room_after_src),
+                ]
+            } else if dst_wraps {
+                [
+                    (src_ptr, dst_ptr, room_after_dst),
+                    (src_ptr.add(room_after_dst), ptr, count - room_after_dst),
+                ]
+            } else {
+                [
+                    (src_ptr, dst_ptr, count),
+                    // null pointers are fine as long as the count is 0
+                    (ptr::null(), ptr::null_mut(), 0),
+                ]
+            }
         }
     }
 
     /// Copies a contiguous block of memory len long from src to dst
     #[inline]
-    unsafe fn copy_nonoverlapping(&mut self, src: usize, dst: usize, len: usize) {
+    unsafe fn copy(&mut self, src: WrappedIndex, dst: WrappedIndex, len: usize) {
+        debug_assert!(
+            dst + len <= self.capacity(),
+            "cpy dst={} src={} len={} cap={}",
+            dst,
+            src,
+            len,
+            self.capacity()
+        );
+        debug_assert!(
+            src + len <= self.capacity(),
+            "cpy dst={} src={} len={} cap={}",
+            dst,
+            src,
+            len,
+            self.capacity()
+        );
+        // SAFETY: Upheld by caller.
+        unsafe {
+            ptr::copy(self.ptr().add(src.as_index()), self.ptr().add(dst.as_index()), len);
+        }
+    }
+
+    /// Copies a contiguous block of memory len long from src to dst
+    #[inline]
+    unsafe fn copy_nonoverlapping(&mut self, src: WrappedIndex, dst: WrappedIndex, len: usize) {
         debug_assert!(
             dst + len <= self.capacity(),
             "cno dst={} src={} len={} cap={}",
@@ -267,15 +379,20 @@ impl<T, A: Allocator> VecDeque<T, A> {
             len,
             self.capacity()
         );
+        // SAFETY: Upheld by caller.
         unsafe {
-            ptr::copy_nonoverlapping(self.ptr().add(src), self.ptr().add(dst), len);
+            ptr::copy_nonoverlapping(
+                self.ptr().add(src.as_index()),
+                self.ptr().add(dst.as_index()),
+                len,
+            );
         }
     }
 
     /// Copies a potentially wrapping block of memory len long from src to dest.
     /// (abs(dst - src) + len) must be no larger than capacity() (There must be at
     /// most one continuous overlapping region between src and dest).
-    unsafe fn wrap_copy(&mut self, src: usize, dst: usize, len: usize) {
+    unsafe fn wrap_copy(&mut self, src: WrappedIndex, dst: WrappedIndex, len: usize) {
         debug_assert!(
             cmp::min(src.abs_diff(dst), self.capacity() - src.abs_diff(dst)) + len
                 <= self.capacity(),
@@ -291,10 +408,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
             return;
         }
 
-        let dst_after_src = self.wrap_sub(dst, src) < len;
+        let dst_after_src = self.wrap_sub(dst, src.as_index()) < len;
 
-        let src_pre_wrap_len = self.capacity() - src;
-        let dst_pre_wrap_len = self.capacity() - dst;
+        let src_pre_wrap_len = self.capacity() - src.as_index();
+        let dst_pre_wrap_len = self.capacity() - dst.as_index();
         let src_wraps = src_pre_wrap_len < len;
         let dst_wraps = dst_pre_wrap_len < len;
 
@@ -307,6 +424,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 // 2 [_ _ A A A A B B _]
                 //            D . . .
                 //
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
                     self.copy(src, dst, len);
                 }
@@ -320,9 +438,14 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 // 3 [B B B B _ _ _ A A]
                 //    . .           D .
                 //
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
                     self.copy(src, dst, dst_pre_wrap_len);
-                    self.copy(src + dst_pre_wrap_len, 0, len - dst_pre_wrap_len);
+                    self.copy(
+                        src.add(dst_pre_wrap_len),
+                        WrappedIndex::zero(),
+                        len - dst_pre_wrap_len,
+                    );
                 }
             }
             (true, false, true) => {
@@ -334,8 +457,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 // 3 [B B _ _ _ A A A A]
                 //    . .           D .
                 //
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
-                    self.copy(src + dst_pre_wrap_len, 0, len - dst_pre_wrap_len);
+                    self.copy(
+                        src.add(dst_pre_wrap_len),
+                        WrappedIndex::zero(),
+                        len - dst_pre_wrap_len,
+                    );
                     self.copy(src, dst, dst_pre_wrap_len);
                 }
             }
@@ -348,9 +476,14 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 // 3 [C C _ _ _ B B C C]
                 //              D . . .
                 //
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
                     self.copy(src, dst, src_pre_wrap_len);
-                    self.copy(0, dst + src_pre_wrap_len, len - src_pre_wrap_len);
+                    self.copy(
+                        WrappedIndex::zero(),
+                        dst.add(src_pre_wrap_len),
+                        len - src_pre_wrap_len,
+                    );
                 }
             }
             (true, true, false) => {
@@ -362,8 +495,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 // 3 [C C A A _ _ _ C C]
                 //    D . . .
                 //
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
-                    self.copy(0, dst + src_pre_wrap_len, len - src_pre_wrap_len);
+                    self.copy(
+                        WrappedIndex::zero(),
+                        dst.add(src_pre_wrap_len),
+                        len - src_pre_wrap_len,
+                    );
                     self.copy(src, dst, src_pre_wrap_len);
                 }
             }
@@ -379,10 +517,15 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 //
                 debug_assert!(dst_pre_wrap_len > src_pre_wrap_len);
                 let delta = dst_pre_wrap_len - src_pre_wrap_len;
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
                     self.copy(src, dst, src_pre_wrap_len);
-                    self.copy(0, dst + src_pre_wrap_len, delta);
-                    self.copy(delta, 0, len - dst_pre_wrap_len);
+                    self.copy(WrappedIndex::zero(), dst.add(src_pre_wrap_len), delta);
+                    self.copy(
+                        WrappedIndex::from_arbitrary_number(delta),
+                        WrappedIndex::zero(),
+                        len - dst_pre_wrap_len,
+                    );
                 }
             }
             (true, true, true) => {
@@ -397,9 +540,18 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 //
                 debug_assert!(src_pre_wrap_len > dst_pre_wrap_len);
                 let delta = src_pre_wrap_len - dst_pre_wrap_len;
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
-                    self.copy(0, delta, len - src_pre_wrap_len);
-                    self.copy(self.capacity() - delta, 0, delta);
+                    self.copy(
+                        WrappedIndex::zero(),
+                        WrappedIndex::from_arbitrary_number(delta),
+                        len - src_pre_wrap_len,
+                    );
+                    self.copy(
+                        WrappedIndex::from_arbitrary_number(self.capacity() - delta),
+                        WrappedIndex::zero(),
+                        delta,
+                    );
                     self.copy(src, dst, dst_pre_wrap_len);
                 }
             }
@@ -409,18 +561,60 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// Copies all values from `src` to `dst`, wrapping around if needed.
     /// Assumes capacity is sufficient.
     #[inline]
-    unsafe fn copy_slice(&mut self, dst: usize, src: &[T]) {
+    unsafe fn copy_slice(&mut self, dst: WrappedIndex, src: &[T]) {
         debug_assert!(src.len() <= self.capacity());
-        let head_room = self.capacity() - dst;
+        let head_room = self.capacity() - dst.as_index();
         if src.len() <= head_room {
+            // ignore-tidy-undocumented-unsafe
             unsafe {
-                ptr::copy_nonoverlapping(src.as_ptr(), self.ptr().add(dst), src.len());
+                ptr::copy_nonoverlapping(src.as_ptr(), self.ptr().add(dst.as_index()), src.len());
             }
         } else {
             let (left, right) = src.split_at(head_room);
+            // ignore-tidy-undocumented-unsafe
             unsafe {
-                ptr::copy_nonoverlapping(left.as_ptr(), self.ptr().add(dst), left.len());
+                ptr::copy_nonoverlapping(left.as_ptr(), self.ptr().add(dst.as_index()), left.len());
                 ptr::copy_nonoverlapping(right.as_ptr(), self.ptr(), right.len());
+            }
+        }
+    }
+
+    /// Copies all values from `src` to `dst` in reversed order, wrapping around if needed.
+    /// Assumes capacity is sufficient.
+    /// Equivalent to calling [`VecDeque::copy_slice`] with a [reversed](https://doc.rust-lang.org/std/primitive.slice.html#method.reverse) slice.
+    #[inline]
+    unsafe fn copy_slice_reversed(&mut self, dst: WrappedIndex, src: &[T]) {
+        /// # Safety
+        ///
+        /// See [`ptr::copy_nonoverlapping`].
+        unsafe fn copy_nonoverlapping_reversed<T>(src: *const T, dst: *mut T, count: usize) {
+            for i in 0..count {
+                // SAFETY: Upheld by caller.
+                unsafe { ptr::copy_nonoverlapping(src.add(count - 1 - i), dst.add(i), 1) };
+            }
+        }
+
+        debug_assert!(src.len() <= self.capacity());
+        let head_room = self.capacity() - dst.as_index();
+        if src.len() <= head_room {
+            // ignore-tidy-undocumented-unsafe
+            unsafe {
+                copy_nonoverlapping_reversed(
+                    src.as_ptr(),
+                    self.ptr().add(dst.as_index()),
+                    src.len(),
+                );
+            }
+        } else {
+            let (left, right) = src.split_at(src.len() - head_room);
+            // ignore-tidy-undocumented-unsafe
+            unsafe {
+                copy_nonoverlapping_reversed(
+                    right.as_ptr(),
+                    self.ptr().add(dst.as_index()),
+                    right.len(),
+                );
+                copy_nonoverlapping_reversed(left.as_ptr(), self.ptr(), left.len());
             }
         }
     }
@@ -434,12 +628,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
     #[inline]
     unsafe fn write_iter(
         &mut self,
-        dst: usize,
+        dst: WrappedIndex,
         iter: impl Iterator<Item = T>,
         written: &mut usize,
     ) {
+        // ignore-tidy-undocumented-unsafe
         iter.enumerate().for_each(|(i, element)| unsafe {
-            self.buffer_write(dst + i, element);
+            self.buffer_write(dst.add(i), element);
             *written += 1;
         });
     }
@@ -454,7 +649,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// Assumes capacity is sufficient.
     unsafe fn write_iter_wrapping(
         &mut self,
-        dst: usize,
+        dst: WrappedIndex,
         mut iter: impl Iterator<Item = T>,
         len: usize,
     ) -> usize {
@@ -469,20 +664,22 @@ impl<T, A: Allocator> VecDeque<T, A> {
             }
         }
 
-        let head_room = self.capacity() - dst;
+        let head_room = self.capacity() - dst.as_index();
 
         let mut guard = Guard { deque: self, written: 0 };
 
         if head_room >= len {
+            // ignore-tidy-undocumented-unsafe
             unsafe { guard.deque.write_iter(dst, iter, &mut guard.written) };
         } else {
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 guard.deque.write_iter(
                     dst,
                     ByRefSized(&mut iter).take(head_room),
                     &mut guard.written,
                 );
-                guard.deque.write_iter(0, iter, &mut guard.written)
+                guard.deque.write_iter(WrappedIndex::zero(), iter, &mut guard.written)
             };
         }
 
@@ -519,16 +716,22 @@ impl<T, A: Allocator> VecDeque<T, A> {
             // A
             // Nop
         } else {
-            let head_len = old_capacity - self.head;
+            let head_len = old_capacity - self.head.as_index();
             let tail_len = self.len - head_len;
             if head_len > tail_len && new_capacity - old_capacity >= tail_len {
                 // B
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
-                    self.copy_nonoverlapping(0, old_capacity, tail_len);
+                    self.copy_nonoverlapping(
+                        WrappedIndex::zero(),
+                        WrappedIndex::from_arbitrary_number(old_capacity),
+                        tail_len,
+                    );
                 }
             } else {
                 // C
-                let new_head = new_capacity - head_len;
+                let new_head = WrappedIndex::from_arbitrary_number(new_capacity - head_len);
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
                     // can't use copy_nonoverlapping here, because if e.g. head_len = 2
                     // and new_capacity = old_capacity + 1, then the heads overlap.
@@ -538,6 +741,96 @@ impl<T, A: Allocator> VecDeque<T, A> {
             }
         }
         debug_assert!(self.head < self.capacity() || self.capacity() == 0);
+    }
+
+    /// Creates an iterator which uses a closure to determine if an element in the range should be removed.
+    ///
+    /// If the closure returns `true`, the element is removed from the deque and yielded. If the closure
+    /// returns `false`, or panics, the element remains in the deque and will not be yielded.
+    ///
+    /// Only elements that fall in the provided range are considered for extraction, but any elements
+    /// after the range will still have to be moved if any element has been extracted.
+    ///
+    /// If the returned `ExtractIf` is not exhausted, e.g. because it is dropped without iterating
+    /// or the iteration short-circuits, then the remaining elements will be retained.
+    /// Use `extract_if().for_each(drop)` if you do not need the returned iterator,
+    /// or [`retain_mut`] with a negated predicate if you also do not need to restrict the range.
+    ///
+    /// [`retain_mut`]: VecDeque::retain_mut
+    ///
+    /// Using this method is equivalent to the following code:
+    ///
+    /// ```
+    /// #![feature(vec_deque_extract_if)]
+    /// # use std::collections::VecDeque;
+    /// # let some_predicate = |x: &mut i32| { *x % 2 == 1 };
+    /// # let mut deq: VecDeque<_> = (0..10).collect();
+    /// # let mut deq2 = deq.clone();
+    /// # let range = 1..5;
+    /// let mut i = range.start;
+    /// let end_items = deq.len() - range.end;
+    /// # let mut extracted = vec![];
+    ///
+    /// while i < deq.len() - end_items {
+    ///     if some_predicate(&mut deq[i]) {
+    ///         let val = deq.remove(i).unwrap();
+    ///         // your code here
+    /// #         extracted.push(val);
+    ///     } else {
+    ///         i += 1;
+    ///     }
+    /// }
+    ///
+    /// # let extracted2: Vec<_> = deq2.extract_if(range, some_predicate).collect();
+    /// # assert_eq!(deq, deq2);
+    /// # assert_eq!(extracted, extracted2);
+    /// ```
+    ///
+    /// But `extract_if` is easier to use. `extract_if` is also more efficient,
+    /// because it can backshift the elements of the array in bulk.
+    ///
+    /// The iterator also lets you mutate the value of each element in the
+    /// closure, regardless of whether you choose to keep or remove it.
+    ///
+    /// # Panics
+    ///
+    /// If `range` is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// Splitting a deque into even and odd values, reusing the original deque:
+    ///
+    /// ```
+    /// #![feature(vec_deque_extract_if)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut numbers = VecDeque::from([1, 2, 3, 4, 5, 6, 8, 9, 11, 13, 14, 15]);
+    ///
+    /// let evens = numbers.extract_if(.., |x| *x % 2 == 0).collect::<VecDeque<_>>();
+    /// let odds = numbers;
+    ///
+    /// assert_eq!(evens, VecDeque::from([2, 4, 6, 8, 14]));
+    /// assert_eq!(odds, VecDeque::from([1, 3, 5, 9, 11, 13, 15]));
+    /// ```
+    ///
+    /// Using the range argument to only process a part of the deque:
+    ///
+    /// ```
+    /// #![feature(vec_deque_extract_if)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut items = VecDeque::from([0, 0, 0, 0, 0, 0, 0, 1, 2, 1, 2, 1, 2]);
+    /// let ones = items.extract_if(7.., |x| *x == 1).collect::<VecDeque<_>>();
+    /// assert_eq!(items, VecDeque::from([0, 0, 0, 0, 0, 0, 0, 2, 2, 2]));
+    /// assert_eq!(ones.len(), 3);
+    /// ```
+    #[unstable(feature = "vec_deque_extract_if", issue = "147750")]
+    pub fn extract_if<F, R>(&mut self, range: R, filter: F) -> ExtractIf<'_, T, F, A>
+    where
+        F: FnMut(&mut T) -> bool,
+        R: RangeBounds<usize>,
+    {
+        ExtractIf::new(self, filter, range)
     }
 }
 
@@ -557,7 +850,7 @@ impl<T> VecDeque<T> {
     #[must_use]
     pub const fn new() -> VecDeque<T> {
         // FIXME(const-hack): This should just be `VecDeque::new_in(Global)` once that hits stable.
-        VecDeque { head: 0, len: 0, buf: RawVec::new() }
+        VecDeque { head: WrappedIndex::zero(), len: 0, buf: RawVec::new() }
     }
 
     /// Creates an empty deque with space for at least `capacity` elements.
@@ -567,12 +860,11 @@ impl<T> VecDeque<T> {
     /// ```
     /// use std::collections::VecDeque;
     ///
-    /// let deque: VecDeque<u32> = VecDeque::with_capacity(10);
+    /// let deque: VecDeque<i32> = VecDeque::with_capacity(10);
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[must_use]
-    #[track_caller]
     pub fn with_capacity(capacity: usize) -> VecDeque<T> {
         Self::with_capacity_in(capacity, Global)
     }
@@ -598,7 +890,11 @@ impl<T> VecDeque<T> {
     #[inline]
     #[unstable(feature = "try_with_capacity", issue = "91913")]
     pub fn try_with_capacity(capacity: usize) -> Result<VecDeque<T>, TryReserveError> {
-        Ok(VecDeque { head: 0, len: 0, buf: RawVec::try_with_capacity_in(capacity, Global)? })
+        Ok(VecDeque {
+            head: WrappedIndex::zero(),
+            len: 0,
+            buf: RawVec::try_with_capacity_in(capacity, Global)?,
+        })
     }
 }
 
@@ -608,14 +904,17 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::VecDeque;
+    /// # #![feature(allocator_api)]
     ///
-    /// let deque: VecDeque<u32> = VecDeque::new();
+    /// use std::collections::VecDeque;
+    /// use std::alloc::Global;
+    ///
+    /// let deque: VecDeque<i32> = VecDeque::new_in(Global);
     /// ```
     #[inline]
     #[unstable(feature = "allocator_api", issue = "32838")]
     pub const fn new_in(alloc: A) -> VecDeque<T, A> {
-        VecDeque { head: 0, len: 0, buf: RawVec::new_in(alloc) }
+        VecDeque { head: WrappedIndex::zero(), len: 0, buf: RawVec::new_in(alloc) }
     }
 
     /// Creates an empty deque with space for at least `capacity` elements.
@@ -623,14 +922,20 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::VecDeque;
+    /// # #![feature(allocator_api)]
     ///
-    /// let deque: VecDeque<u32> = VecDeque::with_capacity(10);
+    /// use std::collections::VecDeque;
+    /// use std::alloc::Global;
+    ///
+    /// let deque: VecDeque<i32> = VecDeque::with_capacity_in(10, Global);
     /// ```
     #[unstable(feature = "allocator_api", issue = "32838")]
-    #[track_caller]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> VecDeque<T, A> {
-        VecDeque { head: 0, len: 0, buf: RawVec::with_capacity_in(capacity, alloc) }
+        VecDeque {
+            head: WrappedIndex::zero(),
+            len: 0,
+            buf: RawVec::with_capacity_in(capacity, alloc),
+        }
     }
 
     /// Creates a `VecDeque` from a raw allocation, when the initialized
@@ -659,7 +964,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
         // and that the allocation is valid for use in `RawVec`.
         unsafe {
             VecDeque {
-                head: initialized.start,
+                head: WrappedIndex::from_arbitrary_number(initialized.start),
                 len: initialized.end.unchecked_sub(initialized.start),
                 buf: RawVec::from_raw_parts_in(ptr, capacity, alloc),
             }
@@ -685,8 +990,9 @@ impl<T, A: Allocator> VecDeque<T, A> {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get(&self, index: usize) -> Option<&T> {
         if index < self.len {
-            let idx = self.to_physical_idx(index);
-            unsafe { Some(&*self.ptr().add(idx)) }
+            let idx = self.to_wrapped_index(index);
+            // ignore-tidy-undocumented-unsafe
+            unsafe { Some(&*self.ptr().add(idx.as_index())) }
         } else {
             None
         }
@@ -715,8 +1021,9 @@ impl<T, A: Allocator> VecDeque<T, A> {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         if index < self.len {
-            let idx = self.to_physical_idx(index);
-            unsafe { Some(&mut *self.ptr().add(idx)) }
+            let idx = self.to_wrapped_index(index);
+            // ignore-tidy-undocumented-unsafe
+            unsafe { Some(&mut *self.ptr().add(idx.as_index())) }
         } else {
             None
         }
@@ -749,9 +1056,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
     pub fn swap(&mut self, i: usize, j: usize) {
         assert!(i < self.len());
         assert!(j < self.len());
-        let ri = self.to_physical_idx(i);
-        let rj = self.to_physical_idx(j);
-        unsafe { ptr::swap(self.ptr().add(ri), self.ptr().add(rj)) }
+        let ri = self.to_wrapped_index(i);
+        let rj = self.to_wrapped_index(j);
+        // ignore-tidy-undocumented-unsafe
+        unsafe { ptr::swap(self.ptr().add(ri.as_index()), self.ptr().add(rj.as_index())) }
     }
 
     /// Returns the number of elements the deque can hold without
@@ -794,13 +1102,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// [`reserve`]: VecDeque::reserve
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[track_caller]
     pub fn reserve_exact(&mut self, additional: usize) {
         let new_cap = self.len.checked_add(additional).expect("capacity overflow");
         let old_cap = self.capacity();
 
         if new_cap > old_cap {
             self.buf.reserve_exact(self.len, additional);
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 self.handle_capacity_increase(old_cap);
             }
@@ -825,7 +1133,6 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[cfg_attr(not(test), rustc_diagnostic_item = "vecdeque_reserve")]
-    #[track_caller]
     pub fn reserve(&mut self, additional: usize) {
         let new_cap = self.len.checked_add(additional).expect("capacity overflow");
         let old_cap = self.capacity();
@@ -834,6 +1141,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
             // we don't need to reserve_exact(), as the size doesn't have
             // to be a power of 2.
             self.buf.reserve(self.len, additional);
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 self.handle_capacity_increase(old_cap);
             }
@@ -875,7 +1183,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     ///     Ok(output)
     /// }
-    /// # process_data(&[1, 2, 3]).expect("why is the test harness OOMing on 12 bytes?");
+    /// # process_data(&[1, 2, 3]).expect("reserving capacity for 12 bytes should never fail");
     /// ```
     #[stable(feature = "try_reserve", since = "1.57.0")]
     pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
@@ -885,6 +1193,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
         if new_cap > old_cap {
             self.buf.try_reserve_exact(self.len, additional)?;
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 self.handle_capacity_increase(old_cap);
             }
@@ -923,7 +1232,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     ///     Ok(output)
     /// }
-    /// # process_data(&[1, 2, 3]).expect("why is the test harness OOMing on 12 bytes?");
+    /// # process_data(&[1, 2, 3]).expect("reserving capacity for 12 bytes should never fail");
     /// ```
     #[stable(feature = "try_reserve", since = "1.57.0")]
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
@@ -933,6 +1242,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
         if new_cap > old_cap {
             self.buf.try_reserve(self.len, additional)?;
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 self.handle_capacity_increase(old_cap);
             }
@@ -957,7 +1267,6 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(buf.capacity() >= 4);
     /// ```
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
-    #[track_caller]
     pub fn shrink_to_fit(&mut self) {
         self.shrink_to(0);
     }
@@ -983,7 +1292,6 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(buf.capacity() >= 4);
     /// ```
     #[stable(feature = "shrink_to", since = "1.56.0")]
-    #[track_caller]
     pub fn shrink_to(&mut self, min_capacity: usize) {
         let target_cap = min_capacity.max(self.len);
 
@@ -1006,8 +1314,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
         let old_head = self.head;
 
         if self.len == 0 {
-            self.head = 0;
-        } else if self.head >= target_cap && tail_outside {
+            self.head = WrappedIndex::zero();
+        } else if self.head.as_index() >= target_cap && tail_outside {
             // Head and tail are both out of bounds, so copy all of them to the front.
             //
             //  H := head
@@ -1016,11 +1324,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
             //   [. . . . . . . . o o o o o o o . ]
             //    H           L
             //   [o o o o o o o . ]
+            //
+            // SAFETY: `self.head >= target_cap >= self.len`, therefore these accesses
+            // do not overlap.
             unsafe {
-                // nonoverlapping because `self.head >= target_cap >= self.len`.
-                self.copy_nonoverlapping(self.head, 0, self.len);
+                self.copy_nonoverlapping(self.head, WrappedIndex::zero(), self.len);
             }
-            self.head = 0;
+            self.head = WrappedIndex::zero();
         } else if self.head < target_cap && tail_outside {
             // Head is in bounds, tail is out of bounds.
             // Copy the overflowing part to the beginning of the
@@ -1033,8 +1343,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
             //      L   H
             //   [o o . o o o o o ]
             let len = self.head + self.len - target_cap;
+            // SAFETY: head is < target_cap, so the index is wrapped
             unsafe {
-                self.copy_nonoverlapping(target_cap, 0, len);
+                self.copy_nonoverlapping(
+                    WrappedIndex::from_arbitrary_number(target_cap),
+                    WrappedIndex::zero(),
+                    len,
+                );
             }
         } else if !self.is_contiguous() {
             // The head slice is at least partially out of bounds, tail is in bounds.
@@ -1047,8 +1362,11 @@ impl<T, A: Allocator> VecDeque<T, A> {
             //   [o o o o o . . . . . . . . . o o ]
             //            L   H
             //   [o o o o o . o o ]
-            let head_len = self.capacity() - self.head;
-            let new_head = target_cap - head_len;
+            let head_len = self.capacity() - self.head.as_index();
+
+            // head_len is at least one, so new_head will be < target_cap
+            let new_head = WrappedIndex::from_arbitrary_number(target_cap - head_len);
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 // can't use `copy_nonoverlapping()` here because the new and old
                 // regions for the head might overlap.
@@ -1059,18 +1377,16 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
         struct Guard<'a, T, A: Allocator> {
             deque: &'a mut VecDeque<T, A>,
-            old_head: usize,
+            old_head: WrappedIndex,
             target_cap: usize,
         }
 
         impl<T, A: Allocator> Drop for Guard<'_, T, A> {
             #[cold]
             fn drop(&mut self) {
-                unsafe {
-                    // SAFETY: This is only called if `buf.shrink_to_fit` unwinds,
-                    // which is the only time it's safe to call `abort_shrink`.
-                    self.deque.abort_shrink(self.old_head, self.target_cap)
-                }
+                // SAFETY: This is only called if `buf.shrink_to_fit` unwinds,
+                // which is the only time it's safe to call `abort_shrink`.
+                unsafe { self.deque.abort_shrink(self.old_head, self.target_cap) }
             }
         }
 
@@ -1091,7 +1407,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// `old_head` refers to the head index before `shrink_to` was called. `target_cap`
     /// is the capacity that it was trying to shrink to.
-    unsafe fn abort_shrink(&mut self, old_head: usize, target_cap: usize) {
+    unsafe fn abort_shrink(&mut self, old_head: WrappedIndex, target_cap: usize) {
         // Moral equivalent of self.head + self.len <= target_cap. Won't overflow
         // because `self.len <= target_cap`.
         if self.head <= target_cap - self.len {
@@ -1100,7 +1416,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
         }
 
         // `shrink_to` already copied the head to fit into the new capacity, so this won't overflow.
-        let head_len = target_cap - self.head;
+        let head_len = target_cap - self.head.as_index();
         // `self.head > target_cap - self.len` => `self.len > target_cap - self.head =: head_len` so this must be positive.
         let tail_len = self.len - head_len;
 
@@ -1108,14 +1424,19 @@ impl<T, A: Allocator> VecDeque<T, A> {
             // There's enough spare capacity to copy the tail to the back (because `tail_len < self.capacity() - target_cap`),
             // and copying the tail should be cheaper than copying the head (because `tail_len <= head_len`).
 
+            // SAFETY: The old tail and the new tail can't overlap because the head slice lies
+            // between them. The head slice ends at `target_cap`, so that's where we copy to.
             unsafe {
-                // The old tail and the new tail can't overlap because the head slice lies between them. The
-                // head slice ends at `target_cap`, so that's where we copy to.
-                self.copy_nonoverlapping(0, target_cap, tail_len);
+                self.copy_nonoverlapping(
+                    WrappedIndex::zero(),
+                    WrappedIndex::from_arbitrary_number(target_cap),
+                    tail_len,
+                );
             }
         } else {
             // Either there's not enough spare capacity to make the deque contiguous, or the head is shorter than the tail
             // (and therefore hopefully cheaper to copy).
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 // The old and the new head slice can overlap, so we can't use `copy_nonoverlapping` here.
                 self.copy(self.head, old_head, head_len);
@@ -1143,33 +1464,22 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// buf.truncate(1);
     /// assert_eq!(buf, [5]);
     /// ```
+    #[doc(alias = "retain_front")]
     #[stable(feature = "deque_extras", since = "1.16.0")]
     pub fn truncate(&mut self, len: usize) {
-        /// Runs the destructor for all items in the slice when it gets dropped (normally or
-        /// during unwinding).
-        struct Dropper<'a, T>(&'a mut [T]);
-
-        impl<'a, T> Drop for Dropper<'a, T> {
-            fn drop(&mut self) {
-                unsafe {
-                    ptr::drop_in_place(self.0);
-                }
-            }
+        if len >= self.len {
+            return;
         }
 
-        // Safe because:
-        //
+        let (front, back) = self.as_mut_slices();
+
+        // SAFETY:
         // * Any slice passed to `drop_in_place` is valid; the second case has
         //   `len <= front.len()` and returning on `len > self.len()` ensures
         //   `begin <= back.len()` in the first case
         // * The head of the VecDeque is moved before calling `drop_in_place`,
         //   so no value is dropped twice if `drop_in_place` panics
         unsafe {
-            if len >= self.len {
-                return;
-            }
-
-            let (front, back) = self.as_mut_slices();
             if len > front.len() {
                 let begin = len - front.len();
                 let drop_back = back.get_unchecked_mut(begin..) as *mut _;
@@ -1197,7 +1507,6 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(vec_deque_truncate_front)]
     /// use std::collections::VecDeque;
     ///
     /// let mut buf = VecDeque::new();
@@ -1206,37 +1515,28 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// buf.push_front(15);
     /// assert_eq!(buf, [15, 10, 5]);
     /// assert_eq!(buf.as_slices(), (&[15, 10, 5][..], &[][..]));
-    /// buf.truncate_front(1);
+    /// buf.retain_back(1);
     /// assert_eq!(buf.as_slices(), (&[5][..], &[][..]));
     /// ```
-    #[unstable(feature = "vec_deque_truncate_front", issue = "140667")]
-    pub fn truncate_front(&mut self, len: usize) {
-        /// Runs the destructor for all items in the slice when it gets dropped (normally or
-        /// during unwinding).
-        struct Dropper<'a, T>(&'a mut [T]);
-
-        impl<'a, T> Drop for Dropper<'a, T> {
-            fn drop(&mut self) {
-                unsafe {
-                    ptr::drop_in_place(self.0);
-                }
-            }
+    #[doc(alias = "truncate_front")]
+    #[stable(feature = "vec_deque_truncate_front", since = "1.99.0")]
+    pub fn retain_back(&mut self, len: usize) {
+        if len >= self.len {
+            // No action is taken
+            return;
         }
 
-        unsafe {
-            if len >= self.len {
-                // No action is taken
-                return;
-            }
+        let (front, back) = self.as_mut_slices();
 
-            let (front, back) = self.as_mut_slices();
+        // ignore-tidy-undocumented-unsafe
+        unsafe {
             if len > back.len() {
                 // The 'back' slice remains unchanged.
                 // front.len() + back.len() == self.len, so 'end' is non-negative
                 // and end < front.len()
                 let end = front.len() - (len - back.len());
                 let drop_front = front.get_unchecked_mut(..end) as *mut _;
-                self.head += end;
+                self.head = self.head.add(end);
                 self.len = len;
                 ptr::drop_in_place(drop_front);
             } else {
@@ -1244,13 +1544,100 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 // 'end' is non-negative by the condition above
                 let end = back.len() - len;
                 let drop_back = back.get_unchecked_mut(..end) as *mut _;
-                self.head = self.to_physical_idx(self.len - len);
+                self.head = self.to_wrapped_index(self.len - len);
                 self.len = len;
 
                 // Make sure the second half is dropped even when a destructor
                 // in the first one panics.
                 let _back_dropper = Dropper(&mut *drop_back);
                 ptr::drop_in_place(drop_front);
+            }
+        }
+    }
+
+    /// Shortens the deque to the elements within `range`, dropping the rest.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting point is greater than the end point or if
+    /// the end point is greater than the length of the deque.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![feature(vec_deque_retain_range)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut buf: VecDeque<_> = (0..6).collect();
+    /// buf.truncate_to_range(2..5);
+    /// assert_eq!(buf, [2, 3, 4]);
+    /// ```
+    #[unstable(feature = "vec_deque_retain_range", issue = "156215")]
+    pub fn truncate_to_range<R>(&mut self, range: R)
+    where
+        R: RangeBounds<usize>,
+    {
+        let Range { start, end } = slice::range(range, ..self.len);
+
+        if start == 0 && end == self.len {
+            return;
+        } else if start == end {
+            self.clear();
+            return;
+        } else if start == 0 {
+            self.truncate(end);
+            return;
+        } else if end == self.len {
+            self.retain_back(self.len - start);
+            return;
+        }
+
+        // Both the dropped prefix [0..start) and the dropped suffix [end..self.len) are
+        // non-empty.  Plan up to three physical slices to drop, then update head/len, then
+        // drop.  Only one of the dropped prefix or dropped suffix can cross between slices.
+        let (front, back) = self.as_mut_slices();
+        let flen = front.len();
+        let blen = back.len();
+        let fptr = front.as_mut_ptr();
+        let bptr = back.as_mut_ptr();
+
+        // ignore-tidy-undocumented-unsafe
+        unsafe {
+            let (drop_a, drop_b, drop_c) = if end <= flen {
+                // Kept range lies in `front`.  The dropped suffix is the rest of `front`
+                // plus all of `back`.
+                let pre = ptr::slice_from_raw_parts_mut(fptr, start);
+                let mid = ptr::slice_from_raw_parts_mut(fptr.add(end), flen - end);
+                (pre, mid, Some(back as *mut [T]))
+            } else if start >= flen {
+                // Kept range lies in `back`.  The dropped prefix is all of `front` plus the
+                // start of `back`.
+                let mid = ptr::slice_from_raw_parts_mut(bptr, start - flen);
+                let suf = ptr::slice_from_raw_parts_mut(bptr.add(end - flen), blen - (end - flen));
+                (front as *mut [T], mid, Some(suf))
+            } else {
+                // Kept range straddles the boundary.  The dropped prefix is in `front`, the
+                // dropped suffix is in `back`.  Only two regions to drop.
+                let pre = ptr::slice_from_raw_parts_mut(fptr, start);
+                let suf = ptr::slice_from_raw_parts_mut(bptr.add(end - flen), blen - (end - flen));
+                (pre, suf, None)
+            };
+
+            // Set these once only, then drop.  If we called truncate + retain_back, a panic in
+            // a destructor could leave this truncation in a half completed state.
+            self.head = self.to_wrapped_index(start);
+            self.len = end - start;
+
+            match drop_c {
+                Some(c) => {
+                    let _g_a = Dropper(&mut *drop_a);
+                    let _g_b = Dropper(&mut *drop_b);
+                    ptr::drop_in_place(c);
+                }
+                None => {
+                    let _g_a = Dropper(&mut *drop_a);
+                    ptr::drop_in_place(drop_b);
+                }
             }
         }
     }
@@ -1459,20 +1846,20 @@ impl<T, A: Allocator> VecDeque<T, A> {
             // `slice::range` guarantees that `start <= end <= len`.
             // because `len != 0`, we know that `start < end`, so `start < len`
             // and the indexing is valid.
-            let wrapped_start = self.to_physical_idx(start);
+            let wrapped_start = self.to_wrapped_index(start);
 
             // this subtraction can never overflow because `wrapped_start` is
             // at most `self.capacity()` (and if `self.capacity != 0`, then `wrapped_start` is strictly less
             // than `self.capacity`).
-            let head_len = self.capacity() - wrapped_start;
+            let head_len = self.capacity() - wrapped_start.as_index();
 
             if head_len >= len {
                 // we know that `len + wrapped_start <= self.capacity <= usize::MAX`, so this addition can't overflow
-                (wrapped_start..wrapped_start + len, 0..0)
+                (wrapped_start.as_index()..wrapped_start + len, 0..0)
             } else {
                 // can't overflow because of the if condition
                 let tail_len = len - head_len;
-                (wrapped_start..self.capacity(), 0..tail_len)
+                (wrapped_start.as_index()..self.capacity(), 0..tail_len)
             }
         }
     }
@@ -1481,8 +1868,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// # Panics
     ///
-    /// Panics if the starting point is greater than the end point or if
-    /// the end point is greater than the length of the deque.
+    /// Panics if the range has `start_bound > end_bound`, or, if the range is
+    /// bounded on either end and past the length of the deque.
     ///
     /// # Examples
     ///
@@ -1508,8 +1895,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
         // are valid ranges into the physical buffer, so
         // it's ok to pass them to `buffer_range` and
         // dereference the result.
-        let a = unsafe { &*self.buffer_range(a_range) };
-        let b = unsafe { &*self.buffer_range(b_range) };
+        let (a, b) = unsafe { (&*self.buffer_range(a_range), &*self.buffer_range(b_range)) };
+
         Iter::new(a.iter(), b.iter())
     }
 
@@ -1517,8 +1904,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// # Panics
     ///
-    /// Panics if the starting point is greater than the end point or if
-    /// the end point is greater than the length of the deque.
+    /// Panics if the range has `start_bound > end_bound`, or, if the range is
+    /// bounded on either end and past the length of the deque.
     ///
     /// # Examples
     ///
@@ -1544,12 +1931,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
         R: RangeBounds<usize>,
     {
         let (a_range, b_range) = self.slice_ranges(range, self.len);
-        // SAFETY: The ranges returned by `slice_ranges`
-        // are valid ranges into the physical buffer, so
-        // it's ok to pass them to `buffer_range` and
-        // dereference the result.
-        let a = unsafe { &mut *self.buffer_range(a_range) };
-        let b = unsafe { &mut *self.buffer_range(b_range) };
+        let (a, b) =
+            // SAFETY: The ranges returned by `slice_ranges`
+            // are valid ranges into the physical buffer, so
+            // it's ok to pass them to `buffer_range` and
+            // dereference the result.
+            unsafe { (&mut *self.buffer_range(a_range), &mut *self.buffer_range(b_range)) };
+
         IterMut::new(a.iter_mut(), b.iter_mut())
     }
 
@@ -1563,8 +1951,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// # Panics
     ///
-    /// Panics if the starting point is greater than the end point or if
-    /// the end point is greater than the length of the deque.
+    /// Panics if the range has `start_bound > end_bound`, or, if the range is
+    /// bounded on either end and past the length of the deque.
     ///
     /// # Leaking
     ///
@@ -1625,7 +2013,66 @@ impl<T, A: Allocator> VecDeque<T, A> {
         // "forget" about the values after the start of the drain until after
         // the drain is complete and the Drain destructor is run.
 
+        // ignore-tidy-undocumented-unsafe
         unsafe { Drain::new(self, drain_start, drain_len) }
+    }
+
+    /// Creates a splicing iterator that replaces the specified range in the deque with the given
+    /// `replace_with` iterator and yields the removed items. `replace_with` does not need to be the
+    /// same length as `range`.
+    ///
+    /// `range` is removed even if the `Splice` iterator is not consumed before it is dropped.
+    ///
+    /// It is unspecified how many elements are removed from the deque if the `Splice` value is
+    /// leaked.
+    ///
+    /// The input iterator `replace_with` is only consumed when the `Splice` value is dropped.
+    ///
+    /// This is optimal if:
+    ///
+    /// * The tail (elements in the deque after `range`) is empty,
+    /// * or `replace_with` yields fewer or equal elements than `range`'s length
+    /// * or the lower bound of its `size_hint()` is exact.
+    ///
+    /// Otherwise, a temporary vector is allocated and the tail is moved twice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range has `start_bound > end_bound`, or, if the range is
+    /// bounded on either end and past the length of the deque.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![feature(deque_extend_front)]
+    /// # use std::collections::VecDeque;
+    ///
+    /// let mut v = VecDeque::from(vec![1, 2, 3, 4]);
+    /// let new = [7, 8, 9];
+    /// let u: Vec<_> = v.splice(1..3, new).collect();
+    /// assert_eq!(v, [1, 7, 8, 9, 4]);
+    /// assert_eq!(u, [2, 3]);
+    /// ```
+    ///
+    /// Using `splice` to insert new items into a vector efficiently at a specific position
+    /// indicated by an empty range:
+    ///
+    /// ```
+    /// # #![feature(deque_extend_front)]
+    /// # use std::collections::VecDeque;
+    ///
+    /// let mut v = VecDeque::from(vec![1, 5]);
+    /// let new = [2, 3, 4];
+    /// v.splice(1..1, new);
+    /// assert_eq!(v, [1, 2, 3, 4, 5]);
+    /// ```
+    #[unstable(feature = "deque_extend_front", issue = "146975")]
+    pub fn splice<R, I>(&mut self, range: R, replace_with: I) -> Splice<'_, I::IntoIter, A>
+    where
+        R: RangeBounds<usize>,
+        I: IntoIterator<Item = T>,
+    {
+        Splice { drain: self.drain(range), replace_with: replace_with.into_iter() }
     }
 
     /// Clears the deque, removing all values.
@@ -1641,11 +2088,12 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(deque.is_empty());
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[expect(clippy::manual_clear, reason = "implements clear")]
     #[inline]
     pub fn clear(&mut self) {
         self.truncate(0);
         // Not strictly necessary, but leaves things in a more consistent/predictable state.
-        self.head = 0;
+        self.head = WrappedIndex::zero();
     }
 
     /// Returns `true` if the deque contains an element equal to the
@@ -1791,8 +2239,9 @@ impl<T, A: Allocator> VecDeque<T, A> {
             None
         } else {
             let old_head = self.head;
-            self.head = self.to_physical_idx(1);
+            self.head = self.to_wrapped_index(1);
             self.len -= 1;
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 core::hint::assert_unchecked(self.len < self.capacity());
                 Some(self.buffer_read(old_head))
@@ -1820,9 +2269,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
             None
         } else {
             self.len -= 1;
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 core::hint::assert_unchecked(self.len < self.capacity());
-                Some(self.buffer_read(self.to_physical_idx(self.len)))
+                Some(self.buffer_read(self.to_wrapped_index(self.len)))
             }
         }
     }
@@ -1834,7 +2284,6 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(vec_deque_pop_if)]
     /// use std::collections::VecDeque;
     ///
     /// let mut deque: VecDeque<i32> = vec![0, 1, 2, 3, 4].into();
@@ -1844,7 +2293,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(deque, [1, 2, 3, 4]);
     /// assert_eq!(deque.pop_front_if(pred), None);
     /// ```
-    #[unstable(feature = "vec_deque_pop_if", issue = "135889")]
+    #[stable(feature = "vec_deque_pop_if", since = "1.93.0")]
     pub fn pop_front_if(&mut self, predicate: impl FnOnce(&mut T) -> bool) -> Option<T> {
         let first = self.front_mut()?;
         if predicate(first) { self.pop_front() } else { None }
@@ -1857,7 +2306,6 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(vec_deque_pop_if)]
     /// use std::collections::VecDeque;
     ///
     /// let mut deque: VecDeque<i32> = vec![0, 1, 2, 3, 4].into();
@@ -1867,10 +2315,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(deque, [0, 1, 2, 3]);
     /// assert_eq!(deque.pop_back_if(pred), None);
     /// ```
-    #[unstable(feature = "vec_deque_pop_if", issue = "135889")]
+    #[stable(feature = "vec_deque_pop_if", since = "1.93.0")]
     pub fn pop_back_if(&mut self, predicate: impl FnOnce(&mut T) -> bool) -> Option<T> {
-        let first = self.back_mut()?;
-        if predicate(first) { self.pop_back() } else { None }
+        let last = self.back_mut()?;
+        if predicate(last) { self.pop_back() } else { None }
     }
 
     /// Prepends an element to the deque.
@@ -1886,18 +2334,33 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(d.front(), Some(&2));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[track_caller]
     pub fn push_front(&mut self, value: T) {
+        let _ = self.push_front_mut(value);
+    }
+
+    /// Prepends an element to the deque, returning a reference to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut d = VecDeque::from([1, 2, 3]);
+    /// let x = d.push_front_mut(8);
+    /// *x -= 1;
+    /// assert_eq!(d.front(), Some(&7));
+    /// ```
+    #[stable(feature = "push_mut", since = "1.95.0")]
+    #[must_use = "if you don't need a reference to the value, use `VecDeque::push_front` instead"]
+    pub fn push_front_mut(&mut self, value: T) -> &mut T {
         if self.is_full() {
             self.grow();
         }
 
         self.head = self.wrap_sub(self.head, 1);
         self.len += 1;
-
-        unsafe {
-            self.buffer_write(self.head, value);
-        }
+        // SAFETY: We know that self.head is within range of the deque.
+        unsafe { self.buffer_write(self.head, value) }
     }
 
     /// Appends an element to the back of the deque.
@@ -1914,14 +2377,100 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_confusables("push", "put", "append")]
-    #[track_caller]
     pub fn push_back(&mut self, value: T) {
+        let _ = self.push_back_mut(value);
+    }
+
+    /// Appends an element to the back of the deque, returning a reference to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut d = VecDeque::from([1, 2, 3]);
+    /// let x = d.push_back_mut(9);
+    /// *x += 1;
+    /// assert_eq!(d.back(), Some(&10));
+    /// ```
+    #[stable(feature = "push_mut", since = "1.95.0")]
+    #[must_use = "if you don't need a reference to the value, use `VecDeque::push_back` instead"]
+    pub fn push_back_mut(&mut self, value: T) -> &mut T {
         if self.is_full() {
             self.grow();
         }
 
-        unsafe { self.buffer_write(self.to_physical_idx(self.len), value) }
+        let len = self.len;
         self.len += 1;
+        // ignore-tidy-undocumented-unsafe
+        unsafe { self.buffer_write(self.to_wrapped_index(len), value) }
+    }
+
+    /// Prepends all contents of the iterator to the front of the deque.
+    /// The order of the contents is preserved.
+    ///
+    /// To get behavior like [`append`][VecDeque::append] where elements are moved
+    /// from the other collection to this one, use `self.prepend(other.drain(..))`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(deque_extend_front)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut deque = VecDeque::from([4, 5, 6]);
+    /// deque.prepend([1, 2, 3]);
+    /// assert_eq!(deque, [1, 2, 3, 4, 5, 6]);
+    /// ```
+    ///
+    /// Move values between collections like [`append`][VecDeque::append] does but prepend to the front:
+    ///
+    /// ```
+    /// #![feature(deque_extend_front)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut deque1 = VecDeque::from([4, 5, 6]);
+    /// let mut deque2 = VecDeque::from([1, 2, 3]);
+    /// deque1.prepend(deque2.drain(..));
+    /// assert_eq!(deque1, [1, 2, 3, 4, 5, 6]);
+    /// assert!(deque2.is_empty());
+    /// ```
+    #[unstable(feature = "deque_extend_front", issue = "146975")]
+    #[track_caller]
+    pub fn prepend<I: IntoIterator<Item = T, IntoIter: DoubleEndedIterator>>(&mut self, other: I) {
+        self.extend_front(other.into_iter().rev())
+    }
+
+    /// Prepends all contents of the iterator to the front of the deque,
+    /// as if [`push_front`][VecDeque::push_front] was called repeatedly with
+    /// the values yielded by the iterator.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(deque_extend_front)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut deque = VecDeque::from([4, 5, 6]);
+    /// deque.extend_front([3, 2, 1]);
+    /// assert_eq!(deque, [1, 2, 3, 4, 5, 6]);
+    /// ```
+    ///
+    /// This behaves like [`push_front`][VecDeque::push_front] was called repeatedly:
+    ///
+    /// ```
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut deque = VecDeque::from([4, 5, 6]);
+    /// for v in [3, 2, 1] {
+    ///     deque.push_front(v);
+    /// }
+    /// assert_eq!(deque, [1, 2, 3, 4, 5, 6]);
+    /// ```
+    #[unstable(feature = "deque_extend_front", issue = "146975")]
+    #[track_caller]
+    pub fn extend_front<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        <Self as SpecExtendFront<T, I::IntoIter>>::spec_extend_front(self, iter.into_iter());
     }
 
     #[inline]
@@ -2007,7 +2556,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// # Panics
     ///
-    /// Panics if `index` is strictly greater than deque's length
+    /// Panics if `index` is strictly greater than the deque's length.
     ///
     /// # Examples
     ///
@@ -2027,9 +2576,36 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(vec_deque, &['a', 'd', 'b', 'c', 'e']);
     /// ```
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
-    #[track_caller]
     pub fn insert(&mut self, index: usize, value: T) {
+        let _ = self.insert_mut(index, value);
+    }
+
+    /// Inserts an element at `index` within the deque, shifting all elements
+    /// with indices greater than or equal to `index` towards the back, and
+    /// returning a reference to it.
+    ///
+    /// Element at index 0 is the front of the queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is strictly greater than the deque's length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut vec_deque = VecDeque::from([1, 2, 3]);
+    ///
+    /// let x = vec_deque.insert_mut(1, 5);
+    /// *x += 7;
+    /// assert_eq!(vec_deque, &[1, 12, 2, 3]);
+    /// ```
+    #[stable(feature = "push_mut", since = "1.95.0")]
+    #[must_use = "if you don't need a reference to the value, use `VecDeque::insert` instead"]
+    pub fn insert_mut(&mut self, index: usize, value: T) -> &mut T {
         assert!(index <= self.len(), "index out of bounds");
+
         if self.is_full() {
             self.grow();
         }
@@ -2039,19 +2615,21 @@ impl<T, A: Allocator> VecDeque<T, A> {
             // `index + 1` can't overflow, because if index was usize::MAX, then either the
             // assert would've failed, or the deque would've tried to grow past usize::MAX
             // and panicked.
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 // see `remove()` for explanation why this wrap_copy() call is safe.
-                self.wrap_copy(self.to_physical_idx(index), self.to_physical_idx(index + 1), k);
-                self.buffer_write(self.to_physical_idx(index), value);
+                self.wrap_copy(self.to_wrapped_index(index), self.to_wrapped_index(index + 1), k);
                 self.len += 1;
+                self.buffer_write(self.to_wrapped_index(index), value)
             }
         } else {
             let old_head = self.head;
             self.head = self.wrap_sub(self.head, 1);
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 self.wrap_copy(old_head, self.head, index);
-                self.buffer_write(self.to_physical_idx(index), value);
                 self.len += 1;
+                self.buffer_write(self.to_wrapped_index(index), value)
             }
         }
     }
@@ -2084,20 +2662,22 @@ impl<T, A: Allocator> VecDeque<T, A> {
             return None;
         }
 
-        let wrapped_idx = self.to_physical_idx(index);
+        let wrapped_idx = self.to_wrapped_index(index);
 
+        // ignore-tidy-undocumented-unsafe
         let elem = unsafe { Some(self.buffer_read(wrapped_idx)) };
 
         let k = self.len - index - 1;
-        // safety: due to the nature of the if-condition, whichever wrap_copy gets called,
-        // its length argument will be at most `self.len / 2`, so there can't be more than
-        // one overlapping area.
         if k < index {
+            // SAFETY: due to the nature of the if-condition, whichever wrap_copy gets called,
+            // its length argument will be at most `self.len / 2`, so there can't be more than
+            // one overlapping area.
             unsafe { self.wrap_copy(self.wrap_add(wrapped_idx, 1), wrapped_idx, k) };
             self.len -= 1;
         } else {
             let old_head = self.head;
-            self.head = self.to_physical_idx(1);
+            self.head = self.to_wrapped_index(1);
+            // ignore-tidy-undocumented-unsafe
             unsafe { self.wrap_copy(old_head, self.head, index) };
             self.len -= 1;
         }
@@ -2131,7 +2711,6 @@ impl<T, A: Allocator> VecDeque<T, A> {
     #[inline]
     #[must_use = "use `.truncate()` if you don't need the other half"]
     #[stable(feature = "split_off", since = "1.4.0")]
-    #[track_caller]
     pub fn split_off(&mut self, at: usize) -> Self
     where
         A: Clone,
@@ -2142,11 +2721,12 @@ impl<T, A: Allocator> VecDeque<T, A> {
         let other_len = len - at;
         let mut other = VecDeque::with_capacity_in(other_len, self.allocator().clone());
 
-        unsafe {
-            let (first_half, second_half) = self.as_slices();
+        let (first_half, second_half) = self.as_slices();
+        let first_len = first_half.len();
+        let second_len = second_half.len();
 
-            let first_len = first_half.len();
-            let second_len = second_half.len();
+        // ignore-tidy-undocumented-unsafe
+        unsafe {
             if at < first_len {
                 // `at` lies in the first half.
                 let amount_in_first = first_len - at;
@@ -2198,28 +2778,28 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     #[inline]
     #[stable(feature = "append", since = "1.4.0")]
-    #[track_caller]
     pub fn append(&mut self, other: &mut Self) {
         if T::IS_ZST {
             self.len = self.len.checked_add(other.len).expect("capacity overflow");
             other.len = 0;
-            other.head = 0;
+            other.head = WrappedIndex::zero();
             return;
         }
 
         self.reserve(other.len);
+        let (left, right) = other.as_slices();
+        // ignore-tidy-undocumented-unsafe
         unsafe {
-            let (left, right) = other.as_slices();
-            self.copy_slice(self.to_physical_idx(self.len), left);
+            self.copy_slice(self.to_wrapped_index(self.len), left);
             // no overflow, because self.capacity() >= old_cap + left.len() >= self.len + left.len()
-            self.copy_slice(self.to_physical_idx(self.len + left.len()), right);
+            self.copy_slice(self.to_wrapped_index(self.len + left.len()), right);
         }
         // SAFETY: Update pointers after copying to avoid leaving doppelganger
         // in case of panics.
         self.len += other.len;
         // Now that we own its values, forget everything in `other`.
         other.len = 0;
-        other.head = 0;
+        other.head = WrappedIndex::zero();
     }
 
     /// Retains only the elements specified by the predicate.
@@ -2321,13 +2901,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
     // be called in cold paths.
     // This may panic or abort
     #[inline(never)]
-    #[track_caller]
     fn grow(&mut self) {
         // Extend or possibly remove this assertion when valid use-cases for growing the
         // buffer without it being full emerge
         debug_assert!(self.is_full());
         let old_cap = self.capacity();
         self.buf.grow_one();
+        // ignore-tidy-undocumented-unsafe
         unsafe {
             self.handle_capacity_increase(old_cap);
         }
@@ -2360,7 +2940,6 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(buf, [5, 10, 101, 102, 103]);
     /// ```
     #[stable(feature = "vec_resize_with", since = "1.33.0")]
-    #[track_caller]
     pub fn resize_with(&mut self, new_len: usize, generator: impl FnMut() -> T) {
         let len = self.len;
 
@@ -2429,11 +3008,14 @@ impl<T, A: Allocator> VecDeque<T, A> {
     #[stable(feature = "deque_make_contiguous", since = "1.48.0")]
     pub fn make_contiguous(&mut self) -> &mut [T] {
         if T::IS_ZST {
-            self.head = 0;
+            self.head = WrappedIndex::zero();
         }
 
         if self.is_contiguous() {
-            unsafe { return slice::from_raw_parts_mut(self.ptr().add(self.head), self.len) }
+            // ignore-tidy-undocumented-unsafe
+            unsafe {
+                return slice::from_raw_parts_mut(self.ptr().add(self.head.as_index()), self.len);
+            }
         }
 
         let &mut Self { head, len, .. } = self;
@@ -2441,9 +3023,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
         let cap = self.capacity();
 
         let free = cap - len;
-        let head_len = cap - head;
-        let tail = len - head_len;
-        let tail_len = tail;
+        let head_len = cap - head.as_index();
+
+        // tail <= head < capacity
+        // head cannot be <= capacity, because we know that VecDeque is non-empty, since it is not
+        // contiguous at this point
+        let tail = WrappedIndex::from_arbitrary_number(len - head_len);
+        let tail_len = tail.as_index();
 
         if free >= head_len {
             // there is enough free space to copy the head in one go,
@@ -2452,14 +3038,19 @@ impl<T, A: Allocator> VecDeque<T, A> {
             //
             // from: DEFGH....ABC
             // to:   ABCDEFGH....
+            // ignore-tidy-undocumented-unsafe
             unsafe {
-                self.copy(0, head_len, tail_len);
+                self.copy(
+                    WrappedIndex::zero(),
+                    WrappedIndex::from_arbitrary_number(head_len),
+                    tail_len,
+                );
                 // ...DEFGH.ABC
-                self.copy_nonoverlapping(head, 0, head_len);
+                self.copy_nonoverlapping(head, WrappedIndex::zero(), head_len);
                 // ABCDEFGH....
             }
 
-            self.head = 0;
+            self.head = WrappedIndex::zero();
         } else if free >= tail_len {
             // there is enough free space to copy the tail in one go,
             // this means that we first shift the head forwards, and then
@@ -2467,10 +3058,11 @@ impl<T, A: Allocator> VecDeque<T, A> {
             //
             // from: FGH....ABCDE
             // to:   ...ABCDEFGH.
+            // ignore-tidy-undocumented-unsafe
             unsafe {
                 self.copy(head, tail, head_len);
                 // FGHABCDE....
-                self.copy_nonoverlapping(0, tail + head_len, tail_len);
+                self.copy_nonoverlapping(WrappedIndex::zero(), tail.add(head_len), tail_len);
                 // ...ABCDEFGH.
             }
 
@@ -2499,6 +3091,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 //  2. rotate used part of the buffer
                 //  3. update head to point to the new beginning (which is just `free`)
 
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
                     // if there is no free space in the buffer, then the slices are already
                     // right next to each other and we don't need to move any memory.
@@ -2506,7 +3099,11 @@ impl<T, A: Allocator> VecDeque<T, A> {
                         // because we only move the tail forward as much as there's free space
                         // behind it, we don't overwrite any elements of the head slice, and
                         // the slices end up right next to each other.
-                        self.copy(0, free, tail_len);
+                        self.copy(
+                            WrappedIndex::zero(),
+                            WrappedIndex::from_arbitrary_number(free),
+                            tail_len,
+                        );
                     }
 
                     // We just copied the tail right next to the head slice,
@@ -2519,7 +3116,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
                     // the used part of the buffer now is `free..self.capacity()`, so set
                     // `head` to the beginning of that range.
-                    self.head = free;
+                    self.head = WrappedIndex::from_arbitrary_number(free);
                 }
             } else {
                 // head is shorter so:
@@ -2527,12 +3124,17 @@ impl<T, A: Allocator> VecDeque<T, A> {
                 //  2. rotate used part of the buffer
                 //  3. update head to point to the new beginning (which is the beginning of the buffer)
 
+                // ignore-tidy-undocumented-unsafe
                 unsafe {
                     // if there is no free space in the buffer, then the slices are already
                     // right next to each other and we don't need to move any memory.
                     if free != 0 {
                         // copy the head slice to lie right behind the tail slice.
-                        self.copy(self.head, tail_len, head_len);
+                        self.copy(
+                            self.head,
+                            WrappedIndex::from_arbitrary_number(tail_len),
+                            head_len,
+                        );
                     }
 
                     // because we copied the head slice so that both slices lie right
@@ -2545,12 +3147,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
                     // the used part of the buffer now is `0..self.len`, so set
                     // `head` to the beginning of that range.
-                    self.head = 0;
+                    self.head = WrappedIndex::zero();
                 }
             }
         }
 
-        unsafe { slice::from_raw_parts_mut(ptr.add(self.head), self.len) }
+        // ignore-tidy-undocumented-unsafe
+        unsafe { slice::from_raw_parts_mut(ptr.add(self.head.as_index()), self.len) }
     }
 
     /// Rotates the double-ended queue `n` places to the left.
@@ -2590,8 +3193,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
         assert!(n <= self.len());
         let k = self.len - n;
         if n <= k {
+            // SAFETY: Ensured by check.
             unsafe { self.rotate_left_inner(n) }
         } else {
+            // SAFETY: Ensured by check.
             unsafe { self.rotate_right_inner(k) }
         }
     }
@@ -2633,8 +3238,10 @@ impl<T, A: Allocator> VecDeque<T, A> {
         assert!(n <= self.len());
         let k = self.len - n;
         if n <= k {
+            // SAFETY: Ensured by check.
             unsafe { self.rotate_right_inner(n) }
         } else {
+            // SAFETY: Ensured by check.
             unsafe { self.rotate_left_inner(k) }
         }
     }
@@ -2649,17 +3256,19 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
     unsafe fn rotate_left_inner(&mut self, mid: usize) {
         debug_assert!(mid * 2 <= self.len());
+        // SAFETY: Upheld by caller.
         unsafe {
-            self.wrap_copy(self.head, self.to_physical_idx(self.len), mid);
+            self.wrap_copy(self.head, self.to_wrapped_index(self.len), mid);
         }
-        self.head = self.to_physical_idx(mid);
+        self.head = self.to_wrapped_index(mid);
     }
 
     unsafe fn rotate_right_inner(&mut self, k: usize) {
         debug_assert!(k * 2 <= self.len());
         self.head = self.wrap_sub(self.head, k);
+        // SAFETY: Upheld by caller.
         unsafe {
-            self.wrap_copy(self.to_physical_idx(self.len), self.head, k);
+            self.wrap_copy(self.to_wrapped_index(self.len), self.head, k);
         }
     }
 
@@ -2765,7 +3374,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
         F: FnMut(&'a T) -> Ordering,
     {
         let (front, back) = self.as_slices();
-        let cmp_back = back.first().map(|elem| f(elem));
+        let cmp_back = back.first().map(&mut f);
 
         if let Some(Ordering::Equal) = cmp_back {
             Ok(front.len())
@@ -2876,7 +3485,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     {
         let (front, back) = self.as_slices();
 
-        if let Some(true) = back.first().map(|v| pred(v)) {
+        if let Some(true) = back.first().map(&mut pred) {
             back.partition_point(pred) + front.len()
         } else {
             front.partition_point(pred)
@@ -2907,7 +3516,6 @@ impl<T: Clone, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(buf, [5, 10, 20, 20, 20]);
     /// ```
     #[stable(feature = "deque_extras", since = "1.16.0")]
-    #[track_caller]
     pub fn resize(&mut self, new_len: usize, value: T) {
         if new_len > self.len() {
             let extra = new_len - self.len();
@@ -2916,17 +3524,333 @@ impl<T: Clone, A: Allocator> VecDeque<T, A> {
             self.truncate(new_len);
         }
     }
+
+    /// Clones the elements at the range `src` and appends them to the end.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting index is greater than the end index
+    /// or if either index is greater than the length of the vector.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(deque_extend_front)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut characters = VecDeque::from(['a', 'b', 'c', 'd', 'e']);
+    /// characters.extend_from_within(2..);
+    /// assert_eq!(characters, ['a', 'b', 'c', 'd', 'e', 'c', 'd', 'e']);
+    ///
+    /// let mut numbers = VecDeque::from([0, 1, 2, 3, 4]);
+    /// numbers.extend_from_within(..2);
+    /// assert_eq!(numbers, [0, 1, 2, 3, 4, 0, 1]);
+    ///
+    /// let mut strings = VecDeque::from([String::from("hello"), String::from("world"), String::from("!")]);
+    /// strings.extend_from_within(1..=2);
+    /// assert_eq!(strings, ["hello", "world", "!", "world", "!"]);
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "deque_extend_front", issue = "146975")]
+    pub fn extend_from_within<R>(&mut self, src: R)
+    where
+        R: RangeBounds<usize>,
+    {
+        let range = slice::range(src, ..self.len());
+        self.reserve(range.len());
+
+        // SAFETY:
+        // - `slice::range` guarantees that the given range is valid for indexing self
+        // - at least `range.len()` additional space is available
+        unsafe {
+            self.spec_extend_from_within(range);
+        }
+    }
+
+    /// Clones the elements at the range `src` and prepends them to the front.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting index is greater than the end index
+    /// or if either index is greater than the length of the vector.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(deque_extend_front)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut characters = VecDeque::from(['a', 'b', 'c', 'd', 'e']);
+    /// characters.prepend_from_within(2..);
+    /// assert_eq!(characters, ['c', 'd', 'e', 'a', 'b', 'c', 'd', 'e']);
+    ///
+    /// let mut numbers = VecDeque::from([0, 1, 2, 3, 4]);
+    /// numbers.prepend_from_within(..2);
+    /// assert_eq!(numbers, [0, 1, 0, 1, 2, 3, 4]);
+    ///
+    /// let mut strings = VecDeque::from([String::from("hello"), String::from("world"), String::from("!")]);
+    /// strings.prepend_from_within(1..=2);
+    /// assert_eq!(strings, ["world", "!", "hello", "world", "!"]);
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "deque_extend_front", issue = "146975")]
+    pub fn prepend_from_within<R>(&mut self, src: R)
+    where
+        R: RangeBounds<usize>,
+    {
+        let range = slice::range(src, ..self.len());
+        self.reserve(range.len());
+
+        // SAFETY:
+        // - `slice::range` guarantees that the given range is valid for indexing self
+        // - at least `range.len()` additional space is available
+        unsafe {
+            self.spec_prepend_from_within(range);
+        }
+    }
 }
 
-/// Returns the index in the underlying buffer for a given logical element index.
-#[inline]
-fn wrap_index(logical_index: usize, capacity: usize) -> usize {
-    debug_assert!(
-        (logical_index == 0 && capacity == 0)
-            || logical_index < capacity
-            || (logical_index - capacity) < capacity
-    );
-    if logical_index >= capacity { logical_index - capacity } else { logical_index }
+/// Associated functions have the following preconditions:
+///
+/// - `src` needs to be a valid range: `src.start <= src.end <= self.len()`.
+/// - The buffer must have enough spare capacity: `self.capacity() - self.len() >= src.len()`.
+#[cfg(not(no_global_oom_handling))]
+trait SpecExtendFromWithin {
+    unsafe fn spec_extend_from_within(&mut self, src: Range<usize>);
+
+    unsafe fn spec_prepend_from_within(&mut self, src: Range<usize>);
+}
+
+#[cfg(not(no_global_oom_handling))]
+impl<T: Clone, A: Allocator> SpecExtendFromWithin for VecDeque<T, A> {
+    default unsafe fn spec_extend_from_within(&mut self, src: Range<usize>) {
+        let dst = self.len();
+        let count = src.end - src.start;
+        let src = src.start;
+
+        // SAFETY:
+        // - Ranges do not overlap: src entirely spans initialized values, dst entirely spans uninitialized values.
+        // - Ranges are in bounds: guaranteed by the caller.
+        let ranges = unsafe { self.nonoverlapping_ranges(src, dst, count, self.head) };
+
+        // `len` is updated after every clone to prevent leaking and
+        // leave the deque in the right state when a clone implementation panics
+
+        for (src, dst, count) in ranges {
+            for offset in 0..count {
+                // SAFETY: The allocations of `dst` and `src` go up to `count` elems,
+                // and `nonoverlapping_ranges` ensures `dst` and `src` are valid
+                // for writes and reads respectively.
+                unsafe { dst.add(offset).write((*src.add(offset)).clone()) };
+                self.len += 1;
+            }
+        }
+    }
+
+    default unsafe fn spec_prepend_from_within(&mut self, src: Range<usize>) {
+        let dst = 0;
+        let count = src.end - src.start;
+        let src = src.start + count;
+
+        let new_head = self.wrap_sub(self.head, count);
+        let cap = self.capacity();
+
+        // SAFETY:
+        // - Ranges do not overlap: src entirely spans initialized values, dst entirely spans uninitialized values.
+        // - Ranges are in bounds: guaranteed by the caller.
+        let ranges = unsafe { self.nonoverlapping_ranges(src, dst, count, new_head) };
+
+        // Cloning is done in reverse because we prepend to the front of the deque,
+        // we can't get holes in the *logical* buffer.
+        // `head` and `len` are updated after every clone to prevent leaking and
+        // leave the deque in the right state when a clone implementation panics
+
+        // Clone the first range
+        let (src, dst, count) = ranges[1];
+        for offset in (0..count).rev() {
+            // ignore-tidy-undocumented-unsafe
+            unsafe { dst.add(offset).write((*src.add(offset)).clone()) };
+            // ignore-tidy-undocumented-unsafe
+            self.head = unsafe { self.head.sub(1) };
+            self.len += 1;
+        }
+
+        // Clone the second range
+        let (src, dst, count) = ranges[0];
+        let mut iter = (0..count).rev();
+        if let Some(offset) = iter.next() {
+            // ignore-tidy-undocumented-unsafe
+            unsafe { dst.add(offset).write((*src.add(offset)).clone()) };
+            // After the first clone of the second range, wrap `head` around
+            if self.head.is_zero() {
+                // SAFETY: the wrapped index may be temporarily equal to the capacity even if it
+                // is not zero, because we subtract it one line below.
+                // FIXME: should `from_arbitrary_number` be unsafe? its docs imply so...
+                self.head = WrappedIndex::from_arbitrary_number(cap);
+            }
+            // ignore-tidy-undocumented-unsafe
+            self.head = unsafe { self.head.sub(1) };
+            self.len += 1;
+
+            // Continue like normal
+            for offset in iter {
+                // ignore-tidy-undocumented-unsafe
+                unsafe { dst.add(offset).write((*src.add(offset)).clone()) };
+                // ignore-tidy-undocumented-unsafe
+                self.head = unsafe { self.head.sub(1) };
+                self.len += 1;
+            }
+        }
+    }
+}
+
+#[cfg(not(no_global_oom_handling))]
+impl<T: TrivialClone, A: Allocator> SpecExtendFromWithin for VecDeque<T, A> {
+    unsafe fn spec_extend_from_within(&mut self, src: Range<usize>) {
+        let dst = self.len();
+        let count = src.end - src.start;
+        let src = src.start;
+
+        // SAFETY:
+        // - Ranges do not overlap: src entirely spans initialized values, dst entirely spans uninitialized values.
+        // - Ranges are in bounds: guaranteed by the caller.
+        let ranges = unsafe { self.nonoverlapping_ranges(src, dst, count, self.head) };
+        for (src, dst, count) in ranges {
+            // SAFETY: Ditto.
+            unsafe { ptr::copy_nonoverlapping(src, dst, count) };
+        }
+
+        // SAFETY:
+        // - The elements were just initialized by `copy_nonoverlapping`
+        self.len += count;
+    }
+
+    unsafe fn spec_prepend_from_within(&mut self, src: Range<usize>) {
+        let dst = 0;
+        let count = src.end - src.start;
+        let src = src.start + count;
+
+        let new_head = self.wrap_sub(self.head, count);
+
+        // SAFETY:
+        // - Ranges do not overlap: src entirely spans initialized values, dst entirely spans uninitialized values.
+        // - Ranges are in bounds: guaranteed by the caller.
+        let ranges = unsafe { self.nonoverlapping_ranges(src, dst, count, new_head) };
+        for (src, dst, count) in ranges {
+            // SAFETY: Ditto.
+            unsafe { ptr::copy_nonoverlapping(src, dst, count) };
+        }
+
+        // SAFETY:
+        // - The elements were just initialized by `copy_nonoverlapping`
+        self.head = new_head;
+        self.len += count;
+    }
+}
+
+use index::{WrappedIndex, wrap_index};
+
+// The code is separated into a module to make it harder to construct a BufferIndex without
+// going through wrapping.
+mod index {
+    use core::cmp::Ordering;
+
+    /// Returns the index in the underlying buffer for a given logical element index.
+    #[inline]
+    pub(super) fn wrap_index(logical_index: usize, capacity: usize) -> WrappedIndex {
+        debug_assert!(
+            (logical_index == 0 && capacity == 0)
+                || logical_index < capacity
+                || (logical_index - capacity) < capacity
+        );
+        if logical_index >= capacity {
+            WrappedIndex(logical_index - capacity)
+        } else {
+            WrappedIndex(logical_index)
+        }
+    }
+
+    /// Represents an index that can be safely used to index the VecDeque buffer.
+    /// It exists as a separate type to avoid passing logical (unwrapped) indices to various
+    /// VecDeque functions by accident.
+    ///
+    /// The invariant of this index is that it is always < VecDeque capacity, unless the VecDeque
+    /// is empty (in that case the index can be 0 when the capacity is 0).
+    #[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub(super) struct WrappedIndex(usize);
+
+    impl WrappedIndex {
+        /// The newly constructed index has to be in-bounds for the VecDeque
+        /// that uses the index.
+        #[inline(always)]
+        pub(super) fn from_arbitrary_number(index: usize) -> Self {
+            Self(index)
+        }
+
+        /// Safety invariant: the newly constructed index must still be in-bounds for the VecDeque
+        #[inline(always)]
+        pub(super) unsafe fn add(self, offset: usize) -> Self {
+            Self(self.0 + offset)
+        }
+
+        /// Safety invariant: the newly constructed index must still be in-bounds for the VecDeque
+        #[inline(always)]
+        pub(super) unsafe fn sub(self, offset: usize) -> Self {
+            debug_assert!(self.0 >= offset);
+            Self(self.0 - offset)
+        }
+
+        #[inline(always)]
+        pub(super) const fn zero() -> Self {
+            Self(0)
+        }
+
+        #[inline(always)]
+        pub(super) fn abs_diff(self, other: Self) -> usize {
+            self.0.abs_diff(other.0)
+        }
+
+        #[inline(always)]
+        pub(super) fn as_index(self) -> usize {
+            self.0
+        }
+
+        #[inline(always)]
+        pub(super) fn is_zero(self) -> bool {
+            self.0 == 0
+        }
+    }
+
+    impl core::ops::Add<usize> for WrappedIndex {
+        // The output might not be wrapped anymore
+        type Output = usize;
+
+        #[inline(always)]
+        fn add(self, rhs: usize) -> Self::Output {
+            self.0 + rhs
+        }
+    }
+
+    impl core::fmt::Display for WrappedIndex {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+
+    impl core::cmp::PartialEq<usize> for WrappedIndex {
+        #[inline(always)]
+        fn eq(&self, other: &usize) -> bool {
+            self.0.eq(other)
+        }
+    }
+
+    impl core::cmp::PartialOrd<usize> for WrappedIndex {
+        #[inline(always)]
+        fn partial_cmp(&self, other: &usize) -> Option<Ordering> {
+            self.0.partial_cmp(other)
+        }
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -3013,7 +3937,7 @@ impl<T, A: Allocator> Index<usize> for VecDeque<T, A> {
 
     #[inline]
     fn index(&self, index: usize) -> &T {
-        self.get(index).expect("Out of bounds access")
+        self.get(index).expect("out of bounds access")
     }
 }
 
@@ -3021,13 +3945,12 @@ impl<T, A: Allocator> Index<usize> for VecDeque<T, A> {
 impl<T, A: Allocator> IndexMut<usize> for VecDeque<T, A> {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut T {
-        self.get_mut(index).expect("Out of bounds access")
+        self.get_mut(index).expect("out of bounds access")
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> FromIterator<T> for VecDeque<T> {
-    #[track_caller]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> VecDeque<T> {
         SpecFromIter::spec_from_iter(iter.into_iter())
     }
@@ -3067,19 +3990,16 @@ impl<'a, T, A: Allocator> IntoIterator for &'a mut VecDeque<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T, A: Allocator> Extend<T> for VecDeque<T, A> {
-    #[track_caller]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         <Self as SpecExtend<T, I::IntoIter>>::spec_extend(self, iter.into_iter());
     }
 
     #[inline]
-    #[track_caller]
     fn extend_one(&mut self, elem: T) {
         self.push_back(elem);
     }
 
     #[inline]
-    #[track_caller]
     fn extend_reserve(&mut self, additional: usize) {
         self.reserve(additional);
     }
@@ -3095,19 +4015,16 @@ impl<T, A: Allocator> Extend<T> for VecDeque<T, A> {
 
 #[stable(feature = "extend_ref", since = "1.2.0")]
 impl<'a, T: 'a + Copy, A: Allocator> Extend<&'a T> for VecDeque<T, A> {
-    #[track_caller]
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         self.spec_extend(iter.into_iter());
     }
 
     #[inline]
-    #[track_caller]
     fn extend_one(&mut self, &elem: &'a T) {
         self.push_back(elem);
     }
 
     #[inline]
-    #[track_caller]
     fn extend_reserve(&mut self, additional: usize) {
         self.reserve(additional);
     }
@@ -3140,8 +4057,13 @@ impl<T, A: Allocator> From<Vec<T, A>> for VecDeque<T, A> {
     /// any additional memory.
     #[inline]
     fn from(other: Vec<T, A>) -> Self {
-        let (ptr, len, cap, alloc) = other.into_raw_parts_with_alloc();
-        Self { head: 0, len, buf: unsafe { RawVec::from_raw_parts_in(ptr, cap, alloc) } }
+        let (ptr, len, cap, alloc) = other.into_raw_parts_with_allocator();
+        Self {
+            head: WrappedIndex::zero(),
+            len,
+            // ignore-tidy-undocumented-unsafe
+            buf: unsafe { RawVec::from_raw_parts_in(ptr, cap, alloc) },
+        }
     }
 }
 
@@ -3179,6 +4101,7 @@ impl<T, A: Allocator> From<VecDeque<T, A>> for Vec<T, A> {
     fn from(mut other: VecDeque<T, A>) -> Self {
         other.make_contiguous();
 
+        // ignore-tidy-undocumented-unsafe
         unsafe {
             let other = ManuallyDrop::new(other);
             let buf = other.buf.ptr();
@@ -3186,8 +4109,8 @@ impl<T, A: Allocator> From<VecDeque<T, A>> for Vec<T, A> {
             let cap = other.capacity();
             let alloc = ptr::read(other.allocator());
 
-            if other.head != 0 {
-                ptr::copy(buf.add(other.head), buf, len);
+            if !other.head.is_zero() {
+                ptr::copy(buf.add(other.head.as_index()), buf, len);
             }
             Vec::from_raw_parts_in(buf, len, cap, alloc)
         }
@@ -3205,7 +4128,6 @@ impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
     /// let deq2: VecDeque<_> = [1, 2, 3, 4].into();
     /// assert_eq!(deq1, deq2);
     /// ```
-    #[track_caller]
     fn from(arr: [T; N]) -> Self {
         let mut deq = VecDeque::with_capacity(N);
         let arr = ManuallyDrop::new(arr);
@@ -3215,7 +4137,7 @@ impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
                 ptr::copy_nonoverlapping(arr.as_ptr(), deq.ptr(), N);
             }
         }
-        deq.head = 0;
+        deq.head = WrappedIndex::zero();
         deq.len = N;
         deq
     }

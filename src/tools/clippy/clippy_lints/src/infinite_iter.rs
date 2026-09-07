@@ -1,9 +1,9 @@
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::ty::{get_type_diagnostic_name, implements_trait};
+use clippy_utils::res::MaybeDef as _;
+use clippy_utils::ty::implements_trait;
 use clippy_utils::{higher, sym};
 use rustc_hir::{BorrowKind, Closure, Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_span::Symbol;
 
 declare_clippy_lint! {
@@ -177,7 +177,7 @@ fn is_infinite(cx: &LateContext<'_>, expr: &Expr<'_>) -> Finiteness {
                 Finite
             }
         },
-        ExprKind::Struct(..) => higher::Range::hir(expr).is_some_and(|r| r.end.is_none()).into(),
+        ExprKind::Struct(..) => higher::Range::hir(cx, expr).is_some_and(|r| r.end.is_none()).into(),
         _ => Finite,
     }
 }
@@ -235,7 +235,7 @@ fn complete_infinite_iter(cx: &LateContext<'_>, expr: &Expr<'_>) -> Finiteness {
             } else if method.ident.name == sym::collect {
                 let ty = cx.typeck_results().expr_ty(expr);
                 if matches!(
-                    get_type_diagnostic_name(cx, ty),
+                    ty.opt_diag_name(cx),
                     Some(
                         sym::BinaryHeap
                             | sym::BTreeMap
@@ -251,10 +251,8 @@ fn complete_infinite_iter(cx: &LateContext<'_>, expr: &Expr<'_>) -> Finiteness {
                 }
             }
         },
-        ExprKind::Binary(op, l, r) => {
-            if op.node.is_comparison() {
-                return is_infinite(cx, l).and(is_infinite(cx, r)).and(MaybeInfinite);
-            }
+        ExprKind::Binary(op, l, r) if op.node.is_comparison() => {
+            return is_infinite(cx, l).and(is_infinite(cx, r)).and(MaybeInfinite);
         }, // TODO: ExprKind::Loop + Match
         _ => (),
     }

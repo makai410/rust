@@ -60,7 +60,7 @@ pub fn get_fn<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, instance: Instance<'tcx>) 
         // reference. It also occurs when testing libcore and in some
         // other weird situations. Annoying.
         if cx.val_ty(func) != ptrtype {
-            // TODO(antoyo): cast the pointer.
+            // FIXME(antoyo): cast the pointer.
             func
         }
         else {
@@ -76,7 +76,7 @@ pub fn get_fn<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, instance: Instance<'tcx>) 
         {
             let instance_def_id = instance.def_id();
 
-            // TODO(antoyo): set linkage and attributes.
+            // FIXME(antoyo): set linkage and attributes.
 
             // Apply an appropriate linkage/visibility value to our item that we
             // just declared.
@@ -105,8 +105,8 @@ pub fn get_fn<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, instance: Instance<'tcx>) 
             let is_hidden = if is_generic {
                 // This is a monomorphization of a generic function.
                 if !(cx.tcx.sess.opts.share_generics()
-                    || tcx.codegen_fn_attrs(instance_def_id).inline
-                        == rustc_attr_data_structures::InlineAttr::Never)
+                    || tcx.codegen_instance_attrs(instance.def).inline
+                        == rustc_hir::attrs::InlineAttr::Never)
                 {
                     // When not sharing generics, all instances are in the same
                     // crate and have hidden visibility.

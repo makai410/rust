@@ -1,4 +1,4 @@
-//@ error-pattern unable to turn pointer into raw bytes
+//@ ignore-backends: gcc
 //@ normalize-stderr: "alloc[0-9]+\+0x[a-z0-9]+" -> "ALLOC"
 
 const C: () = unsafe {

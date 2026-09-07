@@ -1,12 +1,10 @@
 use clippy_utils::diagnostics::span_lint_and_help;
-use clippy_utils::ty::is_must_use_ty;
+use clippy_utils::ty::opt_must_use_path;
 use clippy_utils::{nth_arg, return_ty};
-use rustc_attr_data_structures::{AttributeKind, find_attr};
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{Body, FnDecl, OwnerId, TraitItem, TraitItemKind};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_session::declare_lint_pass;
+use rustc_hir::{Body, FnDecl, OwnerId, TraitItem, TraitItemKind, find_attr};
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, declare_lint_pass};
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -69,15 +67,13 @@ declare_clippy_lint! {
 declare_lint_pass!(ReturnSelfNotMustUse => [RETURN_SELF_NOT_MUST_USE]);
 
 fn check_method(cx: &LateContext<'_>, decl: &FnDecl<'_>, fn_def: LocalDefId, span: Span, owner_id: OwnerId) {
-    if !span.in_external_macro(cx.sess().source_map())
-        // If it comes from an external macro, better ignore it.
-        && decl.implicit_self.has_implicit_self()
+    if decl.implicit_self().has_implicit_self()
         // We only show this warning for public exported methods.
         && cx.effective_visibilities.is_exported(fn_def)
         // We don't want to emit this lint if the `#[must_use]` attribute is already there.
         && !find_attr!(
             cx.tcx.hir_attrs(owner_id.into()),
-            AttributeKind::MustUse { .. }
+            MustUse { .. }
         )
         && cx.tcx.visibility(fn_def.to_def_id()).is_public()
         && let ret_ty = return_ty(cx, owner_id)
@@ -87,8 +83,9 @@ fn check_method(cx: &LateContext<'_>, decl: &FnDecl<'_>, fn_def: LocalDefId, spa
         // For this check, we don't want to remove the reference on the returned type because if
         // there is one, we shouldn't emit a warning!
         && self_arg.peel_refs() == ret_ty
-        // If `Self` is already marked as `#[must_use]`, no need for the attribute here.
-        && !is_must_use_ty(cx, ret_ty)
+        // If `Self` is already considered as `#[must_use]`, no need for the attribute here.
+        && opt_must_use_path(cx, ret_ty).is_none()
+        && !span.in_external_macro(cx.sess().source_map())
     {
         span_lint_and_help(
             cx,
@@ -113,10 +110,9 @@ impl<'tcx> LateLintPass<'tcx> for ReturnSelfNotMustUse {
     ) {
         if matches!(kind, FnKind::Method(_, _))
             // We are only interested in methods, not in functions or associated functions.
-            && let Some(impl_def) = cx.tcx.impl_of_method(fn_def.to_def_id())
             // We don't want this method to be te implementation of a trait because the
             // `#[must_use]` should be put on the trait definition directly.
-            && cx.tcx.trait_id_of_impl(impl_def).is_none()
+            && cx.tcx.inherent_impl_of_assoc(fn_def.to_def_id()).is_some()
         {
             let hir_id = cx.tcx.local_def_id_to_hir_id(fn_def);
             check_method(cx, decl, fn_def, span, hir_id.expect_owner());

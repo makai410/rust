@@ -1,9 +1,10 @@
 use super::SAME_ITEM_PUSH;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::msrvs::Msrv;
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::source::snippet_with_context;
-use clippy_utils::ty::{implements_trait, is_type_diagnostic_item};
-use clippy_utils::{msrvs, path_to_local, std_or_core, sym};
+use clippy_utils::ty::implements_trait;
+use clippy_utils::{msrvs, std_or_core, sym};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
@@ -81,7 +82,7 @@ pub(super) fn check<'tcx>(
                                 ExprKind::Lit(..) => emit_lint(cx, vec, pushed_item, ctxt, msrv),
                                 // immutable bindings that are initialized with constant
                                 ExprKind::Path(ref path) => {
-                                    if let Res::Def(DefKind::Const, ..) = cx.qpath_res(path, init.hir_id) {
+                                    if let Res::Def(DefKind::Const { .. }, ..) = cx.qpath_res(path, init.hir_id) {
                                         emit_lint(cx, vec, pushed_item, ctxt, msrv);
                                     }
                                 },
@@ -90,7 +91,7 @@ pub(super) fn check<'tcx>(
                         }
                     },
                     // constant
-                    Res::Def(DefKind::Const, ..) => emit_lint(cx, vec, pushed_item, ctxt, msrv),
+                    Res::Def(DefKind::Const { .. }, ..) => emit_lint(cx, vec, pushed_item, ctxt, msrv),
                     _ => {},
                 }
             },
@@ -125,7 +126,7 @@ impl<'a, 'tcx> SameItemPushVisitor<'a, 'tcx> {
         if !self.non_deterministic_expr
             && !self.multiple_pushes
             && let Some((vec, _, _)) = self.vec_push
-            && let Some(hir_id) = path_to_local(vec)
+            && let Some(hir_id) = vec.res_local_id()
         {
             !self.used_locals.contains(&hir_id)
         } else {
@@ -141,7 +142,7 @@ impl<'tcx> Visitor<'tcx> for SameItemPushVisitor<'_, 'tcx> {
             ExprKind::Loop(..) | ExprKind::Match(..) | ExprKind::If(..) => self.non_deterministic_expr = true,
             ExprKind::Block(block, _) => self.visit_block(block),
             _ => {
-                if let Some(hir_id) = path_to_local(expr) {
+                if let Some(hir_id) = expr.res_local_id() {
                     self.used_locals.insert(hir_id);
                 }
                 walk_expr(self, expr);
@@ -186,7 +187,7 @@ fn get_vec_push<'tcx>(
             && let ExprKind::MethodCall(path, self_expr, [pushed_item], _) = &semi_stmt.kind
             // Check that the method being called is push() on a Vec
             && path.ident.name == sym::push
-            && is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(self_expr), sym::Vec)
+            && cx.typeck_results().expr_ty(self_expr).is_diag_item(cx, sym::Vec)
     {
         return Some((self_expr, pushed_item, semi_stmt.span.ctxt()));
     }

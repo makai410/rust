@@ -1,11 +1,11 @@
 target
-/doc
 tex/*/out
 *.dot
 *.out
 *.rs.bk
 .vscode
 .helix
+.zed
 *.mm_profdata
 perf.data
 perf.data.old

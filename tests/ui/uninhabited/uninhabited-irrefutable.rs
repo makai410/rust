@@ -1,6 +1,5 @@
 //@ revisions: normal exhaustive_patterns
 #![cfg_attr(exhaustive_patterns, feature(exhaustive_patterns))]
-#![feature(never_type)]
 
 mod foo {
     pub struct SecretlyEmpty {
@@ -34,5 +33,5 @@ fn main() {
     //~| NOTE for more information
     //~| NOTE pattern `Foo::A(_)` is currently uninhabited
     //~| NOTE the matched value is of type `Foo`
-    //~| HELP you might want to use `let else`
+    //~| HELP you might want to use `let...else`
 }

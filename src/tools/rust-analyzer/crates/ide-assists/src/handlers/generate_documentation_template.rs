@@ -3,9 +3,9 @@ use ide_db::assists::AssistId;
 use itertools::Itertools;
 use stdx::{format_to, to_lower_snake_case};
 use syntax::{
-    AstNode, AstToken, Edition,
+    AstNode, Edition,
     algo::skip_whitespace_token,
-    ast::{self, HasDocComments, HasGenericArgs, HasName, edit::IndentLevel},
+    ast::{self, HasAttrs, HasGenericArgs, HasName, edit::IndentLevel},
     match_ast,
 };
 
@@ -43,7 +43,7 @@ use crate::assist_context::{AssistContext, Assists};
 // ```
 pub(crate) fn generate_documentation_template(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let name = ctx.find_node_at_offset::<ast::Name>()?;
     let ast_func = name.syntax().parent().and_then(ast::Fn::cast)?;
@@ -95,12 +95,14 @@ pub(crate) fn generate_documentation_template(
 // /// ```
 // pub fn add(a: i32, b: i32) -> i32 { a + b }
 // ```
-pub(crate) fn generate_doc_example(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
-    let tok: ast::Comment = ctx.find_token_at_offset()?;
-    let node = tok.syntax().parent()?;
-    let last_doc_token =
-        ast::AnyHasDocComments::cast(node.clone())?.doc_comments().last()?.syntax().clone();
-    let next_token = skip_whitespace_token(last_doc_token.next_token()?, syntax::Direction::Next)?;
+pub(crate) fn generate_doc_example(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
+    let doc_at_cursor: ast::DocComment = ctx.find_node_at_offset()?;
+    let node = doc_at_cursor.syntax().parent()?;
+    let last_doc_comment = ast::AnyHasAttrs::cast(node.clone())?.doc_comments().last()?;
+    let next_token = skip_whitespace_token(
+        last_doc_comment.syntax().last_token()?.next_token()?,
+        syntax::Direction::Next,
+    )?;
 
     let example = match_ast! {
         match node {
@@ -127,7 +129,7 @@ pub(crate) fn generate_doc_example(acc: &mut Assists, ctx: &AssistContext<'_>) -
     )
 }
 
-fn make_example_for_fn(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<String> {
+fn make_example_for_fn(ast_func: &ast::Fn, ctx: &AssistContext<'_, '_>) -> Option<String> {
     if !is_public(ast_func, ctx)? {
         // Doctests for private items can't actually name the item, so they're pretty useless.
         return None;
@@ -148,11 +150,11 @@ fn make_example_for_fn(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<St
     let self_name = self_name(ast_func);
 
     format_to!(example, "use {use_path};\n\n");
-    if let Some(self_name) = &self_name {
-        if let Some(mut_) = is_ref_mut_self(ast_func) {
-            let mut_ = if mut_ { "mut " } else { "" };
-            format_to!(example, "let {mut_}{self_name} = ;\n");
-        }
+    if let Some(self_name) = &self_name
+        && let Some(mut_) = is_ref_mut_self(ast_func)
+    {
+        let mut_ = if mut_ { "mut " } else { "" };
+        format_to!(example, "let {mut_}{self_name} = ;\n");
     }
     for param_name in &ref_mut_params {
         format_to!(example, "let mut {param_name} = ;\n");
@@ -170,10 +172,10 @@ fn make_example_for_fn(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<St
         format_to!(example, "{function_call};\n");
     }
     // Check the mutated values
-    if let Some(self_name) = &self_name {
-        if is_ref_mut_self(ast_func) == Some(true) {
-            format_to!(example, "assert_eq!({self_name}, );");
-        }
+    if let Some(self_name) = &self_name
+        && is_ref_mut_self(ast_func) == Some(true)
+    {
+        format_to!(example, "assert_eq!({self_name}, );");
     }
     for param_name in &ref_mut_params {
         format_to!(example, "assert_eq!({param_name}, );");
@@ -182,7 +184,7 @@ fn make_example_for_fn(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<St
     Some(example)
 }
 
-fn introduction_builder(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<String> {
+fn introduction_builder(ast_func: &ast::Fn, ctx: &AssistContext<'_, '_>) -> Option<String> {
     let hir_func = ctx.sema.to_def(ast_func)?;
     let container = hir_func.as_assoc_item(ctx.db())?.container(ctx.db());
     if let hir::AssocItemContainer::Impl(imp) = container {
@@ -281,7 +283,7 @@ fn safety_builder(ast_func: &ast::Fn) -> Option<Vec<String>> {
 }
 
 /// Checks if the function is public / exported
-fn is_public(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<bool> {
+fn is_public(ast_func: &ast::Fn, ctx: &AssistContext<'_, '_>) -> Option<bool> {
     let hir_func = ctx.sema.to_def(ast_func)?;
     Some(
         hir_func.visibility(ctx.db()) == Visibility::Public
@@ -290,7 +292,7 @@ fn is_public(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<bool> {
 }
 
 /// Checks that all parent modules of the function are public / exported
-fn all_parent_mods_public(hir_func: &hir::Function, ctx: &AssistContext<'_>) -> bool {
+fn all_parent_mods_public(hir_func: &hir::Function, ctx: &AssistContext<'_, '_>) -> bool {
     let mut module = hir_func.module(ctx.db());
     loop {
         if let Some(parent) = module.parent(ctx.db()) {
@@ -305,7 +307,7 @@ fn all_parent_mods_public(hir_func: &hir::Function, ctx: &AssistContext<'_>) -> 
 }
 
 /// Returns the name of the current crate
-fn crate_name(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<String> {
+fn crate_name(ast_func: &ast::Fn, ctx: &AssistContext<'_, '_>) -> Option<String> {
     let krate = ctx.sema.scope(ast_func.syntax())?.krate();
     Some(krate.display_name(ctx.db())?.to_string())
 }
@@ -313,12 +315,28 @@ fn crate_name(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> Option<String> {
 /// `None` if function without a body; some bool to guess if function can panic
 fn can_panic(ast_func: &ast::Fn) -> Option<bool> {
     let body = ast_func.body()?.to_string();
-    let can_panic = body.contains("panic!(")
-        // FIXME it would be better to not match `debug_assert*!` macro invocations
-        || body.contains("assert!(")
-        || body.contains(".unwrap()")
-        || body.contains(".expect(");
-    Some(can_panic)
+    let mut iter = body.chars();
+    let assert_postfix = |s| {
+        ["!(", "_eq!(", "_ne!(", "_matches!("].iter().any(|postfix| str::starts_with(s, postfix))
+    };
+
+    while !iter.as_str().is_empty() {
+        let s = iter.as_str();
+        iter.next();
+        if s.strip_prefix("debug_assert").is_some_and(assert_postfix) {
+            iter.nth(10);
+            continue;
+        }
+        if s.strip_prefix("assert").is_some_and(assert_postfix)
+            || s.starts_with("panic!(")
+            || s.starts_with(".unwrap()")
+            || s.starts_with(".expect(")
+        {
+            return Some(true);
+        }
+    }
+
+    Some(false)
 }
 
 /// Helper function to get the name that should be given to `self` arguments
@@ -362,7 +380,7 @@ fn self_partial_type(ast_func: &ast::Fn) -> Option<String> {
 }
 
 /// Helper function to determine if the function is in a trait implementation
-fn is_in_trait_impl(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> bool {
+fn is_in_trait_impl(ast_func: &ast::Fn, ctx: &AssistContext<'_, '_>) -> bool {
     ctx.sema
         .to_def(ast_func)
         .and_then(|hir_func| hir_func.as_assoc_item(ctx.db()))
@@ -371,7 +389,7 @@ fn is_in_trait_impl(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> bool {
 }
 
 /// Helper function to determine if the function definition is in a trait definition
-fn is_in_trait_def(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> bool {
+fn is_in_trait_def(ast_func: &ast::Fn, ctx: &AssistContext<'_, '_>) -> bool {
     ctx.sema
         .to_def(ast_func)
         .and_then(|hir_func| hir_func.as_assoc_item(ctx.db()))
@@ -474,7 +492,7 @@ fn string_vec_from(string_array: &[&str]) -> Vec<String> {
 }
 
 /// Helper function to build the path of the module in the which is the node
-fn build_path(ast_func: &ast::Fn, ctx: &AssistContext<'_>, edition: Edition) -> Option<String> {
+fn build_path(ast_func: &ast::Fn, ctx: &AssistContext<'_, '_>, edition: Edition) -> Option<String> {
     let crate_name = crate_name(ast_func, ctx)?;
     let leaf = self_partial_type(ast_func)
         .or_else(|| ast_func.name().map(|n| n.to_string()))
@@ -492,7 +510,7 @@ fn return_type(ast_func: &ast::Fn) -> Option<ast::Type> {
 }
 
 /// Helper function to determine if the function returns some data
-fn returns_a_value(ast_func: &ast::Fn, ctx: &AssistContext<'_>) -> bool {
+fn returns_a_value(ast_func: &ast::Fn, ctx: &AssistContext<'_, '_>) -> bool {
     ctx.sema
         .to_def(ast_func)
         .map(|hir_func| hir_func.ret_type(ctx.db()))
@@ -678,6 +696,24 @@ pub fn panics_if(a: bool) {
     }
 
     #[test]
+    fn guesses_debug_assert_macro_cannot_panic() {
+        check_assist(
+            generate_documentation_template,
+            r#"
+pub fn $0debug_panics_if_not(a: bool) {
+    debug_assert!(a == true);
+}
+"#,
+            r#"
+/// .
+pub fn debug_panics_if_not(a: bool) {
+    debug_assert!(a == true);
+}
+"#,
+        );
+    }
+
+    #[test]
     fn guesses_assert_macro_can_panic() {
         check_assist(
             generate_documentation_template,
@@ -694,6 +730,28 @@ pub fn $0panics_if_not(a: bool) {
 /// Panics if .
 pub fn panics_if_not(a: bool) {
     assert!(a == true);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn guesses_assert_eq_macro_can_panic() {
+        check_assist(
+            generate_documentation_template,
+            r#"
+pub fn $0panics_if_not(a: bool) {
+    assert_eq!(a, true);
+}
+"#,
+            r#"
+/// .
+///
+/// # Panics
+///
+/// Panics if .
+pub fn panics_if_not(a: bool) {
+    assert_eq!(a, true);
 }
 "#,
         );

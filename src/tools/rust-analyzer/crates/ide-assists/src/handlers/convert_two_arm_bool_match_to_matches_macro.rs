@@ -25,7 +25,7 @@ use crate::{AssistContext, AssistId, Assists};
 // ```
 pub(crate) fn convert_two_arm_bool_match_to_matches_macro(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     use ArmBodyExpression::*;
     let match_expr = ctx.find_node_at_offset::<ast::MatchExpr>()?;
@@ -100,10 +100,10 @@ fn is_bool_literal_expr(
     sema: &Semantics<'_, RootDatabase>,
     expr: &ast::Expr,
 ) -> Option<ArmBodyExpression> {
-    if let ast::Expr::Literal(lit) = expr {
-        if let ast::LiteralKind::Bool(b) = lit.kind() {
-            return Some(ArmBodyExpression::Literal(b));
-        }
+    if let ast::Expr::Literal(lit) = expr
+        && let ast::LiteralKind::Bool(b) = lit.kind()
+    {
+        return Some(ArmBodyExpression::Literal(b));
     }
 
     if !sema.type_of_expr(expr)?.original.is_bool() {

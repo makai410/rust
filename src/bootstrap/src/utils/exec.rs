@@ -7,6 +7,7 @@
 //! relevant to command execution in the bootstrap process. This includes settings such as
 //! dry-run mode, verbosity level, and failure behavior.
 
+use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Formatter};
@@ -14,26 +15,21 @@ use std::fs::File;
 use std::hash::Hash;
 use std::io::{BufWriter, Write};
 use std::panic::Location;
-use std::path::Path;
-use std::process;
+use std::path::{Path, PathBuf};
 use std::process::{
     Child, ChildStderr, ChildStdout, Command, CommandArgs, CommandEnvs, ExitStatus, Output, Stdio,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use build_helper::ci::CiEnv;
 use build_helper::drop_bomb::DropBomb;
-use build_helper::exit;
 
-use crate::PathBuf;
 use crate::core::config::DryRun;
-#[cfg(feature = "tracing")]
-use crate::trace_cmd;
+use crate::utils::helpers::{self, t};
 
 /// What should be done when the command fails.
 #[derive(Debug, Copy, Clone)]
-pub enum BehaviorOnFailure {
+pub(crate) enum BehaviorOnFailure {
     /// Immediately stop bootstrap.
     Exit,
     /// Delay failure until the end of bootstrap invocation.
@@ -45,7 +41,7 @@ pub enum BehaviorOnFailure {
 /// How should the output of a specific stream of the command (stdout/stderr) be handled
 /// (whether it should be captured or printed).
 #[derive(Debug, Copy, Clone)]
-pub enum OutputMode {
+pub(crate) enum OutputMode {
     /// Prints the stream by inheriting it from the bootstrap process.
     Print,
     /// Captures the stream into memory.
@@ -53,14 +49,14 @@ pub enum OutputMode {
 }
 
 impl OutputMode {
-    pub fn captures(&self) -> bool {
+    pub(crate) fn captures(&self) -> bool {
         match self {
             OutputMode::Print => false,
             OutputMode::Capture => true,
         }
     }
 
-    pub fn stdio(&self) -> Stdio {
+    pub(crate) fn stdio(&self) -> Stdio {
         match self {
             OutputMode::Print => Stdio::inherit(),
             OutputMode::Capture => Stdio::piped(),
@@ -69,7 +65,7 @@ impl OutputMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
-pub struct CommandFingerprint {
+pub(crate) struct CommandFingerprint {
     program: OsString,
     args: Vec<OsString>,
     envs: Vec<(OsString, Option<OsString>)>,
@@ -77,51 +73,61 @@ pub struct CommandFingerprint {
 }
 
 impl CommandFingerprint {
+    #[cfg(feature = "tracing")]
+    pub(crate) fn program_name(&self) -> String {
+        Path::new(&self.program)
+            .file_name()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown command>".to_string())
+    }
+
     /// Helper method to format both Command and BootstrapCommand as a short execution line,
     /// without all the other details (e.g. environment variables).
-    pub fn format_short_cmd(&self) -> String {
-        let program = Path::new(&self.program);
-        let mut line = vec![program.file_name().unwrap().to_str().unwrap().to_owned()];
-        line.extend(self.args.iter().map(|arg| arg.to_string_lossy().into_owned()));
-        line.extend(self.cwd.iter().map(|p| p.to_string_lossy().into_owned()));
-        line.join(" ")
+    pub(crate) fn format_short_cmd(&self) -> String {
+        use std::fmt::Write;
+
+        let mut cmd = self.program.to_string_lossy().to_string();
+        for arg in &self.args {
+            let arg = arg.to_string_lossy();
+            if arg.contains(' ') {
+                write!(cmd, " '{arg}'").unwrap();
+            } else {
+                write!(cmd, " {arg}").unwrap();
+            }
+        }
+        if let Some(cwd) = &self.cwd {
+            write!(cmd, " [workdir={}]", cwd.to_string_lossy()).unwrap();
+        }
+        cmd
     }
 }
 
 #[derive(Default, Clone)]
-pub struct CommandProfile {
-    pub traces: Vec<ExecutionTrace>,
+pub(crate) struct CommandProfile {
+    pub(crate) traces: Vec<ExecutionTrace>,
 }
 
 #[derive(Default)]
-pub struct CommandProfiler {
+pub(crate) struct CommandProfiler {
     stats: Mutex<HashMap<CommandFingerprint, CommandProfile>>,
 }
 
 impl CommandProfiler {
-    pub fn record_execution(&self, key: CommandFingerprint, start_time: Instant) {
+    pub(crate) fn record_execution(&self, key: CommandFingerprint, start_time: Instant) {
         let mut stats = self.stats.lock().unwrap();
         let entry = stats.entry(key).or_default();
         entry.traces.push(ExecutionTrace::Executed { duration: start_time.elapsed() });
     }
 
-    pub fn record_cache_hit(&self, key: CommandFingerprint) {
+    pub(crate) fn record_cache_hit(&self, key: CommandFingerprint) {
         let mut stats = self.stats.lock().unwrap();
         let entry = stats.entry(key).or_default();
         entry.traces.push(ExecutionTrace::CacheHit);
     }
 
-    pub fn report_summary(&self, start_time: Instant) {
-        let pid = process::id();
-        let filename = format!("bootstrap-profile-{pid}.txt");
-
-        let file = match File::create(&filename) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to create profiler output file: {e}");
-                return;
-            }
-        };
+    /// Report summary of executed commands file at the specified `path`.
+    pub(crate) fn report_summary(&self, path: &Path, start_time: Instant) {
+        let file = t!(File::create(path));
 
         let mut writer = BufWriter::new(file);
         let stats = self.stats.lock().unwrap();
@@ -142,7 +148,7 @@ impl CommandProfiler {
             })
             .collect();
 
-        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.2));
 
         let total_bootstrap_duration = start_time.elapsed();
 
@@ -211,13 +217,11 @@ impl CommandProfiler {
         writeln!(writer, "Total cache hits: {total_cache_hits}").unwrap();
         writeln!(writer, "Estimated time saved due to cache hits: {total_saved_duration:.2?}")
             .unwrap();
-
-        println!("Command profiler report saved to {filename}");
     }
 }
 
 #[derive(Clone)]
-pub enum ExecutionTrace {
+pub(crate) enum ExecutionTrace {
     CacheHit,
     Executed { duration: Duration },
 }
@@ -238,11 +242,11 @@ pub enum ExecutionTrace {
 ///
 /// [allow_failure]: BootstrapCommand::allow_failure
 /// [delay_failure]: BootstrapCommand::delay_failure
-pub struct BootstrapCommand {
+pub(crate) struct BootstrapCommand {
     command: Command,
-    pub failure_behavior: BehaviorOnFailure,
+    pub(crate) failure_behavior: BehaviorOnFailure,
     // Run the command even during dry run
-    pub run_in_dry_run: bool,
+    pub(crate) run_in_dry_run: bool,
     // This field makes sure that each command is executed (or disarmed) before it is dropped,
     // to avoid forgetting to execute a command.
     drop_bomb: DropBomb,
@@ -251,20 +255,23 @@ pub struct BootstrapCommand {
 
 impl<'a> BootstrapCommand {
     #[track_caller]
-    pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
+    pub(crate) fn new<S: AsRef<OsStr>>(program: S) -> Self {
         Command::new(program).into()
     }
-    pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
+    pub(crate) fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
         self.command.arg(arg.as_ref());
         self
     }
 
-    pub fn do_not_cache(&mut self) -> &mut Self {
-        self.should_cache = false;
+    /// Cache the command. If it will be executed multiple times with the exact same arguments
+    /// and environment variables in the same bootstrap invocation, the previous result will be
+    /// loaded from memory.
+    pub(crate) fn cached(&mut self) -> &mut Self {
+        self.should_cache = true;
         self
     }
 
-    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    pub(crate) fn args<I, S>(&mut self, args: I) -> &mut Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -273,7 +280,7 @@ impl<'a> BootstrapCommand {
         self
     }
 
-    pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
+    pub(crate) fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
@@ -282,44 +289,44 @@ impl<'a> BootstrapCommand {
         self
     }
 
-    pub fn get_envs(&self) -> CommandEnvs<'_> {
+    pub(crate) fn get_envs(&self) -> CommandEnvs<'_> {
         self.command.get_envs()
     }
 
-    pub fn get_args(&self) -> CommandArgs<'_> {
+    pub(crate) fn get_args(&self) -> CommandArgs<'_> {
         self.command.get_args()
     }
 
-    pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
+    pub(crate) fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Self {
         self.command.env_remove(key);
         self
     }
 
-    pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
+    pub(crate) fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
         self.command.current_dir(dir);
         self
     }
 
-    pub fn stdin(&mut self, stdin: std::process::Stdio) -> &mut Self {
+    pub(crate) fn stdin(&mut self, stdin: std::process::Stdio) -> &mut Self {
         self.command.stdin(stdin);
         self
     }
 
     #[must_use]
-    pub fn delay_failure(self) -> Self {
+    pub(crate) fn delay_failure(self) -> Self {
         Self { failure_behavior: BehaviorOnFailure::DelayFail, ..self }
     }
 
-    pub fn fail_fast(self) -> Self {
+    pub(crate) fn fail_fast(self) -> Self {
         Self { failure_behavior: BehaviorOnFailure::Exit, ..self }
     }
 
     #[must_use]
-    pub fn allow_failure(self) -> Self {
+    pub(crate) fn allow_failure(self) -> Self {
         Self { failure_behavior: BehaviorOnFailure::Ignore, ..self }
     }
 
-    pub fn run_in_dry_run(&mut self) -> &mut Self {
+    pub(crate) fn run_in_dry_run(&mut self) -> &mut Self {
         self.run_in_dry_run = true;
         self
     }
@@ -327,25 +334,29 @@ impl<'a> BootstrapCommand {
     /// Run the command, while printing stdout and stderr.
     /// Returns true if the command has succeeded.
     #[track_caller]
-    pub fn run(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> bool {
+    pub(crate) fn run(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> bool {
         exec_ctx.as_ref().run(self, OutputMode::Print, OutputMode::Print).is_success()
     }
 
     /// Run the command, while capturing and returning all its output.
     #[track_caller]
-    pub fn run_capture(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
+    pub(crate) fn run_capture(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
         exec_ctx.as_ref().run(self, OutputMode::Capture, OutputMode::Capture)
     }
 
     /// Run the command, while capturing and returning stdout, and printing stderr.
     #[track_caller]
-    pub fn run_capture_stdout(&mut self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
+    pub(crate) fn run_capture_stdout(
+        &mut self,
+        exec_ctx: impl AsRef<ExecutionContext>,
+    ) -> CommandOutput {
         exec_ctx.as_ref().run(self, OutputMode::Capture, OutputMode::Print)
     }
 
     /// Spawn the command in background, while capturing and returning all its output.
     #[track_caller]
-    pub fn start_capture(
+    #[expect(dead_code, reason = "general-purpose, currently unused")]
+    pub(crate) fn start_capture(
         &'a mut self,
         exec_ctx: impl AsRef<ExecutionContext>,
     ) -> DeferredCommand<'a> {
@@ -354,7 +365,7 @@ impl<'a> BootstrapCommand {
 
     /// Spawn the command in background, while capturing and returning stdout, and printing stderr.
     #[track_caller]
-    pub fn start_capture_stdout(
+    pub(crate) fn start_capture_stdout(
         &'a mut self,
         exec_ctx: impl AsRef<ExecutionContext>,
     ) -> DeferredCommand<'a> {
@@ -364,7 +375,7 @@ impl<'a> BootstrapCommand {
     /// Spawn the command in background, while capturing and returning stdout, and printing stderr.
     /// Returns None in dry-mode
     #[track_caller]
-    pub fn stream_capture_stdout(
+    pub(crate) fn stream_capture_stdout(
         &'a mut self,
         exec_ctx: impl AsRef<ExecutionContext>,
     ) -> Option<StreamingCommand> {
@@ -373,28 +384,16 @@ impl<'a> BootstrapCommand {
 
     /// Mark the command as being executed, disarming the drop bomb.
     /// If this method is not called before the command is dropped, its drop will panic.
-    pub fn mark_as_executed(&mut self) {
+    pub(crate) fn mark_as_executed(&mut self) {
         self.drop_bomb.defuse();
     }
 
     /// Returns the source code location where this command was created.
-    pub fn get_created_location(&self) -> std::panic::Location<'static> {
+    pub(crate) fn get_created_location(&self) -> std::panic::Location<'static> {
         self.drop_bomb.get_created_location()
     }
 
-    /// If in a CI environment, forces the command to run with colors.
-    pub fn force_coloring_in_ci(&mut self) {
-        if CiEnv::is_ci() {
-            // Due to use of stamp/docker, the output stream of bootstrap is not
-            // a TTY in CI, so coloring is by-default turned off.
-            // The explicit `TERM=xterm` environment is needed for
-            // `--color always` to actually work. This env var was lost when
-            // compiling through the Makefile. Very strange.
-            self.env("TERM", "xterm").args(["--color", "always"]);
-        }
-    }
-
-    pub fn fingerprint(&self) -> CommandFingerprint {
+    pub(crate) fn fingerprint(&self) -> CommandFingerprint {
         let command = &self.command;
         CommandFingerprint {
             program: command.get_program().into(),
@@ -420,7 +419,7 @@ impl From<Command> for BootstrapCommand {
     fn from(command: Command) -> Self {
         let program = command.get_program().to_owned();
         Self {
-            should_cache: true,
+            should_cache: false,
             command,
             failure_behavior: BehaviorOnFailure::Exit,
             run_in_dry_run: false,
@@ -434,21 +433,21 @@ impl From<Command> for BootstrapCommand {
 enum CommandStatus {
     /// The command has started and finished with some status.
     Finished(ExitStatus),
-    /// It was not even possible to start the command.
-    DidNotStart,
+    /// It was not even possible to start the command or wait for it to finish.
+    DidNotStartOrFinish,
 }
 
 /// Create a new BootstrapCommand. This is a helper function to make command creation
 /// shorter than `BootstrapCommand::new`.
 #[track_caller]
 #[must_use]
-pub fn command<S: AsRef<OsStr>>(program: S) -> BootstrapCommand {
+pub(crate) fn command<S: AsRef<OsStr>>(program: S) -> BootstrapCommand {
     BootstrapCommand::new(program)
 }
 
 /// Represents the output of an executed process.
 #[derive(Clone, PartialEq)]
-pub struct CommandOutput {
+pub(crate) struct CommandOutput {
     status: CommandStatus,
     stdout: Option<Vec<u8>>,
     stderr: Option<Vec<u8>>,
@@ -456,9 +455,9 @@ pub struct CommandOutput {
 
 impl CommandOutput {
     #[must_use]
-    pub fn did_not_start(stdout: OutputMode, stderr: OutputMode) -> Self {
+    pub(crate) fn not_finished(stdout: OutputMode, stderr: OutputMode) -> Self {
         Self {
-            status: CommandStatus::DidNotStart,
+            status: CommandStatus::DidNotStartOrFinish,
             stdout: match stdout {
                 OutputMode::Print => None,
                 OutputMode::Capture => Some(vec![]),
@@ -471,7 +470,7 @@ impl CommandOutput {
     }
 
     #[must_use]
-    pub fn from_output(output: Output, stdout: OutputMode, stderr: OutputMode) -> Self {
+    pub(crate) fn from_output(output: Output, stdout: OutputMode, stderr: OutputMode) -> Self {
         Self {
             status: CommandStatus::Finished(output.status),
             stdout: match stdout {
@@ -486,27 +485,27 @@ impl CommandOutput {
     }
 
     #[must_use]
-    pub fn is_success(&self) -> bool {
+    pub(crate) fn is_success(&self) -> bool {
         match self.status {
             CommandStatus::Finished(status) => status.success(),
-            CommandStatus::DidNotStart => false,
+            CommandStatus::DidNotStartOrFinish => false,
         }
     }
 
     #[must_use]
-    pub fn is_failure(&self) -> bool {
+    pub(crate) fn is_failure(&self) -> bool {
         !self.is_success()
     }
 
-    pub fn status(&self) -> Option<ExitStatus> {
+    pub(crate) fn status(&self) -> Option<ExitStatus> {
         match self.status {
             CommandStatus::Finished(status) => Some(status),
-            CommandStatus::DidNotStart => None,
+            CommandStatus::DidNotStartOrFinish => None,
         }
     }
 
     #[must_use]
-    pub fn stdout(&self) -> String {
+    pub(crate) fn stdout(&self) -> String {
         String::from_utf8(
             self.stdout.clone().expect("Accessing stdout of a command that did not capture stdout"),
         )
@@ -514,26 +513,16 @@ impl CommandOutput {
     }
 
     #[must_use]
-    pub fn stdout_if_present(&self) -> Option<String> {
-        self.stdout.as_ref().and_then(|s| String::from_utf8(s.clone()).ok())
-    }
-
-    #[must_use]
-    pub fn stdout_if_ok(&self) -> Option<String> {
+    pub(crate) fn stdout_if_ok(&self) -> Option<String> {
         if self.is_success() { Some(self.stdout()) } else { None }
     }
 
     #[must_use]
-    pub fn stderr(&self) -> String {
+    pub(crate) fn stderr(&self) -> String {
         String::from_utf8(
             self.stderr.clone().expect("Accessing stderr of a command that did not capture stderr"),
         )
         .expect("Cannot parse process stderr as UTF-8")
-    }
-
-    #[must_use]
-    pub fn stderr_if_present(&self) -> Option<String> {
-        self.stderr.as_ref().and_then(|s| String::from_utf8(s.clone()).ok())
     }
 }
 
@@ -548,17 +537,17 @@ impl Default for CommandOutput {
 }
 
 #[derive(Clone, Default)]
-pub struct ExecutionContext {
+pub(crate) struct ExecutionContext {
     dry_run: DryRun,
-    verbose: u8,
-    pub fail_fast: bool,
+    pub(crate) verbosity: u8,
+    fail_fast: bool,
     delayed_failures: Arc<Mutex<Vec<String>>>,
     command_cache: Arc<CommandCache>,
     profiler: Arc<CommandProfiler>,
 }
 
 #[derive(Default)]
-pub struct CommandCache {
+pub(crate) struct CommandCache {
     cache: Mutex<HashMap<CommandFingerprint, CommandOutput>>,
 }
 
@@ -577,10 +566,11 @@ enum CommandState<'a> {
     },
 }
 
-pub struct StreamingCommand {
+pub(crate) struct StreamingCommand {
     child: Child,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
+    pub(crate) stdout: Option<ChildStdout>,
+    #[expect(dead_code, reason = "symmetric with `stdout`")]
+    pub(crate) stderr: Option<ChildStderr>,
     fingerprint: CommandFingerprint,
     start_time: Instant,
     #[cfg(feature = "tracing")]
@@ -588,71 +578,63 @@ pub struct StreamingCommand {
 }
 
 #[must_use]
-pub struct DeferredCommand<'a> {
+pub(crate) struct DeferredCommand<'a> {
     state: CommandState<'a>,
 }
 
 impl CommandCache {
-    pub fn get(&self, key: &CommandFingerprint) -> Option<CommandOutput> {
+    pub(crate) fn get(&self, key: &CommandFingerprint) -> Option<CommandOutput> {
         self.cache.lock().unwrap().get(key).cloned()
     }
 
-    pub fn insert(&self, key: CommandFingerprint, output: CommandOutput) {
+    pub(crate) fn insert(&self, key: CommandFingerprint, output: CommandOutput) {
         self.cache.lock().unwrap().insert(key, output);
     }
 }
 
 impl ExecutionContext {
-    pub fn new() -> Self {
-        ExecutionContext::default()
+    pub(crate) fn new(verbosity: u8, fail_fast: bool) -> Self {
+        Self { verbosity, fail_fast, ..Default::default() }
     }
 
-    pub fn dry_run(&self) -> bool {
+    pub(crate) fn dry_run(&self) -> bool {
         match self.dry_run {
             DryRun::Disabled => false,
             DryRun::SelfCheck | DryRun::UserSelected => true,
         }
     }
 
-    pub fn profiler(&self) -> &CommandProfiler {
+    pub(crate) fn profiler(&self) -> &CommandProfiler {
         &self.profiler
     }
 
-    pub fn get_dry_run(&self) -> &DryRun {
+    pub(crate) fn get_dry_run(&self) -> &DryRun {
         &self.dry_run
     }
 
-    pub fn verbose(&self, f: impl Fn()) {
+    pub(crate) fn do_if_verbose(&self, f: impl Fn()) {
         if self.is_verbose() {
             f()
         }
     }
 
-    pub fn is_verbose(&self) -> bool {
-        self.verbose > 0
+    pub(crate) fn is_verbose(&self) -> bool {
+        self.verbosity > 0
     }
 
-    pub fn fail_fast(&self) -> bool {
-        self.fail_fast
-    }
-
-    pub fn set_dry_run(&mut self, value: DryRun) {
+    pub(crate) fn set_dry_run(&mut self, value: DryRun) {
         self.dry_run = value;
     }
 
-    pub fn set_verbose(&mut self, value: u8) {
-        self.verbose = value;
+    pub(crate) fn set_verbosity(&mut self, value: u8) {
+        self.verbosity = value;
     }
 
-    pub fn set_fail_fast(&mut self, value: bool) {
-        self.fail_fast = value;
-    }
-
-    pub fn add_to_delay_failure(&self, message: String) {
+    pub(crate) fn add_to_delay_failure(&self, message: String) {
         self.delayed_failures.lock().unwrap().push(message);
     }
 
-    pub fn report_failures_and_exit(&self) {
+    pub(crate) fn report_failures_and_exit(&self) {
         let failures = self.delayed_failures.lock().unwrap();
         if failures.is_empty() {
             return;
@@ -661,14 +643,14 @@ impl ExecutionContext {
         for failure in &*failures {
             eprintln!("  - {failure}");
         }
-        exit!(1);
+        helpers::exit_process(1);
     }
 
     /// Execute a command and return its output.
     /// Note: Ideally, you should use one of the BootstrapCommand::run* functions to
     /// execute commands. They internally call this method.
     #[track_caller]
-    pub fn start<'a>(
+    pub(crate) fn start<'a>(
         &self,
         command: &'a mut BootstrapCommand,
         stdout: OutputMode,
@@ -676,15 +658,15 @@ impl ExecutionContext {
     ) -> DeferredCommand<'a> {
         let fingerprint = command.fingerprint();
 
-        #[cfg(feature = "tracing")]
-        let span_guard = trace_cmd!(command);
-
         if let Some(cached_output) = self.command_cache.get(&fingerprint) {
             command.mark_as_executed();
-            self.verbose(|| println!("Cache hit: {command:?}"));
+            self.do_if_verbose(|| println!("Cache hit: {command:?}"));
             self.profiler.record_cache_hit(fingerprint);
             return DeferredCommand { state: CommandState::Cached(cached_output) };
         }
+
+        #[cfg(feature = "tracing")]
+        let span_guard = crate::utils::tracing::trace_cmd(command);
 
         let created_at = command.get_created_location();
         let executed_at = std::panic::Location::caller();
@@ -705,7 +687,7 @@ impl ExecutionContext {
             };
         }
 
-        self.verbose(|| {
+        self.do_if_verbose(|| {
             println!("running: {command:?} (created at {created_at}, executed at {executed_at})")
         });
 
@@ -736,7 +718,7 @@ impl ExecutionContext {
     /// Note: Ideally, you should use one of the BootstrapCommand::run* functions to
     /// execute commands. They internally call this method.
     #[track_caller]
-    pub fn run(
+    pub(crate) fn run(
         &self,
         command: &mut BootstrapCommand,
         stdout: OutputMode,
@@ -745,33 +727,19 @@ impl ExecutionContext {
         self.start(command, stdout, stderr).wait_for_output(self)
     }
 
-    fn fail(&self, message: &str, output: CommandOutput) -> ! {
-        if self.is_verbose() {
-            println!("{message}");
-        } else {
-            let (stdout, stderr) = (output.stdout_if_present(), output.stderr_if_present());
-            // If the command captures output, the user would not see any indication that
-            // it has failed. In this case, print a more verbose error, since to provide more
-            // context.
-            if stdout.is_some() || stderr.is_some() {
-                if let Some(stdout) = output.stdout_if_present().take_if(|s| !s.trim().is_empty()) {
-                    println!("STDOUT:\n{stdout}\n");
-                }
-                if let Some(stderr) = output.stderr_if_present().take_if(|s| !s.trim().is_empty()) {
-                    println!("STDERR:\n{stderr}\n");
-                }
-                println!("Command has failed. Rerun with -v to see more details.");
-            } else {
-                println!("Command has failed. Rerun with -v to see more details.");
-            }
+    fn fail(&self, message: &str) -> ! {
+        println!("{message}");
+
+        if !self.is_verbose() {
+            println!("Command has failed. Rerun with -v to see more details.");
         }
-        exit!(1);
+        helpers::exit_process(1);
     }
 
     /// Spawns the command with configured stdout and stderr handling.
     ///
     /// Returns None if in dry-run mode or Panics if the command fails to spawn.
-    pub fn stream(
+    pub(crate) fn stream(
         &self,
         command: &mut BootstrapCommand,
         stdout: OutputMode,
@@ -783,7 +751,7 @@ impl ExecutionContext {
         }
 
         #[cfg(feature = "tracing")]
-        let span_guard = trace_cmd!(command);
+        let span_guard = crate::utils::tracing::trace_cmd(command);
 
         let start_time = Instant::now();
         let fingerprint = command.fingerprint();
@@ -817,7 +785,7 @@ impl AsRef<ExecutionContext> for ExecutionContext {
 }
 
 impl StreamingCommand {
-    pub fn wait(
+    pub(crate) fn wait(
         mut self,
         exec_ctx: impl AsRef<ExecutionContext>,
     ) -> Result<ExitStatus, std::io::Error> {
@@ -829,7 +797,7 @@ impl StreamingCommand {
 }
 
 impl<'a> DeferredCommand<'a> {
-    pub fn wait_for_output(self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
+    pub(crate) fn wait_for_output(self, exec_ctx: impl AsRef<ExecutionContext>) -> CommandOutput {
         match self.state {
             CommandState::Cached(output) => output,
             CommandState::Deferred {
@@ -856,7 +824,7 @@ impl<'a> DeferredCommand<'a> {
                     && command.should_cache
                 {
                     exec_ctx.command_cache.insert(fingerprint.clone(), output.clone());
-                    exec_ctx.profiler.record_execution(fingerprint.clone(), start_time);
+                    exec_ctx.profiler.record_execution(fingerprint, start_time);
                 }
 
                 output
@@ -864,7 +832,7 @@ impl<'a> DeferredCommand<'a> {
         }
     }
 
-    pub fn finish_process(
+    pub(crate) fn finish_process(
         mut process: Option<Result<Child, std::io::Error>>,
         command: &mut BootstrapCommand,
         stdout: OutputMode,
@@ -872,6 +840,8 @@ impl<'a> DeferredCommand<'a> {
         executed_at: &'a std::panic::Location<'a>,
         exec_ctx: &ExecutionContext,
     ) -> CommandOutput {
+        use std::fmt::Write;
+
         command.mark_as_executed();
 
         let process = match process.take() {
@@ -881,79 +851,92 @@ impl<'a> DeferredCommand<'a> {
 
         let created_at = command.get_created_location();
 
-        let mut message = String::new();
+        #[allow(clippy::enum_variant_names)]
+        enum FailureReason {
+            FailedAtRuntime(ExitStatus),
+            FailedToFinish(std::io::Error),
+            FailedToStart(std::io::Error),
+        }
 
-        let output = match process {
+        let (output, fail_reason) = match process {
             Ok(child) => match child.wait_with_output() {
-                Ok(result) if result.status.success() => {
+                Ok(output) if output.status.success() => {
                     // Successful execution
-                    CommandOutput::from_output(result, stdout, stderr)
+                    (CommandOutput::from_output(output, stdout, stderr), None)
                 }
-                Ok(result) => {
-                    // Command ran but failed
-                    use std::fmt::Write;
-
-                    writeln!(
-                        message,
-                        r#"
-Command {command:?} did not execute successfully.
-Expected success, got {}
-Created at: {created_at}
-Executed at: {executed_at}"#,
-                        result.status,
+                Ok(output) => {
+                    // Command started, but then it failed
+                    let status = output.status;
+                    (
+                        CommandOutput::from_output(output, stdout, stderr),
+                        Some(FailureReason::FailedAtRuntime(status)),
                     )
-                    .unwrap();
-
-                    let output = CommandOutput::from_output(result, stdout, stderr);
-
-                    if stdout.captures() {
-                        writeln!(message, "\nSTDOUT ----\n{}", output.stdout().trim()).unwrap();
-                    }
-                    if stderr.captures() {
-                        writeln!(message, "\nSTDERR ----\n{}", output.stderr().trim()).unwrap();
-                    }
-
-                    output
                 }
                 Err(e) => {
                     // Failed to wait for output
-                    use std::fmt::Write;
-
-                    writeln!(
-                        message,
-                        "\n\nCommand {command:?} did not execute successfully.\
-                        \nIt was not possible to execute the command: {e:?}"
+                    (
+                        CommandOutput::not_finished(stdout, stderr),
+                        Some(FailureReason::FailedToFinish(e)),
                     )
-                    .unwrap();
-
-                    CommandOutput::did_not_start(stdout, stderr)
                 }
             },
             Err(e) => {
                 // Failed to spawn the command
-                use std::fmt::Write;
-
-                writeln!(
-                    message,
-                    "\n\nCommand {command:?} did not execute successfully.\
-                    \nIt was not possible to execute the command: {e:?}"
-                )
-                .unwrap();
-
-                CommandOutput::did_not_start(stdout, stderr)
+                (CommandOutput::not_finished(stdout, stderr), Some(FailureReason::FailedToStart(e)))
             }
         };
 
-        if !output.is_success() {
+        if let Some(fail_reason) = fail_reason {
+            let mut error_message = String::new();
+            let command_str = if exec_ctx.is_verbose() {
+                format!("{command:?}")
+            } else {
+                command.fingerprint().format_short_cmd()
+            };
+            let action = match fail_reason {
+                FailureReason::FailedAtRuntime(e) => {
+                    format!("failed with exit code {}", e.code().unwrap_or(1))
+                }
+                FailureReason::FailedToFinish(e) => {
+                    format!("failed to finish: {e:?}")
+                }
+                FailureReason::FailedToStart(e) => {
+                    format!("failed to start: {e:?}")
+                }
+            };
+            writeln!(
+                error_message,
+                r#"Command `{command_str}` {action}
+Created at: {created_at}
+Executed at: {executed_at}"#,
+            )
+            .unwrap();
+            if stdout.captures() {
+                writeln!(error_message, "\n--- STDOUT vvv\n{}", output.stdout().trim()).unwrap();
+            }
+            if stderr.captures() {
+                writeln!(error_message, "\n--- STDERR vvv\n{}", output.stderr().trim()).unwrap();
+            }
+            let backtrace = if exec_ctx.verbosity > 1 {
+                Backtrace::force_capture()
+            } else if matches!(command.failure_behavior, BehaviorOnFailure::Ignore) {
+                Backtrace::disabled()
+            } else {
+                Backtrace::capture()
+            };
+            if matches!(backtrace.status(), BacktraceStatus::Captured) {
+                writeln!(error_message, "\n--- BACKTRACE vvv\n{backtrace}").unwrap();
+            }
+
             match command.failure_behavior {
                 BehaviorOnFailure::DelayFail => {
                     if exec_ctx.fail_fast {
-                        exec_ctx.fail(&message, output);
+                        exec_ctx.fail(&error_message);
                     }
-                    exec_ctx.add_to_delay_failure(message);
+                    exec_ctx.add_to_delay_failure(error_message);
                 }
                 BehaviorOnFailure::Exit => {
-                    exec_ctx.fail(&message, output);
+                    exec_ctx.fail(&error_message);
                 }
                 BehaviorOnFailure::Ignore => {
                     // If failures are allowed, either the error has been printed already

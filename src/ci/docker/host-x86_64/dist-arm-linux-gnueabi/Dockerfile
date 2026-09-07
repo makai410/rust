@@ -4,6 +4,7 @@ COPY scripts/cross-apt-packages.sh /scripts/
 RUN sh /scripts/cross-apt-packages.sh
 
 COPY scripts/crosstool-ng.sh /scripts/
+COPY scripts/crosstool-ng-sha256-20260705.diff /scripts/
 RUN sh /scripts/crosstool-ng.sh
 
 WORKDIR /build
@@ -27,9 +28,8 @@ ENV CC_arm_unknown_linux_gnueabi=arm-unknown-linux-gnueabi-gcc \
 
 ENV HOSTS=arm-unknown-linux-gnueabi
 
-ENV RUST_CONFIGURE_ARGS \
-      --enable-full-tools \
+ENV RUST_CONFIGURE_ARGS="--enable-full-tools \
       --disable-docs \
       --enable-sanitizers \
-      --enable-profiler
-ENV SCRIPT python3 ../x.py dist --host $HOSTS --target $HOSTS
+      --enable-profiler"
+ENV SCRIPT="python3 ../x.py dist --host $HOSTS --target $HOSTS"

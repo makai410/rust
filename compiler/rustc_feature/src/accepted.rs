@@ -25,9 +25,6 @@ declare_features! (
     // feature-group-start: for testing purposes
     // -------------------------------------------------------------------------
 
-    /// A temporary feature gate used to enable parser extensions needed
-    /// to bootstrap fix for #5723.
-    (accepted, issue_5723_bootstrap, "1.0.0", None),
     /// These are used to test this portion of the compiler,
     /// they don't actually mean anything.
     (accepted, test_accepted_feature, "1.0.0", None),
@@ -49,6 +46,8 @@ declare_features! (
 
     /// Allows `#[target_feature(...)]` on aarch64 platforms
     (accepted, aarch64_target_feature, "1.61.0", Some(44839)),
+    /// Allows `extern "custom" fn()`.
+    (accepted, abi_custom, "CURRENT_RUSTC_VERSION", Some(140829)),
     /// Allows using the `efiapi` ABI.
     (accepted, abi_efiapi, "1.68.0", Some(65815)),
     /// Allows the sysV64 ABI to be specified on all platforms
@@ -60,6 +59,8 @@ declare_features! (
     (accepted, adx_target_feature, "1.61.0", Some(44839)),
     /// Allows explicit discriminants on non-unit enum variants.
     (accepted, arbitrary_enum_discriminant, "1.66.0", Some(60553)),
+    /// Allows #[cfg(...)] on inline assembly templates and operands.
+    (accepted, asm_cfg, "1.93.0", Some(140364)),
     /// Allows using `const` operands in inline assembly.
     (accepted, asm_const, "1.82.0", Some(93332)),
     /// Allows using `label` operands in inline assembly.
@@ -95,6 +96,11 @@ declare_features! (
     (accepted, c_str_literals, "1.77.0", Some(105723)),
     /// Allows `extern "C-unwind" fn` to enable unwinding across ABI boundaries and treat `extern "C" fn` as nounwind.
     (accepted, c_unwind, "1.81.0", Some(74990)),
+    /// Allows using C-variadics.
+    (accepted, c_variadic, "1.99.0", Some(44930)),
+    /// Allows defining c-variadic naked functions with any extern ABI that is allowed
+    /// on c-variadic foreign functions.
+    (accepted, c_variadic_naked_functions, "1.99.0", Some(148767)),
     /// Allows `#[cfg_attr(predicate, multiple, attributes, here)]`.
     (accepted, cfg_attr_multi, "1.33.0", Some(54881)),
     /// Allows the use of `#[cfg(<true/false>)]`.
@@ -103,10 +109,14 @@ declare_features! (
     (accepted, cfg_doctest, "1.40.0", Some(62210)),
     /// Enables `#[cfg(panic = "...")]` config key.
     (accepted, cfg_panic, "1.60.0", Some(77443)),
+    /// Provides a native way to easily manage multiple conditional flags without having to rewrite each clause multiple times.
+    (accepted, cfg_select, "1.95.0", Some(115585)),
     /// Allows `cfg(target_abi = "...")`.
     (accepted, cfg_target_abi, "1.78.0", Some(80970)),
     /// Allows `cfg(target_feature = "...")`.
     (accepted, cfg_target_feature, "1.27.0", Some(29717)),
+    /// Allows `cfg(target_has_atomic_primitive_alignment = "...")`.
+    (accepted, cfg_target_has_atomic_equal_alignment, "1.97.0", Some(93822)),
     /// Allows `cfg(target_vendor = "...")`.
     (accepted, cfg_target_vendor, "1.33.0", Some(29718)),
     /// Allows implementing `Clone` for closures where possible (RFC 2132).
@@ -203,6 +213,9 @@ declare_features! (
     (accepted, expr_fragment_specifier_2024, "1.83.0", Some(123742)),
     /// Allows arbitrary expressions in key-value attributes at parse time.
     (accepted, extended_key_value_attributes, "1.54.0", Some(78835)),
+    /// Allows using `aapcs`, `efiapi`, `sysv64` and `win64` as calling conventions
+    /// for functions with varargs.
+    (accepted, extended_varargs_abi_support, "1.91.0", Some(100189)),
     /// Allows resolving absolute paths as paths from other crates.
     (accepted, extern_absolute_paths, "1.30.0", Some(44660)),
     /// Allows `extern crate foo as bar;`. This puts `bar` into extern prelude.
@@ -212,6 +225,8 @@ declare_features! (
     (accepted, extern_crate_self, "1.34.0", Some(56409)),
     /// Allows access to crate names passed via `--extern` through prelude.
     (accepted, extern_prelude, "1.30.0", Some(44660)),
+    /// Allows using `system` as a calling convention with varargs.
+    (accepted, extern_system_varargs, "1.93.0", Some(136946)),
     /// Allows using F16C intrinsics from `core::arch::{x86, x86_64}`.
     (accepted, f16c_target_feature, "1.68.0", Some(44839)),
     /// Allows field shorthands (`x` meaning `x: x`) in struct literal expressions.
@@ -228,7 +243,7 @@ declare_features! (
     (accepted, generic_param_attrs, "1.27.0", Some(48848)),
     /// Allows the `#[global_allocator]` attribute.
     (accepted, global_allocator, "1.28.0", Some(27389)),
-    // FIXME: explain `globs`.
+    /// Allows globs imports (`use module::*;`) to import all public items from a module.
     (accepted, globs, "1.0.0", None),
     /// Allows using `..=X` as a pattern.
     (accepted, half_open_range_patterns, "1.66.0", Some(67264)),
@@ -236,6 +251,8 @@ declare_features! (
     (accepted, i128_type, "1.26.0", Some(35118)),
     /// Allows the use of `if let` expressions.
     (accepted, if_let, "1.0.0", None),
+    /// Allows `if let` guard in match arms.
+    (accepted, if_let_guard, "1.95.0", Some(51114)),
     /// Rescoping temporaries in `if let` to align with Rust 2024.
     (accepted, if_let_rescope, "1.84.0", Some(124085)),
     /// Allows top level or-patterns (`p | q`) in `if let` and `while let`.
@@ -261,7 +278,7 @@ declare_features! (
     /// Allows some increased flexibility in the name resolution rules,
     /// especially around globs and shadowing (RFC 1560).
     (accepted, item_like_imports, "1.15.0", Some(35120)),
-    // Allows using the `kl` and `widekl` target features and the associated intrinsics
+    /// Allows using the `kl` and `widekl` target features and the associated intrinsics
     (accepted, keylocker_x86, "1.89.0", Some(134813)),
     /// Allows `'a: { break 'a; }`.
     (accepted, label_break_value, "1.65.0", Some(48594)),
@@ -318,6 +335,8 @@ declare_features! (
     (accepted, native_link_modifiers_verbatim, "1.67.0", Some(81490)),
     /// Allows specifying the whole-archive link modifier
     (accepted, native_link_modifiers_whole_archive, "1.61.0", Some(81490)),
+    /// Allows the `!` type.
+    (accepted, never_type, "CURRENT_RUSTC_VERSION", Some(35121)),
     /// Allows using non lexical lifetimes (RFC 2094).
     (accepted, nll, "1.63.0", Some(43234)),
     /// Allows using `#![no_std]`.
@@ -384,6 +403,8 @@ declare_features! (
     (accepted, return_position_impl_trait_in_trait, "1.75.0", Some(91611)),
     /// Allows code like `let x: &'static u32 = &42` to work (RFC 1414).
     (accepted, rvalue_static_promotion, "1.21.0", Some(38865)),
+    /// Allows use of the `vector` and related s390x target features.
+    (accepted, s390x_target_feature_vector, "1.93.0", Some(145649)),
     /// Allows `Self` in type definitions (RFC 2300).
     (accepted, self_in_typedefs, "1.32.0", Some(49303)),
     /// Allows `Self` struct constructor (RFC 2302).
@@ -396,6 +417,8 @@ declare_features! (
     (accepted, slice_patterns, "1.42.0", Some(62254)),
     /// Allows use of `&foo[a..b]` as a slicing syntax.
     (accepted, slicing_syntax, "1.0.0", None),
+    /// Allows use of `sse4a` target feature.
+    (accepted, sse4a_target_feature, "1.91.0", Some(44839)),
     /// Allows elision of `'static` lifetimes in `static`s and `const`s.
     (accepted, static_in_const, "1.17.0", Some(35897)),
     /// Allows the definition recursive static items.
@@ -408,6 +431,8 @@ declare_features! (
     (accepted, target_feature, "1.27.0", None),
     /// Allows the use of `#[target_feature]` on safe functions.
     (accepted, target_feature_11, "1.86.0", Some(69098)),
+    /// Allows use of `tbm` target feature.
+    (accepted, tbm_target_feature, "1.91.0", Some(44839)),
     /// Allows `fn main()` with return types which implements `Termination` (RFC 1937).
     (accepted, termination_trait, "1.26.0", Some(43301)),
     /// Allows `#[test]` functions where the return type implements `Termination` (RFC 1937).

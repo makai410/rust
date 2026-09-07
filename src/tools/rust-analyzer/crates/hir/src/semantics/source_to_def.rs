@@ -10,7 +10,7 @@
 //! This problem is a part of more-or-less every IDE feature implemented. Every
 //! IDE functionality (like goto to definition), conceptually starts with a
 //! specific cursor position in a file. Starting with this text offset, we first
-//! figure out what syntactic construct are we at: is this a pattern, an
+//! figure out what syntactic construct we are at: is this a pattern, an
 //! expression, an item definition.
 //!
 //! Knowing only the syntax gives us relatively little info. For example,
@@ -32,11 +32,11 @@
 //! Specifically, the algorithm goes like this:
 //!
 //! 1. Find the syntactic container for the syntax. For example, field's
-//!    container is the struct, and structs container is a module.
+//!    container is the struct, and the struct's container is a module.
 //! 2. Recursively get the def corresponding to container.
 //! 3. Ask the container def for all child defs. These child defs contain
 //!    the answer and answer's siblings.
-//! 4. For each child def, ask for it's source.
+//! 4. For each child def, ask for its source.
 //! 5. The child def whose source is the syntax node we've started with
 //!    is the answer.
 //!
@@ -85,16 +85,18 @@
 //! active crate for a given position, and then provide an API to resolve all
 //! syntax nodes against this specific crate.
 
+use base_db::relevant_crates;
 use either::Either;
 use hir_def::{
-    AdtId, BlockId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExternBlockId,
-    ExternCrateId, FieldId, FunctionId, GenericDefId, GenericParamId, ImplId, LifetimeParamId,
-    Lookup, MacroId, ModuleId, StaticId, StructId, TraitAliasId, TraitId, TypeAliasId, TypeParamId,
-    UnionId, UseId, VariantId,
+    AdtId, BlockId, BuiltinDeriveImplId, ConstId, ConstParamId, DefWithBodyId, EnumId,
+    EnumVariantId, ExpressionStoreOwnerId, ExternBlockId, ExternCrateId, FieldId, FunctionId,
+    GenericDefId, GenericParamId, ImplId, LifetimeParamId, Lookup, MacroId, ModuleId, StaticId,
+    StructId, TraitId, TypeAliasId, TypeParamId, UnionId, UseId, VariantId,
     dyn_map::{
         DynMap,
         keys::{self, Key},
     },
+    expr_store::{Body, ExpressionStore},
     hir::{BindingId, Expr, LabelId},
     nameres::{block_def_map, crate_def_map},
 };
@@ -112,19 +114,22 @@ use syntax::{
 };
 use tt::TextRange;
 
-use crate::{InFile, InlineAsmOperand, db::HirDatabase, semantics::child_by_source::ChildBySource};
+use crate::{
+    InFile, InlineAsmOperand, SemanticsImpl, db::HirDatabase,
+    semantics::child_by_source::ChildBySource,
+};
 
 #[derive(Default)]
-pub(super) struct SourceToDefCache {
+pub(super) struct SourceToDefCache<'db> {
     pub(super) dynmap_cache: FxHashMap<(ChildContainer, HirFileId), DynMap>,
-    expansion_info_cache: FxHashMap<MacroCallId, ExpansionInfo>,
+    expansion_info_cache: FxHashMap<MacroCallId, ExpansionInfo<'db>>,
     pub(super) file_to_def_cache: FxHashMap<FileId, SmallVec<[ModuleId; 1]>>,
     pub(super) included_file_cache: FxHashMap<EditionedFileId, Option<MacroCallId>>,
     /// Rootnode to HirFileId cache
     pub(super) root_to_file_cache: FxHashMap<SyntaxNode, HirFileId>,
 }
 
-impl SourceToDefCache {
+impl<'db> SourceToDefCache<'db> {
     pub(super) fn cache(
         root_to_file_cache: &mut FxHashMap<SyntaxNode, HirFileId>,
         root_node: SyntaxNode,
@@ -144,24 +149,36 @@ impl SourceToDefCache {
             return m;
         }
         self.included_file_cache.insert(file, None);
-        for &crate_id in db.relevant_crates(file.file_id(db)).iter() {
-            db.include_macro_invoc(crate_id).iter().for_each(|&(macro_call_id, file_id)| {
+        for &crate_id in relevant_crates(db, file.file_id(db)) {
+            for &(macro_call_id, file_id) in hir_def::include_macro_invoc(db, crate_id) {
                 self.included_file_cache.insert(file_id, Some(macro_call_id));
-            });
+            }
         }
         self.included_file_cache.get(&file).copied().flatten()
     }
 
     pub(super) fn get_or_insert_expansion(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         macro_file: MacroCallId,
-    ) -> &ExpansionInfo {
+    ) -> &ExpansionInfo<'db> {
         self.expansion_info_cache.entry(macro_file).or_insert_with(|| {
             let exp_info = macro_file.expansion_info(db);
 
+            // Ensure that the cache contains syntax nodes from expanded macros,
+            // whose root may be in another file.
             let InMacroFile { file_id, value } = exp_info.expanded();
             Self::cache(&mut self.root_to_file_cache, value, file_id.into());
+
+            // include!("foo.rs") invocations are awkward: in addition to the
+            // expansion site there's the included file (foo.rs), so we need to
+            // ensure that it exists in the cache too.
+            if macro_file.is_include_macro(db) {
+                let arg = exp_info.arg();
+                if let Some(arg_node) = arg.value {
+                    Self::cache(&mut self.root_to_file_cache, arg_node.tree_top(), arg.file_id);
+                }
+            }
 
             exp_info
         })
@@ -170,29 +187,24 @@ impl SourceToDefCache {
 
 pub(super) struct SourceToDefCtx<'db, 'cache> {
     pub(super) db: &'db dyn HirDatabase,
-    pub(super) cache: &'cache mut SourceToDefCache,
+    pub(super) cache: &'cache mut SourceToDefCache<'db>,
 }
 
-impl SourceToDefCtx<'_, '_> {
+impl<'db> SourceToDefCtx<'db, '_> {
     pub(super) fn file_to_def(&mut self, file: FileId) -> &SmallVec<[ModuleId; 1]> {
         let _p = tracing::info_span!("SourceToDefCtx::file_to_def").entered();
         self.cache.file_to_def_cache.entry(file).or_insert_with(|| {
             let mut mods = SmallVec::new();
 
-            for &crate_id in self.db.relevant_crates(file).iter() {
+            for &crate_id in relevant_crates(self.db, file) {
                 // Note: `mod` declarations in block modules cannot be supported here
                 let crate_def_map = crate_def_map(self.db, crate_id);
                 let n_mods = mods.len();
-                let modules = |file| {
-                    crate_def_map
-                        .modules_for_file(self.db, file)
-                        .map(|local_id| crate_def_map.module_id(local_id))
-                };
+                let modules = |file| crate_def_map.modules_for_file(self.db, file);
                 mods.extend(modules(file));
                 if mods.len() == n_mods {
                     mods.extend(
-                        self.db
-                            .include_macro_invoc(crate_id)
+                        hir_def::include_macro_invoc(self.db, crate_id)
                             .iter()
                             .filter(|&&(_, file_id)| file_id.file_id(self.db) == file)
                             .flat_map(|&(macro_call_id, file_id)| {
@@ -239,8 +251,8 @@ impl SourceToDefCtx<'_, '_> {
 
         let child_name = src.value.name()?.as_name();
         let def_map = parent_module.def_map(self.db);
-        let &child_id = def_map[parent_module.local_id].children.get(&child_name)?;
-        Some(def_map.module_id(child_id))
+        let &child_id = def_map[parent_module].children.get(&child_name)?;
+        Some(child_id)
     }
 
     pub(super) fn source_file_to_def(&mut self, src: InFile<&ast::SourceFile>) -> Option<ModuleId> {
@@ -251,12 +263,6 @@ impl SourceToDefCtx<'_, '_> {
 
     pub(super) fn trait_to_def(&mut self, src: InFile<&ast::Trait>) -> Option<TraitId> {
         self.to_def(src, keys::TRAIT)
-    }
-    pub(super) fn trait_alias_to_def(
-        &mut self,
-        src: InFile<&ast::TraitAlias>,
-    ) -> Option<TraitAliasId> {
-        self.to_def(src, keys::TRAIT_ALIAS)
     }
     pub(super) fn impl_to_def(&mut self, src: InFile<&ast::Impl>) -> Option<ImplId> {
         self.to_def(src, keys::IMPL)
@@ -344,8 +350,8 @@ impl SourceToDefCtx<'_, '_> {
                 _ => None,
             })
             .position(|it| it == *src.value)?;
-        let container = self.find_pat_or_label_container(src.syntax_ref())?;
-        let source_map = self.db.body_with_source_map(container).1;
+        let container = self.find_container(src.syntax_ref())?.as_expression_store_owner()?;
+        let (_, source_map) = ExpressionStore::with_source_map(self.db, container);
         let expr = source_map.node_expr(src.with_value(&ast::Expr::AsmExpr(asm)))?.as_expr()?;
         Some(InlineAsmOperand { owner: container, expr, index })
     }
@@ -353,14 +359,18 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn bind_pat_to_def(
         &mut self,
         src: InFile<&ast::IdentPat>,
-    ) -> Option<(DefWithBodyId, BindingId)> {
-        let container = self.find_pat_or_label_container(src.syntax_ref())?;
-        let (body, source_map) = self.db.body_with_source_map(container);
+        semantics: &SemanticsImpl<'db>,
+    ) -> Option<crate::Local<'db>> {
+        let container = self.find_container(src.syntax_ref())?.as_expression_store_owner()?;
+        let (store, source_map) = ExpressionStore::with_source_map(self.db, container);
         let src = src.cloned().map(ast::Pat::from);
         let pat_id = source_map.node_pat(src.as_ref())?;
         // the pattern could resolve to a constant, verify that this is not the case
-        if let crate::Pat::Bind { id, .. } = body[pat_id.as_pat()?] {
-            Some((container, id))
+        let pat_id = pat_id.as_pat()?;
+        if let crate::Pat::Bind { id, .. } = store[pat_id] {
+            let parent_infer =
+                semantics.infer_body_for_expr_or_pat(container, store, pat_id.into())?;
+            Some(crate::Local { parent: container, parent_infer, binding_id: id })
         } else {
             None
         }
@@ -369,17 +379,19 @@ impl SourceToDefCtx<'_, '_> {
         &mut self,
         src: InFile<&ast::SelfParam>,
     ) -> Option<(DefWithBodyId, BindingId)> {
-        let container = self.find_pat_or_label_container(src.syntax_ref())?;
-        let body = self.db.body(container);
-        Some((container, body.self_param?))
+        let container = self
+            .find_container(src.syntax_ref())?
+            .as_expression_store_owner()?
+            .as_def_with_body()?;
+        let body = Body::of(self.db, container);
+        Some((container, body.self_param?.user_written))
     }
     pub(super) fn label_to_def(
         &mut self,
         src: InFile<&ast::Label>,
-    ) -> Option<(DefWithBodyId, LabelId)> {
-        let container = self.find_pat_or_label_container(src.syntax_ref())?;
-        let source_map = self.db.body_with_source_map(container).1;
-
+    ) -> Option<(ExpressionStoreOwnerId, LabelId)> {
+        let container = self.find_container(src.syntax_ref())?.as_expression_store_owner()?;
+        let (_, source_map) = ExpressionStore::with_source_map(self.db, container);
         let label_id = source_map.node_label(src)?;
         Some((container, label_id))
     }
@@ -387,13 +399,14 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn label_ref_to_def(
         &mut self,
         src: InFile<&ast::Lifetime>,
-    ) -> Option<(DefWithBodyId, LabelId)> {
+    ) -> Option<(ExpressionStoreOwnerId, LabelId)> {
         let break_or_continue = ast::Expr::cast(src.value.syntax().parent()?)?;
-        let container = self.find_pat_or_label_container(src.syntax_ref())?;
-        let (body, source_map) = self.db.body_with_source_map(container);
+        let container = self.find_container(src.syntax_ref())?.as_expression_store_owner()?;
+        let (store, source_map) = ExpressionStore::with_source_map(self.db, container);
         let break_or_continue =
             source_map.node_expr(src.with_value(&break_or_continue))?.as_expr()?;
-        let (Expr::Break { label, .. } | Expr::Continue { label }) = body[break_or_continue] else {
+        let (Expr::Break { label, .. } | Expr::Continue { label }) = store[break_or_continue]
+        else {
             return None;
         };
         Some((container, label?))
@@ -403,8 +416,8 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn attr_to_derive_macro_call(
         &mut self,
         item: InFile<&ast::Adt>,
-        src: InFile<ast::Attr>,
-    ) -> Option<(AttrId, MacroCallId, &[Option<MacroCallId>])> {
+        src: InFile<ast::Meta>,
+    ) -> Option<(AttrId, MacroCallId, &[Option<Either<MacroCallId, BuiltinDeriveImplId>>])> {
         let map = self.dyn_map(item)?;
         map[keys::DERIVE_MACRO_CALL]
             .get(&AstPtr::new(&src.value))
@@ -419,12 +432,16 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn derive_macro_calls<'slf>(
         &'slf mut self,
         adt: InFile<&ast::Adt>,
-    ) -> Option<impl Iterator<Item = (AttrId, MacroCallId, &'slf [Option<MacroCallId>])> + use<'slf>>
-    {
+    ) -> Option<
+        impl Iterator<
+            Item = (AttrId, MacroCallId, &'slf [Option<Either<MacroCallId, BuiltinDeriveImplId>>]),
+        > + use<'slf>,
+    > {
         self.dyn_map(adt).as_ref().map(|&map| {
             let dyn_map = &map[keys::DERIVE_MACRO_CALL];
             adt.value
                 .attrs()
+                .flat_map(|attr| attr.skip_cfg_attrs())
                 .filter_map(move |attr| dyn_map.get(&AstPtr::new(&attr)))
                 .map(|&(attr_id, call_id, ref ids)| (attr_id, call_id, &**ids))
         })
@@ -555,36 +572,10 @@ impl SourceToDefCtx<'_, '_> {
                 }
                 ast::Item::Enum(it) => this.enum_to_def(InFile::new(file_id, it)).map(Into::into),
                 ast::Item::Trait(it) => this.trait_to_def(InFile::new(file_id, it)).map(Into::into),
-                ast::Item::TraitAlias(it) => {
-                    this.trait_alias_to_def(InFile::new(file_id, it)).map(Into::into)
-                }
                 ast::Item::TypeAlias(it) => {
                     this.type_alias_to_def(InFile::new(file_id, it)).map(Into::into)
                 }
                 ast::Item::Impl(it) => this.impl_to_def(InFile::new(file_id, it)).map(Into::into),
-                _ => None,
-            }
-        })
-    }
-
-    // FIXME: Remove this when we do inference in signatures
-    fn find_pat_or_label_container(&mut self, src: InFile<&SyntaxNode>) -> Option<DefWithBodyId> {
-        self.parent_ancestors_with_macros(src, |this, InFile { file_id, value }, _| {
-            let item = match ast::Item::cast(value.clone()) {
-                Some(it) => it,
-                None => {
-                    let variant = ast::Variant::cast(value)?;
-                    return this
-                        .enum_variant_to_def(InFile::new(file_id, &variant))
-                        .map(Into::into);
-                }
-            };
-            match &item {
-                ast::Item::Fn(it) => this.fn_to_def(InFile::new(file_id, it)).map(Into::into),
-                ast::Item::Const(it) => this.const_to_def(InFile::new(file_id, it)).map(Into::into),
-                ast::Item::Static(it) => {
-                    this.static_to_def(InFile::new(file_id, it)).map(Into::into)
-                }
                 _ => None,
             }
         })
@@ -635,9 +626,6 @@ impl SourceToDefCtx<'_, '_> {
                 ast::Item::Enum(it) => self.enum_to_def(container.with_value(it))?.into(),
                 ast::Item::TypeAlias(it) => ChildContainer::GenericDefId(
                     self.type_alias_to_def(container.with_value(it))?.into(),
-                ),
-                ast::Item::TraitAlias(it) => ChildContainer::GenericDefId(
-                    self.trait_alias_to_def(container.with_value(it))?.into(),
                 ),
                 ast::Item::Struct(it) => {
                     let def = self.struct_to_def(container.with_value(it))?;
@@ -767,6 +755,24 @@ impl ChildContainer {
             ChildContainer::EnumId(it) => it.child_by_source(db, file_id),
             ChildContainer::VariantId(it) => it.child_by_source(db, file_id),
             ChildContainer::GenericDefId(it) => it.child_by_source(db, file_id),
+        }
+    }
+
+    pub(crate) fn as_expression_store_owner(self) -> Option<ExpressionStoreOwnerId> {
+        match self {
+            ChildContainer::DefWithBodyId(it) => Some(it.into()),
+            ChildContainer::ModuleId(_) => None,
+            ChildContainer::TraitId(it) => {
+                Some(ExpressionStoreOwnerId::Signature(GenericDefId::TraitId(it)))
+            }
+            ChildContainer::EnumId(it) => {
+                Some(ExpressionStoreOwnerId::Signature(GenericDefId::AdtId(it.into())))
+            }
+            ChildContainer::ImplId(it) => {
+                Some(ExpressionStoreOwnerId::Signature(GenericDefId::ImplId(it)))
+            }
+            ChildContainer::VariantId(_) => None,
+            ChildContainer::GenericDefId(it) => Some(it.into()),
         }
     }
 }

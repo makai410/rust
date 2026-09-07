@@ -2,8 +2,7 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait MyTrait {
+const trait MyTrait {
     fn do_something(&self);
 }
 
@@ -14,7 +13,7 @@ trait OtherTrait {
 
 struct MyStruct<T>(T);
 
-impl const MyTrait for u32 {
+const impl MyTrait for u32 {
     fn do_something(&self) {}
 }
 

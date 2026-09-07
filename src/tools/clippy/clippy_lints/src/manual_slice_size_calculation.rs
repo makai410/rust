@@ -2,13 +2,12 @@ use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_context;
-use clippy_utils::{expr_or_init, is_in_const_context, std_or_core};
+use clippy_utils::ty::peel_and_count_ty_refs;
+use clippy_utils::{expr_or_init, is_in_const_context, std_or_core, sym};
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty;
-use rustc_session::impl_lint_pass;
-use rustc_span::symbol::sym;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -38,6 +37,7 @@ declare_clippy_lint! {
     complexity,
     "manual slice size calculation"
 }
+
 impl_lint_pass!(ManualSliceSizeCalculation => [MANUAL_SLICE_SIZE_CALCULATION]);
 
 pub struct ManualSliceSizeCalculation {
@@ -46,7 +46,7 @@ pub struct ManualSliceSizeCalculation {
 
 impl ManualSliceSizeCalculation {
     pub fn new(conf: &Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
 
@@ -102,7 +102,7 @@ fn simplify_half<'tcx>(
         && let ExprKind::MethodCall(method_path, receiver, [], _) = expr1.kind
         && method_path.ident.name == sym::len
         && let receiver_ty = cx.typeck_results().expr_ty(receiver)
-        && let (receiver_ty, refs_count) = clippy_utils::ty::walk_ptrs_ty_depth(receiver_ty)
+        && let (receiver_ty, refs_count, _) = peel_and_count_ty_refs(receiver_ty)
         && let ty::Slice(ty1) = receiver_ty.kind()
         // expr2 is `size_of::<T2>()`?
         && let ExprKind::Call(func, []) = expr2.kind

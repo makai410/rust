@@ -1,38 +1,32 @@
 use rustc_abi::Size;
+use rustc_target::spec::Os;
 
-use crate::concurrency::sync::LAZY_INIT_COOKIE;
+use crate::concurrency::sync::{AccessKind, SyncObj};
 use crate::*;
 
-/// Do a bytewise comparison of the two places, using relaxed atomic reads. This is used to check if
+/// Do a bytewise comparison of the two places. This is used to check if
 /// a synchronization primitive matches its static initializer value.
 ///
-/// The reads happen in chunks of 4, so all racing accesses must also use that access size.
-fn bytewise_equal_atomic_relaxed<'tcx>(
+/// `prefix`, if set, indicates that only the first N bytes should be compared.
+fn bytewise_equal<'tcx>(
     ecx: &MiriInterpCx<'tcx>,
     left: &MPlaceTy<'tcx>,
     right: &MPlaceTy<'tcx>,
+    prefix: Option<u64>,
 ) -> InterpResult<'tcx, bool> {
     let size = left.layout.size;
     assert_eq!(size, right.layout.size);
+    let cmp_size = prefix.map(Size::from_bytes).unwrap_or(size);
 
-    // We do this in chunks of 4, so that we are okay to race with (sufficiently aligned)
-    // 4-byte atomic accesses.
-    assert!(size.bytes().is_multiple_of(4));
-    for i in 0..(size.bytes() / 4) {
-        let offset = Size::from_bytes(i.strict_mul(4));
-        let load = |place: &MPlaceTy<'tcx>| {
-            let byte = place.offset(offset, ecx.machine.layouts.u32, ecx)?;
-            ecx.read_scalar_atomic(&byte, AtomicReadOrd::Relaxed)?.to_u32()
-        };
-        let left = load(left)?;
-        let right = load(right)?;
-        if left != right {
-            return interp_ok(false);
-        }
-    }
+    let left_bytes = ecx.read_bytes_ptr_strip_provenance(left.ptr(), cmp_size)?;
+    let right_bytes = ecx.read_bytes_ptr_strip_provenance(right.ptr(), cmp_size)?;
 
-    interp_ok(true)
+    interp_ok(left_bytes == right_bytes)
 }
+
+// The in-memory marker values we use to indicate whether objects have been initialized.
+const PTHREAD_UNINIT: u8 = 0;
+const PTHREAD_INIT: u8 = 1;
 
 // # pthread_mutexattr_t
 // We store some data directly inside the type, ignoring the platform layout:
@@ -40,8 +34,14 @@ fn bytewise_equal_atomic_relaxed<'tcx>(
 
 #[inline]
 fn mutexattr_kind_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, u64> {
-    interp_ok(match &*ecx.tcx.sess.target.os {
-        "linux" | "illumos" | "solaris" | "macos" | "freebsd" | "android" => 0,
+    interp_ok(match &ecx.tcx.sess.target.os {
+        Os::Linux
+        | Os::Illumos
+        | Os::Solaris
+        | Os::MacOs
+        | Os::FreeBsd
+        | Os::Android
+        | Os::NetBsd => 0,
         os => throw_unsup_format!("`pthread_mutexattr` is not supported on {os}"),
     })
 }
@@ -103,7 +103,7 @@ fn mutexattr_translate_kind<'tcx>(
 
 // # pthread_mutex_t
 // We store some data directly inside the type, ignoring the platform layout:
-// - init: u32
+// - init: u8
 
 /// The mutex kind.
 #[derive(Debug, Clone, Copy)]
@@ -120,14 +120,29 @@ struct PthreadMutex {
     kind: MutexKind,
 }
 
+impl SyncObj for PthreadMutex {
+    fn on_access<'tcx>(&self, access_kind: AccessKind) -> InterpResult<'tcx> {
+        if !self.mutex_ref.queue_is_empty() {
+            throw_ub_format!(
+                "{access_kind} of `pthread_mutex_t` is forbidden while the queue is non-empty"
+            );
+        }
+        interp_ok(())
+    }
+
+    fn delete_on_write(&self) -> bool {
+        true
+    }
+}
+
 /// To ensure an initialized mutex that was moved somewhere else can be distinguished from
 /// a statically initialized mutex that is used the first time, we pick some offset within
 /// `pthread_mutex_t` and use it as an "initialized" flag.
 fn mutex_init_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, Size> {
-    let offset = match &*ecx.tcx.sess.target.os {
-        "linux" | "illumos" | "solaris" | "freebsd" | "android" => 0,
-        // macOS stores a signature in the first bytes, so we move to offset 4.
-        "macos" => 4,
+    let offset = match &ecx.tcx.sess.target.os {
+        Os::Linux | Os::Illumos | Os::Solaris | Os::FreeBsd | Os::Android => 0,
+        // macOS and NetBSD store a signature in the first bytes, so we move to offset 4.
+        Os::MacOs | Os::NetBsd => 4,
         os => throw_unsup_format!("`pthread_mutex` is not supported on {os}"),
     };
     let offset = Size::from_bytes(offset);
@@ -138,23 +153,23 @@ fn mutex_init_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, Size>
         let check_static_initializer = |name| {
             let static_initializer = ecx.eval_path(&["libc", name]);
             let init_field =
-                static_initializer.offset(offset, ecx.machine.layouts.u32, ecx).unwrap();
-            let init = ecx.read_scalar(&init_field).unwrap().to_u32().unwrap();
-            assert_ne!(
-                init, LAZY_INIT_COOKIE,
-                "{name} is incompatible with our initialization cookie"
+                static_initializer.offset(offset, ecx.machine.layouts.u8, ecx).unwrap();
+            let init = ecx.read_scalar(&init_field).unwrap().to_u8().unwrap();
+            assert_eq!(
+                init, PTHREAD_UNINIT,
+                "{name} is incompatible with our initialization logic"
             );
         };
 
         check_static_initializer("PTHREAD_MUTEX_INITIALIZER");
         // Check non-standard initializers.
-        match &*ecx.tcx.sess.target.os {
-            "linux" => {
+        match &ecx.tcx.sess.target.os {
+            Os::Linux => {
                 check_static_initializer("PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP");
                 check_static_initializer("PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP");
                 check_static_initializer("PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP");
             }
-            "illumos" | "solaris" | "macos" | "freebsd" | "android" => {
+            Os::Illumos | Os::Solaris | Os::MacOs | Os::FreeBsd | Os::Android | Os::NetBsd => {
                 // No non-standard initializers.
             }
             os => throw_unsup_format!("`pthread_mutex` is not supported on {os}"),
@@ -172,7 +187,7 @@ fn mutex_create<'tcx>(
 ) -> InterpResult<'tcx, PthreadMutex> {
     let mutex = ecx.deref_pointer_as(mutex_ptr, ecx.libc_ty_layout("pthread_mutex_t"))?;
     let data = PthreadMutex { mutex_ref: MutexRef::new(), kind };
-    ecx.lazy_sync_init(&mutex, mutex_init_offset(ecx)?, data.clone())?;
+    ecx.init_immovable_sync(&mutex, mutex_init_offset(ecx)?, PTHREAD_INIT, data.clone())?;
     interp_ok(data)
 }
 
@@ -186,10 +201,11 @@ where
     'tcx: 'a,
 {
     let mutex = ecx.deref_pointer_as(mutex_ptr, ecx.libc_ty_layout("pthread_mutex_t"))?;
-    ecx.lazy_sync_get_data(
+    ecx.get_immovable_sync_with_static_init(
         &mutex,
         mutex_init_offset(ecx)?,
-        || throw_ub_format!("`pthread_mutex_t` can't be moved after first use"),
+        PTHREAD_UNINIT,
+        PTHREAD_INIT,
         |ecx| {
             let kind = mutex_kind_from_static_initializer(ecx, &mutex)?;
             interp_ok(PthreadMutex { mutex_ref: MutexRef::new(), kind })
@@ -202,17 +218,23 @@ fn mutex_kind_from_static_initializer<'tcx>(
     ecx: &MiriInterpCx<'tcx>,
     mutex: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, MutexKind> {
+    let prefix = match &ecx.tcx.sess.target.os {
+        // On android, there's a 4-byte `value` header followed by "padding", and some versions
+        // of libc leave that uninitialized. Only check the `value` bytes.
+        Os::Android => Some(4),
+        _ => None,
+    };
+    let is_initializer = |name| bytewise_equal(ecx, mutex, &ecx.eval_path(&["libc", name]), prefix);
+
     // All the static initializers recognized here *must* be checked in `mutex_init_offset`!
-    let is_initializer =
-        |name| bytewise_equal_atomic_relaxed(ecx, mutex, &ecx.eval_path(&["libc", name]));
 
     // PTHREAD_MUTEX_INITIALIZER is recognized on all targets.
     if is_initializer("PTHREAD_MUTEX_INITIALIZER")? {
         return interp_ok(MutexKind::Default);
     }
     // Support additional platform-specific initializers.
-    match &*ecx.tcx.sess.target.os {
-        "linux" =>
+    match &ecx.tcx.sess.target.os {
+        Os::Linux =>
             if is_initializer("PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP")? {
                 return interp_ok(MutexKind::Recursive);
             } else if is_initializer("PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP")? {
@@ -220,23 +242,40 @@ fn mutex_kind_from_static_initializer<'tcx>(
             },
         _ => {}
     }
-    throw_unsup_format!("unsupported static initializer used for `pthread_mutex_t`");
+    throw_ub_format!(
+        "`pthread_mutex_t` was not properly initialized at this location, or it got overwritten"
+    );
 }
 
 // # pthread_rwlock_t
 // We store some data directly inside the type, ignoring the platform layout:
-// - init: u32
+// - init: u8
 
 #[derive(Debug, Clone)]
 struct PthreadRwLock {
     rwlock_ref: RwLockRef,
 }
 
+impl SyncObj for PthreadRwLock {
+    fn on_access<'tcx>(&self, access_kind: AccessKind) -> InterpResult<'tcx> {
+        if !self.rwlock_ref.queue_is_empty() {
+            throw_ub_format!(
+                "{access_kind} of `pthread_rwlock_t` is forbidden while the queue is non-empty"
+            );
+        }
+        interp_ok(())
+    }
+
+    fn delete_on_write(&self) -> bool {
+        true
+    }
+}
+
 fn rwlock_init_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, Size> {
-    let offset = match &*ecx.tcx.sess.target.os {
-        "linux" | "illumos" | "solaris" | "freebsd" | "android" => 0,
+    let offset = match &ecx.tcx.sess.target.os {
+        Os::Linux | Os::Illumos | Os::Solaris | Os::FreeBsd | Os::Android => 0,
         // macOS stores a signature in the first bytes, so we move to offset 4.
-        "macos" => 4,
+        Os::MacOs => 4,
         os => throw_unsup_format!("`pthread_rwlock` is not supported on {os}"),
     };
     let offset = Size::from_bytes(offset);
@@ -245,11 +284,11 @@ fn rwlock_init_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, Size
     // the `init` field must start out not equal to LAZY_INIT_COOKIE.
     if !ecx.machine.pthread_rwlock_sanity.replace(true) {
         let static_initializer = ecx.eval_path(&["libc", "PTHREAD_RWLOCK_INITIALIZER"]);
-        let init_field = static_initializer.offset(offset, ecx.machine.layouts.u32, ecx).unwrap();
-        let init = ecx.read_scalar(&init_field).unwrap().to_u32().unwrap();
-        assert_ne!(
-            init, LAZY_INIT_COOKIE,
-            "PTHREAD_RWLOCK_INITIALIZER is incompatible with our initialization cookie"
+        let init_field = static_initializer.offset(offset, ecx.machine.layouts.u8, ecx).unwrap();
+        let init = ecx.read_scalar(&init_field).unwrap().to_u8().unwrap();
+        assert_eq!(
+            init, PTHREAD_UNINIT,
+            "PTHREAD_RWLOCK_INITIALIZER is incompatible with our initialization logic"
         );
     }
 
@@ -264,17 +303,27 @@ where
     'tcx: 'a,
 {
     let rwlock = ecx.deref_pointer_as(rwlock_ptr, ecx.libc_ty_layout("pthread_rwlock_t"))?;
-    ecx.lazy_sync_get_data(
+    ecx.get_immovable_sync_with_static_init(
         &rwlock,
         rwlock_init_offset(ecx)?,
-        || throw_ub_format!("`pthread_rwlock_t` can't be moved after first use"),
+        PTHREAD_UNINIT,
+        PTHREAD_INIT,
         |ecx| {
-            if !bytewise_equal_atomic_relaxed(
+            let prefix = match &ecx.tcx.sess.target.os {
+                // On android, there's a 4-byte `value` header followed by "padding", and some
+                // versions of libc leave that uninitialized. Only check the `value` bytes.
+                Os::Android => Some(4),
+                _ => None,
+            };
+            if !bytewise_equal(
                 ecx,
                 &rwlock,
                 &ecx.eval_path(&["libc", "PTHREAD_RWLOCK_INITIALIZER"]),
+                prefix,
             )? {
-                throw_unsup_format!("unsupported static initializer used for `pthread_rwlock_t`");
+                throw_ub_format!(
+                    "`pthread_rwlock_t` was not properly initialized at this location, or it got overwritten"
+                );
             }
             interp_ok(PthreadRwLock { rwlock_ref: RwLockRef::new() })
         },
@@ -287,8 +336,8 @@ where
 
 #[inline]
 fn condattr_clock_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, u64> {
-    interp_ok(match &*ecx.tcx.sess.target.os {
-        "linux" | "illumos" | "solaris" | "freebsd" | "android" => 0,
+    interp_ok(match &ecx.tcx.sess.target.os {
+        Os::Linux | Os::Illumos | Os::Solaris | Os::FreeBsd | Os::Android => 0,
         // macOS does not have a clock attribute.
         os => throw_unsup_format!("`pthread_condattr` clock field is not supported on {os}"),
     })
@@ -297,14 +346,13 @@ fn condattr_clock_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, u
 fn condattr_get_clock_id<'tcx>(
     ecx: &MiriInterpCx<'tcx>,
     attr_ptr: &OpTy<'tcx>,
-) -> InterpResult<'tcx, i32> {
+) -> InterpResult<'tcx, Scalar> {
     ecx.deref_pointer_and_read(
         attr_ptr,
         condattr_clock_offset(ecx)?,
         ecx.libc_ty_layout("pthread_condattr_t"),
         ecx.machine.layouts.i32,
-    )?
-    .to_i32()
+    )
 }
 
 fn condattr_set_clock_id<'tcx>(
@@ -321,29 +369,15 @@ fn condattr_set_clock_id<'tcx>(
     )
 }
 
-/// Translates the clock from what is stored in pthread_condattr_t to our enum.
-fn condattr_translate_clock_id<'tcx>(
-    ecx: &MiriInterpCx<'tcx>,
-    raw_id: i32,
-) -> InterpResult<'tcx, ClockId> {
-    interp_ok(if raw_id == ecx.eval_libc_i32("CLOCK_REALTIME") {
-        ClockId::Realtime
-    } else if raw_id == ecx.eval_libc_i32("CLOCK_MONOTONIC") {
-        ClockId::Monotonic
-    } else {
-        throw_unsup_format!("unsupported clock id: {raw_id}");
-    })
-}
-
 // # pthread_cond_t
 // We store some data directly inside the type, ignoring the platform layout:
-// - init: u32
+// - init: u8
 
 fn cond_init_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, Size> {
-    let offset = match &*ecx.tcx.sess.target.os {
-        "linux" | "illumos" | "solaris" | "freebsd" | "android" => 0,
+    let offset = match &ecx.tcx.sess.target.os {
+        Os::Linux | Os::Illumos | Os::Solaris | Os::FreeBsd | Os::Android => 0,
         // macOS stores a signature in the first bytes, so we move to offset 4.
-        "macos" => 4,
+        Os::MacOs => 4,
         os => throw_unsup_format!("`pthread_cond` is not supported on {os}"),
     };
     let offset = Size::from_bytes(offset);
@@ -352,37 +386,46 @@ fn cond_init_offset<'tcx>(ecx: &MiriInterpCx<'tcx>) -> InterpResult<'tcx, Size> 
     // the `init` field must start out not equal to LAZY_INIT_COOKIE.
     if !ecx.machine.pthread_condvar_sanity.replace(true) {
         let static_initializer = ecx.eval_path(&["libc", "PTHREAD_COND_INITIALIZER"]);
-        let init_field = static_initializer.offset(offset, ecx.machine.layouts.u32, ecx).unwrap();
-        let init = ecx.read_scalar(&init_field).unwrap().to_u32().unwrap();
-        assert_ne!(
-            init, LAZY_INIT_COOKIE,
-            "PTHREAD_COND_INITIALIZER is incompatible with our initialization cookie"
+        let init_field = static_initializer.offset(offset, ecx.machine.layouts.u8, ecx).unwrap();
+        let init = ecx.read_scalar(&init_field).unwrap().to_u8().unwrap();
+        assert_eq!(
+            init, PTHREAD_UNINIT,
+            "PTHREAD_COND_INITIALIZER is incompatible with our initialization logic"
         );
     }
 
     interp_ok(offset)
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ClockId {
-    Realtime,
-    Monotonic,
-}
-
 #[derive(Debug, Clone)]
 struct PthreadCondvar {
     condvar_ref: CondvarRef,
-    clock: ClockId,
+    clock: TimeoutClock,
+}
+
+impl SyncObj for PthreadCondvar {
+    fn on_access<'tcx>(&self, access_kind: AccessKind) -> InterpResult<'tcx> {
+        if !self.condvar_ref.queue_is_empty() {
+            throw_ub_format!(
+                "{access_kind} of `pthread_cond_t` is forbidden while the queue is non-empty"
+            );
+        }
+        interp_ok(())
+    }
+
+    fn delete_on_write(&self) -> bool {
+        true
+    }
 }
 
 fn cond_create<'tcx>(
     ecx: &mut MiriInterpCx<'tcx>,
     cond_ptr: &OpTy<'tcx>,
-    clock: ClockId,
+    clock: TimeoutClock,
 ) -> InterpResult<'tcx, PthreadCondvar> {
     let cond = ecx.deref_pointer_as(cond_ptr, ecx.libc_ty_layout("pthread_cond_t"))?;
     let data = PthreadCondvar { condvar_ref: CondvarRef::new(), clock };
-    ecx.lazy_sync_init(&cond, cond_init_offset(ecx)?, data.clone())?;
+    ecx.init_immovable_sync(&cond, cond_init_offset(ecx)?, PTHREAD_INIT, data.clone())?;
     interp_ok(data)
 }
 
@@ -394,20 +437,33 @@ where
     'tcx: 'a,
 {
     let cond = ecx.deref_pointer_as(cond_ptr, ecx.libc_ty_layout("pthread_cond_t"))?;
-    ecx.lazy_sync_get_data(
+    ecx.get_immovable_sync_with_static_init(
         &cond,
         cond_init_offset(ecx)?,
-        || throw_ub_format!("`pthread_cond_t` can't be moved after first use"),
+        PTHREAD_UNINIT,
+        PTHREAD_INIT,
         |ecx| {
-            if !bytewise_equal_atomic_relaxed(
+            let prefix = match &ecx.tcx.sess.target.os {
+                // On android, there's a 4-byte `value` header followed by "padding", and some
+                // versions of libc leave that uninitialized. Only check the `value` bytes.
+                Os::Android => Some(4),
+                _ => None,
+            };
+            if !bytewise_equal(
                 ecx,
                 &cond,
                 &ecx.eval_path(&["libc", "PTHREAD_COND_INITIALIZER"]),
+                prefix,
             )? {
-                throw_unsup_format!("unsupported static initializer used for `pthread_cond_t`");
+                throw_ub_format!(
+                    "`pthread_cond_t` was not properly initialized at this location, or it got overwritten"
+                );
             }
             // This used the static initializer. The clock there is always CLOCK_REALTIME.
-            interp_ok(PthreadCondvar { condvar_ref: CondvarRef::new(), clock: ClockId::Realtime })
+            interp_ok(PthreadCondvar {
+                condvar_ref: CondvarRef::new(),
+                clock: TimeoutClock::RealTime,
+            })
         },
     )
 }
@@ -513,17 +569,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         throw_ub_format!(
                             "trying to acquire default mutex already locked by the current thread"
                         ),
-                    MutexKind::Normal => throw_machine_stop!(TerminationInfo::Deadlock),
+                    MutexKind::Normal => throw_machine_stop!(TerminationInfo::LocalDeadlock),
                     MutexKind::ErrorCheck => this.eval_libc_i32("EDEADLK"),
                     MutexKind::Recursive => {
-                        this.mutex_lock(&mutex.mutex_ref);
+                        this.mutex_lock(&mutex.mutex_ref)?;
                         0
                     }
                 }
             }
         } else {
             // The mutex is unlocked. Let's lock it.
-            this.mutex_lock(&mutex.mutex_ref);
+            this.mutex_lock(&mutex.mutex_ref)?;
             0
         };
         this.write_scalar(Scalar::from_i32(ret), dest)?;
@@ -543,14 +599,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     MutexKind::Default | MutexKind::Normal | MutexKind::ErrorCheck =>
                         this.eval_libc_i32("EBUSY"),
                     MutexKind::Recursive => {
-                        this.mutex_lock(&mutex.mutex_ref);
+                        this.mutex_lock(&mutex.mutex_ref)?;
                         0
                     }
                 }
             }
         } else {
             // The mutex is unlocked. Let's lock it.
-            this.mutex_lock(&mutex.mutex_ref);
+            this.mutex_lock(&mutex.mutex_ref)?;
             0
         }))
     }
@@ -593,11 +649,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             throw_ub_format!("destroyed a locked mutex");
         }
 
+        // This write also deletes the interpreter state for this mutex.
         // This might lead to false positives, see comment in pthread_mutexattr_destroy
-        this.write_uninit(
-            &this.deref_pointer_as(mutex_op, this.libc_ty_layout("pthread_mutex_t"))?,
-        )?;
-        // FIXME: delete interpreter state associated with this mutex.
+        let mutex_place =
+            this.deref_pointer_as(mutex_op, this.libc_ty_layout("pthread_mutex_t"))?;
+        this.write_uninit(&mutex_place)?;
 
         interp_ok(())
     }
@@ -618,7 +674,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 dest.clone(),
             );
         } else {
-            this.rwlock_reader_lock(&rwlock.rwlock_ref);
+            this.rwlock_reader_lock(&rwlock.rwlock_ref)?;
             this.write_null(dest)?;
         }
 
@@ -633,7 +689,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         if rwlock.rwlock_ref.is_write_locked() {
             interp_ok(Scalar::from_i32(this.eval_libc_i32("EBUSY")))
         } else {
-            this.rwlock_reader_lock(&rwlock.rwlock_ref);
+            this.rwlock_reader_lock(&rwlock.rwlock_ref)?;
             interp_ok(Scalar::from_i32(0))
         }
     }
@@ -666,7 +722,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 dest.clone(),
             );
         } else {
-            this.rwlock_writer_lock(&rwlock.rwlock_ref);
+            this.rwlock_writer_lock(&rwlock.rwlock_ref)?;
             this.write_null(dest)?;
         }
 
@@ -681,7 +737,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         if rwlock.rwlock_ref.is_locked() {
             interp_ok(Scalar::from_i32(this.eval_libc_i32("EBUSY")))
         } else {
-            this.rwlock_writer_lock(&rwlock.rwlock_ref);
+            this.rwlock_writer_lock(&rwlock.rwlock_ref)?;
             interp_ok(Scalar::from_i32(0))
         }
     }
@@ -711,11 +767,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             throw_ub_format!("destroyed a locked rwlock");
         }
 
+        // This write also deletes the interpreter state for this rwlock.
         // This might lead to false positives, see comment in pthread_mutexattr_destroy
-        this.write_uninit(
-            &this.deref_pointer_as(rwlock_op, this.libc_ty_layout("pthread_rwlock_t"))?,
-        )?;
-        // FIXME: delete interpreter state associated with this rwlock.
+        let rwlock_place =
+            this.deref_pointer_as(rwlock_op, this.libc_ty_layout("pthread_rwlock_t"))?;
+        this.write_uninit(&rwlock_place)?;
 
         interp_ok(())
     }
@@ -724,7 +780,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         // no clock attribute on macOS
-        if this.tcx.sess.target.os != "macos" {
+        if this.tcx.sess.target.os != Os::MacOs {
             // The default value of the clock attribute shall refer to the system
             // clock.
             // https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_condattr_setclock.html
@@ -742,11 +798,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
 
-        let clock_id = this.read_scalar(clock_id_op)?.to_i32()?;
-        if clock_id == this.eval_libc_i32("CLOCK_REALTIME")
-            || clock_id == this.eval_libc_i32("CLOCK_MONOTONIC")
-        {
-            condattr_set_clock_id(this, attr_op, clock_id)?;
+        let clock_id = this.read_scalar(clock_id_op)?;
+        if this.parse_clockid(clock_id).is_some() {
+            condattr_set_clock_id(this, attr_op, clock_id.to_i32()?)?;
         } else {
             let einval = this.eval_libc_i32("EINVAL");
             return interp_ok(Scalar::from_i32(einval));
@@ -764,7 +818,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let clock_id = condattr_get_clock_id(this, attr_op)?;
         this.write_scalar(
-            Scalar::from_i32(clock_id),
+            clock_id,
             &this.deref_pointer_as(clk_id_op, this.libc_ty_layout("clockid_t"))?,
         )?;
 
@@ -776,7 +830,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // Destroying an uninit pthread_condattr is UB, so check to make sure it's not uninit.
         // There's no clock attribute on macOS.
-        if this.tcx.sess.target.os != "macos" {
+        if this.tcx.sess.target.os != Os::MacOs {
             condattr_get_clock_id(this, attr_op)?;
         }
 
@@ -798,14 +852,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let attr = this.read_pointer(attr_op)?;
         // Default clock if `attr` is null, and on macOS where there is no clock attribute.
-        let clock_id = if this.ptr_is_null(attr)? || this.tcx.sess.target.os == "macos" {
-            this.eval_libc_i32("CLOCK_REALTIME")
+        let clock_id = if this.ptr_is_null(attr)? || this.tcx.sess.target.os == Os::MacOs {
+            this.eval_libc("CLOCK_REALTIME")
         } else {
             condattr_get_clock_id(this, attr_op)?
         };
-        let clock_id = condattr_translate_clock_id(this, clock_id)?;
+        let Some(clock) = this.parse_clockid(clock_id) else {
+            // This is UB since this situation cannot arise when using pthread_condattr_setclock.
+            throw_ub_format!("pthread_cond_init: invalid attributes (unsupported clock)")
+        };
 
-        cond_create(this, cond_op, clock_id)?;
+        cond_create(this, cond_op, clock)?;
 
         interp_ok(())
     }
@@ -851,8 +908,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         cond_op: &OpTy<'tcx>,
         mutex_op: &OpTy<'tcx>,
-        abstime_op: &OpTy<'tcx>,
+        timeout_op: &OpTy<'tcx>,
         dest: &MPlaceTy<'tcx>,
+        macos_relative_np: bool,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
@@ -860,28 +918,30 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let mutex_ref = mutex_get_data(this, mutex_op)?.mutex_ref.clone();
 
         // Extract the timeout.
-        let duration = match this
-            .read_timespec(&this.deref_pointer_as(abstime_op, this.libc_ty_layout("timespec"))?)?
-        {
-            Some(duration) => duration,
-            None => {
-                let einval = this.eval_libc("EINVAL");
-                this.write_scalar(einval, dest)?;
-                return interp_ok(());
-            }
+        let Some(duration) = this
+            .read_timespec(&this.deref_pointer_as(timeout_op, this.libc_ty_layout("timespec"))?)?
+        else {
+            let einval = this.eval_libc("EINVAL");
+            this.write_scalar(einval, dest)?;
+            return interp_ok(());
         };
-        let timeout_clock = match data.clock {
-            ClockId::Realtime => {
+
+        let (clock, style) = if macos_relative_np {
+            // `pthread_cond_timedwait_relative_np` always measures time against the
+            // monotonic clock, regardless of the condvar clock.
+            (TimeoutClock::Monotonic, TimeoutStyle::Relative)
+        } else {
+            if data.clock == TimeoutClock::RealTime {
                 this.check_no_isolation("`pthread_cond_timedwait` with `CLOCK_REALTIME`")?;
-                TimeoutClock::RealTime
             }
-            ClockId::Monotonic => TimeoutClock::Monotonic,
+
+            (data.clock, TimeoutStyle::Absolute)
         };
 
         this.condvar_wait(
             data.condvar_ref,
             mutex_ref,
-            Some((timeout_clock, TimeoutAnchor::Absolute, duration)),
+            Some(this.machine.timeout(clock, style, duration)),
             Scalar::from_i32(0),
             this.eval_libc("ETIMEDOUT"), // retval_timeout
             dest.clone(),
@@ -896,13 +956,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Reading the field also has the side-effect that we detect double-`destroy`
         // since we make the field uninit below.
         let condvar = &cond_get_data(this, cond_op)?.condvar_ref;
-        if condvar.is_awaited() {
+        if !condvar.queue_is_empty() {
             throw_ub_format!("destroying an awaited conditional variable");
         }
 
+        // This write also deletes the interpreter state for this mutex.
         // This might lead to false positives, see comment in pthread_mutexattr_destroy
-        this.write_uninit(&this.deref_pointer_as(cond_op, this.libc_ty_layout("pthread_cond_t"))?)?;
-        // FIXME: delete interpreter state associated with this condvar.
+        let cond_place = this.deref_pointer_as(cond_op, this.libc_ty_layout("pthread_cond_t"))?;
+        this.write_uninit(&cond_place)?;
 
         interp_ok(())
     }

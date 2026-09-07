@@ -1,7 +1,8 @@
 //! `run-make-support` is a support library for run-make tests. It provides command wrappers and
 //! convenience utility functions to help test writers reduce duplication. The support library
-//! notably is built via cargo: this means that if your test wants some non-trivial utility, such
-//! as `object` or `wasmparser`, they can be re-exported and be made available through this library.
+//! notably is built via bootstrap cargo: this means that if your test wants some non-trivial
+//! utility, such as `object` or `wasmparser`, they can be re-exported and be made available through
+//! this library.
 
 #![warn(unreachable_pub)]
 
@@ -33,7 +34,16 @@ pub mod rfs {
 }
 
 // Re-exports of third-party library crates.
-pub use {bstr, gimli, libc, object, regex, serde_json, similar, wasmparser};
+pub use bstr;
+pub use gimli;
+pub use libc;
+pub use object;
+pub use regex;
+pub use rustdoc_json_types;
+pub use serde_json;
+pub use similar;
+pub use tempfile;
+pub use wasmparser;
 
 // Helpers for building names of output artifacts that are potentially target-specific.
 pub use crate::artifact_names::{
@@ -44,6 +54,7 @@ pub use crate::assertion_helpers::{
     assert_contains, assert_contains_regex, assert_count_is, assert_dirs_are_equal, assert_equals,
     assert_not_contains, assert_not_contains_regex,
 };
+pub use crate::command::CompletedProcess;
 // `diff` is implemented in terms of the [similar] library.
 //
 // [similar]: https://github.com/mitsuhiko/similar
@@ -56,23 +67,25 @@ pub use crate::external_deps::c_build::{
 };
 // Re-exports of external dependencies.
 pub use crate::external_deps::c_cxx_compiler::{
-    Cc, Gcc, cc, cxx, extra_c_flags, extra_cxx_flags, gcc,
+    Cc, Gcc, cc, cxx, extra_c_flags, extra_cxx_flags, extra_linker_flags, gcc,
 };
 pub use crate::external_deps::cargo::cargo;
 pub use crate::external_deps::clang::{Clang, clang};
 pub use crate::external_deps::htmldocck::htmldocck;
 pub use crate::external_deps::llvm::{
     self, LlvmAr, LlvmBcanalyzer, LlvmDis, LlvmDwarfdump, LlvmFilecheck, LlvmNm, LlvmObjcopy,
-    LlvmObjdump, LlvmProfdata, LlvmReadobj, llvm_ar, llvm_bcanalyzer, llvm_dis, llvm_dwarfdump,
-    llvm_filecheck, llvm_nm, llvm_objcopy, llvm_objdump, llvm_profdata, llvm_readobj,
+    LlvmObjdump, LlvmProfdata, LlvmReadobj, llvm_ar, llvm_as, llvm_bcanalyzer, llvm_dis,
+    llvm_dwarfdump, llvm_filecheck, llvm_nm, llvm_objcopy, llvm_objdump, llvm_profdata,
+    llvm_readobj,
 };
 pub use crate::external_deps::python::python_command;
-pub use crate::external_deps::rustc::{self, Rustc, bare_rustc, rustc, rustc_path};
+pub use crate::external_deps::rustc::{self, Rustc, bare_rustc, rustc, rustc_minicore, rustc_path};
 pub use crate::external_deps::rustdoc::{Rustdoc, bare_rustdoc, rustdoc};
 // Path-related helpers.
 pub use crate::path_helpers::{
     build_root, cwd, filename_contains, filename_not_in_denylist, has_extension, has_prefix,
-    has_suffix, not_contains, path, shallow_find_directories, shallow_find_files, source_root,
+    has_suffix, not_contains, path, recursive_find_files, shallow_find_directories,
+    shallow_find_files, source_root,
 };
 // Convenience helpers for running binaries and other commands.
 pub use crate::run::{cmd, run, run_fail, run_with_args};
@@ -83,6 +96,6 @@ pub use crate::string::{
 };
 // Helpers for checking target information.
 pub use crate::targets::{
-    apple_os, is_aix, is_darwin, is_win7, is_windows, is_windows_gnu, is_windows_msvc,
+    apple_os, is_aix, is_arm64ec, is_darwin, is_win7, is_windows, is_windows_gnu, is_windows_msvc,
     llvm_components_contain, target, uname,
 };

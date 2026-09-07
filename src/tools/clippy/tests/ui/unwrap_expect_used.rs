@@ -1,6 +1,5 @@
-#![warn(clippy::unwrap_used, clippy::expect_used)]
-#![allow(clippy::unnecessary_literal_unwrap)]
-#![feature(never_type)]
+#![warn(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::unnecessary_literal_unwrap)]
 
 use std::convert::Infallible;
 
@@ -82,4 +81,16 @@ mod with_expansion {
         let _ = open!(file).unwrap_err(); //~ unwrap_used
         let _ = open!(file).expect_err("can open"); //~ expect_used
     }
+}
+
+fn issue16484() {
+    let opt = Some(());
+    Option::unwrap(opt); //~ unwrap_used
+    Option::expect(opt, "error message"); //~ expect_used
+
+    let res: Result<(), i32> = Ok(());
+    Result::unwrap(res); //~ unwrap_used
+    Result::expect(res, "error message"); //~ expect_used
+    Result::unwrap_err(res); //~ unwrap_used
+    Result::expect_err(res, "error message"); //~ expect_used
 }

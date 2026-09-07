@@ -1,14 +1,15 @@
 use std::convert::Infallible;
 use std::marker::PhantomData;
 
-use rustc_type_ir::data_structures::ensure_sufficient_stack;
 use rustc_type_ir::search_graph::{self, PathKind};
-use rustc_type_ir::solve::{CanonicalInput, Certainty, NoSolution, QueryResult};
-use rustc_type_ir::{Interner, TypingMode};
+use rustc_type_ir::solve::{AccessedOpaques, Certainty, NoSolution, QueryResult, RerunResultExt};
+use rustc_type_ir::{Interner, MayBeErased, TypingMode};
 
+use crate::canonical::response_no_constraints_raw;
 use crate::delegate::SolverDelegate;
-use crate::solve::inspect::ProofTreeBuilder;
-use crate::solve::{EvalCtxt, FIXPOINT_STEP_LIMIT, has_no_inference_or_external_constraints};
+use crate::solve::{
+    EvalCtxt, FIXPOINT_STEP_LIMIT, has_no_inference_or_external_constraints, inspect,
+};
 
 /// This type is never constructed. We only use it to implement `search_graph::Delegate`
 /// for all types which impl `SolverDelegate` and doing it directly fails in coherence.
@@ -27,14 +28,14 @@ where
     type ValidationScope = Infallible;
     fn enter_validation_scope(
         _cx: Self::Cx,
-        _input: CanonicalInput<I>,
+        _input: I::CanonicalInput,
     ) -> Option<Self::ValidationScope> {
         None
     }
 
     const FIXPOINT_STEP_LIMIT: usize = FIXPOINT_STEP_LIMIT;
 
-    type ProofTreeBuilder = ProofTreeBuilder<D>;
+    type ProofTreeBuilder = inspect::ProofTreeBuilder<D>;
     fn inspect_is_noop(inspect: &mut Self::ProofTreeBuilder) -> bool {
         inspect.is_noop()
     }
@@ -44,11 +45,13 @@ where
     fn initial_provisional_result(
         cx: I,
         kind: PathKind,
-        input: CanonicalInput<I>,
-    ) -> QueryResult<I> {
+        input: I::CanonicalInput,
+    ) -> (QueryResult<I>, AccessedOpaques<I>) {
         match kind {
             PathKind::Coinductive => response_no_constraints(cx, input, Certainty::Yes),
-            PathKind::Unknown => response_no_constraints(cx, input, Certainty::overflow(false)),
+            PathKind::Unknown | PathKind::ForcedAmbiguity => {
+                response_no_constraints(cx, input, Certainty::overflow(false))
+            }
             // Even though we know these cycles to be unproductive, we still return
             // overflow during coherence. This is both as we are not 100% confident in
             // the implementation yet and any incorrect errors would be unsound there.
@@ -58,81 +61,97 @@ where
             // See `tests/ui/traits/next-solver/cycles/unproductive-in-coherence.rs` for an
             // example where this would matter. We likely should change these cycles to `NoSolution`
             // even in coherence once this is a bit more settled.
-            PathKind::Inductive => match input.typing_mode {
+            PathKind::Inductive => match input.typing_mode.0 {
                 TypingMode::Coherence => {
                     response_no_constraints(cx, input, Certainty::overflow(false))
                 }
-                TypingMode::Analysis { .. }
-                | TypingMode::Borrowck { .. }
-                | TypingMode::PostBorrowckAnalysis { .. }
-                | TypingMode::PostAnalysis => Err(NoSolution),
+                TypingMode::Typeck { .. }
+                | TypingMode::PostTypeckUntilBorrowck { .. }
+                | TypingMode::Reflection
+                | TypingMode::PostBorrowck { .. }
+                | TypingMode::PostAnalysis
+                | TypingMode::Codegen
+                | TypingMode::ErasedNotCoherence(MayBeErased) => {
+                    (Err(NoSolution), AccessedOpaques::default())
+                }
             },
         }
     }
 
     fn is_initial_provisional_result(
-        cx: Self::Cx,
-        kind: PathKind,
-        input: CanonicalInput<I>,
-        result: QueryResult<I>,
-    ) -> bool {
-        Self::initial_provisional_result(cx, kind, input) == result
+        result: (QueryResult<I>, AccessedOpaques<I>),
+    ) -> Option<PathKind> {
+        match result.0 {
+            Ok(response) => {
+                if has_no_inference_or_external_constraints(response) {
+                    if response.value.certainty == Certainty::Yes {
+                        return Some(PathKind::Coinductive);
+                    } else if response.value.certainty == Certainty::overflow(false) {
+                        return Some(PathKind::Unknown);
+                    }
+                }
+
+                None
+            }
+            Err(NoSolution) => Some(PathKind::Inductive),
+        }
     }
 
-    fn on_stack_overflow(
+    fn stack_overflow_result(
         cx: I,
-        input: CanonicalInput<I>,
-        inspect: &mut ProofTreeBuilder<D>,
-    ) -> QueryResult<I> {
-        inspect.canonical_goal_evaluation_overflow();
+        input: I::CanonicalInput,
+    ) -> (QueryResult<I>, AccessedOpaques<I>) {
         response_no_constraints(cx, input, Certainty::overflow(true))
     }
 
-    fn on_fixpoint_overflow(cx: I, input: CanonicalInput<I>) -> QueryResult<I> {
+    const FIXPOINT_OVERFLOW_AMBIGUITY_KIND: Certainty = Certainty::overflow(false);
+    fn fixpoint_overflow_result(
+        cx: I,
+        input: I::CanonicalInput,
+    ) -> (QueryResult<I>, AccessedOpaques<I>) {
         response_no_constraints(cx, input, Certainty::overflow(false))
     }
 
-    fn is_ambiguous_result(result: QueryResult<I>) -> bool {
-        result.is_ok_and(|response| {
-            has_no_inference_or_external_constraints(response)
-                && matches!(response.value.certainty, Certainty::Maybe(_))
+    fn is_ambiguous_result(result: (QueryResult<I>, AccessedOpaques<I>)) -> Option<Certainty> {
+        result.0.ok().and_then(|response| {
+            if has_no_inference_or_external_constraints(response)
+                && matches!(response.value.certainty, Certainty::Maybe { .. })
+            {
+                Some(response.value.certainty)
+            } else {
+                None
+            }
         })
-    }
-
-    fn propagate_ambiguity(
-        cx: I,
-        for_input: CanonicalInput<I>,
-        from_result: QueryResult<I>,
-    ) -> QueryResult<I> {
-        let certainty = from_result.unwrap().value.certainty;
-        response_no_constraints(cx, for_input, certainty)
     }
 
     fn compute_goal(
         search_graph: &mut SearchGraph<D>,
         cx: I,
-        input: CanonicalInput<I>,
+        input: I::CanonicalInput,
         inspect: &mut Self::ProofTreeBuilder,
-    ) -> QueryResult<I> {
-        ensure_sufficient_stack(|| {
-            EvalCtxt::enter_canonical(cx, search_graph, input, inspect, |ecx, goal| {
-                let result = ecx.compute_goal(goal);
-                ecx.inspect.query_result(result);
-                result
-            })
+    ) -> (QueryResult<I>, AccessedOpaques<I>) {
+        EvalCtxt::enter_canonical(cx, search_graph, input, inspect, |ecx, goal| {
+            // if we're in `RerunNonErased`, don't even bother with inspect, and immediately return
+            let result = ecx.compute_goal(goal).map_err_to_rerun()?;
+
+            ecx.inspect.query_result(result);
+            result.map_err(Into::into)
         })
     }
 }
 
 fn response_no_constraints<I: Interner>(
     cx: I,
-    input: CanonicalInput<I>,
+    input: I::CanonicalInput,
     certainty: Certainty,
-) -> QueryResult<I> {
-    Ok(super::response_no_constraints_raw(
-        cx,
-        input.canonical.max_universe,
-        input.canonical.variables,
-        certainty,
-    ))
+) -> (QueryResult<I>, AccessedOpaques<I>) {
+    (
+        Ok(response_no_constraints_raw(
+            cx,
+            input.canonical.max_universe,
+            input.canonical.var_kinds,
+            certainty,
+        )),
+        AccessedOpaques::default(),
+    )
 }

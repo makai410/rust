@@ -4,9 +4,6 @@ version = "0.0.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-lang/rust.git"
 edition = "2024"
-include = [
-  '/libunwind/*',
-]
 
 [lib]
 test = false
@@ -14,9 +11,7 @@ bench = false
 doc = false
 
 [dependencies]
-core = { path = "../core" }
-compiler_builtins = { path = "../compiler-builtins/compiler-builtins" }
-cfg-if = "1.0"
+core = { path = "../rustc-std-workspace-core", package = "rustc-std-workspace-core" }
 
 [target.'cfg(not(all(windows, target_env = "msvc")))'.dependencies]
 libc = { version = "0.2.140", features = ['rustc-dep-of-std'], default-features = false }
@@ -37,4 +32,4 @@ system-llvm-libunwind = []
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = ['cfg(emscripten_wasm_eh)', 'cfg(target_arch, values("loongarch32"))']
+check-cfg = ['cfg(target_arch, values("loongarch32"))']

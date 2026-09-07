@@ -1,3 +1,4 @@
+//@ edition:2015
 //@ run-pass
 #![allow(dead_code)]
 #![allow(unused_mut)]
@@ -8,7 +9,6 @@
 // for `ByRef`. The right answer was to consider the result ambiguous
 // until more type information was available.
 
-#![feature(lang_items)]
 #![no_implicit_prelude]
 
 use std::marker::Sized;

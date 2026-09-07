@@ -1,13 +1,13 @@
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 use std::marker::PhantomData;
 
 use rustc_data_structures::undo_log::{Rollback, UndoLogs};
 use rustc_data_structures::{snapshot_vec as sv, unify as ut};
-use rustc_middle::ty::{self, OpaqueHiddenType, OpaqueTypeKey};
+use rustc_middle::ty::{self, OpaqueTypeKey, ProvisionalHiddenType};
 use tracing::debug;
 
 use crate::infer::unify_key::{ConstVidKey, RegionVidKey};
-use crate::infer::{InferCtxtInner, region_constraints, type_variable};
+use crate::infer::{InferCtxtInner, SolverRegionConstraint, region_constraints, type_variable};
 use crate::traits;
 
 pub struct Snapshot<'tcx> {
@@ -19,8 +19,8 @@ pub struct Snapshot<'tcx> {
 #[derive(Clone)]
 pub(crate) enum UndoLog<'tcx> {
     DuplicateOpaqueType,
-    OpaqueTypes(OpaqueTypeKey<'tcx>, Option<OpaqueHiddenType<'tcx>>),
-    TypeVariables(sv::UndoLog<ut::Delegate<type_variable::TyVidEqKey<'tcx>>>),
+    OpaqueTypes(OpaqueTypeKey<'tcx>, Option<ProvisionalHiddenType<'tcx>>),
+    TypeVariables(type_variable::UndoLog<'tcx>),
     ConstUnificationTable(sv::UndoLog<ut::Delegate<ConstVidKey<'tcx>>>),
     IntUnificationTable(sv::UndoLog<ut::Delegate<ty::IntVid>>),
     FloatUnificationTable(sv::UndoLog<ut::Delegate<ty::FloatVid>>),
@@ -28,6 +28,9 @@ pub(crate) enum UndoLog<'tcx> {
     RegionUnificationTable(sv::UndoLog<ut::Delegate<RegionVidKey<'tcx>>>),
     ProjectionCache(traits::UndoLog<'tcx>),
     PushTypeOutlivesConstraint,
+    OverwriteSolverRegionConstraint { old_constraint: SolverRegionConstraint<'tcx> },
+    PushRegionAssumption,
+    PushHirTypeckPotentiallyRegionDependentGoal,
 }
 
 macro_rules! impl_from {
@@ -47,6 +50,8 @@ impl_from! {
     RegionConstraintCollector(region_constraints::UndoLog<'tcx>),
 
     TypeVariables(sv::UndoLog<ut::Delegate<type_variable::TyVidEqKey<'tcx>>>),
+    TypeVariables(sv::UndoLog<ut::Delegate<type_variable::TyVidSubKey>>),
+    TypeVariables(type_variable::UndoLog<'tcx>),
     IntUnificationTable(sv::UndoLog<ut::Delegate<ty::IntVid>>),
     FloatUnificationTable(sv::UndoLog<ut::Delegate<ty::FloatVid>>),
 
@@ -73,9 +78,20 @@ impl<'tcx> Rollback<UndoLog<'tcx>> for InferCtxtInner<'tcx> {
                 self.region_constraint_storage.as_mut().unwrap().unification_table.reverse(undo)
             }
             UndoLog::ProjectionCache(undo) => self.projection_cache.reverse(undo),
+            UndoLog::OverwriteSolverRegionConstraint { old_constraint } => {
+                self.solver_region_constraint_storage.overwrite(old_constraint);
+            }
             UndoLog::PushTypeOutlivesConstraint => {
                 let popped = self.region_obligations.pop();
                 assert_matches!(popped, Some(_), "pushed region constraint but could not pop it");
+            }
+            UndoLog::PushRegionAssumption => {
+                let popped = self.region_assumptions.pop();
+                assert_matches!(popped, Some(_), "pushed region assumption but could not pop it");
+            }
+            UndoLog::PushHirTypeckPotentiallyRegionDependentGoal => {
+                let popped = self.hir_typeck_potentially_region_dependent_goals.pop();
+                assert_matches!(popped, Some(_), "pushed goal but could not pop it");
             }
         }
     }
@@ -114,7 +130,6 @@ where
 
     fn extend<J>(&mut self, undos: J)
     where
-        Self: Sized,
         J: IntoIterator<Item = T>,
     {
         if self.in_snapshot() {

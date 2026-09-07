@@ -2,7 +2,6 @@ use std::panic;
 
 use crate::command::Command;
 use crate::env_var;
-use crate::util::handle_failed_output;
 
 /// `TARGET`
 #[must_use]
@@ -46,6 +45,12 @@ pub fn is_aix() -> bool {
     target().contains("aix")
 }
 
+/// Check if target is arm64ec.
+#[must_use]
+pub fn is_arm64ec() -> bool {
+    target().starts_with("arm64ec")
+}
+
 /// Get the target OS on Apple operating systems.
 #[must_use]
 pub fn apple_os() -> &'static str {
@@ -75,11 +80,5 @@ pub fn llvm_components_contain(component: &str) -> bool {
 #[track_caller]
 #[must_use]
 pub fn uname() -> String {
-    let caller = panic::Location::caller();
-    let mut uname = Command::new("uname");
-    let output = uname.run();
-    if !output.status().success() {
-        handle_failed_output(&uname, output, caller.line());
-    }
-    output.stdout_utf8()
+    Command::new("uname").run().stdout_utf8()
 }

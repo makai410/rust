@@ -2,14 +2,14 @@ use std::fmt::Display;
 
 use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help};
+use clippy_utils::paths;
 use clippy_utils::paths::PathLookup;
-use clippy_utils::source::SpanRangeExt;
-use clippy_utils::{path_def_id, paths};
+use clippy_utils::res::MaybeQPath as _;
+use clippy_utils::source::SpanExt as _;
 use rustc_ast::ast::{LitKind, StrStyle};
 use rustc_hir::def_id::DefIdMap;
 use rustc_hir::{BorrowKind, Expr, ExprKind, OwnerId};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_span::{BytePos, Span};
 
 declare_clippy_lint! {
@@ -34,36 +34,6 @@ declare_clippy_lint! {
     pub INVALID_REGEX,
     correctness,
     "invalid regular expressions"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for trivial [regex](https://crates.io/crates/regex)
-    /// creation (with `Regex::new`, `RegexBuilder::new`, or `RegexSet::new`).
-    ///
-    /// ### Why is this bad?
-    /// Matching the regex can likely be replaced by `==` or
-    /// `str::starts_with`, `str::ends_with` or `std::contains` or other `str`
-    /// methods.
-    ///
-    /// ### Known problems
-    /// If the same regex is going to be applied to multiple
-    /// inputs, the precomputations done by `Regex` construction can give
-    /// significantly better performance than any of the `str`-based methods.
-    ///
-    /// ### Example
-    /// ```ignore
-    /// Regex::new("^foobar")
-    /// ```
-    ///
-    /// Use instead:
-    /// ```ignore
-    /// str::starts_with("foobar")
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub TRIVIAL_REGEX,
-    nursery,
-    "trivial regular expressions"
 }
 
 declare_clippy_lint! {
@@ -104,6 +74,38 @@ declare_clippy_lint! {
     "regular expression compilation performed in a loop"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for trivial [regex](https://crates.io/crates/regex)
+    /// creation (with `Regex::new`, `RegexBuilder::new`, or `RegexSet::new`).
+    ///
+    /// ### Why is this bad?
+    /// Matching the regex can likely be replaced by `==` or
+    /// `str::starts_with`, `str::ends_with` or `std::contains` or other `str`
+    /// methods.
+    ///
+    /// ### Known problems
+    /// If the same regex is going to be applied to multiple
+    /// inputs, the precomputations done by `Regex` construction can give
+    /// significantly better performance than any of the `str`-based methods.
+    ///
+    /// ### Example
+    /// ```ignore
+    /// Regex::new("^foobar")
+    /// ```
+    ///
+    /// Use instead:
+    /// ```ignore
+    /// str::starts_with("foobar")
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub TRIVIAL_REGEX,
+    nursery,
+    "trivial regular expressions"
+}
+
+impl_lint_pass!(Regex => [INVALID_REGEX, REGEX_CREATION_IN_LOOPS, TRIVIAL_REGEX]);
+
 #[derive(Copy, Clone)]
 enum RegexKind {
     Unicode,
@@ -117,8 +119,6 @@ pub struct Regex {
     definitions: DefIdMap<RegexKind>,
     loop_stack: Vec<(OwnerId, Span)>,
 }
-
-impl_lint_pass!(Regex => [INVALID_REGEX, TRIVIAL_REGEX, REGEX_CREATION_IN_LOOPS]);
 
 impl<'tcx> LateLintPass<'tcx> for Regex {
     fn check_crate(&mut self, cx: &LateContext<'tcx>) {
@@ -138,7 +138,7 @@ impl<'tcx> LateLintPass<'tcx> for Regex {
 
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         if let ExprKind::Call(fun, [arg]) = expr.kind
-            && let Some(def_id) = path_def_id(cx, fun)
+            && let Some(def_id) = fun.res(cx).opt_def_id()
             && let Some(regex_kind) = self.definitions.get(&def_id)
         {
             if let Some(&(loop_item_id, loop_span)) = self.loop_stack.last()
@@ -189,7 +189,7 @@ fn lint_syntax_error(cx: &LateContext<'_>, error: &regex_syntax::Error, unescape
     };
 
     if let Some((primary, auxiliary, kind)) = parts
-        && let Some(literal_snippet) = base.get_source_text(cx)
+        && let Some(literal_snippet) = base.get_text(cx)
         && let Some(inner) = literal_snippet.get(offset as usize..)
         // Only convert to native rustc spans if the parsed regex matches the
         // source snippet exactly, to ensure the span offsets are correct

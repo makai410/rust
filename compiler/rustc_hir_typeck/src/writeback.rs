@@ -16,18 +16,18 @@ use rustc_data_structures::unord::ExtendUnord;
 use rustc_errors::{E0720, ErrorGuaranteed};
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, InferKind, Visitor};
-use rustc_hir::{self as hir, AmbigArg, HirId};
+use rustc_hir::{self as hir, AmbigArg, HirId, find_attr};
 use rustc_infer::traits::solve::Goal;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCoercion};
 use rustc_middle::ty::{
-    self, DefiningScopeKind, OpaqueHiddenType, Ty, TyCtxt, TypeFoldable, TypeFolder,
+    self, DefiningScopeKind, DefinitionSiteHiddenType, Flags, Ty, TyCtxt, TypeFoldable, TypeFolder,
     TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
-    fold_regions,
+    Unnormalized, fold_regions,
 };
-use rustc_span::{Span, sym};
+use rustc_span::Span;
 use rustc_trait_selection::error_reporting::infer::need_type_info::TypeAnnotationNeeded;
-use rustc_trait_selection::opaque_types::check_opaque_type_parameter_valid;
+use rustc_trait_selection::opaque_types::opaque_type_has_defining_use_args;
 use rustc_trait_selection::solve;
 use tracing::{debug, instrument};
 
@@ -45,7 +45,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         // This attribute causes us to dump some writeback information
         // in the form of errors, which is used for unit tests.
-        let rustc_dump_user_args = self.tcx.has_attr(item_def_id, sym::rustc_dump_user_args);
+        let rustc_dump_user_args =
+            self.has_rustc_attrs && find_attr!(self.tcx, item_def_id, RustcDumpUserArgs);
 
         let mut wbcx = WritebackCx::new(self, body, rustc_dump_user_args);
         for param in body.params {
@@ -74,10 +75,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         wbcx.visit_user_provided_tys();
         wbcx.visit_user_provided_sigs();
         wbcx.visit_coroutine_interior();
+        wbcx.visit_transmutes();
+        wbcx.visit_offloads();
         wbcx.visit_offset_of_container_types();
-
-        wbcx.typeck_results.rvalue_scopes =
-            mem::take(&mut self.typeck_results.borrow_mut().rvalue_scopes);
+        wbcx.visit_potentially_region_dependent_goals();
 
         let used_trait_imports =
             mem::take(&mut self.typeck_results.borrow_mut().used_trait_imports);
@@ -217,7 +218,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     // to use builtin indexing because the index type is known to be
     // usize-ish
     fn fix_index_builtin_expr(&mut self, e: &hir::Expr<'_>) {
-        if let hir::ExprKind::Index(ref base, ref index, _) = e.kind {
+        if let hir::ExprKind::Index(base, index, _) = e.kind {
             // All valid indexing looks like this; might encounter non-valid indexes at this point.
             let base_ty = self.typeck_results.expr_ty_adjusted(base);
             if let ty::Ref(_, base_ty_inner, _) = *base_ty.kind() {
@@ -227,21 +228,19 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
                     self.typeck_results.type_dependent_defs_mut().remove(e.hir_id);
                     self.typeck_results.node_args_mut().remove(e.hir_id);
 
-                    if let Some(a) = self.typeck_results.adjustments_mut().get_mut(base.hir_id) {
+                    if let Some(a) = self.typeck_results.adjustments_mut().get_mut(base.hir_id)
                         // Discard the need for a mutable borrow
-
                         // Extra adjustment made when indexing causes a drop
                         // of size information - we need to get rid of it
                         // Since this is "after" the other adjustment to be
                         // discarded, we do an extra `pop()`
-                        if let Some(Adjustment {
+                        && let Some(Adjustment {
                             kind: Adjust::Pointer(PointerCoercion::Unsize),
                             ..
                         }) = a.pop()
-                        {
-                            // So the borrow discard actually happens here
-                            a.pop();
-                        }
+                    {
+                        // So the borrow discard actually happens here
+                        a.pop();
                     }
                 }
             }
@@ -350,7 +349,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for WritebackCx<'cx, 'tcx> {
     fn visit_ty(&mut self, hir_ty: &'tcx hir::Ty<'tcx, AmbigArg>) {
         intravisit::walk_ty(self, hir_ty);
         // If there are type checking errors, Type privacy pass will stop,
-        // so we may not get the type from hid_id, see #104513
+        // so we may not get the type from hir_id, see #104513
         if let Some(ty) = self.fcx.node_ty_opt(hir_ty.hir_id) {
             let ty = self.resolve(ty, &hir_ty.span);
             self.write_ty_to_typeck_results(hir_ty.hir_id, ty);
@@ -377,12 +376,12 @@ impl<'cx, 'tcx> Visitor<'tcx> for WritebackCx<'cx, 'tcx> {
 
 impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     fn eval_closure_size(&mut self) {
-        self.tcx().with_stable_hashing_context(|ref hcx| {
+        self.tcx().with_stable_hashing_context(|mut hcx| {
             let fcx_typeck_results = self.fcx.typeck_results.borrow();
 
             self.typeck_results.closure_size_eval = fcx_typeck_results
                 .closure_size_eval
-                .to_sorted(hcx, false)
+                .to_sorted(&mut hcx, false)
                 .into_iter()
                 .map(|(&closure_def_id, data)| {
                     let closure_hir_id = self.tcx().local_def_id_to_hir_id(closure_def_id);
@@ -394,12 +393,12 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     }
 
     fn visit_min_capture_map(&mut self) {
-        self.tcx().with_stable_hashing_context(|ref hcx| {
+        self.tcx().with_stable_hashing_context(|mut hcx| {
             let fcx_typeck_results = self.fcx.typeck_results.borrow();
 
             self.typeck_results.closure_min_captures = fcx_typeck_results
                 .closure_min_captures
-                .to_sorted(hcx, false)
+                .to_sorted(&mut hcx, false)
                 .into_iter()
                 .map(|(&closure_def_id, root_min_captures)| {
                     let root_var_map_wb = root_min_captures
@@ -425,12 +424,12 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     }
 
     fn visit_fake_reads_map(&mut self) {
-        self.tcx().with_stable_hashing_context(move |ref hcx| {
+        self.tcx().with_stable_hashing_context(move |mut hcx| {
             let fcx_typeck_results = self.fcx.typeck_results.borrow();
 
             self.typeck_results.closure_fake_reads = fcx_typeck_results
                 .closure_fake_reads
-                .to_sorted(hcx, true)
+                .to_sorted(&mut hcx, true)
                 .into_iter()
                 .map(|(&closure_def_id, fake_reads)| {
                     let resolved_fake_reads = fake_reads
@@ -534,8 +533,46 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         }
     }
 
+    fn visit_transmutes(&mut self) {
+        let tcx = self.tcx();
+        let fcx_typeck_results = self.fcx.typeck_results.borrow();
+        assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
+        for &(from, to, hir_id) in self.fcx.deferred_transmute_checks.borrow().iter() {
+            let span = tcx.hir_span(hir_id);
+            let from = self.resolve(from, &span);
+            let to = self.resolve(to, &span);
+            self.typeck_results.transmutes_to_check.push((from, to, hir_id));
+        }
+    }
+
+    fn visit_offloads(&mut self) {
+        let tcx = self.tcx();
+        let fcx_typeck_results = self.fcx.typeck_results.borrow();
+        assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
+        for &(kernel_ty, args_ty, ret_ty, hir_id) in
+            self.fcx.deferred_offload_checks.borrow().iter()
+        {
+            let span = tcx.hir_span(hir_id);
+            let kernel_ty = self.resolve(kernel_ty, &span);
+            let args_ty = self.resolve(args_ty, &span);
+            let ret_ty = self.resolve(ret_ty, &span);
+            self.typeck_results.offloads_to_check.push((kernel_ty, args_ty, ret_ty, hir_id));
+        }
+    }
+
+    fn visit_opaque_types_next(&mut self) {
+        let mut fcx_typeck_results = self.fcx.typeck_results.borrow_mut();
+        assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
+        assert_eq!(self.typeck_results.hidden_types.len(), 0);
+        self.typeck_results.hidden_types = mem::take(&mut fcx_typeck_results.hidden_types);
+    }
+
     #[instrument(skip(self), level = "debug")]
     fn visit_opaque_types(&mut self) {
+        if self.fcx.next_trait_solver() {
+            return self.visit_opaque_types_next();
+        }
+
         let tcx = self.tcx();
         // We clone the opaques instead of stealing them here as they are still used for
         // normalization in the next generation trait solver.
@@ -546,25 +583,23 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         for (opaque_type_key, hidden_type) in opaque_types {
             let hidden_type = self.resolve(hidden_type, &hidden_type.span);
             let opaque_type_key = self.resolve(opaque_type_key, &hidden_type.span);
-
-            if !self.fcx.next_trait_solver() {
-                if let ty::Alias(ty::Opaque, alias_ty) = hidden_type.ty.kind()
-                    && alias_ty.def_id == opaque_type_key.def_id.to_def_id()
-                    && alias_ty.args == opaque_type_key.args
-                {
-                    continue;
-                }
+            if let &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) =
+                hidden_type.ty.kind()
+                && def_id == opaque_type_key.def_id.to_def_id()
+                && args == opaque_type_key.args
+            {
+                continue;
             }
 
-            if let Err(err) = check_opaque_type_parameter_valid(
-                &self.fcx,
+            if let Err(err) = opaque_type_has_defining_use_args(
+                self.fcx,
                 opaque_type_key,
                 hidden_type.span,
                 DefiningScopeKind::HirTypeck,
             ) {
-                self.typeck_results.concrete_opaque_types.insert(
+                self.typeck_results.hidden_types.insert(
                     opaque_type_key.def_id,
-                    ty::OpaqueHiddenType::new_error(tcx, err.report(self.fcx)),
+                    ty::DefinitionSiteHiddenType::new_error(tcx, err.report(self.fcx)),
                 );
             }
 
@@ -574,24 +609,20 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
                 DefiningScopeKind::HirTypeck,
             );
 
-            if let Some(prev) = self
-                .typeck_results
-                .concrete_opaque_types
-                .insert(opaque_type_key.def_id, hidden_type)
+            if let Some(prev) =
+                self.typeck_results.hidden_types.insert(opaque_type_key.def_id, hidden_type)
             {
-                let entry = &mut self
-                    .typeck_results
-                    .concrete_opaque_types
-                    .get_mut(&opaque_type_key.def_id)
-                    .unwrap();
+                let entry =
+                    self.typeck_results.hidden_types.get_mut(&opaque_type_key.def_id).unwrap();
                 if prev.ty != hidden_type.ty {
-                    if let Some(guar) = self.typeck_results.tainted_by_errors {
-                        entry.ty = Ty::new_error(tcx, guar);
+                    let guar = if let Some(guar) = self.typeck_results.tainted_by_errors {
+                        guar
                     } else {
                         let (Ok(guar) | Err(guar)) =
                             prev.build_mismatch_error(&hidden_type, tcx).map(|d| d.emit());
-                        entry.ty = Ty::new_error(tcx, guar);
-                    }
+                        guar
+                    };
+                    *entry = DefinitionSiteHiddenType::new_error(tcx, guar);
                 }
 
                 // Pick a better span if there is one.
@@ -602,15 +633,17 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
 
         let recursive_opaques: Vec<_> = self
             .typeck_results
-            .concrete_opaque_types
+            .hidden_types
             .iter()
             .filter(|&(&def_id, hidden_ty)| {
                 hidden_ty
                     .ty
+                    .instantiate_identity()
+                    .skip_norm_wip()
                     .visit_with(&mut HasRecursiveOpaque {
                         def_id,
                         seen: Default::default(),
-                        opaques: &self.typeck_results.concrete_opaque_types,
+                        opaques: &self.typeck_results.hidden_types,
                         tcx,
                     })
                     .is_break()
@@ -625,8 +658,8 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
                 .with_code(E0720)
                 .emit();
             self.typeck_results
-                .concrete_opaque_types
-                .insert(def_id, OpaqueHiddenType { span, ty: Ty::new_error(tcx, guar) });
+                .hidden_types
+                .insert(def_id, DefinitionSiteHiddenType::new_error(tcx, guar));
         }
     }
 
@@ -644,6 +677,11 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             self.fcx.typeck_results.borrow_mut().type_dependent_defs_mut().remove(hir_id)
         {
             self.typeck_results.type_dependent_defs_mut().insert(hir_id, def);
+        }
+
+        // Export splatted function call resolutions.
+        if let Some(def) = self.fcx.typeck_results.borrow_mut().splatted_defs_mut().remove(hir_id) {
+            self.typeck_results.splatted_defs_mut().insert(hir_id, def);
         }
 
         // Resolve any borrowings for the node with id `node_id`
@@ -755,12 +793,39 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
         let common_hir_owner = fcx_typeck_results.hir_owner;
 
-        for (local_id, &(container, ref indices)) in
-            fcx_typeck_results.offset_of_data().items_in_stable_order()
-        {
+        for (local_id, indices) in fcx_typeck_results.offset_of_data().items_in_stable_order() {
             let hir_id = HirId { owner: common_hir_owner, local_id };
-            let container = self.resolve(container, &hir_id);
-            self.typeck_results.offset_of_data_mut().insert(hir_id, (container, indices.clone()));
+            let indices = indices
+                .iter()
+                .map(|&(ty, variant, field)| (self.resolve(ty, &hir_id), variant, field))
+                .collect();
+            self.typeck_results.offset_of_data_mut().insert(hir_id, indices);
+        }
+    }
+
+    fn visit_potentially_region_dependent_goals(&mut self) {
+        let obligations = self.fcx.take_hir_typeck_potentially_region_dependent_goals();
+        if self.fcx.tainted_by_errors().is_none() {
+            for obligation in obligations {
+                let (predicate, mut cause) =
+                    self.fcx.resolve_vars_if_possible((obligation.predicate, obligation.cause));
+                if predicate.has_non_region_infer() {
+                    self.fcx.dcx().span_delayed_bug(
+                        cause.span,
+                        format!("unexpected inference variable after writeback: {predicate:?}"),
+                    );
+                } else {
+                    let predicate = self.tcx().erase_and_anonymize_regions(predicate);
+                    if cause.has_infer() || cause.has_placeholders() {
+                        // We can't use the obligation cause as it references
+                        // information local to this query.
+                        cause = self.fcx.misc(cause.span);
+                    }
+                    self.typeck_results
+                        .potentially_region_dependent_goals
+                        .insert((predicate, cause));
+                }
+            }
         }
     }
 
@@ -885,10 +950,11 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
         }
     }
 
+    #[instrument(level = "debug", skip(self, outer_exclusive_binder, new_err))]
     fn handle_term<T>(
         &mut self,
         value: T,
-        outer_exclusive_binder: impl FnOnce(T) -> ty::DebruijnIndex,
+        outer_exclusive_binder: impl FnOnce(&T) -> ty::DebruijnIndex,
         new_err: impl Fn(TyCtxt<'tcx>, ErrorGuaranteed) -> T,
     ) -> T
     where
@@ -898,12 +964,14 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
         // We must deeply normalize in the new solver, since later lints expect
         // that types that show up in the typeck are fully normalized.
         let mut value = if self.should_normalize && self.fcx.next_trait_solver() {
-            let body_id = tcx.hir_body_owner_def_id(self.body.id());
-            let cause = ObligationCause::misc(self.span.to_span(tcx), body_id);
+            let body_def_id = tcx.hir_body_owner_def_id(self.body.id());
+            let cause = ObligationCause::misc(self.span.to_span(tcx), body_def_id);
             let at = self.fcx.at(&cause, self.fcx.param_env);
-            let universes = vec![None; outer_exclusive_binder(value).as_usize()];
+            let universes = vec![None; outer_exclusive_binder(&value).as_usize()];
             match solve::deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals(
-                at, value, universes,
+                at,
+                Unnormalized::new_wip(value),
+                universes,
             ) {
                 Ok((value, goals)) => {
                     self.nested_goals.extend(goals);
@@ -931,8 +999,8 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
         // borrowck, and specifically region constraints will be populated during
         // MIR typeck which is run on the new body.
         //
-        // We're not using `tcx.erase_regions` as that also anonymizes bound variables,
-        // regressing borrowck diagnostics.
+        // We're not using `tcx.erase_and_anonymize_regions` as that also
+        // anonymizes bound variables, regressing borrowck diagnostics.
         value = fold_regions(tcx, value, |_, _| tcx.lifetimes.re_erased);
 
         // Normalize consts in writeback, because GCE doesn't normalize eagerly.
@@ -950,8 +1018,10 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Resolver<'cx, 'tcx> {
     }
 
     fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
-        debug_assert!(!r.is_bound(), "Should not be resolving bound region.");
-        self.fcx.tcx.lifetimes.re_erased
+        match r.kind() {
+            ty::ReBound(..) => r,
+            _ => self.fcx.tcx.lifetimes.re_erased,
+        }
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
@@ -989,14 +1059,16 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for EagerlyNormalizeConsts<'tcx> {
     }
 
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
-        self.tcx.try_normalize_erasing_regions(self.typing_env, ct).unwrap_or(ct)
+        self.tcx
+            .try_normalize_erasing_regions(self.typing_env, Unnormalized::new_wip(ct))
+            .unwrap_or(ct)
     }
 }
 
 struct HasRecursiveOpaque<'a, 'tcx> {
     def_id: LocalDefId,
     seen: FxHashSet<LocalDefId>,
-    opaques: &'a FxIndexMap<LocalDefId, ty::OpaqueHiddenType<'tcx>>,
+    opaques: &'a FxIndexMap<LocalDefId, ty::DefinitionSiteHiddenType<'tcx>>,
     tcx: TyCtxt<'tcx>,
 }
 
@@ -1004,8 +1076,8 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for HasRecursiveOpaque<'_, 'tcx> {
     type Result = ControlFlow<()>;
 
     fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
-        if let ty::Alias(ty::Opaque, alias_ty) = *t.kind()
-            && let Some(def_id) = alias_ty.def_id.as_local()
+        if let ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) = *t.kind()
+            && let Some(def_id) = def_id.as_local()
         {
             if self.def_id == def_id {
                 return ControlFlow::Break(());
@@ -1014,9 +1086,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for HasRecursiveOpaque<'_, 'tcx> {
             if self.seen.insert(def_id)
                 && let Some(hidden_ty) = self.opaques.get(&def_id)
             {
-                ty::EarlyBinder::bind(hidden_ty.ty)
-                    .instantiate(self.tcx, alias_ty.args)
-                    .visit_with(self)?;
+                hidden_ty.ty.instantiate(self.tcx, args).skip_norm_wip().visit_with(self)?;
             }
         }
 

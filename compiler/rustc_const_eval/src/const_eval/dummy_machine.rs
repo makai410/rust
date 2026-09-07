@@ -25,17 +25,8 @@ pub macro throw_machine_stop_str($($tt:tt)*) {{
             write!(f, $($tt)*)
         }
     }
+    impl rustc_middle::mir::interpret::MachineStopType for Zst {}
 
-    impl rustc_middle::mir::interpret::MachineStopType for Zst {
-        fn diagnostic_message(&self) -> rustc_errors::DiagMessage {
-            self.to_string().into()
-        }
-
-        fn add_args(
-            self: Box<Self>,
-            _: &mut dyn FnMut(rustc_errors::DiagArgName, rustc_errors::DiagArgValue),
-        ) {}
-    }
     throw_machine_stop!(Zst)
 }}
 
@@ -114,12 +105,29 @@ impl<'tcx> interpret::Machine<'tcx> for DummyMachine {
         unimplemented!()
     }
 
+    fn call_llvm_intrinsic(
+        _ecx: &mut InterpCx<'tcx, Self>,
+        _instance: ty::Instance<'tcx>,
+        _args: &[interpret::OpTy<'tcx, Self::Provenance>],
+        _destination: &interpret::PlaceTy<'tcx, Self::Provenance>,
+        _target: Option<BasicBlock>,
+    ) -> interpret::InterpResult<'tcx> {
+        unimplemented!()
+    }
+
     fn assert_panic(
         _ecx: &mut InterpCx<'tcx, Self>,
         _msg: &rustc_middle::mir::AssertMessage<'tcx>,
         _unwind: UnwindAction,
     ) -> interpret::InterpResult<'tcx> {
         unimplemented!()
+    }
+
+    #[inline(always)]
+    fn runtime_checks(_ecx: &InterpCx<'tcx, Self>, r: RuntimeChecks) -> InterpResult<'tcx, bool> {
+        // Runtime checks have different value depending on the crate they are codegenned in.
+        // Verify we aren't trying to evaluate them in mir-optimizations.
+        panic!("compiletime machine evaluated {r:?}")
     }
 
     fn binary_ptr_op(

@@ -1,16 +1,15 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::get_parent_expr;
 use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_context;
+use clippy_utils::{get_parent_expr, sym};
 use rustc_ast::ast::LitKind;
 use rustc_data_structures::packed::Pu128;
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind, GenericArg, QPath};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::{self, Ty};
-use rustc_session::impl_lint_pass;
-use rustc_span::{Span, sym};
+use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -34,17 +33,17 @@ declare_clippy_lint! {
     "manual implementation of `size_of::<T>() * 8` can be simplified with `T::BITS`"
 }
 
+impl_lint_pass!(ManualBits => [MANUAL_BITS]);
+
 pub struct ManualBits {
     msrv: Msrv,
 }
 
 impl ManualBits {
     pub fn new(conf: &'static Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
-
-impl_lint_pass!(ManualBits => [MANUAL_BITS]);
 
 impl<'tcx> LateLintPass<'tcx> for ManualBits {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
@@ -101,8 +100,9 @@ fn get_size_of_ty<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) -> Option<
     {
         cx.typeck_results()
             .node_args(count_func.hir_id)
-            .types()
-            .next()
+            .iter()
+            .next() // the `T` in `size_of::<T>`
+            .and_then(ty::GenericArg::as_type)
             .map(|resolved_ty| (real_ty_span, resolved_ty))
     } else {
         None

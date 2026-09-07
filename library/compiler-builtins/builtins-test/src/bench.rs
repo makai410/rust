@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use compiler_builtins::float::Float;
+use compiler_builtins::support::Float;
 
 /// Fuzz with these many items to ensure equal functions
 pub const CHECK_ITER_ITEMS: u32 = 10_000;
@@ -17,27 +17,13 @@ pub fn skip_sys_checks(test_name: &str) -> bool {
         "extend_f16_f32",
         "trunc_f32_f16",
         "trunc_f64_f16",
-        // FIXME(#616): re-enable once fix is in nightly
-        // <https://github.com/rust-lang/compiler-builtins/issues/616>
-        "mul_f32",
-        "mul_f64",
     ];
-
-    // FIXME(f16_f128): error on LE ppc64. There are more tests that are cfg-ed out completely
-    // in their benchmark modules due to runtime panics.
-    // <https://github.com/rust-lang/compiler-builtins/issues/617#issuecomment-2125914639>
-    const PPC64LE_SKIPPED: &[&str] = &["extend_f32_f128"];
 
     // FIXME(f16_f128): system symbols have incorrect results
     // <https://github.com/rust-lang/compiler-builtins/issues/617#issuecomment-2125914639>
     const X86_NO_SSE_SKIPPED: &[&str] = &[
         "add_f128", "sub_f128", "mul_f128", "div_f128", "powi_f32", "powi_f64",
     ];
-
-    // FIXME(f16_f128): Wide multiply carry bug in `compiler-rt`, re-enable when nightly no longer
-    // uses `compiler-rt` version.
-    // <https://github.com/llvm/llvm-project/issues/91840>
-    const AARCH64_SKIPPED: &[&str] = &["mul_f128", "div_f128"];
 
     // FIXME(llvm): system symbols have incorrect results on Windows
     // <https://github.com/rust-lang/compiler-builtins/issues/617#issuecomment-2121359807>
@@ -57,19 +43,7 @@ pub fn skip_sys_checks(test_name: &str) -> bool {
         return true;
     }
 
-    if cfg!(all(target_arch = "powerpc64", target_endian = "little"))
-        && PPC64LE_SKIPPED.contains(&test_name)
-    {
-        return true;
-    }
-
-    if cfg!(all(target_arch = "x86", not(target_feature = "sse")))
-        && X86_NO_SSE_SKIPPED.contains(&test_name)
-    {
-        return true;
-    }
-
-    if cfg!(target_arch = "aarch64") && AARCH64_SKIPPED.contains(&test_name) {
+    if cfg!(x86_no_sse2) && X86_NO_SSE_SKIPPED.contains(&test_name) {
         return true;
     }
 
@@ -102,11 +76,11 @@ macro_rules! float_bench {
         sig: ($($arg:ident: $arg_ty:ty),*) -> $ret_ty:ty,
         // Path to the crate in compiler_builtins
         crate_fn: $crate_fn:path,
-        // Optional alias on ppc
+        // Optional name on ppc
         $( crate_fn_ppc: $crate_fn_ppc:path, )?
         // Name of the system symbol
         sys_fn: $sys_fn:ident,
-        // Optional alias on ppc
+        // Optional name on ppc
         $( sys_fn_ppc: $sys_fn_ppc:path, )?
         // Meta saying whether the system symbol is available
         sys_available: $sys_available:meta,
@@ -148,7 +122,7 @@ macro_rules! float_bench {
                 #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
                 let target_crate_fn = $crate_fn;
 
-                // On PPC, use an alias if specified
+                // On PPC, use the PPC name if specified
                 #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
                 let target_crate_fn = float_bench!(@coalesce $($crate_fn_ppc)?, $crate_fn);
 
@@ -161,7 +135,7 @@ macro_rules! float_bench {
                 #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
                 let target_sys_fn = $sys_fn;
 
-                // On PPC, use an alias if specified
+                // On PPC, use the PPC name if specified
                 #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
                 let target_sys_fn = float_bench!(@coalesce $($sys_fn_ppc)?, $sys_fn);
 

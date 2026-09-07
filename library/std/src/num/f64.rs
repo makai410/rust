@@ -13,7 +13,7 @@
 #![allow(missing_docs)]
 
 #[stable(feature = "rust1", since = "1.0.0")]
-#[allow(deprecated, deprecated_in_future)]
+#[allow(deprecated, deprecated_in_future, clippy::legacy_numeric_constants)]
 pub use core::f64::{
     DIGITS, EPSILON, INFINITY, MANTISSA_DIGITS, MAX, MAX_10_EXP, MAX_EXP, MIN, MIN_10_EXP, MIN_EXP,
     MIN_POSITIVE, NAN, NEG_INFINITY, RADIX, consts,
@@ -26,7 +26,7 @@ use crate::sys::cmath;
 
 #[cfg(not(test))]
 impl f64 {
-    /// Returns the largest integer less than or equal to `self`.
+    /// Returns the largest integer that is less than or equal to `self`.
     ///
     /// This function always returns the precise result.
     ///
@@ -44,13 +44,13 @@ impl f64 {
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_float_round_methods", issue = "141555")]
+    #[rustc_const_stable(feature = "const_float_round_methods", since = "1.90.0")]
     #[inline]
     pub const fn floor(self) -> f64 {
         core::f64::math::floor(self)
     }
 
-    /// Returns the smallest integer greater than or equal to `self`.
+    /// Returns the smallest integer that is greater than or equal to `self`.
     ///
     /// This function always returns the precise result.
     ///
@@ -59,15 +59,17 @@ impl f64 {
     /// ```
     /// let f = 3.01_f64;
     /// let g = 4.0_f64;
+    /// let h = -3.01_f64;
     ///
     /// assert_eq!(f.ceil(), 4.0);
     /// assert_eq!(g.ceil(), 4.0);
+    /// assert_eq!(h.ceil(), -3.0);
     /// ```
     #[doc(alias = "ceiling")]
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_float_round_methods", issue = "141555")]
+    #[rustc_const_stable(feature = "const_float_round_methods", since = "1.90.0")]
     #[inline]
     pub const fn ceil(self) -> f64 {
         core::f64::math::ceil(self)
@@ -96,7 +98,7 @@ impl f64 {
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_float_round_methods", issue = "141555")]
+    #[rustc_const_stable(feature = "const_float_round_methods", since = "1.90.0")]
     #[inline]
     pub const fn round(self) -> f64 {
         core::f64::math::round(self)
@@ -123,7 +125,7 @@ impl f64 {
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "round_ties_even", since = "1.77.0")]
-    #[rustc_const_unstable(feature = "const_float_round_methods", issue = "141555")]
+    #[rustc_const_stable(feature = "const_float_round_methods", since = "1.90.0")]
     #[inline]
     pub const fn round_ties_even(self) -> f64 {
         core::f64::math::round_ties_even(self)
@@ -149,7 +151,7 @@ impl f64 {
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_float_round_methods", issue = "141555")]
+    #[rustc_const_stable(feature = "const_float_round_methods", since = "1.90.0")]
     #[inline]
     pub const fn trunc(self) -> f64 {
         core::f64::math::trunc(self)
@@ -173,7 +175,7 @@ impl f64 {
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_float_round_methods", issue = "141555")]
+    #[rustc_const_stable(feature = "const_float_round_methods", since = "1.90.0")]
     #[inline]
     pub const fn fract(self) -> f64 {
         core::f64::math::fract(self)
@@ -217,7 +219,8 @@ impl f64 {
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn mul_add(self, a: f64, b: f64) -> f64 {
+    #[rustc_const_stable(feature = "const_mul_add", since = "1.94.0")]
+    pub const fn mul_add(self, a: f64, b: f64) -> f64 {
         core::f64::math::mul_add(self, a, b)
     }
 
@@ -251,7 +254,8 @@ impl f64 {
         core::f64::math::div_euclid(self, rhs)
     }
 
-    /// Calculates the least nonnegative remainder of `self (mod rhs)`.
+    /// Calculates the least nonnegative remainder of `self` when divided by
+    /// `rhs`.
     ///
     /// In particular, the return value `r` satisfies `0.0 <= r < rhs.abs()` in
     /// most cases. However, due to a floating point round-off error it can
@@ -294,6 +298,11 @@ impl f64 {
     /// It might have a different sequence of rounding operations than `powf`,
     /// so the results are not guaranteed to agree.
     ///
+    /// Note that this function is special in that it can return non-NaN results for NaN inputs. For
+    /// example, `f64::powi(f64::NAN, 0)` returns `1.0`. However, if an input is a *signaling*
+    /// NaN, then the result is non-deterministically either a NaN or the result that the
+    /// corresponding quiet NaN would produce.
+    ///
     /// # Unspecified precision
     ///
     /// The precision of this function is non-deterministic. This means it varies by platform, Rust version, and
@@ -307,6 +316,7 @@ impl f64 {
     /// assert!(abs_difference <= 1e-14);
     ///
     /// assert_eq!(f64::powi(f64::NAN, 0), 1.0);
+    /// assert_eq!(f64::powi(0.0, 0), 1.0);
     /// ```
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
@@ -317,6 +327,11 @@ impl f64 {
     }
 
     /// Raises a number to a floating point power.
+    ///
+    /// Note that this function is special in that it can return non-NaN results for NaN inputs. For
+    /// example, `f64::powf(f64::NAN, 0.0)` returns `1.0`. However, if an input is a *signaling*
+    /// NaN, then the result is non-deterministically either a NaN or the result that the
+    /// corresponding quiet NaN would produce.
     ///
     /// # Unspecified precision
     ///
@@ -332,13 +347,14 @@ impl f64 {
     ///
     /// assert_eq!(f64::powf(1.0, f64::NAN), 1.0);
     /// assert_eq!(f64::powf(f64::NAN, 0.0), 1.0);
+    /// assert_eq!(f64::powf(0.0, 0.0), 1.0);
     /// ```
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn powf(self, n: f64) -> f64 {
-        unsafe { intrinsics::powf64(self, n) }
+        intrinsics::powf64(self, n)
     }
 
     /// Returns the square root of a number.
@@ -395,7 +411,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn exp(self) -> f64 {
-        unsafe { intrinsics::expf64(self) }
+        intrinsics::exp(self)
     }
 
     /// Returns `2^(self)`.
@@ -420,7 +436,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn exp2(self) -> f64 {
-        unsafe { intrinsics::exp2f64(self) }
+        intrinsics::exp2(self)
     }
 
     /// Returns the natural logarithm of the number.
@@ -455,7 +471,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn ln(self) -> f64 {
-        unsafe { intrinsics::logf64(self) }
+        intrinsics::log(self)
     }
 
     /// Returns the logarithm of the number with respect to an arbitrary base.
@@ -525,7 +541,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn log2(self) -> f64 {
-        unsafe { intrinsics::log2f64(self) }
+        intrinsics::log2(self)
     }
 
     /// Returns the base 10 logarithm of the number.
@@ -558,7 +574,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn log10(self) -> f64 {
-        unsafe { intrinsics::log10f64(self) }
+        intrinsics::log10(self)
     }
 
     /// The positive difference of two numbers.
@@ -683,7 +699,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn sin(self) -> f64 {
-        unsafe { intrinsics::sinf64(self) }
+        intrinsics::sin(self)
     }
 
     /// Computes the cosine of a number (in radians).
@@ -707,7 +723,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn cos(self) -> f64 {
-        unsafe { intrinsics::cosf64(self) }
+        intrinsics::cos(self)
     }
 
     /// Computes the tangent of a number (in radians).
@@ -749,12 +765,12 @@ impl f64 {
     /// # Examples
     ///
     /// ```
-    /// let f = std::f64::consts::FRAC_PI_2;
+    /// let f = std::f64::consts::FRAC_PI_4;
     ///
     /// // asin(sin(pi/2))
-    /// let abs_difference = (f.sin().asin() - std::f64::consts::FRAC_PI_2).abs();
+    /// let abs_difference = (f.sin().asin() - f).abs();
     ///
-    /// assert!(abs_difference < 1e-7);
+    /// assert!(abs_difference < 1e-14);
     /// ```
     #[doc(alias = "arcsin")]
     #[rustc_allow_incoherent_impl]
@@ -826,10 +842,12 @@ impl f64 {
 
     /// Computes the four quadrant arctangent of `self` (`y`) and `other` (`x`) in radians.
     ///
-    /// * `x = 0`, `y = 0`: `0`
-    /// * `x >= 0`: `arctan(y/x)` -> `[-pi/2, pi/2]`
-    /// * `y >= 0`: `arctan(y/x) + pi` -> `(pi/2, pi]`
-    /// * `y < 0`: `arctan(y/x) - pi` -> `(-pi, -pi/2)`
+    ///  | `x`     | `y`     | Piecewise Definition | Range         |
+    ///  |---------|---------|----------------------|---------------|
+    ///  | `>= +0` | `>= +0` | `arctan(y/x)`        | `[+0, +pi/2]` |
+    ///  | `>= +0` | `<= -0` | `arctan(y/x)`        | `[-pi/2, -0]` |
+    ///  | `<= -0` | `>= +0` | `arctan(y/x) + pi`   | `[+pi/2, +pi]`|
+    ///  | `<= -0` | `<= -0` | `arctan(y/x) - pi`   | `[-pi, -pi/2]`|
     ///
     /// # Unspecified precision
     ///
@@ -891,6 +909,7 @@ impl f64 {
     #[rustc_allow_incoherent_impl]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn sin_cos(self) -> (f64, f64) {
         (self.sin(), self.cos())
     }
@@ -1075,9 +1094,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn asinh(self) -> f64 {
-        let ax = self.abs();
-        let ix = 1.0 / ax;
-        (ax + (ax / (Self::hypot(1.0, ix) + ix))).ln_1p().copysign(self)
+        cmath::asinh(self)
     }
 
     /// Inverse hyperbolic cosine function.
@@ -1103,11 +1120,7 @@ impl f64 {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn acosh(self) -> f64 {
-        if self < 1.0 {
-            Self::NAN
-        } else {
-            (self + ((self - 1.0).sqrt() * (self + 1.0).sqrt())).ln()
-        }
+        cmath::acosh(self)
     }
 
     /// Inverse hyperbolic tangent function.
@@ -1120,10 +1133,10 @@ impl f64 {
     /// # Examples
     ///
     /// ```
-    /// let e = std::f64::consts::E;
-    /// let f = e.tanh().atanh();
+    /// let x = std::f64::consts::FRAC_PI_6;
+    /// let f = x.tanh().atanh();
     ///
-    /// let abs_difference = (f - e).abs();
+    /// let abs_difference = (f - x).abs();
     ///
     /// assert!(abs_difference < 1.0e-10);
     /// ```
@@ -1153,7 +1166,7 @@ impl f64 {
     ///
     /// let abs_difference = (x.gamma() - 24.0).abs();
     ///
-    /// assert!(abs_difference <= f64::EPSILON);
+    /// assert!(abs_difference <= 1e-10);
     /// ```
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]
@@ -1248,7 +1261,7 @@ impl f64 {
     /// let one = x.erf() + x.erfc();
     /// let abs_difference = (one - 1.0).abs();
     ///
-    /// assert!(abs_difference <= f64::EPSILON);
+    /// assert!(abs_difference <= 1e-10);
     /// ```
     #[rustc_allow_incoherent_impl]
     #[must_use = "method returns a new number and does not mutate the original value"]

@@ -9,23 +9,29 @@ use crate::collections::BTreeMap;
 use crate::ffi::{CStr, CString, OsStr, OsString};
 use crate::os::unix::prelude::*;
 use crate::path::Path;
+use crate::process::StdioPipes;
 use crate::sys::fd::FileDesc;
 use crate::sys::fs::File;
-#[cfg(not(target_os = "fuchsia"))]
+#[cfg(not(any(target_os = "fuchsia", target_os = "l4re")))]
 use crate::sys::fs::OpenOptions;
-use crate::sys::pipe::{self, AnonPipe};
-use crate::sys::process::env::{CommandEnv, CommandEnvs};
-use crate::sys_common::{FromInner, IntoInner};
-use crate::{fmt, io};
+use crate::sys::pipe::pipe;
+use crate::sys::process::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
+use crate::sys::{FromInner, IntoInner, cvt_r};
+use crate::{fmt, io, mem};
 
 mod cstring_array;
 
-cfg_if::cfg_if! {
-    if #[cfg(target_os = "fuchsia")] {
+cfg_select! {
+    target_os = "fuchsia" => {
         // fuchsia doesn't have /dev/null
-    } else if #[cfg(target_os = "vxworks")] {
+    }
+    target_os = "l4re" => {
+        // l4re doesn't have /dev/null
+    }
+    target_os = "vxworks" => {
         const DEV_NULL: &CStr = c"/null";
-    } else {
+    }
+    _ => {
         const DEV_NULL: &CStr = c"/dev/null";
     }
 }
@@ -35,8 +41,8 @@ cfg_if::cfg_if! {
 // to support older Android version (independent of libc version).
 // The following implementations are based on
 // https://github.com/aosp-mirror/platform_bionic/blob/ad8dcd6023294b646e5a8288c0ed431b0845da49/libc/include/android/legacy_signal_inlines.h
-cfg_if::cfg_if! {
-    if #[cfg(target_os = "android")] {
+cfg_select! {
+    target_os = "android" => {
         #[allow(dead_code)]
         pub unsafe fn sigemptyset(set: *mut libc::sigset_t) -> libc::c_int {
             set.write_bytes(0u8, 1);
@@ -45,8 +51,9 @@ cfg_if::cfg_if! {
 
         #[allow(dead_code)]
         pub unsafe fn sigaddset(set: *mut libc::sigset_t, signum: libc::c_int) -> libc::c_int {
-            use crate::slice;
             use libc::{c_ulong, sigset_t};
+
+            use crate::slice;
 
             // The implementations from bionic (android libc) type pun `sigset_t` as an
             // array of `c_ulong`. This works, but lets add a smoke check to make sure
@@ -58,7 +65,7 @@ cfg_if::cfg_if! {
 
             let bit = (signum - 1) as usize;
             if set.is_null() || bit >= (8 * size_of::<sigset_t>()) {
-                crate::sys::pal::os::set_errno(libc::EINVAL);
+                crate::sys::io::set_errno(libc::EINVAL);
                 return -1;
             }
             let raw = slice::from_raw_parts_mut(
@@ -69,9 +76,10 @@ cfg_if::cfg_if! {
             raw[bit / LONG_BIT] |= 1 << (bit % LONG_BIT);
             return 0;
         }
-    } else {
+    }
+    _ => {
         #[allow(unused_imports)]
-        pub use libc::{sigemptyset, sigaddset};
+        pub use libc::{sigaddset, sigemptyset};
     }
 }
 
@@ -101,14 +109,6 @@ pub struct Command {
     setsid: bool,
 }
 
-// passed back to std::process with the pipes connected to the child, if any
-// were requested
-pub struct StdioPipes {
-    pub stdin: Option<AnonPipe>,
-    pub stdout: Option<AnonPipe>,
-    pub stderr: Option<AnonPipe>,
-}
-
 // passed to do_exec() with configuration of what the child stdio should look
 // like
 #[cfg_attr(target_os = "vita", allow(dead_code))]
@@ -123,9 +123,9 @@ pub enum ChildStdio {
     Explicit(c_int),
     Owned(FileDesc),
 
-    // On Fuchsia, null stdio is the default, so we simply don't specify
-    // any actions at the time of spawning.
-    #[cfg(target_os = "fuchsia")]
+    // On Fuchsia and L4Re, null stdio is the default, so we simply don't
+    // specify any actions at the time of spawning.
+    #[cfg(any(target_os = "fuchsia", target_os = "l4re"))]
     Null,
 }
 
@@ -219,7 +219,7 @@ impl Command {
     pub fn chroot(&mut self, dir: &Path) {
         self.chroot = Some(os2c(dir.as_os_str(), &mut self.saw_nul));
         if self.cwd.is_none() {
-            self.cwd(&OsStr::new("/"));
+            self.cwd(OsStr::new("/"));
         }
     }
     pub fn setsid(&mut self, setsid: bool) {
@@ -265,6 +265,14 @@ impl Command {
 
     pub fn get_envs(&self) -> CommandEnvs<'_> {
         self.env.iter()
+    }
+
+    pub fn get_env_clear(&self) -> bool {
+        self.env.does_clear()
+    }
+
+    pub fn get_resolved_envs(&self) -> CommandResolvedEnvs {
+        CommandResolvedEnvs::new(self.env.capture())
     }
 
     pub fn get_current_dir(&self) -> Option<&Path> {
@@ -393,7 +401,7 @@ fn construct_envp(env: BTreeMap<OsString, OsString>, saw_nul: &mut bool) -> CStr
 }
 
 impl Stdio {
-    pub fn to_child_stdio(&self, readable: bool) -> io::Result<(ChildStdio, Option<AnonPipe>)> {
+    pub fn to_child_stdio(&self, readable: bool) -> io::Result<(ChildStdio, Option<ChildPipe>)> {
         match *self {
             Stdio::Inherit => Ok((ChildStdio::Inherit, None)),
 
@@ -418,12 +426,12 @@ impl Stdio {
             }
 
             Stdio::MakePipe => {
-                let (reader, writer) = pipe::anon_pipe()?;
+                let (reader, writer) = pipe()?;
                 let (ours, theirs) = if readable { (writer, reader) } else { (reader, writer) };
-                Ok((ChildStdio::Owned(theirs.into_inner()), Some(ours)))
+                Ok((ChildStdio::Owned(theirs), Some(ours)))
             }
 
-            #[cfg(not(target_os = "fuchsia"))]
+            #[cfg(not(any(target_os = "fuchsia", target_os = "l4re")))]
             Stdio::Null => {
                 let mut opts = OpenOptions::new();
                 opts.read(readable);
@@ -432,15 +440,9 @@ impl Stdio {
                 Ok((ChildStdio::Owned(fd.into_inner()), None))
             }
 
-            #[cfg(target_os = "fuchsia")]
+            #[cfg(any(target_os = "fuchsia", target_os = "l4re"))]
             Stdio::Null => Ok((ChildStdio::Null, None)),
         }
-    }
-}
-
-impl From<AnonPipe> for Stdio {
-    fn from(pipe: AnonPipe) -> Stdio {
-        Stdio::Fd(pipe.into_inner())
     }
 }
 
@@ -485,7 +487,7 @@ impl ChildStdio {
             ChildStdio::Explicit(fd) => Some(fd),
             ChildStdio::Owned(ref fd) => Some(fd.as_raw_fd()),
 
-            #[cfg(target_os = "fuchsia")]
+            #[cfg(any(target_os = "fuchsia", target_os = "l4re"))]
             ChildStdio::Null => None,
         }
     }
@@ -631,4 +633,65 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter.clone()).finish()
     }
+}
+
+pub type ChildPipe = crate::sys::pipe::Pipe;
+
+pub fn read_output(
+    out: ChildPipe,
+    stdout: &mut Vec<u8>,
+    err: ChildPipe,
+    stderr: &mut Vec<u8>,
+) -> io::Result<()> {
+    // Set both pipes into nonblocking mode as we're gonna be reading from both
+    // in the `select` loop below, and we wouldn't want one to block the other!
+    out.set_nonblocking(true)?;
+    err.set_nonblocking(true)?;
+
+    let mut fds: [libc::pollfd; 2] = unsafe { mem::zeroed() };
+    fds[0].fd = out.as_raw_fd();
+    fds[0].events = libc::POLLIN;
+    fds[1].fd = err.as_raw_fd();
+    fds[1].events = libc::POLLIN;
+    loop {
+        // wait for either pipe to become readable using `poll`
+        cvt_r(|| unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) })?;
+
+        if fds[0].revents != 0 && read(&out, stdout)? {
+            err.set_nonblocking(false)?;
+            return err.read_to_end(stderr).map(drop);
+        }
+        if fds[1].revents != 0 && read(&err, stderr)? {
+            out.set_nonblocking(false)?;
+            return out.read_to_end(stdout).map(drop);
+        }
+    }
+
+    // Read as much as we can from each pipe, ignoring EWOULDBLOCK or
+    // EAGAIN. If we hit EOF, then this will happen because the underlying
+    // reader will return Ok(0), in which case we'll see `Ok` ourselves. In
+    // this case we flip the other fd back into blocking mode and read
+    // whatever's leftover on that file descriptor.
+    fn read(fd: &FileDesc, dst: &mut Vec<u8>) -> Result<bool, io::Error> {
+        match fd.read_to_end(dst) {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    || e.raw_os_error() == Some(libc::EAGAIN)
+                {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+pub fn getpid() -> u32 {
+    unsafe { libc::getpid() as u32 }
+}
+
+pub fn getppid() -> u32 {
+    unsafe { libc::getppid() as u32 }
 }

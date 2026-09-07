@@ -1,12 +1,12 @@
 #![feature(f128)]
 #![feature(f16)]
-#![allow(
-    dead_code,
-    clippy::borrow_as_ptr,
-    unnecessary_transmutes,
-    clippy::needless_lifetimes,
-    clippy::missing_transmute_annotations
+#![warn(
+    clippy::crosspointer_transmute,
+    clippy::transmute_bytes_to_str,
+    clippy::transmute_int_to_bool,
+    clippy::useless_transmute
 )]
+#![expect(integer_to_ptr_transmutes, clippy::needless_lifetimes)]
 //@no-rustfix
 extern crate core;
 
@@ -22,7 +22,6 @@ fn my_vec() -> MyVec<i32> {
 }
 
 #[allow(clippy::needless_lifetimes, clippy::transmute_ptr_to_ptr)]
-#[warn(clippy::useless_transmute)]
 unsafe fn _generic<'a, T, U: 'a>(t: &'a T) {
     unsafe {
         // FIXME: should lint
@@ -41,7 +40,6 @@ unsafe fn _generic<'a, T, U: 'a>(t: &'a T) {
     }
 }
 
-#[warn(clippy::useless_transmute)]
 fn useless() {
     unsafe {
         let _: Vec<i32> = core::mem::transmute(my_vec());
@@ -60,12 +58,10 @@ fn useless() {
         //~^ useless_transmute
 
         let _: *const usize = std::mem::transmute(5_isize);
-        //~^ useless_transmute
 
         let _ = std::ptr::dangling::<usize>();
 
         let _: *const usize = std::mem::transmute(1 + 1usize);
-        //~^ useless_transmute
 
         let _ = (1 + 1_usize) as *const usize;
     }
@@ -89,7 +85,6 @@ fn useless() {
 
 struct Usize(usize);
 
-#[warn(clippy::crosspointer_transmute)]
 fn crosspointer() {
     let mut int: Usize = Usize(0);
     let int_const_ptr: *const Usize = &int as *const Usize;
@@ -110,7 +105,6 @@ fn crosspointer() {
     }
 }
 
-#[warn(clippy::transmute_int_to_bool)]
 fn int_to_bool() {
     let _: bool = unsafe { std::mem::transmute(0_u8) };
     //~^ transmute_int_to_bool
@@ -127,6 +121,19 @@ fn bytes_to_str(mb: &mut [u8]) {
 
     const _: &str = unsafe { std::mem::transmute(B) };
     //~^ transmute_bytes_to_str
+}
+
+fn issue16104() {
+    let b = vec![1_u8, 2_u8];
+    macro_rules! take_ref {
+        ($x:expr) => {
+            $x.as_slice()
+        };
+    }
+    unsafe {
+        let _: &str = std::mem::transmute(take_ref!(b));
+        //~^ transmute_bytes_to_str
+    }
 }
 
 fn main() {}

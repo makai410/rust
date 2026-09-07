@@ -2,6 +2,13 @@
 //!
 //! It is mainly a `HirDatabase` for semantic analysis, plus a `SymbolsDatabase`, for fuzzy search.
 
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
+extern crate self as ide_db;
+
 mod apply_change;
 
 pub mod active_parameter;
@@ -14,6 +21,8 @@ pub mod items_locator;
 pub mod label;
 pub mod path_transform;
 pub mod prime_caches;
+pub mod ra_fixture;
+pub mod range_mapper;
 pub mod rename;
 pub mod rust_doc;
 pub mod search;
@@ -51,32 +60,25 @@ use salsa::Durability;
 use std::{fmt, mem::ManuallyDrop};
 
 use base_db::{
-    CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, RootQueryDb,
-    SourceDatabase, SourceRoot, SourceRootId, SourceRootInput, query_group,
+    CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, Nonce, SourceDatabase,
+    SourceRoot, SourceRootId, SourceRootInput, set_all_crates_with_durability,
 };
-use hir::{
-    FilePositionWrapper, FileRangeWrapper,
-    db::{DefDatabase, ExpandDatabase},
-};
+use hir::{FilePositionWrapper, FileRangeWrapper, db::HirDatabase};
 use triomphe::Arc;
 
-use crate::{line_index::LineIndex, symbol_index::SymbolsDatabase};
+use crate::line_index::LineIndex;
 pub use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 pub use ::line_index;
 
 /// `base_db` is normally also needed in places where `ide_db` is used, so this re-export is for convenience.
-pub use base_db;
+pub use base_db::{self, FxIndexMap, FxIndexSet, LibraryRoots, LocalRoots};
 pub use span::{self, FileId};
-
-pub type FxIndexSet<T> = indexmap::IndexSet<T, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
-pub type FxIndexMap<K, V> =
-    indexmap::IndexMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 pub type FilePosition = FilePositionWrapper<FileId>;
 pub type FileRange = FileRangeWrapper<FileId>;
 
-#[salsa_macros::db]
+#[salsa::db]
 pub struct RootDatabase {
     // FIXME: Revisit this commit now that we migrated to the new salsa, given we store arcs in this
     // db directly now
@@ -87,11 +89,12 @@ pub struct RootDatabase {
     storage: ManuallyDrop<salsa::Storage<Self>>,
     files: Arc<Files>,
     crates_map: Arc<CratesMap>,
+    nonce: Nonce,
 }
 
 impl std::panic::RefUnwindSafe for RootDatabase {}
 
-#[salsa_macros::db]
+#[salsa::db]
 impl salsa::Database for RootDatabase {}
 
 impl Drop for RootDatabase {
@@ -106,6 +109,7 @@ impl Clone for RootDatabase {
             storage: self.storage.clone(),
             files: self.files.clone(),
             crates_map: self.crates_map.clone(),
+            nonce: self.nonce,
         }
     }
 }
@@ -116,7 +120,7 @@ impl fmt::Debug for RootDatabase {
     }
 }
 
-#[salsa_macros::db]
+#[salsa::db]
 impl SourceDatabase for RootDatabase {
     fn file_text(&self, file_id: vfs::FileId) -> FileText {
         self.files.file_text(file_id)
@@ -153,7 +157,7 @@ impl SourceDatabase for RootDatabase {
     }
 
     fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput {
-        self.files.file_source_root(id)
+        self.files.file_source_root(self, id)
     }
 
     fn set_file_source_root_with_durability(
@@ -169,6 +173,14 @@ impl SourceDatabase for RootDatabase {
     fn crates_map(&self) -> Arc<CratesMap> {
         self.crates_map.clone()
     }
+
+    fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
+        (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())
+    }
+
+    fn line_column(&self, file: FileId, offset: syntax::TextSize) -> Result<(u32, u32), ()> {
+        line_index(self, file).try_line_col(offset).map(|lc| (lc.line, lc.col)).ok_or(())
+    }
 }
 
 impl Default for RootDatabase {
@@ -183,20 +195,25 @@ impl RootDatabase {
             storage: ManuallyDrop::new(salsa::Storage::default()),
             files: Default::default(),
             crates_map: Default::default(),
+            nonce: Nonce::new(),
         };
         // This needs to be here otherwise `CrateGraphBuilder` will panic.
-        db.set_all_crates(Arc::new(Box::new([])));
+        set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
         CrateGraphBuilder::default().set_in_db(&mut db);
-        db.set_proc_macros_with_durability(Default::default(), Durability::MEDIUM);
-        db.set_local_roots_with_durability(Default::default(), Durability::MEDIUM);
-        db.set_library_roots_with_durability(Default::default(), Durability::MEDIUM);
-        db.set_expand_proc_attr_macros_with_durability(false, Durability::HIGH);
+        hir::ProcMacros::init_default(&db, Durability::MEDIUM);
+        _ = base_db::LibraryRoots::builder(Default::default())
+            .durability(Durability::MEDIUM)
+            .new(&db);
+        _ = base_db::LocalRoots::builder(Default::default())
+            .durability(Durability::MEDIUM)
+            .new(&db);
+        hir::db::set_expand_proc_attr_macros(&mut db, false);
         db.update_base_query_lru_capacities(lru_capacity);
         db
     }
 
     pub fn enable_proc_attr_macros(&mut self) {
-        self.set_expand_proc_attr_macros_with_durability(true, Durability::HIGH);
+        hir::db::set_expand_proc_attr_macros(self, true);
     }
 
     pub fn update_base_query_lru_capacities(&mut self, _lru_capacity: Option<u16>) {
@@ -236,15 +253,21 @@ impl RootDatabase {
     }
 }
 
-#[query_group::query_group]
-pub trait LineIndexDatabase: base_db::RootQueryDb {
-    #[salsa::invoke_interned(line_index)]
-    fn line_index(&self, file_id: FileId) -> Arc<LineIndex>;
-}
-
-fn line_index(db: &dyn LineIndexDatabase, file_id: FileId) -> Arc<LineIndex> {
-    let text = db.file_text(file_id).text(db);
-    Arc::new(LineIndex::new(&text))
+pub fn line_index(db: &dyn SourceDatabase, file_id: FileId) -> &Arc<LineIndex> {
+    #[salsa::interned]
+    pub struct InternedFileId {
+        #[returns(copy)]
+        id: FileId,
+    }
+    #[salsa::tracked(returns(ref))]
+    fn line_index<'db>(
+        db: &'db dyn SourceDatabase,
+        file_id: InternedFileId<'db>,
+    ) -> Arc<LineIndex> {
+        let text = db.file_text(file_id.id(db)).text(db);
+        Arc::new(LineIndex::new(text))
+    }
+    line_index(db, InternedFileId::new(db, file_id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -253,6 +276,7 @@ pub enum SymbolKind {
     BuiltinAttr,
     Const,
     ConstParam,
+    CrateRoot,
     Derive,
     DeriveHelper,
     Enum,
@@ -273,7 +297,6 @@ pub enum SymbolKind {
     Struct,
     ToolModule,
     Trait,
-    TraitAlias,
     TypeAlias,
     TypeParam,
     Union,
@@ -292,21 +315,21 @@ impl From<hir::MacroKind> for SymbolKind {
     }
 }
 
-impl From<hir::ModuleDef> for SymbolKind {
-    fn from(it: hir::ModuleDef) -> Self {
+impl SymbolKind {
+    pub fn from_module_def(db: &dyn HirDatabase, it: hir::ModuleDef) -> Self {
         match it {
             hir::ModuleDef::Const(..) => SymbolKind::Const,
-            hir::ModuleDef::Variant(..) => SymbolKind::Variant,
+            hir::ModuleDef::EnumVariant(..) => SymbolKind::Variant,
             hir::ModuleDef::Function(..) => SymbolKind::Function,
             hir::ModuleDef::Macro(mac) if mac.is_proc_macro() => SymbolKind::ProcMacro,
             hir::ModuleDef::Macro(..) => SymbolKind::Macro,
+            hir::ModuleDef::Module(m) if m.is_crate_root(db) => SymbolKind::CrateRoot,
             hir::ModuleDef::Module(..) => SymbolKind::Module,
             hir::ModuleDef::Static(..) => SymbolKind::Static,
             hir::ModuleDef::Adt(hir::Adt::Struct(..)) => SymbolKind::Struct,
             hir::ModuleDef::Adt(hir::Adt::Enum(..)) => SymbolKind::Enum,
             hir::ModuleDef::Adt(hir::Adt::Union(..)) => SymbolKind::Union,
             hir::ModuleDef::Trait(..) => SymbolKind::Trait,
-            hir::ModuleDef::TraitAlias(..) => SymbolKind::TraitAlias,
             hir::ModuleDef::TypeAlias(..) => SymbolKind::TypeAlias,
             hir::ModuleDef::BuiltinType(..) => SymbolKind::TypeAlias,
         }
@@ -362,4 +385,41 @@ pub enum Severity {
     Warning,
     WeakWarning,
     Allow,
+}
+
+#[derive(Clone, Copy)]
+pub struct MiniCore<'a>(&'a str);
+
+impl<'a> MiniCore<'a> {
+    #[inline]
+    pub fn new(minicore: &'a str) -> Self {
+        Self(minicore)
+    }
+
+    #[inline]
+    pub const fn default() -> Self {
+        Self(test_utils::MiniCore::RAW_SOURCE)
+    }
+}
+
+impl std::fmt::Debug for MiniCore<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_tuple("MiniCore");
+        if self.0 == test_utils::MiniCore::RAW_SOURCE {
+            // Don't print the whole contents if they correspond to the default.
+            // The `format_args!` makes it so that the output is
+            // `MiniCore(<default>)` and not `MiniCore("<default>").
+            d.field(&format_args!("<default>"));
+        } else {
+            d.field(&self.0);
+        };
+        d.finish()
+    }
+}
+
+impl<'a> Default for MiniCore<'a> {
+    #[inline]
+    fn default() -> Self {
+        Self::default()
+    }
 }

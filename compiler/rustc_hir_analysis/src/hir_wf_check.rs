@@ -51,12 +51,12 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
     struct HirWfCheck<'tcx> {
         tcx: TyCtxt<'tcx>,
         predicate: ty::Predicate<'tcx>,
-        cause: Option<ObligationCause<'tcx>>,
-        cause_depth: usize,
+        cause: Option<ObligationCause<'tcx>> = None,
+        cause_depth: usize = 0,
         icx: ItemCtxt<'tcx>,
         def_id: LocalDefId,
         param_env: ty::ParamEnv<'tcx>,
-        depth: usize,
+        depth: usize = 0,
     }
 
     impl<'tcx> Visitor<'tcx> for HirWfCheck<'tcx> {
@@ -95,7 +95,7 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
                 ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(tcx_ty.into())),
             ));
 
-            for error in ocx.select_all_or_error() {
+            for error in ocx.evaluate_obligations_error_on_ambiguity() {
                 debug!("Wf-check got error for {:?}: {:?}", ty, error);
                 if error.obligation.predicate == self.predicate {
                     // Save the cause from the greatest depth - this corresponds
@@ -103,16 +103,15 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
                     // over less-specific types (e.g. `Option<MyStruct<u8>>`)
                     if self.depth >= self.cause_depth {
                         self.cause = Some(error.obligation.cause);
-                        if let hir::TyKind::TraitObject(..) = ty.kind {
-                            if let DefKind::AssocTy | DefKind::AssocConst | DefKind::AssocFn =
+                        if let hir::TyKind::TraitObject(..) = ty.kind
+                            && let DefKind::AssocTy | DefKind::AssocConst { .. } | DefKind::AssocFn =
                                 self.tcx.def_kind(self.def_id)
-                            {
-                                self.cause = Some(ObligationCause::new(
-                                    ty.span,
-                                    self.def_id,
-                                    ObligationCauseCode::DynCompatible(ty.span),
-                                ));
-                            }
+                        {
+                            self.cause = Some(ObligationCause::new(
+                                ty.span,
+                                self.def_id,
+                                ObligationCauseCode::DynCompatible(ty.span),
+                            ));
                         }
                         self.cause_depth = self.depth
                     }
@@ -125,16 +124,8 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
         }
     }
 
-    let mut visitor = HirWfCheck {
-        tcx,
-        predicate,
-        cause: None,
-        cause_depth: 0,
-        icx,
-        def_id,
-        param_env: tcx.param_env(def_id.to_def_id()),
-        depth: 0,
-    };
+    let param_env = tcx.param_env(def_id.to_def_id());
+    let mut visitor = HirWfCheck { tcx, predicate, icx, def_id, param_env, .. };
 
     // Get the starting `hir::Ty` using our `WellFormedLoc`.
     // We will walk 'into' this type to try to find
@@ -155,8 +146,9 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
                 hir::ItemKind::TyAlias(_, _, ty)
                 | hir::ItemKind::Static(_, _, ty, _)
                 | hir::ItemKind::Const(_, _, ty, _) => vec![ty],
-                hir::ItemKind::Impl(impl_) => match &impl_.of_trait {
-                    Some(t) => t
+                hir::ItemKind::Impl(impl_) => match impl_.of_trait {
+                    Some(of_trait) => of_trait
+                        .trait_ref
                         .path
                         .segments
                         .last()

@@ -1,25 +1,24 @@
+use clippy_utils::res::MaybeDef as _;
 use rustc_data_structures::fx::FxHashMap;
 
 use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
-use clippy_utils::ty::is_type_diagnostic_item;
 use clippy_utils::{paths, sym};
 use rustc_ast::ast::LitKind;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::Ty;
-use rustc_span::Span;
-use rustc_span::source_map::Spanned;
+use rustc_span::{Span, Spanned};
 
 use super::{NONSENSICAL_OPEN_OPTIONS, SUSPICIOUS_OPEN_OPTIONS};
 
 fn is_open_options(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
-    is_type_diagnostic_item(cx, ty, sym::FsOpenOptions) || paths::TOKIO_IO_OPEN_OPTIONS.matches_ty(cx, ty)
+    ty.is_diag_item(cx, sym::FsOpenOptions) || paths::TOKIO_IO_OPEN_OPTIONS.matches_ty(cx, ty)
 }
 
 pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>, recv: &'tcx Expr<'_>) {
     if let Some(method_id) = cx.typeck_results().type_dependent_def_id(e.hir_id)
-        && let Some(impl_id) = cx.tcx.impl_of_method(method_id)
-        && is_open_options(cx, cx.tcx.type_of(impl_id).instantiate_identity())
+        && let Some(impl_id) = cx.tcx.impl_of_assoc(method_id)
+        && is_open_options(cx, cx.tcx.type_of(impl_id).instantiate_identity().skip_norm_wip())
     {
         let mut options = Vec::new();
         if get_open_options(cx, recv, &mut options) {
@@ -111,7 +110,7 @@ fn get_open_options(
                     // This might be a user defined extension trait with a method like `truncate_write`
                     // which would be a false positive
                     if let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(argument.hir_id)
-                        && cx.tcx.trait_of_item(method_def_id).is_some()
+                        && cx.tcx.trait_of_assoc(method_def_id).is_some()
                     {
                         return false;
                     }

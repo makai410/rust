@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use serde_yaml::Value;
 
 use crate::GitHubContext;
@@ -44,7 +44,7 @@ impl Job {
     }
 
     fn is_linux(&self) -> bool {
-        self.os.contains("ubuntu")
+        self.os.contains("ubuntu") || self.os.contains("linux")
     }
 }
 
@@ -85,6 +85,10 @@ impl JobDatabase {
             .cloned()
             .collect()
     }
+
+    fn find_auto_job_by_name(&self, job_name: &str) -> Option<&Job> {
+        self.auto_jobs.iter().find(|job| job.name == job_name)
+    }
 }
 
 pub fn load_job_db(db: &str) -> anyhow::Result<JobDatabase> {
@@ -97,12 +101,129 @@ pub fn load_job_db(db: &str) -> anyhow::Result<JobDatabase> {
         db.apply_merge().context("failed to apply merge keys")
     };
 
-    // Apply merge twice to handle nested merges
+    // Apply merge twice to handle nested merges up to depth 2.
     apply_merge(&mut db)?;
     apply_merge(&mut db)?;
 
-    let db: JobDatabase = serde_yaml::from_value(db).context("failed to parse job database")?;
+    let mut db: JobDatabase = serde_yaml::from_value(db).context("failed to parse job database")?;
+
+    register_pr_jobs_as_auto_jobs(&mut db)?;
+    validate_job_database(&db)?;
+
     Ok(db)
+}
+
+/// Maintain invariant that PR CI jobs must be a subset of Auto CI jobs modulo carve-outs.
+///
+/// When PR jobs are auto-registered as Auto jobs, they will have `continue_on_error` overridden to
+/// be `false` to avoid wasting Auto CI resources.
+///
+/// When a job is already both a PR job and a auto job, we will post-validate their "equivalence
+/// modulo certain carve-outs" in [`validate_job_database`].
+///
+/// This invariant is important to make sure that it's not easily possible (without modifying
+/// `citool`) to have PRs with red PR-only CI jobs merged into `main`, causing all subsequent PR
+/// CI runs to be red until the cause is fixed.
+fn register_pr_jobs_as_auto_jobs(db: &mut JobDatabase) -> anyhow::Result<()> {
+    for pr_job in &db.pr_jobs {
+        // It's acceptable to "override" a PR job in Auto job, for instance, `test-x86_64-gnu-tools` will
+        // receive an additional `DEPLOY_TOOLSTATES_JSON: toolstates-linux.json` env when under Auto
+        // environment versus PR environment.
+        if db.find_auto_job_by_name(&pr_job.name).is_some() {
+            continue;
+        }
+
+        let auto_registered_job = Job { continue_on_error: Some(false), ..pr_job.clone() };
+        db.auto_jobs.push(auto_registered_job);
+    }
+
+    Ok(())
+}
+
+fn validate_job_database(db: &JobDatabase) -> anyhow::Result<()> {
+    fn ensure_no_duplicate_job_names(section: &str, jobs: &Vec<Job>) -> anyhow::Result<()> {
+        let mut job_names = HashSet::new();
+        for job in jobs {
+            let job_name = job.name.as_str();
+            if !job_names.insert(job_name) {
+                return Err(anyhow::anyhow!(
+                    "duplicate job name `{job_name}` in section `{section}`"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    ensure_no_duplicate_job_names("pr", &db.pr_jobs)?;
+    ensure_no_duplicate_job_names("auto", &db.auto_jobs)?;
+    ensure_no_duplicate_job_names("try", &db.try_jobs)?;
+    ensure_no_duplicate_job_names("optional", &db.optional_jobs)?;
+
+    fn equivalent_modulo_carve_out(pr_job: &Job, auto_job: &Job) -> anyhow::Result<()> {
+        let Job {
+            name,
+            os,
+            only_on_channel,
+            free_disk,
+            doc_url,
+            codebuild,
+
+            // Carve-out configs allowed to be different.
+            env: _,
+            continue_on_error: _,
+        } = pr_job;
+
+        if *name == auto_job.name
+            && *os == auto_job.os
+            && *only_on_channel == auto_job.only_on_channel
+            && *free_disk == auto_job.free_disk
+            && *doc_url == auto_job.doc_url
+            && *codebuild == auto_job.codebuild
+        {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "PR job `{}` differs from corresponding Auto job `{}` in configuration other than `continue_on_error` and `env`",
+                pr_job.name,
+                auto_job.name
+            ))
+        }
+    }
+
+    for pr_job in &db.pr_jobs {
+        // At this point, any PR job must also be an Auto job, auto-registered or overridden.
+        let auto_job = db
+            .find_auto_job_by_name(&pr_job.name)
+            .expect("PR job must either be auto-registered as Auto job or overridden");
+
+        equivalent_modulo_carve_out(pr_job, auto_job)?;
+    }
+
+    // Auto CI should "fail-fast" to avoid wasting Auto CI resources.
+    // However, some experimental auto jobs can be made optional, for example if we are unsure about
+    // their flakiness. Those have to be prefixed with `optional-`.
+    for auto_job in &db.auto_jobs {
+        if auto_job.continue_on_error == Some(true) && !auto_job.name.starts_with("optional-") {
+            return Err(anyhow!(
+                "Auto job `{job}` cannot have `continue_on_error: true`. If the job should be optional, name it `optional-{job}`.",
+                job = auto_job.name
+            ));
+        }
+    }
+
+    // All jobs should follow a naming convention - either they are test or dist jobs.
+    for job in &db.auto_jobs {
+        let name = job.name.strip_prefix("optional-").unwrap_or(&job.name);
+        if name.starts_with("dist-") || name.starts_with("test-") {
+            continue;
+        }
+        return Err(anyhow!(
+            "Auto job `{job}` name must start with test- or dist-`.",
+            job = job.name
+        ));
+    }
+
+    Ok(())
 }
 
 /// Representation of a job outputted to a GitHub Actions workflow.
@@ -161,11 +282,15 @@ pub enum RunType {
     /// Workflows that run after a push to a PR branch
     PullRequest,
     /// Try run started with @bors try
-    TryJob { job_patterns: Option<Vec<String>> },
+    TryJob {
+        job_patterns: Option<Vec<String>>,
+        /// Should the limit on the number of try jobs be ignored?
+        nolimit: bool,
+    },
     /// Merge attempt workflow
     AutoJob,
     /// Fake job only used for sharing Github Actions cache.
-    MasterJob,
+    MainJob,
 }
 
 /// Maximum number of custom try jobs that can be requested in a single
@@ -179,7 +304,7 @@ fn calculate_jobs(
 ) -> anyhow::Result<Vec<GithubActionsJob>> {
     let (jobs, prefix, base_env) = match run_type {
         RunType::PullRequest => (db.pr_jobs.clone(), "PR", &db.envs.pr_env),
-        RunType::TryJob { job_patterns } => {
+        RunType::TryJob { job_patterns, nolimit } => {
             let jobs = if let Some(patterns) = job_patterns {
                 let mut jobs: Vec<Job> = vec![];
                 let mut unknown_patterns = vec![];
@@ -201,9 +326,9 @@ fn calculate_jobs(
                         unknown_patterns.join(", ")
                     ));
                 }
-                if jobs.len() > MAX_TRY_JOBS_COUNT {
+                if jobs.len() > MAX_TRY_JOBS_COUNT && !nolimit {
                     return Err(anyhow::anyhow!(
-                        "It is only possible to schedule up to {MAX_TRY_JOBS_COUNT} custom jobs, received {} custom jobs expanded from {} pattern(s)",
+                        "It is only possible to schedule up to {MAX_TRY_JOBS_COUNT} custom jobs, received {} custom jobs expanded from {} pattern(s). Use `@bors try jobs=... nolimit` to allow running an arbitrary number of try jobs.",
                         jobs.len(),
                         patterns.len()
                     ));
@@ -215,7 +340,7 @@ fn calculate_jobs(
             (jobs, "try", &db.envs.try_env)
         }
         RunType::AutoJob => (db.auto_jobs.clone(), "auto", &db.envs.auto_env),
-        RunType::MasterJob => return Ok(vec![]),
+        RunType::MainJob => return Ok(vec![]),
     };
     let jobs = substitute_github_vars(jobs.clone())
         .context("Failed to substitute GitHub context variables in jobs")?;
@@ -232,7 +357,7 @@ fn calculate_jobs(
             // built toolchain using `rustup-toolchain-install-master`),
             // we inject the `DIST_TRY_BUILD` environment variable to the jobs
             // to tell `opt-dist` to make the build faster by skipping certain steps.
-            if let RunType::TryJob { job_patterns } = run_type {
+            if let RunType::TryJob { job_patterns, nolimit: _ } = run_type {
                 if job_patterns.is_none() {
                     env.insert(
                         "DIST_TRY_BUILD".to_string(),
@@ -267,16 +392,17 @@ pub fn calculate_job_matrix(
     })?;
     eprintln!("Run type: {run_type:?}");
 
-    let jobs = calculate_jobs(&run_type, &db, channel)?;
-    if jobs.is_empty() && !matches!(run_type, RunType::MasterJob) {
+    let mut jobs = calculate_jobs(&run_type, &db, channel)?;
+    if jobs.is_empty() && !matches!(run_type, RunType::MainJob) {
         return Err(anyhow::anyhow!("Computed job list is empty"));
     }
+    jobs.sort_by_key(|j| j.name.clone());
 
     let run_type = match run_type {
         RunType::PullRequest => "pr",
         RunType::TryJob { .. } => "try",
         RunType::AutoJob => "auto",
-        RunType::MasterJob => "master",
+        RunType::MainJob => "main",
     };
 
     eprintln!("Output");
@@ -300,7 +426,10 @@ pub fn find_linux_job<'a>(jobs: &'a [Job], name: &str) -> anyhow::Result<&'a Job
         ));
     };
     if !job.is_linux() {
-        return Err(anyhow::anyhow!("Only Linux jobs can be executed locally"));
+        return Err(anyhow::anyhow!(
+            "Only Linux jobs can be executed locally, os `{}` is not linux",
+            job.os
+        ));
     }
 
     Ok(job)

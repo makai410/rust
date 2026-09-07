@@ -1,4 +1,4 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ revisions: sparc sparcv8plus sparc64
 //@[sparc] compile-flags: --target sparc-unknown-none-elf
 //@[sparc] needs-llvm-components: sparc
@@ -6,10 +6,10 @@
 //@[sparcv8plus] needs-llvm-components: sparc
 //@[sparc64] compile-flags: --target sparc64-unknown-linux-gnu
 //@[sparc64] needs-llvm-components: sparc
-//@ needs-asm-support
+//@ ignore-backends: gcc
 
 #![crate_type = "rlib"]
-#![feature(no_core, asm_experimental_arch)]
+#![feature(no_core, asm_experimental_arch, f128)]
 #![no_core]
 
 extern crate minicore;
@@ -54,5 +54,9 @@ fn f() {
         //~| ERROR type `i32` cannot be used with this register class
         asm!("/* {} */", out(yreg) _);
         //~^ ERROR can only be used as a clobber
+        asm!("", in("d62") 0.0_f64);
+        //[sparc]~^ ERROR cannot use register `d62`
+        asm!("", in("q60") 0.0_f128);
+        //[sparc]~^ ERROR cannot use register `q60`
     }
 }

@@ -2,21 +2,32 @@
 //! and a wrapper around [`TyLoweringContext`] ([`InferenceTyLoweringContext`]) that replaces
 //! it and takes care of diagnostics in inference.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::ops::{Deref, DerefMut};
 
 use either::Either;
-use hir_def::GenericDefId;
-use hir_def::expr_store::ExpressionStore;
 use hir_def::expr_store::path::Path;
-use hir_def::{hir::ExprOrPatId, resolver::Resolver};
-use la_arena::{Idx, RawIdx};
+use hir_def::{ExpressionStoreOwnerId, GenericDefId};
+use hir_def::{expr_store::ExpressionStore, type_ref::TypeRefId};
+use hir_def::{
+    hir::{ExprId, ExprOrPatIdPacked},
+    resolver::Resolver,
+};
+use la_arena::RawIdx;
+use rustc_hash::FxHashMap;
+use thin_vec::ThinVec;
 
-use crate::lower::LifetimeElisionKind;
+use crate::lower::LifetimeLoweringMode;
 use crate::{
-    InferenceDiagnostic, InferenceTyDiagnosticSource, TyLoweringContext, TyLoweringDiagnostic,
-    db::HirDatabase,
-    lower::path::{PathDiagnosticCallback, PathLoweringContext},
+    InferenceDiagnostic, Span, TyLoweringDiagnostic,
+    db::{AnonConstId, HirDatabase},
+    generics::Generics,
+    infer::unify::InferenceTable,
+    lower::{
+        ForbidParamsAfterReason, LifetimeElisionKind, TyLoweringContext, TyLoweringInferVarsCtx,
+        path::{PathDiagnosticCallback, PathLoweringContext},
+    },
+    next_solver::{Const, Region, StoredTy, Ty},
 };
 
 // Unfortunately, this struct needs to use interior mutability (but we encapsulate it)
@@ -24,63 +35,105 @@ use crate::{
 // to our resolver and so we cannot have mutable reference, but we really want to have
 // ability to dispatch diagnostics during this work otherwise the code becomes a complete mess.
 #[derive(Debug, Default, Clone)]
-pub(super) struct Diagnostics(RefCell<Vec<InferenceDiagnostic>>);
+pub(super) struct Diagnostics(RefCell<ThinVec<InferenceDiagnostic>>);
 
 impl Diagnostics {
     pub(super) fn push(&self, diagnostic: InferenceDiagnostic) {
         self.0.borrow_mut().push(diagnostic);
     }
 
-    fn push_ty_diagnostics(
-        &self,
-        source: InferenceTyDiagnosticSource,
-        diagnostics: Vec<TyLoweringDiagnostic>,
-    ) {
-        self.0.borrow_mut().extend(
-            diagnostics.into_iter().map(|diag| InferenceDiagnostic::TyDiagnostic { source, diag }),
-        );
+    pub(super) fn extend(&self, diagnostic: &[InferenceDiagnostic]) {
+        self.0.borrow_mut().extend(diagnostic.iter().cloned());
     }
 
-    pub(super) fn finish(self) -> Vec<InferenceDiagnostic> {
+    fn push_ty_diagnostics(&self, diagnostics: ThinVec<TyLoweringDiagnostic>) {
+        self.0
+            .borrow_mut()
+            .extend(diagnostics.into_iter().map(|diag| InferenceDiagnostic::TyDiagnostic { diag }));
+    }
+
+    pub(super) fn finish(self) -> ThinVec<InferenceDiagnostic> {
         self.0.into_inner()
     }
 }
 
 pub(crate) struct PathDiagnosticCallbackData<'a> {
-    node: ExprOrPatId,
+    node: ExprOrPatIdPacked,
     diagnostics: &'a Diagnostics,
 }
 
-pub(super) struct InferenceTyLoweringContext<'a> {
-    ctx: TyLoweringContext<'a>,
-    diagnostics: &'a Diagnostics,
-    source: InferenceTyDiagnosticSource,
+pub(super) struct InferenceTyLoweringVarsCtx<'a, 'db> {
+    pub(super) table: &'a mut InferenceTable<'db>,
+    pub(super) type_of_type_placeholder: &'a mut FxHashMap<TypeRefId, StoredTy>,
 }
 
-impl<'a> InferenceTyLoweringContext<'a> {
+impl<'db> TyLoweringInferVarsCtx<'db> for InferenceTyLoweringVarsCtx<'_, 'db> {
+    fn next_ty_var(&mut self, span: Span) -> Ty<'db> {
+        let ty = self.table.infer_ctxt.next_ty_var(span);
+
+        if let Span::TypeRefId(type_ref) = span {
+            self.type_of_type_placeholder.insert(type_ref, ty.store());
+        }
+
+        ty
+    }
+    fn next_const_var(&mut self, span: Span) -> Const<'db> {
+        self.table.infer_ctxt.next_const_var(span)
+    }
+    fn next_region_var(&mut self, span: Span) -> Region<'db> {
+        self.table.infer_ctxt.next_region_var(span)
+    }
+
+    fn as_table(&mut self) -> Option<&mut InferenceTable<'db>> {
+        Some(self.table)
+    }
+}
+
+pub(super) struct InferenceTyLoweringContext<'db, 'a> {
+    ctx: TyLoweringContext<'db, 'a>,
+    diagnostics: &'a Diagnostics,
+    defined_anon_consts: &'a RefCell<ThinVec<AnonConstId<'db>>>,
+}
+
+impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
     #[inline]
     pub(super) fn new(
-        db: &'a dyn HirDatabase,
-        resolver: &'a Resolver<'_>,
-        store: &'a ExpressionStore,
+        db: &'db dyn HirDatabase,
+        resolver: &'a Resolver<'db>,
+        store: &'db ExpressionStore,
         diagnostics: &'a Diagnostics,
-        source: InferenceTyDiagnosticSource,
+        def: ExpressionStoreOwnerId,
         generic_def: GenericDefId,
-        lifetime_elision: LifetimeElisionKind,
+        generics: &'a OnceCell<Generics<'db>>,
+        lifetime_elision: LifetimeElisionKind<'db>,
+        allow_using_generic_params: bool,
+        infer_vars: &'a mut InferenceTyLoweringVarsCtx<'a, 'db>,
+        defined_anon_consts: &'a RefCell<ThinVec<AnonConstId<'db>>>,
+        lifetime_lowering_mode: LifetimeLoweringMode,
     ) -> Self {
-        Self {
-            ctx: TyLoweringContext::new(db, resolver, store, generic_def, lifetime_elision),
-            diagnostics,
-            source,
+        let mut ctx = TyLoweringContext::new(
+            db,
+            resolver,
+            store,
+            def,
+            generic_def,
+            generics,
+            lifetime_elision,
+            lifetime_lowering_mode,
+        )
+        .with_infer_vars_behavior(Some(infer_vars));
+        if !allow_using_generic_params {
+            ctx.forbid_params_after(0, ForbidParamsAfterReason::AnonConst);
         }
+        Self { ctx, diagnostics, defined_anon_consts }
     }
 
     #[inline]
     pub(super) fn at_path<'b>(
         &'b mut self,
         path: &'b Path,
-        node: ExprOrPatId,
-    ) -> PathLoweringContext<'b, 'a> {
+        node: ExprOrPatIdPacked,
+    ) -> PathLoweringContext<'b, 'a, 'db> {
         let on_diagnostic = PathDiagnosticCallback {
             data: Either::Right(PathDiagnosticCallbackData { diagnostics: self.diagnostics, node }),
             callback: |data, _, diag| {
@@ -96,11 +149,11 @@ impl<'a> InferenceTyLoweringContext<'a> {
     pub(super) fn at_path_forget_diagnostics<'b>(
         &'b mut self,
         path: &'b Path,
-    ) -> PathLoweringContext<'b, 'a> {
+    ) -> PathLoweringContext<'b, 'a, 'db> {
         let on_diagnostic = PathDiagnosticCallback {
             data: Either::Right(PathDiagnosticCallbackData {
                 diagnostics: self.diagnostics,
-                node: ExprOrPatId::ExprId(Idx::from_raw(RawIdx::from_u32(0))),
+                node: ExprOrPatIdPacked::from(ExprId::from_raw(RawIdx::from_u32(0))),
             }),
             callback: |_data, _, _diag| {},
         };
@@ -113,8 +166,8 @@ impl<'a> InferenceTyLoweringContext<'a> {
     }
 }
 
-impl<'a> Deref for InferenceTyLoweringContext<'a> {
-    type Target = TyLoweringContext<'a>;
+impl<'db, 'a> Deref for InferenceTyLoweringContext<'db, 'a> {
+    type Target = TyLoweringContext<'db, 'a>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -122,17 +175,17 @@ impl<'a> Deref for InferenceTyLoweringContext<'a> {
     }
 }
 
-impl DerefMut for InferenceTyLoweringContext<'_> {
+impl DerefMut for InferenceTyLoweringContext<'_, '_> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.ctx
     }
 }
 
-impl Drop for InferenceTyLoweringContext<'_> {
+impl Drop for InferenceTyLoweringContext<'_, '_> {
     #[inline]
     fn drop(&mut self) {
-        self.diagnostics
-            .push_ty_diagnostics(self.source, std::mem::take(&mut self.ctx.diagnostics));
+        self.diagnostics.push_ty_diagnostics(std::mem::take(&mut self.ctx.diagnostics));
+        self.defined_anon_consts.borrow_mut().extend(self.ctx.defined_anon_consts.iter().copied());
     }
 }

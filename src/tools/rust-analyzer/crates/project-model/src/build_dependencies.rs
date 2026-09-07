@@ -9,18 +9,22 @@
 use std::{cell::RefCell, io, mem, process::Command};
 
 use base_db::Env;
-use cargo_metadata::{Message, camino::Utf8Path};
+use cargo_metadata::{Message, PackageId, camino::Utf8Path};
 use cfg::CfgAtom;
 use itertools::Itertools;
 use la_arena::ArenaMap;
 use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize as _;
+use stdx::never;
 use toolchain::Tool;
+use triomphe::Arc;
 
 use crate::{
     CargoConfig, CargoFeatures, CargoWorkspace, InvocationStrategy, ManifestPath, Package, Sysroot,
-    TargetKind, utf8_stdout,
+    TargetKind,
+    cargo_config_file::{LockfileCopy, LockfileUsage, make_lockfile_copy},
+    utf8_stdout,
 };
 
 /// Output of the build script and proc-macro building steps for a workspace.
@@ -28,6 +32,15 @@ use crate::{
 pub struct WorkspaceBuildScripts {
     outputs: ArenaMap<Package, BuildScriptOutput>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ProcMacroDylibPath {
+    Path(AbsPathBuf),
+    DylibNotFound,
+    NotProcMacro,
+    #[default]
+    NotBuilt,
 }
 
 /// Output of the build script and proc-macro building step for a concrete package.
@@ -43,7 +56,7 @@ pub(crate) struct BuildScriptOutput {
     /// Directory where a build script might place its output.
     pub(crate) out_dir: Option<AbsPathBuf>,
     /// Path to the proc-macro library file if this package exposes proc-macros.
-    pub(crate) proc_macro_dylib_path: Option<AbsPathBuf>,
+    pub(crate) proc_macro_dylib_path: ProcMacroDylibPath,
 }
 
 impl BuildScriptOutput {
@@ -51,7 +64,10 @@ impl BuildScriptOutput {
         self.cfgs.is_empty()
             && self.envs.is_empty()
             && self.out_dir.is_none()
-            && self.proc_macro_dylib_path.is_none()
+            && matches!(
+                self.proc_macro_dylib_path,
+                ProcMacroDylibPath::NotBuilt | ProcMacroDylibPath::NotProcMacro
+            )
     }
 }
 
@@ -67,10 +83,11 @@ impl WorkspaceBuildScripts {
         let current_dir = workspace.workspace_root();
 
         let allowed_features = workspace.workspace_features();
-        let cmd = Self::build_command(
+        let (_guard, cmd) = Self::build_command(
             config,
             &allowed_features,
             workspace.manifest_path(),
+            workspace.target_directory().as_ref(),
             current_dir,
             sysroot,
             toolchain,
@@ -88,11 +105,12 @@ impl WorkspaceBuildScripts {
     ) -> io::Result<Vec<WorkspaceBuildScripts>> {
         assert_eq!(config.invocation_strategy, InvocationStrategy::Once);
 
-        let cmd = Self::build_command(
+        let (_guard, cmd) = Self::build_command(
             config,
             &Default::default(),
-            // This is not gonna be used anyways, so just construct a dummy here
+            // These are not gonna be used anyways, so just construct a dummy here
             &ManifestPath::try_from(working_directory.clone()).unwrap(),
+            working_directory.as_ref(),
             working_directory,
             &Sysroot::empty(),
             None,
@@ -126,6 +144,8 @@ impl WorkspaceBuildScripts {
             |package, cb| {
                 if let Some(&(package, workspace)) = by_id.get(package) {
                     cb(&workspaces[workspace][package].name, &mut res[workspace].outputs[package]);
+                } else {
+                    tracing::error!("Received compiler message for unknown package: {}", package);
                 }
             },
             progress,
@@ -140,12 +160,9 @@ impl WorkspaceBuildScripts {
         if tracing::enabled!(tracing::Level::INFO) {
             for (idx, workspace) in workspaces.iter().enumerate() {
                 for package in workspace.packages() {
-                    let package_build_data = &mut res[idx].outputs[package];
+                    let package_build_data: &mut BuildScriptOutput = &mut res[idx].outputs[package];
                     if !package_build_data.is_empty() {
-                        tracing::info!(
-                            "{}: {package_build_data:?}",
-                            workspace[package].manifest.parent(),
-                        );
+                        tracing::info!("{}: {package_build_data:?}", workspace[package].manifest,);
                     }
                 }
             }
@@ -194,14 +211,40 @@ impl WorkspaceBuildScripts {
             let proc_macro_dylibs: Vec<(String, AbsPathBuf)> = std::fs::read_dir(target_libdir)?
                 .filter_map(|entry| {
                     let dir_entry = entry.ok()?;
-                    if dir_entry.file_type().ok()?.is_file() {
+                    // Use `fs::metadata` rather than `DirEntry::file_type` so that symlinks
+                    // are followed; sysroots assembled out of symlinks (e.g. by nix) link
+                    // the proc-macro dylibs into the target libdir.
+                    if std::fs::metadata(dir_entry.path()).ok()?.is_file() {
                         let path = dir_entry.path();
                         let extension = path.extension()?;
                         if extension == std::env::consts::DLL_EXTENSION {
-                            let name = path.file_stem()?.to_str()?.split_once('-')?.0.to_owned();
-                            let path = AbsPathBuf::try_from(Utf8PathBuf::from_path_buf(path).ok()?)
-                                .ok()?;
-                            return Some((name, path));
+                            let name = path
+                                .file_stem()?
+                                .to_str()?
+                                .split_once('-')?
+                                .0
+                                .trim_start_matches("lib")
+                                .to_owned();
+                            let path = match Utf8PathBuf::from_path_buf(path) {
+                                Ok(path) => path,
+                                Err(path) => {
+                                    tracing::warn!(
+                                        "Proc-macro dylib path contains non-UTF8 characters: {:?}",
+                                        path.display()
+                                    );
+                                    return None;
+                                }
+                            };
+                            return match AbsPathBuf::try_from(path) {
+                                Ok(path) => Some((name, path)),
+                                Err(path) => {
+                                    tracing::error!(
+                                        "proc-macro dylib path is not absolute: {:?}",
+                                        path
+                                    );
+                                    None
+                                }
+                            };
                         }
                     }
                     None
@@ -209,28 +252,24 @@ impl WorkspaceBuildScripts {
                 .collect();
             for p in rustc.packages() {
                 let package = &rustc[p];
-                if package
-                    .targets
-                    .iter()
-                    .any(|&it| matches!(rustc[it].kind, TargetKind::Lib { is_proc_macro: true }))
-                {
-                    if let Some((_, path)) = proc_macro_dylibs
-                        .iter()
-                        .find(|(name, _)| *name.trim_start_matches("lib") == package.name)
-                    {
-                        bs.outputs[p].proc_macro_dylib_path = Some(path.clone());
+                bs.outputs[p].proc_macro_dylib_path =
+                    if package.targets.iter().any(|&it| {
+                        matches!(rustc[it].kind, TargetKind::Lib { is_proc_macro: true })
+                    }) {
+                        match proc_macro_dylibs.iter().find(|(name, _)| *name == package.name) {
+                            Some((_, path)) => ProcMacroDylibPath::Path(path.clone()),
+                            _ => ProcMacroDylibPath::DylibNotFound,
+                        }
+                    } else {
+                        ProcMacroDylibPath::NotProcMacro
                     }
-                }
             }
 
             if tracing::enabled!(tracing::Level::INFO) {
                 for package in rustc.packages() {
                     let package_build_data = &bs.outputs[package];
                     if !package_build_data.is_empty() {
-                        tracing::info!(
-                            "{}: {package_build_data:?}",
-                            rustc[package].manifest.parent(),
-                        );
+                        tracing::info!("{}: {package_build_data:?}", rustc[package].manifest,);
                     }
                 }
             }
@@ -252,7 +291,7 @@ impl WorkspaceBuildScripts {
         // NB: Cargo.toml could have been modified between `cargo metadata` and
         // `cargo check`. We shouldn't assume that package ids we see here are
         // exactly those from `config`.
-        let mut by_id: FxHashMap<String, Package> = FxHashMap::default();
+        let mut by_id: FxHashMap<Arc<PackageId>, Package> = FxHashMap::default();
         for package in workspace.packages() {
             outputs.insert(package, BuildScriptOutput::default());
             by_id.insert(workspace[package].id.clone(), package);
@@ -263,6 +302,12 @@ impl WorkspaceBuildScripts {
             |package, cb| {
                 if let Some(&package) = by_id.get(package) {
                     cb(&workspace[package].name, &mut outputs[package]);
+                } else {
+                    never!(
+                        "Received compiler message for unknown package: {}\n {}",
+                        package,
+                        by_id.keys().join(", ")
+                    );
                 }
             },
             progress,
@@ -272,10 +317,7 @@ impl WorkspaceBuildScripts {
             for package in workspace.packages() {
                 let package_build_data = &outputs[package];
                 if !package_build_data.is_empty() {
-                    tracing::info!(
-                        "{}: {package_build_data:?}",
-                        workspace[package].manifest.parent(),
-                    );
+                    tracing::info!("{}: {package_build_data:?}", workspace[package].manifest,);
                 }
             }
         }
@@ -288,7 +330,7 @@ impl WorkspaceBuildScripts {
         // ideally this would be something like:
         // with_output_for: impl FnMut(&str, dyn FnOnce(&mut BuildScriptOutput)),
         // but owned trait objects aren't a thing
-        mut with_output_for: impl FnMut(&str, &mut dyn FnMut(&str, &mut BuildScriptOutput)),
+        mut with_output_for: impl FnMut(&PackageId, &mut dyn FnMut(&str, &mut BuildScriptOutput)),
         progress: &dyn Fn(String),
     ) -> io::Result<Option<String>> {
         let errors = RefCell::new(String::new());
@@ -311,10 +353,8 @@ impl WorkspaceBuildScripts {
 
                 match message {
                     Message::BuildScriptExecuted(mut message) => {
-                        with_output_for(&message.package_id.repr, &mut |name, data| {
-                            progress(format!(
-                                "building compile-time-deps: build script {name} run"
-                            ));
+                        with_output_for(&message.package_id, &mut |name, data| {
+                            progress(format!("build script {name} run"));
                             let cfgs = {
                                 let mut acc = Vec::new();
                                 for cfg in &message.cfgs {
@@ -344,19 +384,25 @@ impl WorkspaceBuildScripts {
                         });
                     }
                     Message::CompilerArtifact(message) => {
-                        with_output_for(&message.package_id.repr, &mut |name, data| {
-                            progress(format!(
-                                "building compile-time-deps: proc-macro {name} built"
-                            ));
-                            if message.target.kind.contains(&cargo_metadata::TargetKind::ProcMacro)
+                        with_output_for(&message.package_id, &mut |name, data| {
+                            if data.proc_macro_dylib_path == ProcMacroDylibPath::NotBuilt {
+                                data.proc_macro_dylib_path = ProcMacroDylibPath::NotProcMacro;
+                            }
+                            if !matches!(data.proc_macro_dylib_path, ProcMacroDylibPath::Path(_))
+                                && message
+                                    .target
+                                    .kind
+                                    .contains(&cargo_metadata::TargetKind::ProcMacro)
                             {
-                                // Skip rmeta file
-                                if let Some(filename) =
-                                    message.filenames.iter().find(|file| is_dylib(file))
-                                {
-                                    let filename = AbsPath::assert(filename);
-                                    data.proc_macro_dylib_path = Some(filename.to_owned());
-                                }
+                                progress(format!("proc-macro {name} built"));
+                                data.proc_macro_dylib_path =
+                                    match message.filenames.iter().find(|file| is_dylib(file)) {
+                                        Some(filename) => {
+                                            let filename = AbsPath::assert(filename);
+                                            ProcMacroDylibPath::Path(filename.to_owned())
+                                        }
+                                        None => ProcMacroDylibPath::DylibNotFound,
+                                    };
                             }
                         });
                     }
@@ -390,33 +436,64 @@ impl WorkspaceBuildScripts {
         config: &CargoConfig,
         allowed_features: &FxHashSet<String>,
         manifest_path: &ManifestPath,
+        target_dir: &Utf8Path,
         current_dir: &AbsPath,
         sysroot: &Sysroot,
         toolchain: Option<&semver::Version>,
-    ) -> io::Result<Command> {
+    ) -> io::Result<(Option<LockfileCopy>, Command)> {
         match config.run_build_script_command.as_deref() {
             Some([program, args @ ..]) => {
                 let mut cmd = toolchain::command(program, current_dir, &config.extra_env);
                 cmd.args(args);
-                Ok(cmd)
+                Ok((None, cmd))
             }
             _ => {
+                let mut requires_unstable_options = false;
                 let mut cmd = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
 
                 cmd.args(["check", "--quiet", "--workspace", "--message-format=json"]);
                 cmd.args(&config.extra_args);
+                if let Some(config_path) = &config.config_path {
+                    cmd.arg("--config").arg(config_path);
+                }
 
                 cmd.arg("--manifest-path");
                 cmd.arg(manifest_path);
 
-                if let Some(target_dir) = &config.target_dir {
-                    cmd.arg("--target-dir").arg(target_dir);
+                if let Some(target_dir) = config.target_dir_config.target_dir(Some(target_dir)) {
+                    cmd.arg("--target-dir");
+                    cmd.arg(target_dir.as_ref());
                 }
 
-                if let Some(target) = &config.target {
-                    cmd.args(["--target", target]);
+                toolchain::cargo_use_targets(toolchain, &mut cmd, config.target.as_slice());
+                let mut lockfile_copy = None;
+                if let Some(toolchain) = toolchain {
+                    let lockfile_path =
+                        <_ as AsRef<Utf8Path>>::as_ref(manifest_path).with_extension("lock");
+                    lockfile_copy = make_lockfile_copy(toolchain, &lockfile_path);
+                    if let Some(lockfile_copy) = &lockfile_copy {
+                        requires_unstable_options = true;
+                        match lockfile_copy.usage {
+                            LockfileUsage::WithFlag => {
+                                cmd.arg("--lockfile-path");
+                                cmd.arg(lockfile_copy.path.as_str());
+                            }
+                            LockfileUsage::WithEnvVarUnstable => {
+                                cmd.arg("-Zlockfile-path");
+                                cmd.env(
+                                    "CARGO_RESOLVER_LOCKFILE_PATH",
+                                    lockfile_copy.path.as_os_str(),
+                                );
+                            }
+                            LockfileUsage::WithEnvVar => {
+                                cmd.env(
+                                    "CARGO_RESOLVER_LOCKFILE_PATH",
+                                    lockfile_copy.path.as_os_str(),
+                                );
+                            }
+                        }
+                    }
                 }
-
                 match &config.features {
                     CargoFeatures::All => {
                         cmd.arg("--all-features");
@@ -438,6 +515,7 @@ impl WorkspaceBuildScripts {
                 }
 
                 if manifest_path.is_rust_manifest() {
+                    requires_unstable_options = true;
                     cmd.arg("-Zscript");
                 }
 
@@ -457,8 +535,7 @@ impl WorkspaceBuildScripts {
                     toolchain.is_some_and(|v| *v >= COMP_TIME_DEPS_MIN_TOOLCHAIN_VERSION);
 
                 if cargo_comp_time_deps_available {
-                    cmd.env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly");
-                    cmd.arg("-Zunstable-options");
+                    requires_unstable_options = true;
                     cmd.arg("--compile-time-deps");
                     // we can pass this unconditionally, because we won't actually build the
                     // binaries, and as such, this will succeed even on targets without libtest
@@ -481,7 +558,11 @@ impl WorkspaceBuildScripts {
                         cmd.env("RA_RUSTC_WRAPPER", "1");
                     }
                 }
-                Ok(cmd)
+                if requires_unstable_options {
+                    cmd.env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly");
+                    cmd.arg("-Zunstable-options");
+                }
+                Ok((lockfile_copy, cmd))
             }
         }
     }
@@ -489,7 +570,7 @@ impl WorkspaceBuildScripts {
 
 // FIXME: Find a better way to know if it is a dylib.
 fn is_dylib(path: &Utf8Path) -> bool {
-    match path.extension().map(|e| e.to_owned().to_lowercase()) {
+    match path.extension().map(|e| e.to_ascii_lowercase()) {
         None => false,
         Some(ext) => matches!(ext.as_str(), "dll" | "dylib" | "so"),
     }

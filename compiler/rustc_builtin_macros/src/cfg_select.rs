@@ -1,25 +1,118 @@
+use rustc_ast::attr::AttrIdGenerator;
 use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::{AttrKind, Expr, SyntheticAttr, ast};
+use rustc_attr_ir::CfgEntry;
 use rustc_attr_parsing as attr;
-use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacroExpanderResult};
-use rustc_parse::parser::cfg_select::{CfgSelectBranches, CfgSelectPredicate, parse_cfg_select};
+use rustc_attr_parsing::{CfgSelectBranches, parse_cfg_select};
+use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacResult, MacroExpanderResult};
+use rustc_expand::expand::DeclaredIdents;
 use rustc_span::{Ident, Span, sym};
+use smallvec::SmallVec;
 
-use crate::errors::{CfgSelectNoMatches, CfgSelectUnreachable};
+use crate::diagnostics::CfgSelectNoMatches;
 
-/// Selects the first arm whose predicate evaluates to true.
-fn select_arm(ecx: &ExtCtxt<'_>, branches: CfgSelectBranches) -> Option<(TokenStream, Span)> {
-    for (cfg, tt, arm_span) in branches.reachable {
-        if attr::cfg_matches(
-            &cfg,
-            &ecx.sess,
-            ecx.current_expansion.lint_node_id,
-            Some(ecx.ecfg.features),
-        ) {
-            return Some((tt, arm_span));
-        }
+/// This intermediate structure is used to emit parse errors for the branches that are not chosen.
+/// The `MacResult` instance below parses all branches, emitting any errors it encounters, but only
+/// keeps the parse result for the selected branch.
+struct CfgSelectResult<'cx, 'sess> {
+    ecx: &'cx mut ExtCtxt<'sess>,
+    site_span: Span,
+    selected_tts: TokenStream,
+    selected_span: Span,
+    other_branches: CfgSelectBranches,
+    cfg_entry: CfgEntry,
+}
+
+fn tts_to_mac_result<'cx, 'sess>(
+    ecx: &'cx mut ExtCtxt<'sess>,
+    site_span: Span,
+    tts: TokenStream,
+    span: Span,
+) -> Box<dyn MacResult + 'cx> {
+    match ExpandResult::from_tts(ecx, tts, site_span, span, Ident::with_dummy_span(sym::cfg_select))
+    {
+        ExpandResult::Ready(x) => x,
+        _ => unreachable!("from_tts always returns Ready"),
     }
+}
 
-    branches.wildcard.map(|(_, tt, span)| (tt, span))
+macro_rules! forward_to_parser_any_macro {
+    ($method_name:ident, $ret_ty:ty, $other:expr, $selected:expr) => {
+        fn $method_name(self: Box<Self>) -> Option<$ret_ty> {
+            let CfgSelectResult { ecx, site_span, selected_tts, selected_span, cfg_entry, .. } =
+                *self;
+
+            for (cfg_entry, tts, span) in self.other_branches.into_iter_tts() {
+                let result = tts_to_mac_result(ecx, site_span, tts, span).$method_name();
+                $other(&mut *ecx, cfg_entry, span, result);
+            }
+
+            tts_to_mac_result(ecx, site_span, selected_tts, selected_span)
+                .$method_name()
+                .map(|elements| $selected(&mut *ecx, cfg_entry, elements))
+        }
+    };
+
+    ($method_name:ident, $ret_ty:ty) => {
+        forward_to_parser_any_macro!($method_name, $ret_ty, |_, _, _, _| {}, |_, _, elements| {
+            elements
+        });
+    };
+}
+
+/// Construct a `#[<cfg_trace>]` attribute from a `CfgEntry`. This allows us to keep track of items
+/// that were behind a `cfg_select!`, which is relevant for some diagnostics.
+fn mk_attr(g: &AttrIdGenerator, cfg_entry: CfgEntry) -> ast::Attribute {
+    let cfg_span = cfg_entry.span();
+    ast::Attribute {
+        kind: AttrKind::Synthetic(Box::new(SyntheticAttr::CfgAttrTrace(cfg_entry))),
+        id: g.mk_attr_id(),
+        style: ast::AttrStyle::Outer,
+        span: cfg_span,
+    }
+}
+
+impl<'cx, 'sess> MacResult for CfgSelectResult<'cx, 'sess> {
+    forward_to_parser_any_macro!(make_expr, Box<Expr>);
+    forward_to_parser_any_macro!(make_stmts, SmallVec<[ast::Stmt; 1]>);
+    forward_to_parser_any_macro!(
+        make_items,
+        SmallVec<[Box<ast::Item>; 1]>,
+        |ecx: &mut ExtCtxt<'_>,
+         cfg_entry: CfgEntry,
+         _span: Span,
+         items: Option<SmallVec<[Box<ast::Item>; 1]>>| if let Some(items) = items {
+            // Register item names that were not selected for error reporting. We do this
+            // for `#[cfg]` too.
+            for item in items {
+                for name in item.declared_idents() {
+                    ecx.resolver.append_stripped_cfg_item(
+                        ecx.current_expansion.lint_node_id,
+                        name,
+                        cfg_entry.clone(),
+                        cfg_entry.span(),
+                    );
+                }
+            }
+        },
+        |ecx: &mut ExtCtxt<'_>, cfg_entry: CfgEntry, items: SmallVec<[Box<ast::Item>; 1]>| {
+            items
+                .into_iter()
+                .map(|mut item| {
+                    item.attrs.push(mk_attr(&ecx.sess.psess.attr_id_generator, cfg_entry.clone()));
+                    item
+                })
+                .collect()
+        }
+    );
+
+    forward_to_parser_any_macro!(make_impl_items, SmallVec<[Box<ast::AssocItem>; 1]>);
+    forward_to_parser_any_macro!(make_trait_impl_items, SmallVec<[Box<ast::AssocItem>; 1]>);
+    forward_to_parser_any_macro!(make_trait_items, SmallVec<[Box<ast::AssocItem>; 1]>);
+    forward_to_parser_any_macro!(make_foreign_items, SmallVec<[Box<ast::ForeignItem>; 1]>);
+
+    forward_to_parser_any_macro!(make_ty, Box<ast::Ty>);
+    forward_to_parser_any_macro!(make_pat, Box<ast::Pat>);
 }
 
 pub(super) fn expand_cfg_select<'cx>(
@@ -27,37 +120,33 @@ pub(super) fn expand_cfg_select<'cx>(
     sp: Span,
     tts: TokenStream,
 ) -> MacroExpanderResult<'cx> {
-    ExpandResult::Ready(match parse_cfg_select(&mut ecx.new_parser_from_tts(tts)) {
-        Ok(branches) => {
-            if let Some((underscore, _, _)) = branches.wildcard {
-                // Warn for every unreachable predicate. We store the fully parsed branch for rustfmt.
-                for (predicate, _, _) in &branches.unreachable {
-                    let span = match predicate {
-                        CfgSelectPredicate::Wildcard(underscore) => underscore.span,
-                        CfgSelectPredicate::Cfg(cfg) => cfg.span(),
+    ExpandResult::Ready(
+        match parse_cfg_select(
+            &mut ecx.new_parser_from_tts(tts),
+            ecx.sess,
+            Some(ecx.ecfg.features),
+            ecx.current_expansion.lint_node_id,
+        ) {
+            Ok(mut branches) => {
+                if let Some((cfg_entry, selected_tts, selected_span)) =
+                    branches.pop_first_match(|cfg| attr::eval_config_entry(ecx.sess, cfg))
+                {
+                    let mac = CfgSelectResult {
+                        ecx,
+                        selected_tts,
+                        selected_span,
+                        other_branches: branches,
+                        site_span: sp,
+                        cfg_entry,
                     };
-                    let err = CfgSelectUnreachable { span, wildcard_span: underscore.span };
-                    ecx.dcx().emit_warn(err);
+                    return ExpandResult::Ready(Box::new(mac));
+                } else {
+                    // Emit a compiler error when none of the predicates matched.
+                    let guar = ecx.dcx().emit_err(CfgSelectNoMatches { span: sp });
+                    DummyResult::any(sp, guar)
                 }
             }
-
-            if let Some((tts, arm_span)) = select_arm(ecx, branches) {
-                return ExpandResult::from_tts(
-                    ecx,
-                    tts,
-                    sp,
-                    arm_span,
-                    Ident::with_dummy_span(sym::cfg_select),
-                );
-            } else {
-                // Emit a compiler error when none of the predicates matched.
-                let guar = ecx.dcx().emit_err(CfgSelectNoMatches { span: sp });
-                DummyResult::any(sp, guar)
-            }
-        }
-        Err(err) => {
-            let guar = err.emit();
-            DummyResult::any(sp, guar)
-        }
-    })
+            Err(guar) => DummyResult::any(sp, guar),
+        },
+    )
 }

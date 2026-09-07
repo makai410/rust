@@ -27,7 +27,7 @@ use crate::{AssistContext, Assists};
 // ```
 pub(crate) fn sugar_impl_future_into_async(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let ret_type: ast::RetType = ctx.find_node_at_offset()?;
     let function = ret_type.syntax().parent().and_then(ast::Fn::cast)?;
@@ -117,7 +117,7 @@ pub(crate) fn sugar_impl_future_into_async(
 // ```
 pub(crate) fn desugar_async_into_impl_future(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let async_token = ctx.find_token_syntax_at_offset(SyntaxKind::ASYNC_KW)?;
     let function = async_token.parent().and_then(ast::Fn::cast)?;
@@ -132,12 +132,9 @@ pub(crate) fn desugar_async_into_impl_future(
 
     let scope = ctx.sema.scope(function.syntax())?;
     let module = scope.module();
+    let cfg = ctx.config.find_path_config(ctx.sema.is_nightly(module.krate(ctx.sema.db)));
     let future_trait = FamousDefs(&ctx.sema, scope.krate()).core_future_Future()?;
-    let trait_path = module.find_path(
-        ctx.db(),
-        ModuleDef::Trait(future_trait),
-        ctx.config.import_path_config(),
-    )?;
+    let trait_path = module.find_path(ctx.db(), ModuleDef::Trait(future_trait), cfg)?;
     let edition = scope.krate().edition(ctx.db());
     let trait_path = trait_path.display(ctx.db(), edition);
 

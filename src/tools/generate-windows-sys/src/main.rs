@@ -29,11 +29,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     sort_bindings("bindings.txt")?;
 
-    windows_bindgen::bindgen(["--etc", "bindings.txt"]);
+    windows_bindgen::bindgen(["--etc", "bindings.txt"]).unwrap();
 
     let mut f = std::fs::File::options().append(true).open("windows_sys.rs")?;
     f.write_all(ARM32_SHIM.as_bytes())?;
-    writeln!(&mut f, "// ignore-tidy-filelength")?;
+    writeln!(&mut f, "// ignore-tidy-file-filelength")?;
 
     Ok(())
 }

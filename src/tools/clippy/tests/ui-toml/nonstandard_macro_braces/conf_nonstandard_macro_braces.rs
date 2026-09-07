@@ -1,6 +1,7 @@
 //@aux-build:proc_macro_derive.rs
 
 #![warn(clippy::nonstandard_macro_braces)]
+#![allow(clippy::println_empty_string)]
 
 extern crate proc_macro_derive;
 extern crate quote;
@@ -14,10 +15,11 @@ proc_macro_derive::foo_bar!();
 
 #[rustfmt::skip]
 macro_rules! test {
-    () => {
+    () => {{
+        //~v nonstandard_macro_braces
         vec!{0, 0, 0}
         //~^ nonstandard_macro_braces
-    };
+    }};
 }
 
 #[rustfmt::skip]
@@ -66,4 +68,25 @@ fn main() {
     //~^ nonstandard_macro_braces
 
     printlnfoo!["test if printlnfoo is triggered by println"];
+}
+
+#[rustfmt::skip]
+#[expect(clippy::no_effect)]
+fn issue9913() {
+    println! {"hello world"}
+    [0]; // separate statement, not indexing into the result of println.
+    //~^^ nonstandard_macro_braces
+}
+
+fn issue15594() {
+    println!();
+    println!("");
+    println![];
+    //~^ nonstandard_macro_braces
+    println![""];
+    //~^ nonstandard_macro_braces
+    println! {};
+    //~^ nonstandard_macro_braces
+    println! {""};
+    //~^ nonstandard_macro_braces
 }

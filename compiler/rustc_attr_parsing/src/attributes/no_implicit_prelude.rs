@@ -1,13 +1,14 @@
-use rustc_attr_data_structures::AttributeKind;
-use rustc_span::{Span, sym};
+use rustc_feature::AttributeStability;
 
-use crate::attributes::{NoArgsAttributeParser, OnDuplicate};
-use crate::context::Stage;
+use super::prelude::*;
 
 pub(crate) struct NoImplicitPreludeParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for NoImplicitPreludeParser {
+impl NoArgsAttributeParser for NoImplicitPreludeParser {
     const PATH: &[rustc_span::Symbol] = &[sym::no_implicit_prelude];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::NoImplicitPrelude;
+    const ON_DUPLICATE: OnDuplicate = OnDuplicate::Warn;
+    const ALLOWED_TARGETS: AllowedTargets<'_> =
+        AllowedTargets::AllowListWarnRest(&[Allow(Target::Mod), Allow(Target::Crate)]);
+    const STABILITY: AttributeStability = AttributeStability::Stable;
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::NoImplicitPrelude;
 }

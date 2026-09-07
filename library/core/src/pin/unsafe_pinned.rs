@@ -120,8 +120,8 @@ impl<T: ?Sized> UnsafePinned<T> {
     #[inline(always)]
     #[must_use]
     #[unstable(feature = "unsafe_pinned", issue = "125735")]
-    pub const fn raw_get(this: *const Self) -> *const T {
-        this as *const T
+    pub const fn raw_get(this: *const Self) -> *mut T {
+        this as *const T as *mut T
     }
 
     /// Gets a mutable pointer to the wrapped value.
@@ -148,7 +148,8 @@ impl<T: Default> Default for UnsafePinned<T> {
 }
 
 #[unstable(feature = "unsafe_pinned", issue = "125735")]
-impl<T> From<T> for UnsafePinned<T> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl<T> From<T> for UnsafePinned<T> {
     /// Creates a new `UnsafePinned<T>` containing the given value.
     fn from(value: T) -> Self {
         UnsafePinned::new(value)
@@ -177,5 +178,3 @@ impl<T: CoerceUnsized<U>, U> CoerceUnsized<UnsafePinned<U>> for UnsafePinned<T> 
 #[unstable(feature = "dispatch_from_dyn", issue = "none")]
 // #[unstable(feature = "unsafe_pinned", issue = "125735")]
 impl<T: DispatchFromDyn<U>, U> DispatchFromDyn<UnsafePinned<U>> for UnsafePinned<T> {}
-
-// FIXME(unsafe_pinned): impl PinCoerceUnsized for UnsafePinned<T>?

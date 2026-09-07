@@ -1,8 +1,9 @@
 // This file contains a bunch of malformed attributes.
 // We enable a bunch of features to not get feature-gate errs in this test.
+#![deny(invalid_doc_attributes)]
 #![feature(rustc_attrs)]
-#![feature(rustc_allow_const_fn_unstable)]
 #![feature(allow_internal_unstable)]
+// FIXME(#82232, #143834): temporarily renamed to mitigate `#[align]` nameres ambiguity
 #![feature(fn_align)]
 #![feature(optimize_attribute)]
 #![feature(dropck_eyepatch)]
@@ -11,7 +12,7 @@
 #![feature(min_generic_const_args)]
 #![feature(ffi_const, ffi_pure)]
 #![feature(coverage_attribute)]
-#![feature(no_sanitize)]
+#![feature(sanitize)]
 #![feature(marker_trait_attr)]
 #![feature(thread_local)]
 #![feature(must_not_suspend)]
@@ -19,12 +20,8 @@
 #![feature(linkage)]
 #![feature(cfi_encoding, extern_types)]
 #![feature(patchable_function_entry)]
-#![feature(omit_gdb_pretty_printer_section)]
 #![feature(fundamental)]
 
-
-#![omit_gdb_pretty_printer_section = 1]
-//~^ ERROR malformed `omit_gdb_pretty_printer_section` attribute input
 
 #![windows_subsystem]
 //~^ ERROR malformed
@@ -38,29 +35,33 @@
 //~^ ERROR `allow_internal_unstable` expects a list of feature names
 #[rustc_confusables]
 //~^ ERROR malformed
+//~| ERROR attribute cannot be used on
 #[deprecated = 5]
 //~^ ERROR malformed
 #[doc]
-//~^ ERROR valid forms for the attribute are
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR
 #[rustc_macro_transparency]
 //~^ ERROR malformed
+//~| ERROR attribute cannot be used on
 #[repr]
 //~^ ERROR malformed
-//~| ERROR is not supported on function items
 #[rustc_as_ptr = 5]
 //~^ ERROR malformed
 #[inline = 5]
 //~^ ERROR valid forms for the attribute are
 //~| WARN this was previously accepted by the compiler
-#[align]
+#[rustc_align]
 //~^ ERROR malformed
 #[optimize]
+//~^ ERROR malformed
+#[optimize(none, none)]
+//~^ ERROR malformed
+#[optimize(none, speed)]
 //~^ ERROR malformed
 #[cold = 1]
 //~^ ERROR malformed
 #[must_use()]
-//~^ ERROR valid forms for the attribute are
+//~^ ERROR malformed
 #[no_mangle = 1]
 //~^ ERROR malformed
 #[unsafe(naked())]
@@ -71,34 +72,40 @@
 //~^ ERROR malformed
 #[used()]
 //~^ ERROR malformed
+//~| ERROR attribute cannot be used on
 #[crate_name]
 //~^ ERROR malformed
+//~| WARN crate-level attribute should be an inner attribute
 #[doc]
-//~^ ERROR valid forms for the attribute are
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR
 #[target_feature]
 //~^ ERROR malformed
 #[export_stable = 1]
 //~^ ERROR malformed
 #[link]
-//~^ ERROR attribute must be of the form
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR malformed
+//~| WARN attribute cannot be used on
+//~| WARN previously accepted
 #[link_name]
 //~^ ERROR malformed
+//~| WARN cannot be used on functions
+//~| WARN previously accepted
 #[link_section]
 //~^ ERROR malformed
 #[coverage]
 //~^ ERROR malformed `coverage` attribute input
-#[no_sanitize]
+#[sanitize]
 //~^ ERROR malformed
 #[ignore()]
 //~^ ERROR valid forms for the attribute are
 //~| WARN this was previously accepted by the compiler
 #[no_implicit_prelude = 23]
 //~^ ERROR malformed
+//~| WARN cannot be used on functions
+//~| WARN previously accepted
 #[proc_macro = 18]
 //~^ ERROR malformed
-//~| ERROR the `#[proc_macro]` attribute is only usable with crates of the `proc-macro` crate type
+//~| ERROR the `proc_macro` attribute is only usable with crates of the `proc-macro` crate type
 #[cfg]
 //~^ ERROR malformed
 #[cfg_attr]
@@ -115,33 +122,27 @@ fn test() {
 
 #[proc_macro_attribute = 19]
 //~^ ERROR malformed
-//~| ERROR the `#[proc_macro_attribute]` attribute is only usable with crates of the `proc-macro` crate type
+//~| ERROR the `proc_macro_attribute` attribute is only usable with crates of the `proc-macro` crate type
 #[must_use = 1]
 //~^ ERROR malformed
 fn test2() { }
 
 #[proc_macro_derive]
 //~^ ERROR malformed `proc_macro_derive` attribute
-//~| ERROR the `#[proc_macro_derive]` attribute is only usable with crates of the `proc-macro` crate type
+//~| ERROR the `proc_macro_derive` attribute is only usable with crates of the `proc-macro` crate type
 pub fn test3() {}
 
-#[rustc_layout_scalar_valid_range_start]
-//~^ ERROR malformed
-#[rustc_layout_scalar_valid_range_end]
-//~^ ERROR malformed
 #[must_not_suspend()]
 //~^ ERROR malformed
-#[cfi_encoding]
+#[cfi_encoding = ""]
 //~^ ERROR malformed
 struct Test;
 
 #[diagnostic::on_unimplemented]
-//~^ WARN missing options for `on_unimplemented` attribute
+//~^ WARN missing options for `diagnostic::on_unimplemented` attribute
 #[diagnostic::on_unimplemented = 1]
 //~^ WARN malformed
 trait Hey {
-    #[type_const = 1]
-    //~^ ERROR malformed
     const HEY: usize = 5;
 }
 
@@ -186,10 +187,11 @@ extern "C" {
 #[forbid]
 //~^ ERROR malformed
 #[debugger_visualizer]
-//~^ ERROR invalid argument
-//~| ERROR malformed `debugger_visualizer` attribute input
+//~^ ERROR malformed `debugger_visualizer` attribute input
 #[automatically_derived = 18]
 //~^ ERROR malformed
+//~| WARN cannot be used on modules
+//~| WARN previously accepted
 mod yooo {
 
 }
@@ -212,10 +214,10 @@ extern crate wloop;
 //~^ ERROR can't find crate for `wloop` [E0463]
 
 #[macro_export = 18]
-//~^ ERROR malformed `macro_export` attribute input
+//~^ ERROR malformed
 #[allow_internal_unsafe = 1]
 //~^ ERROR malformed
-//~| ERROR allow_internal_unsafe side-steps the unsafe_code lint
+//~| ERROR the `allow_internal_unsafe` attribute side-steps the `unsafe_code` lint
 macro_rules! slump {
     () => {}
 }

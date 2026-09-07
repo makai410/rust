@@ -1,30 +1,31 @@
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
+//@ ignore-backends: gcc
 
 // === GDB TESTS ===================================================================================
 
-// gdb-command:run
+//@ gdb-command:run
 
-// gdb-command:print *boxed_with_padding
-// gdb-check:$1 = boxed_struct::StructWithSomePadding {x: 99, y: 999, z: 9999, w: 99999}
+//@ gdb-command:print *boxed_with_padding
+//@ gdb-check:$1 = boxed_struct::StructWithSomePadding {x: 99, y: 999, z: 9999, w: 99999}
 
-// gdb-command:print *boxed_with_dtor
-// gdb-check:$2 = boxed_struct::StructWithDestructor {x: 77, y: 777, z: 7777, w: 77777}
+//@ gdb-command:print *boxed_with_dtor
+//@ gdb-check:$2 = boxed_struct::StructWithDestructor {x: 77, y: 777, z: 7777, w: 77777}
 
 
 // === LLDB TESTS ==================================================================================
 
-// lldb-command:run
+//@ lldb-command:run
 
-// lldb-command:v *boxed_with_padding
-// lldb-check:[...] { x = 99 y = 999 z = 9999 w = 99999 }
+//@ lldb-command:v *boxed_with_padding
+//@ lldb-check:[...] {x:99, y:999, z:9999, w:99999}
 
-// lldb-command:v *boxed_with_dtor
-// lldb-check:[...] { x = 77 y = 777 z = 7777 w = 77777 }
+//@ lldb-command:v *boxed_with_dtor
+//@ lldb-check:[...] {x:77, y:777, z:7777, w:77777}
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
+#[repr(C)]
 struct StructWithSomePadding {
     x: i16,
     y: i32,
@@ -32,6 +33,7 @@ struct StructWithSomePadding {
     w: i64
 }
 
+#[repr(C)]
 struct StructWithDestructor {
     x: i16,
     y: i32,

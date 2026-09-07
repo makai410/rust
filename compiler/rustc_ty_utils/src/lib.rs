@@ -5,16 +5,10 @@
 //! This API is completely unstable and subject to change.
 
 // tidy-alphabetical-start
-#![allow(internal_features)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(assert_matches)]
-#![feature(associated_type_defaults)]
-#![feature(box_patterns)]
-#![feature(if_let_guard)]
+#![cfg_attr(bootstrap, feature(never_type))]
+#![feature(deref_patterns)]
 #![feature(iterator_try_collect)]
-#![feature(never_type)]
-#![feature(rustdoc_internals)]
+#![feature(option_into_flat_iter)]
 // tidy-alphabetical-end
 
 use rustc_middle::query::Providers;
@@ -23,7 +17,7 @@ mod abi;
 mod assoc;
 mod common_traits;
 mod consts;
-mod errors;
+mod diagnostics;
 mod implied_bounds;
 mod instance;
 mod layout;
@@ -31,11 +25,8 @@ mod needs_drop;
 mod nested_bodies;
 mod opaque_types;
 mod representability;
-pub mod sig_types;
 mod structural_match;
 mod ty;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub fn provide(providers: &mut Providers) {
     abi::provide(providers);

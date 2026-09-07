@@ -9,6 +9,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/AutoUpgrade.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DiagnosticHandler.h"
@@ -33,9 +34,23 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/ModRef.h"
 #include "llvm/Support/Signals.h"
+#include "llvm/Support/SpecialCaseList.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 #include <iostream>
+
+// Some of the functions below rely on LLVM modules that may not always be
+// available. As such, we only try to build it in the first place, if
+// llvm.offload is enabled.
+#ifdef OFFLOAD
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Object/OffloadBinary.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+#endif
 
 // for raw `write` in the bad-alloc handler
 #ifdef _MSC_VER
@@ -58,29 +73,11 @@ using namespace llvm::object;
 // This opcode is an LLVM detail that could hypothetically change (?), so
 // verify that the hard-coded value in `dwarf_const.rs` still agrees with LLVM.
 static_assert(dwarf::DW_OP_LLVM_fragment == 0x1000);
-
-// LLVMAtomicOrdering is already an enum - don't create another
-// one.
-static AtomicOrdering fromRust(LLVMAtomicOrdering Ordering) {
-  switch (Ordering) {
-  case LLVMAtomicOrderingNotAtomic:
-    return AtomicOrdering::NotAtomic;
-  case LLVMAtomicOrderingUnordered:
-    return AtomicOrdering::Unordered;
-  case LLVMAtomicOrderingMonotonic:
-    return AtomicOrdering::Monotonic;
-  case LLVMAtomicOrderingAcquire:
-    return AtomicOrdering::Acquire;
-  case LLVMAtomicOrderingRelease:
-    return AtomicOrdering::Release;
-  case LLVMAtomicOrderingAcquireRelease:
-    return AtomicOrdering::AcquireRelease;
-  case LLVMAtomicOrderingSequentiallyConsistent:
-    return AtomicOrdering::SequentiallyConsistent;
-  }
-
-  report_fatal_error("Invalid LLVMAtomicOrdering value!");
-}
+static_assert(dwarf::DW_OP_constu == 0x10);
+static_assert(dwarf::DW_OP_minus == 0x1c);
+static_assert(dwarf::DW_OP_mul == 0x1e);
+static_assert(dwarf::DW_OP_bregx == 0x92);
+static_assert(dwarf::DW_OP_stack_value == 0x9f);
 
 static LLVM_THREAD_LOCAL char *LastError;
 
@@ -145,19 +142,9 @@ extern "C" void LLVMRustSetLastError(const char *Err) {
   LastError = strdup(Err);
 }
 
-extern "C" LLVMContextRef LLVMRustContextCreate(bool shouldDiscardNames) {
-  auto ctx = new LLVMContext();
-  ctx->setDiscardValueNames(shouldDiscardNames);
-  return wrap(ctx);
-}
-
 extern "C" void LLVMRustSetNormalizedTarget(LLVMModuleRef M,
                                             const char *Target) {
-#if LLVM_VERSION_GE(21, 0)
   unwrap(M)->setTargetTriple(Triple(Triple::normalize(Target)));
-#else
-  unwrap(M)->setTargetTriple(Triple::normalize(Target));
-#endif
 }
 
 extern "C" void LLVMRustPrintPassTimings(RustStringRef OutBuf) {
@@ -168,6 +155,15 @@ extern "C" void LLVMRustPrintPassTimings(RustStringRef OutBuf) {
 extern "C" void LLVMRustPrintStatistics(RustStringRef OutBuf) {
   auto OS = RawRustStringOstream(OutBuf);
   llvm::PrintStatistics(OS);
+}
+
+extern "C" void LLVMRustPrintStatisticsJSON(RustStringRef OutBuf) {
+  auto OS = RawRustStringOstream(OutBuf);
+  llvm::PrintStatisticsJSON(OS);
+}
+
+extern "C" bool LLVMRustIsCall(LLVMValueRef V) {
+  return llvm::isa<llvm::CallBase>(llvm::unwrap(V));
 }
 
 extern "C" LLVMValueRef LLVMRustGetNamedValue(LLVMModuleRef M, const char *Name,
@@ -209,10 +205,12 @@ extern "C" LLVMValueRef LLVMRustGetOrInsertFunction(LLVMModuleRef M,
                   .getCallee());
 }
 
-extern "C" LLVMValueRef LLVMRustGetOrInsertGlobal(LLVMModuleRef M,
-                                                  const char *Name,
-                                                  size_t NameLen,
-                                                  LLVMTypeRef Ty) {
+// Get the global variable with the given name if it exists or create a new
+// external global.
+extern "C" LLVMValueRef
+LLVMRustGetOrInsertGlobalInAddrspace(LLVMModuleRef M, const char *Name,
+                                     size_t NameLen, LLVMTypeRef Ty,
+                                     unsigned int AddressSpace) {
   Module *Mod = unwrap(M);
   auto NameRef = StringRef(Name, NameLen);
 
@@ -223,14 +221,22 @@ extern "C" LLVMValueRef LLVMRustGetOrInsertGlobal(LLVMModuleRef M,
   GlobalVariable *GV = Mod->getGlobalVariable(NameRef, true);
   if (!GV)
     GV = new GlobalVariable(*Mod, unwrap(Ty), false,
-                            GlobalValue::ExternalLinkage, nullptr, NameRef);
+                            GlobalValue::ExternalLinkage, nullptr, NameRef,
+                            nullptr, GlobalValue::NotThreadLocal, AddressSpace);
   return wrap(GV);
 }
 
-extern "C" LLVMValueRef LLVMRustInsertPrivateGlobal(LLVMModuleRef M,
-                                                    LLVMTypeRef Ty) {
-  return wrap(new GlobalVariable(*unwrap(M), unwrap(Ty), false,
-                                 GlobalValue::PrivateLinkage, nullptr));
+// Get the global variable with the given name if it exists or create a new
+// external global.
+extern "C" LLVMValueRef LLVMRustGetOrInsertGlobal(LLVMModuleRef M,
+                                                  const char *Name,
+                                                  size_t NameLen,
+                                                  LLVMTypeRef Ty) {
+  Module *Mod = unwrap(M);
+  unsigned int AddressSpace =
+      Mod->getDataLayout().getDefaultGlobalsAddressSpace();
+  return LLVMRustGetOrInsertGlobalInAddrspace(M, Name, NameLen, Ty,
+                                              AddressSpace);
 }
 
 // Must match the layout of `rustc_codegen_llvm::llvm::ffi::AttributeKind`.
@@ -242,7 +248,7 @@ enum class LLVMRustAttributeKind {
   MinSize = 4,
   Naked = 5,
   NoAlias = 6,
-  NoCapture = 7,
+  CapturesAddress = 7,
   NoInline = 8,
   NonNull = 9,
   NoRedZone = 10,
@@ -277,6 +283,13 @@ enum class LLVMRustAttributeKind {
   FnRetThunkExtern = 41,
   Writable = 42,
   DeadOnUnwind = 43,
+  DeadOnReturn = 44,
+  CapturesReadOnly = 45,
+  CapturesNone = 46,
+  SanitizeRealtimeNonblocking = 47,
+  SanitizeRealtimeBlocking = 48,
+  Convergent = 49,
+  NoFree = 50,
 };
 
 static Attribute::AttrKind fromRust(LLVMRustAttributeKind Kind) {
@@ -295,12 +308,6 @@ static Attribute::AttrKind fromRust(LLVMRustAttributeKind Kind) {
     return Attribute::Naked;
   case LLVMRustAttributeKind::NoAlias:
     return Attribute::NoAlias;
-  case LLVMRustAttributeKind::NoCapture:
-#if LLVM_VERSION_GE(21, 0)
-    report_fatal_error("NoCapture doesn't exist in LLVM 21");
-#else
-    return Attribute::NoCapture;
-#endif
   case LLVMRustAttributeKind::NoCfCheck:
     return Attribute::NoCfCheck;
   case LLVMRustAttributeKind::NoInline:
@@ -369,6 +376,20 @@ static Attribute::AttrKind fromRust(LLVMRustAttributeKind Kind) {
     return Attribute::Writable;
   case LLVMRustAttributeKind::DeadOnUnwind:
     return Attribute::DeadOnUnwind;
+  case LLVMRustAttributeKind::DeadOnReturn:
+    return Attribute::DeadOnReturn;
+  case LLVMRustAttributeKind::CapturesAddress:
+  case LLVMRustAttributeKind::CapturesReadOnly:
+  case LLVMRustAttributeKind::CapturesNone:
+    report_fatal_error("Should be handled separately");
+  case LLVMRustAttributeKind::SanitizeRealtimeNonblocking:
+    return Attribute::SanitizeRealtime;
+  case LLVMRustAttributeKind::SanitizeRealtimeBlocking:
+    return Attribute::SanitizeRealtimeBlocking;
+  case LLVMRustAttributeKind::Convergent:
+    return Attribute::Convergent;
+  case LLVMRustAttributeKind::NoFree:
+    return Attribute::NoFree;
   }
   report_fatal_error("bad LLVMRustAttributeKind");
 }
@@ -418,10 +439,22 @@ extern "C" void LLVMRustEraseInstFromParent(LLVMValueRef Instr) {
 
 extern "C" LLVMAttributeRef
 LLVMRustCreateAttrNoValue(LLVMContextRef C, LLVMRustAttributeKind RustAttr) {
-#if LLVM_VERSION_GE(21, 0)
-  // LLVM 21 replaced the NoCapture attribute with Captures(none).
-  if (RustAttr == LLVMRustAttributeKind::NoCapture) {
+  if (RustAttr == LLVMRustAttributeKind::CapturesNone) {
     return wrap(Attribute::getWithCaptureInfo(*unwrap(C), CaptureInfo::none()));
+  }
+  if (RustAttr == LLVMRustAttributeKind::CapturesAddress) {
+    return wrap(Attribute::getWithCaptureInfo(
+        *unwrap(C), CaptureInfo(CaptureComponents::Address)));
+  }
+  if (RustAttr == LLVMRustAttributeKind::CapturesReadOnly) {
+    return wrap(Attribute::getWithCaptureInfo(
+        *unwrap(C), CaptureInfo(CaptureComponents::Address |
+                                CaptureComponents::ReadProvenance)));
+  }
+#if LLVM_VERSION_GE(23, 0)
+  if (RustAttr == LLVMRustAttributeKind::DeadOnReturn) {
+    return wrap(Attribute::getWithDeadOnReturnInfo(*unwrap(C),
+                                                   llvm::DeadOnReturnInfo()));
   }
 #endif
   return wrap(Attribute::get(*unwrap(C), fromRust(RustAttr)));
@@ -473,6 +506,9 @@ extern "C" LLVMAttributeRef
 LLVMRustCreateRangeAttribute(LLVMContextRef C, unsigned NumBits,
                              const uint64_t LowerWords[],
                              const uint64_t UpperWords[]) {
+  // FIXME(Zalathar): There appears to be no stable guarantee that C++
+  // `AttrKind` values correspond directly to the `unsigned KindID` values
+  // accepted by LLVM-C API functions, though in practice they currently do.
   return LLVMCreateConstantRangeAttribute(C, Attribute::Range, NumBits,
                                           LowerWords, UpperWords);
 }
@@ -540,6 +576,7 @@ enum class LLVMRustMemoryEffects {
   None,
   ReadOnly,
   InaccessibleMemOnly,
+  ReadOnlyNotPure,
 };
 
 extern "C" LLVMAttributeRef
@@ -555,6 +592,10 @@ LLVMRustCreateMemoryEffectsAttr(LLVMContextRef C,
   case LLVMRustMemoryEffects::InaccessibleMemOnly:
     return wrap(Attribute::getWithMemoryEffects(
         *unwrap(C), MemoryEffects::inaccessibleMemOnly()));
+  case LLVMRustMemoryEffects::ReadOnlyNotPure:
+    return wrap(Attribute::getWithMemoryEffects(
+        *unwrap(C),
+        MemoryEffects::readOnly() | MemoryEffects::inaccessibleMemOnly()));
   default:
     report_fatal_error("bad MemoryEffects.");
   }
@@ -604,22 +645,11 @@ extern "C" void LLVMRustSetAllowReassoc(LLVMValueRef V) {
   }
 }
 
-extern "C" LLVMValueRef
-LLVMRustBuildAtomicLoad(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Source,
-                        const char *Name, LLVMAtomicOrdering Order) {
-  Value *Ptr = unwrap(Source);
-  LoadInst *LI = unwrap(B)->CreateLoad(unwrap(Ty), Ptr, Name);
-  LI->setAtomic(fromRust(Order));
-  return wrap(LI);
-}
-
-extern "C" LLVMValueRef LLVMRustBuildAtomicStore(LLVMBuilderRef B,
-                                                 LLVMValueRef V,
-                                                 LLVMValueRef Target,
-                                                 LLVMAtomicOrdering Order) {
-  StoreInst *SI = unwrap(B)->CreateStore(unwrap(V), unwrap(Target));
-  SI->setAtomic(fromRust(Order));
-  return wrap(SI);
+// Enable the NSZ flag on the given instruction.
+extern "C" void LLVMRustSetNoSignedZeros(LLVMValueRef V) {
+  if (auto I = dyn_cast<Instruction>(unwrap<Value>(V))) {
+    I->setHasNoSignedZeros(true);
+  }
 }
 
 extern "C" uint64_t LLVMRustGetArrayNumElements(LLVMTypeRef Ty) {
@@ -633,8 +663,22 @@ extern "C" bool LLVMRustInlineAsmVerify(LLVMTypeRef Ty, char *Constraints,
       unwrap<FunctionType>(Ty), StringRef(Constraints, ConstraintsLen)));
 }
 
+extern "C" void LLVMRustAppendModuleInlineAsm(
+    LLVMModuleRef M, const char *Asm, size_t AsmLen, const char *TargetFeatures,
+    size_t TargetFeaturesLen, const char *TargetCPU, size_t TargetCPULen) {
+#if LLVM_VERSION_GE(23, 0)
+  Module::GlobalAsmProperties Props;
+  Props.TargetFeatures = std::string(TargetFeatures, TargetFeaturesLen);
+  Props.TargetCPU = std::string(TargetCPU, TargetCPULen);
+  unwrap(M)->appendModuleInlineAsm(
+      Module::GlobalAsmFragment(std::string(Asm, AsmLen), Props));
+#else
+  unwrap(M)->appendModuleInlineAsm(StringRef(Asm, AsmLen));
+#endif
+}
+
 template <typename DIT> DIT *unwrapDIPtr(LLVMMetadataRef Ref) {
-  return (DIT *)(Ref ? unwrap<MDNode>(Ref) : nullptr);
+  return (DIT *)(Ref ? unwrap<Metadata>(Ref) : nullptr);
 }
 
 #define DIDescriptor DIScope
@@ -843,10 +887,6 @@ extern "C" uint32_t LLVMRustDebugMetadataVersion() {
   return DEBUG_METADATA_VERSION;
 }
 
-extern "C" uint32_t LLVMRustVersionPatch() { return LLVM_VERSION_PATCH; }
-
-extern "C" uint32_t LLVMRustVersionMinor() { return LLVM_VERSION_MINOR; }
-
 extern "C" uint32_t LLVMRustVersionMajor() { return LLVM_VERSION_MAJOR; }
 
 // FFI equivalent of LLVM's `llvm::Module::ModFlagBehavior`.
@@ -972,14 +1012,6 @@ extern "C" void LLVMRustGlobalAddMetadata(LLVMValueRef Global, unsigned Kind,
   unwrap<GlobalObject>(Global)->addMetadata(Kind, *unwrap<MDNode>(MD));
 }
 
-extern "C" LLVMDIBuilderRef LLVMRustDIBuilderCreate(LLVMModuleRef M) {
-  return wrap(new DIBuilder(*unwrap(M)));
-}
-
-extern "C" void LLVMRustDIBuilderDispose(LLVMDIBuilderRef Builder) {
-  delete unwrap(Builder);
-}
-
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateCompileUnit(
     LLVMDIBuilderRef Builder, unsigned Lang, LLVMMetadataRef FileRef,
     const char *Producer, size_t ProducerLen, bool isOptimized,
@@ -1011,13 +1043,6 @@ LLVMRustDIBuilderCreateFile(LLVMDIBuilderRef Builder, const char *Filename,
   return wrap(unwrap(Builder)->createFile(StringRef(Filename, FilenameLen),
                                           StringRef(Directory, DirectoryLen),
                                           CSInfo, oSource));
-}
-
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderCreateSubroutineType(LLVMDIBuilderRef Builder,
-                                      LLVMMetadataRef ParameterTypes) {
-  return wrap(unwrap(Builder)->createSubroutineType(
-      DITypeRefArray(unwrap<MDTuple>(ParameterTypes))));
 }
 
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateFunction(
@@ -1058,47 +1083,6 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateMethod(
   return wrap(Sub);
 }
 
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderCreateBasicType(LLVMDIBuilderRef Builder, const char *Name,
-                                 size_t NameLen, uint64_t SizeInBits,
-                                 unsigned Encoding) {
-  return wrap(unwrap(Builder)->createBasicType(StringRef(Name, NameLen),
-                                               SizeInBits, Encoding));
-}
-
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderCreateTypedef(LLVMDIBuilderRef Builder, LLVMMetadataRef Type,
-                               const char *Name, size_t NameLen,
-                               LLVMMetadataRef File, unsigned LineNo,
-                               LLVMMetadataRef Scope) {
-  return wrap(unwrap(Builder)->createTypedef(
-      unwrap<DIType>(Type), StringRef(Name, NameLen), unwrap<DIFile>(File),
-      LineNo, unwrapDIPtr<DIScope>(Scope)));
-}
-
-extern "C" LLVMMetadataRef LLVMRustDIBuilderCreatePointerType(
-    LLVMDIBuilderRef Builder, LLVMMetadataRef PointeeTy, uint64_t SizeInBits,
-    uint32_t AlignInBits, unsigned AddressSpace, const char *Name,
-    size_t NameLen) {
-  return wrap(unwrap(Builder)->createPointerType(
-      unwrapDI<DIType>(PointeeTy), SizeInBits, AlignInBits, AddressSpace,
-      StringRef(Name, NameLen)));
-}
-
-extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateStructType(
-    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
-    size_t NameLen, LLVMMetadataRef File, unsigned LineNumber,
-    uint64_t SizeInBits, uint32_t AlignInBits, LLVMDIFlags Flags,
-    LLVMMetadataRef DerivedFrom, LLVMMetadataRef Elements, unsigned RunTimeLang,
-    LLVMMetadataRef VTableHolder, const char *UniqueId, size_t UniqueIdLen) {
-  return wrap(unwrap(Builder)->createStructType(
-      unwrapDI<DIDescriptor>(Scope), StringRef(Name, NameLen),
-      unwrapDI<DIFile>(File), LineNumber, SizeInBits, AlignInBits,
-      fromRust(Flags), unwrapDI<DIType>(DerivedFrom),
-      DINodeArray(unwrapDI<MDTuple>(Elements)), RunTimeLang,
-      unwrapDI<DIType>(VTableHolder), StringRef(UniqueId, UniqueIdLen)));
-}
-
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateVariantPart(
     LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
     size_t NameLen, LLVMMetadataRef File, unsigned LineNumber,
@@ -1111,17 +1095,6 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateVariantPart(
       fromRust(Flags), unwrapDI<DIDerivedType>(Discriminator),
       DINodeArray(unwrapDI<MDTuple>(Elements)),
       StringRef(UniqueId, UniqueIdLen)));
-}
-
-extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateMemberType(
-    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
-    size_t NameLen, LLVMMetadataRef File, unsigned LineNo, uint64_t SizeInBits,
-    uint32_t AlignInBits, uint64_t OffsetInBits, LLVMDIFlags Flags,
-    LLVMMetadataRef Ty) {
-  return wrap(unwrap(Builder)->createMemberType(
-      unwrapDI<DIDescriptor>(Scope), StringRef(Name, NameLen),
-      unwrapDI<DIFile>(File), LineNo, SizeInBits, AlignInBits, OffsetInBits,
-      fromRust(Flags), unwrapDI<DIType>(Ty)));
 }
 
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateVariantMemberType(
@@ -1139,117 +1112,6 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateVariantMemberType(
       fromRust(Flags), unwrapDI<DIType>(Ty)));
 }
 
-extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateStaticMemberType(
-    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
-    size_t NameLen, LLVMMetadataRef File, unsigned LineNo, LLVMMetadataRef Ty,
-    LLVMDIFlags Flags, LLVMValueRef val, uint32_t AlignInBits) {
-  return wrap(unwrap(Builder)->createStaticMemberType(
-      unwrapDI<DIDescriptor>(Scope), StringRef(Name, NameLen),
-      unwrapDI<DIFile>(File), LineNo, unwrapDI<DIType>(Ty), fromRust(Flags),
-      unwrap<llvm::ConstantInt>(val), llvm::dwarf::DW_TAG_member, AlignInBits));
-}
-
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderCreateQualifiedType(LLVMDIBuilderRef Builder, unsigned Tag,
-                                     LLVMMetadataRef Type) {
-  return wrap(
-      unwrap(Builder)->createQualifiedType(Tag, unwrapDI<DIType>(Type)));
-}
-
-extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateStaticVariable(
-    LLVMDIBuilderRef Builder, LLVMMetadataRef Context, const char *Name,
-    size_t NameLen, const char *LinkageName, size_t LinkageNameLen,
-    LLVMMetadataRef File, unsigned LineNo, LLVMMetadataRef Ty,
-    bool IsLocalToUnit, LLVMValueRef V, LLVMMetadataRef Decl = nullptr,
-    uint32_t AlignInBits = 0) {
-  llvm::GlobalVariable *InitVal = cast<llvm::GlobalVariable>(unwrap(V));
-
-  llvm::DIExpression *InitExpr = nullptr;
-  if (llvm::ConstantInt *IntVal = llvm::dyn_cast<llvm::ConstantInt>(InitVal)) {
-    InitExpr = unwrap(Builder)->createConstantValueExpression(
-        IntVal->getValue().getSExtValue());
-  } else if (llvm::ConstantFP *FPVal =
-                 llvm::dyn_cast<llvm::ConstantFP>(InitVal)) {
-    InitExpr = unwrap(Builder)->createConstantValueExpression(
-        FPVal->getValueAPF().bitcastToAPInt().getZExtValue());
-  }
-
-  llvm::DIGlobalVariableExpression *VarExpr =
-      unwrap(Builder)->createGlobalVariableExpression(
-          unwrapDI<DIDescriptor>(Context), StringRef(Name, NameLen),
-          StringRef(LinkageName, LinkageNameLen), unwrapDI<DIFile>(File),
-          LineNo, unwrapDI<DIType>(Ty), IsLocalToUnit,
-          /* isDefined */ true, InitExpr, unwrapDIPtr<MDNode>(Decl),
-          /* templateParams */ nullptr, AlignInBits);
-
-  InitVal->setMetadata("dbg", VarExpr);
-
-  return wrap(VarExpr);
-}
-
-extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateVariable(
-    LLVMDIBuilderRef Builder, unsigned Tag, LLVMMetadataRef Scope,
-    const char *Name, size_t NameLen, LLVMMetadataRef File, unsigned LineNo,
-    LLVMMetadataRef Ty, bool AlwaysPreserve, LLVMDIFlags Flags, unsigned ArgNo,
-    uint32_t AlignInBits) {
-  if (Tag == 0x100) { // DW_TAG_auto_variable
-    return wrap(unwrap(Builder)->createAutoVariable(
-        unwrapDI<DIDescriptor>(Scope), StringRef(Name, NameLen),
-        unwrapDI<DIFile>(File), LineNo, unwrapDI<DIType>(Ty), AlwaysPreserve,
-        fromRust(Flags), AlignInBits));
-  } else {
-    return wrap(unwrap(Builder)->createParameterVariable(
-        unwrapDI<DIDescriptor>(Scope), StringRef(Name, NameLen), ArgNo,
-        unwrapDI<DIFile>(File), LineNo, unwrapDI<DIType>(Ty), AlwaysPreserve,
-        fromRust(Flags)));
-  }
-}
-
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderCreateArrayType(LLVMDIBuilderRef Builder, uint64_t Size,
-                                 uint32_t AlignInBits, LLVMMetadataRef Ty,
-                                 LLVMMetadataRef Subscripts) {
-  return wrap(unwrap(Builder)->createArrayType(
-      Size, AlignInBits, unwrapDI<DIType>(Ty),
-      DINodeArray(unwrapDI<MDTuple>(Subscripts))));
-}
-
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderGetOrCreateSubrange(LLVMDIBuilderRef Builder, int64_t Lo,
-                                     int64_t Count) {
-  return wrap(unwrap(Builder)->getOrCreateSubrange(Lo, Count));
-}
-
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderGetOrCreateArray(LLVMDIBuilderRef Builder,
-                                  LLVMMetadataRef *Ptr, unsigned Count) {
-  Metadata **DataValue = unwrap(Ptr);
-  return wrap(unwrap(Builder)
-                  ->getOrCreateArray(ArrayRef<Metadata *>(DataValue, Count))
-                  .get());
-}
-
-extern "C" void
-LLVMRustDIBuilderInsertDeclareAtEnd(LLVMDIBuilderRef Builder, LLVMValueRef V,
-                                    LLVMMetadataRef VarInfo, uint64_t *AddrOps,
-                                    unsigned AddrOpsCount, LLVMMetadataRef DL,
-                                    LLVMBasicBlockRef InsertAtEnd) {
-  unwrap(Builder)->insertDeclare(
-      unwrap(V), unwrap<DILocalVariable>(VarInfo),
-      unwrap(Builder)->createExpression(
-          llvm::ArrayRef<uint64_t>(AddrOps, AddrOpsCount)),
-      DebugLoc(cast<MDNode>(unwrap(DL))), unwrap(InsertAtEnd));
-}
-
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderCreateEnumerator(LLVMDIBuilderRef Builder, const char *Name,
-                                  size_t NameLen, const uint64_t Value[2],
-                                  unsigned SizeInBits, bool IsUnsigned) {
-  return wrap(unwrap(Builder)->createEnumerator(
-      StringRef(Name, NameLen),
-      APSInt(APInt(SizeInBits, ArrayRef<uint64_t>(Value, 2)), IsUnsigned)));
-}
-
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateEnumerationType(
     LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
     size_t NameLen, LLVMMetadataRef File, unsigned LineNumber,
@@ -1260,19 +1122,6 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateEnumerationType(
       unwrapDI<DIFile>(File), LineNumber, SizeInBits, AlignInBits,
       DINodeArray(unwrapDI<MDTuple>(Elements)), unwrapDI<DIType>(ClassTy),
       /* RunTimeLang */ 0, "", IsScoped));
-}
-
-extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateUnionType(
-    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
-    size_t NameLen, LLVMMetadataRef File, unsigned LineNumber,
-    uint64_t SizeInBits, uint32_t AlignInBits, LLVMDIFlags Flags,
-    LLVMMetadataRef Elements, unsigned RunTimeLang, const char *UniqueId,
-    size_t UniqueIdLen) {
-  return wrap(unwrap(Builder)->createUnionType(
-      unwrapDI<DIDescriptor>(Scope), StringRef(Name, NameLen),
-      unwrapDI<DIFile>(File), LineNumber, SizeInBits, AlignInBits,
-      fromRust(Flags), DINodeArray(unwrapDI<MDTuple>(Elements)), RunTimeLang,
-      StringRef(UniqueId, UniqueIdLen)));
 }
 
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateTemplateTypeParameter(
@@ -1290,6 +1139,36 @@ extern "C" void LLVMRustDICompositeTypeReplaceArrays(
   DICompositeType *Tmp = unwrapDI<DICompositeType>(CompositeTy);
   unwrap(Builder)->replaceArrays(Tmp, DINodeArray(unwrap<MDTuple>(Elements)),
                                  DINodeArray(unwrap<MDTuple>(Params)));
+}
+
+// LLVM's C FFI bindings don't expose the overload of `GetOrCreateSubrange`
+// which takes a metadata node as the upper bound.
+extern "C" LLVMMetadataRef
+LLVMRustDIGetOrCreateSubrange(LLVMDIBuilderRef Builder,
+                              LLVMMetadataRef CountNode, LLVMMetadataRef LB,
+                              LLVMMetadataRef UB, LLVMMetadataRef Stride) {
+  return wrap(unwrap(Builder)->getOrCreateSubrange(
+      unwrapDI<Metadata>(CountNode), unwrapDI<Metadata>(LB),
+      unwrapDI<Metadata>(UB), unwrapDI<Metadata>(Stride)));
+}
+
+// LLVM's CI FFI bindings don't expose the `BitStride` parameter of
+// `createVectorType`.
+extern "C" LLVMMetadataRef
+LLVMRustDICreateVectorType(LLVMDIBuilderRef Builder, uint64_t Size,
+                           uint32_t AlignInBits, LLVMMetadataRef Type,
+                           LLVMMetadataRef Subscripts,
+                           LLVMMetadataRef BitStride) {
+#if LLVM_VERSION_GE(22, 0)
+  return wrap(unwrap(Builder)->createVectorType(
+      Size, AlignInBits, unwrapDI<DIType>(Type),
+      DINodeArray(unwrapDI<MDTuple>(Subscripts)),
+      unwrapDI<Metadata>(BitStride)));
+#else
+  return wrap(unwrap(Builder)->createVectorType(
+      Size, AlignInBits, unwrapDI<DIType>(Type),
+      DINodeArray(unwrapDI<MDTuple>(Subscripts))));
+#endif
 }
 
 extern "C" LLVMMetadataRef
@@ -1318,11 +1197,9 @@ extern "C" void LLVMRustWriteValueToString(LLVMValueRef V, RustStringRef Str) {
   }
 }
 
-DEFINE_SIMPLE_CONVERSION_FUNCTIONS(Twine, LLVMTwineRef)
-
-extern "C" void LLVMRustWriteTwineToString(LLVMTwineRef T, RustStringRef Str) {
+extern "C" void LLVMRustWriteTwineToString(const Twine *T, RustStringRef Str) {
   auto OS = RawRustStringOstream(Str);
-  unwrap(T)->print(OS);
+  T->print(OS);
 }
 
 extern "C" void LLVMRustUnpackOptimizationDiagnostic(
@@ -1358,13 +1235,13 @@ enum class LLVMRustDiagnosticLevel {
 
 extern "C" void LLVMRustUnpackInlineAsmDiagnostic(
     LLVMDiagnosticInfoRef DI, LLVMRustDiagnosticLevel *LevelOut,
-    uint64_t *CookieOut, LLVMTwineRef *MessageOut) {
+    uint64_t *CookieOut, const Twine **MessageOut) {
   // Undefined to call this not on an inline assembly diagnostic!
   llvm::DiagnosticInfoInlineAsm *IA =
       static_cast<llvm::DiagnosticInfoInlineAsm *>(unwrap(DI));
 
   *CookieOut = IA->getLocCookie();
-  *MessageOut = wrap(&IA->getMsgStr());
+  *MessageOut = &IA->getMsgStr();
 
   switch (IA->getSeverity()) {
   case DS_Error:
@@ -1453,76 +1330,20 @@ LLVMRustGetDiagInfoKind(LLVMDiagnosticInfoRef DI) {
   return toRust((DiagnosticKind)unwrap(DI)->getKind());
 }
 
-// This is kept distinct from LLVMGetTypeKind, because when
-// a new type kind is added, the Rust-side enum must be
-// updated or UB will result.
-extern "C" LLVMTypeKind LLVMRustGetTypeKind(LLVMTypeRef Ty) {
-  switch (unwrap(Ty)->getTypeID()) {
-  case Type::VoidTyID:
-    return LLVMVoidTypeKind;
-  case Type::HalfTyID:
-    return LLVMHalfTypeKind;
-  case Type::FloatTyID:
-    return LLVMFloatTypeKind;
-  case Type::DoubleTyID:
-    return LLVMDoubleTypeKind;
-  case Type::X86_FP80TyID:
-    return LLVMX86_FP80TypeKind;
-  case Type::FP128TyID:
-    return LLVMFP128TypeKind;
-  case Type::PPC_FP128TyID:
-    return LLVMPPC_FP128TypeKind;
-  case Type::LabelTyID:
-    return LLVMLabelTypeKind;
-  case Type::MetadataTyID:
-    return LLVMMetadataTypeKind;
-  case Type::IntegerTyID:
-    return LLVMIntegerTypeKind;
-  case Type::FunctionTyID:
-    return LLVMFunctionTypeKind;
-  case Type::StructTyID:
-    return LLVMStructTypeKind;
-  case Type::ArrayTyID:
-    return LLVMArrayTypeKind;
-  case Type::PointerTyID:
-    return LLVMPointerTypeKind;
-  case Type::FixedVectorTyID:
-    return LLVMVectorTypeKind;
-  case Type::TokenTyID:
-    return LLVMTokenTypeKind;
-  case Type::ScalableVectorTyID:
-    return LLVMScalableVectorTypeKind;
-  case Type::BFloatTyID:
-    return LLVMBFloatTypeKind;
-  case Type::X86_AMXTyID:
-    return LLVMX86_AMXTypeKind;
-  default: {
-    std::string error;
-    auto stream = llvm::raw_string_ostream(error);
-    stream << "Rust does not support the TypeID: " << unwrap(Ty)->getTypeID()
-           << " for the type: " << *unwrap(Ty);
-    stream.flush();
-    report_fatal_error(error.c_str());
-  }
-  }
-}
-
-DEFINE_SIMPLE_CONVERSION_FUNCTIONS(SMDiagnostic, LLVMSMDiagnosticRef)
-
-extern "C" LLVMSMDiagnosticRef LLVMRustGetSMDiagnostic(LLVMDiagnosticInfoRef DI,
+extern "C" const SMDiagnostic *LLVMRustGetSMDiagnostic(LLVMDiagnosticInfoRef DI,
                                                        uint64_t *Cookie) {
   llvm::DiagnosticInfoSrcMgr *SM =
       static_cast<llvm::DiagnosticInfoSrcMgr *>(unwrap(DI));
   *Cookie = SM->getLocCookie();
-  return wrap(&SM->getSMDiag());
+  return &SM->getSMDiag();
 }
 
 extern "C" bool
-LLVMRustUnpackSMDiagnostic(LLVMSMDiagnosticRef DRef, RustStringRef MessageOut,
+LLVMRustUnpackSMDiagnostic(const SMDiagnostic *DRef, RustStringRef MessageOut,
                            RustStringRef BufferOut,
                            LLVMRustDiagnosticLevel *LevelOut, unsigned *LocOut,
                            unsigned *RangesOut, size_t *NumRanges) {
-  SMDiagnostic &D = *unwrap(DRef);
+  const SMDiagnostic &D = *DRef;
   auto MessageOS = RawRustStringOstream(MessageOut);
   MessageOS << D.getMessage();
 
@@ -1583,6 +1404,10 @@ LLVMRustBuildMemMove(LLVMBuilderRef B, LLVMValueRef Dst, unsigned DstAlign,
                                        unwrap(Size), IsVolatile));
 }
 
+extern "C" LLVMValueRef LLVMRustBuildVScale(LLVMBuilderRef B, LLVMTypeRef Ty) {
+  return wrap(unwrap(B)->CreateVScale(unwrap(Ty)));
+}
+
 extern "C" LLVMValueRef LLVMRustBuildMemSet(LLVMBuilderRef B, LLVMValueRef Dst,
                                             unsigned DstAlign, LLVMValueRef Val,
                                             LLVMValueRef Size,
@@ -1591,10 +1416,47 @@ extern "C" LLVMValueRef LLVMRustBuildMemSet(LLVMBuilderRef B, LLVMValueRef Dst,
                                       MaybeAlign(DstAlign), IsVolatile));
 }
 
+extern "C" void LLVMRustPositionBuilderPastAllocas(LLVMBuilderRef B,
+                                                   LLVMValueRef Fn) {
+  Function *F = unwrap<Function>(Fn);
+  unwrap(B)->SetInsertPointPastAllocas(F);
+}
 extern "C" void LLVMRustPositionBuilderAtStart(LLVMBuilderRef B,
                                                LLVMBasicBlockRef BB) {
   auto Point = unwrap(BB)->getFirstInsertionPt();
   unwrap(B)->SetInsertPoint(unwrap(BB), Point);
+}
+
+extern "C" void LLVMRustPositionBefore(LLVMBuilderRef B, LLVMValueRef Instr) {
+  if (auto I = dyn_cast<Instruction>(unwrap<Value>(Instr))) {
+    unwrap(B)->SetInsertPoint(I);
+  }
+}
+
+extern "C" void LLVMRustPositionAfter(LLVMBuilderRef B, LLVMValueRef Instr) {
+  if (auto I = dyn_cast<Instruction>(unwrap<Value>(Instr))) {
+    auto J = I->getNextNode();
+    unwrap(B)->SetInsertPoint(J);
+  }
+}
+
+extern "C" LLVMValueRef
+LLVMRustGetFunctionCall(LLVMValueRef Fn, const char *Name, size_t NameLen) {
+  auto targetName = StringRef(Name, NameLen);
+  Function *F = unwrap<Function>(Fn);
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      if (auto *callInst = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        const llvm::Function *calledFunc = callInst->getCalledFunction();
+        if (calledFunc && calledFunc->getName() == targetName) {
+          // Found a call to the target function
+          return wrap(callInst);
+        }
+      }
+    }
+  }
+
+  return nullptr;
 }
 
 extern "C" bool LLVMRustConstIntGetZExtValue(LLVMValueRef CV, uint64_t *value) {
@@ -1628,29 +1490,13 @@ extern "C" void LLVMRustSetDSOLocal(LLVMValueRef Global, bool is_dso_local) {
   unwrap<GlobalValue>(Global)->setDSOLocal(is_dso_local);
 }
 
-struct LLVMRustModuleBuffer {
-  std::string data;
-};
+extern "C" void LLVMRustBufferFree(LLVMRustBuffer *Buffer) { delete Buffer; }
 
-extern "C" LLVMRustModuleBuffer *LLVMRustModuleBufferCreate(LLVMModuleRef M) {
-  auto Ret = std::make_unique<LLVMRustModuleBuffer>();
-  {
-    auto OS = raw_string_ostream(Ret->data);
-    WriteBitcodeToFile(*unwrap(M), OS);
-  }
-  return Ret.release();
-}
-
-extern "C" void LLVMRustModuleBufferFree(LLVMRustModuleBuffer *Buffer) {
-  delete Buffer;
-}
-
-extern "C" const void *
-LLVMRustModuleBufferPtr(const LLVMRustModuleBuffer *Buffer) {
+extern "C" const void *LLVMRustBufferPtr(const LLVMRustBuffer *Buffer) {
   return Buffer->data.data();
 }
 
-extern "C" size_t LLVMRustModuleBufferLen(const LLVMRustModuleBuffer *Buffer) {
+extern "C" size_t LLVMRustBufferLen(const LLVMRustBuffer *Buffer) {
   return Buffer->data.length();
 }
 
@@ -1659,79 +1505,8 @@ extern "C" uint64_t LLVMRustModuleCost(LLVMModuleRef M) {
   return std::distance(std::begin(f), std::end(f));
 }
 
-extern "C" void LLVMRustModuleInstructionStats(LLVMModuleRef M,
-                                               RustStringRef Str) {
-  auto OS = RawRustStringOstream(Str);
-  auto JOS = llvm::json::OStream(OS);
-  auto Module = unwrap(M);
-
-  JOS.object([&] {
-    JOS.attribute("module", Module->getName());
-    JOS.attribute("total", Module->getInstructionCount());
-  });
-}
-
-// Vector reductions:
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceFAdd(LLVMBuilderRef B,
-                                                      LLVMValueRef Acc,
-                                                      LLVMValueRef Src) {
-  return wrap(unwrap(B)->CreateFAddReduce(unwrap(Acc), unwrap(Src)));
-}
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceFMul(LLVMBuilderRef B,
-                                                      LLVMValueRef Acc,
-                                                      LLVMValueRef Src) {
-  return wrap(unwrap(B)->CreateFMulReduce(unwrap(Acc), unwrap(Src)));
-}
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceAdd(LLVMBuilderRef B,
-                                                     LLVMValueRef Src) {
-  return wrap(unwrap(B)->CreateAddReduce(unwrap(Src)));
-}
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceMul(LLVMBuilderRef B,
-                                                     LLVMValueRef Src) {
-  return wrap(unwrap(B)->CreateMulReduce(unwrap(Src)));
-}
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceAnd(LLVMBuilderRef B,
-                                                     LLVMValueRef Src) {
-  return wrap(unwrap(B)->CreateAndReduce(unwrap(Src)));
-}
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceOr(LLVMBuilderRef B,
-                                                    LLVMValueRef Src) {
-  return wrap(unwrap(B)->CreateOrReduce(unwrap(Src)));
-}
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceXor(LLVMBuilderRef B,
-                                                     LLVMValueRef Src) {
-  return wrap(unwrap(B)->CreateXorReduce(unwrap(Src)));
-}
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceMin(LLVMBuilderRef B,
-                                                     LLVMValueRef Src,
-                                                     bool IsSigned) {
-  return wrap(unwrap(B)->CreateIntMinReduce(unwrap(Src), IsSigned));
-}
-extern "C" LLVMValueRef LLVMRustBuildVectorReduceMax(LLVMBuilderRef B,
-                                                     LLVMValueRef Src,
-                                                     bool IsSigned) {
-  return wrap(unwrap(B)->CreateIntMaxReduce(unwrap(Src), IsSigned));
-}
-extern "C" LLVMValueRef
-LLVMRustBuildVectorReduceFMin(LLVMBuilderRef B, LLVMValueRef Src, bool NoNaN) {
-  Instruction *I = unwrap(B)->CreateFPMinReduce(unwrap(Src));
-  I->setHasNoNaNs(NoNaN);
-  return wrap(I);
-}
-extern "C" LLVMValueRef
-LLVMRustBuildVectorReduceFMax(LLVMBuilderRef B, LLVMValueRef Src, bool NoNaN) {
-  Instruction *I = unwrap(B)->CreateFPMaxReduce(unwrap(Src));
-  I->setHasNoNaNs(NoNaN);
-  return wrap(I);
-}
-
-extern "C" LLVMValueRef LLVMRustBuildMinNum(LLVMBuilderRef B, LLVMValueRef LHS,
-                                            LLVMValueRef RHS) {
-  return wrap(unwrap(B)->CreateMinNum(unwrap(LHS), unwrap(RHS)));
-}
-extern "C" LLVMValueRef LLVMRustBuildMaxNum(LLVMBuilderRef B, LLVMValueRef LHS,
-                                            LLVMValueRef RHS) {
-  return wrap(unwrap(B)->CreateMaxNum(unwrap(LHS), unwrap(RHS)));
+extern "C" uint64_t LLVMRustModuleInstructionStats(LLVMModuleRef M) {
+  return unwrap(M)->getInstructionCount();
 }
 
 // Transfers ownership of DiagnosticHandler unique_ptr to the caller.
@@ -1781,6 +1556,14 @@ extern "C" void LLVMRustContextConfigureDiagnosticHandler(
           RemarksFile(std::move(RemarksFile)),
           RemarkStreamer(std::move(RemarkStreamer)),
           LlvmRemarkStreamer(std::move(LlvmRemarkStreamer)) {}
+
+#if LLVM_VERSION_GE(22, 0)
+    ~RustDiagnosticHandler() {
+      if (RemarkStreamer) {
+        RemarkStreamer->releaseSerializer();
+      }
+    }
+#endif
 
     virtual bool handleDiagnostics(const DiagnosticInfo &DI) override {
       // If this diagnostic is one of the optimization remark kinds, we can
@@ -1876,9 +1659,14 @@ extern "C" void LLVMRustContextConfigureDiagnosticHandler(
     // Do not delete the file after we gather remarks
     RemarkFile->keep();
 
+#if LLVM_VERSION_GE(22, 0)
+    auto RemarkSerializer = remarks::createRemarkSerializer(
+        llvm::remarks::Format::YAML, RemarkFile->os());
+#else
     auto RemarkSerializer = remarks::createRemarkSerializer(
         llvm::remarks::Format::YAML, remarks::SerializerMode::Separate,
         RemarkFile->os());
+#endif
     if (Error E = RemarkSerializer.takeError()) {
       std::string Error = std::string("Cannot create remark serializer: ") +
                           toString(std::move(E));
@@ -1923,11 +1711,15 @@ extern "C" bool LLVMRustIsNonGVFunctionPointerTy(LLVMValueRef V) {
   return false;
 }
 
-extern "C" bool LLVMRustLLVMHasZlibCompressionForDebugSymbols() {
+extern "C" LLVMValueRef LLVMRustStripPointerCasts(LLVMValueRef V) {
+  return wrap(unwrap(V)->stripPointerCasts());
+}
+
+extern "C" bool LLVMRustLLVMHasZlibCompression() {
   return llvm::compression::zlib::isAvailable();
 }
 
-extern "C" bool LLVMRustLLVMHasZstdCompressionForDebugSymbols() {
+extern "C" bool LLVMRustLLVMHasZstdCompression() {
   return llvm::compression::zstd::isAvailable();
 }
 
@@ -1948,4 +1740,271 @@ extern "C" void LLVMRustSetNoSanitizeHWAddress(LLVMValueRef Global) {
     MD = GV.getSanitizerMetadata();
   MD.NoHWAddress = true;
   GV.setSanitizerMetadata(MD);
+}
+
+extern "C" bool LLVMRustUpgradeIntrinsicFunction(LLVMValueRef Fn,
+                                                 LLVMValueRef *NewFn) {
+  Function *F = unwrap<Function>(Fn);
+  Function *NewF = nullptr;
+  bool CanUpgrade = UpgradeIntrinsicFunction(F, NewF, false);
+  *NewFn = wrap(NewF);
+  return CanUpgrade;
+}
+
+extern "C" bool LLVMRustIsTargetIntrinsic(unsigned ID) {
+  return Intrinsic::isTargetIntrinsic(ID);
+}
+
+extern "C" LLVMValueRef LLVMRustConstPtrAuth(LLVMValueRef Ptr, uint32_t Key,
+                                             uint64_t Disc,
+                                             LLVMValueRef AddrDiversity,
+                                             LLVMValueRef DeactivationSymbol) {
+  auto *C = cast<Constant>(unwrap<Value>(Ptr));
+  assert(C->getType()->isPointerTy() && "Expected pointer type");
+  assert(!isa<UndefValue>(C) && "Unexpected undef in const_ptr_auth");
+  assert(!isa<ConstantPointerNull>(C) && "Unexpected null in const_ptr_auth");
+
+  LLVMContext &Ctx = C->getContext();
+  auto *KeyC = ConstantInt::get(Type::getInt32Ty(Ctx), Key);
+  auto *DiscC = ConstantInt::get(Type::getInt64Ty(Ctx), Disc);
+  auto *PTy = cast<PointerType>(C->getType());
+  Constant *AddrDiv =
+      AddrDiversity ? dyn_cast<Constant>(unwrap<Value>(AddrDiversity))
+                    : ConstantPointerNull::get(cast<PointerType>(C->getType()));
+  assert(AddrDiv && "Failed to get Address Diversity");
+#if LLVM_VERSION_GE(22, 0)
+  Constant *DeactivationSym =
+      DeactivationSymbol ? dyn_cast<Constant>(unwrap<Value>(DeactivationSymbol))
+                         : ConstantPointerNull::get(PTy);
+  assert(DeactivationSym && "Failed to get Deactivation Symbol");
+
+  return wrap(ConstantPtrAuth::get(C, KeyC, DiscC, AddrDiv, DeactivationSym));
+#else
+  return wrap(ConstantPtrAuth::get(C, KeyC, DiscC, AddrDiv));
+#endif
+}
+
+// Statically assert that the fixed metadata kind IDs declared in
+// `metadata_kind.rs` match the ones actually used by LLVM.
+#define FIXED_MD_KIND(VARIANT, VALUE)                                          \
+  static_assert(::llvm::LLVMContext::VARIANT == VALUE);
+// Must be kept in sync with the corresponding list in `metadata_kind.rs`.
+FIXED_MD_KIND(MD_dbg, 0)
+FIXED_MD_KIND(MD_tbaa, 1)
+FIXED_MD_KIND(MD_prof, 2)
+FIXED_MD_KIND(MD_fpmath, 3)
+FIXED_MD_KIND(MD_range, 4)
+FIXED_MD_KIND(MD_tbaa_struct, 5)
+FIXED_MD_KIND(MD_invariant_load, 6)
+FIXED_MD_KIND(MD_alias_scope, 7)
+FIXED_MD_KIND(MD_noalias, 8)
+FIXED_MD_KIND(MD_nontemporal, 9)
+FIXED_MD_KIND(MD_mem_parallel_loop_access, 10)
+FIXED_MD_KIND(MD_nonnull, 11)
+FIXED_MD_KIND(MD_dereferenceable, 12)
+FIXED_MD_KIND(MD_dereferenceable_or_null, 13)
+FIXED_MD_KIND(MD_make_implicit, 14)
+FIXED_MD_KIND(MD_unpredictable, 15)
+FIXED_MD_KIND(MD_invariant_group, 16)
+FIXED_MD_KIND(MD_align, 17)
+FIXED_MD_KIND(MD_loop, 18)
+FIXED_MD_KIND(MD_type, 19)
+FIXED_MD_KIND(MD_section_prefix, 20)
+FIXED_MD_KIND(MD_absolute_symbol, 21)
+FIXED_MD_KIND(MD_associated, 22)
+FIXED_MD_KIND(MD_callees, 23)
+FIXED_MD_KIND(MD_irr_loop, 24)
+FIXED_MD_KIND(MD_access_group, 25)
+FIXED_MD_KIND(MD_callback, 26)
+FIXED_MD_KIND(MD_preserve_access_index, 27)
+FIXED_MD_KIND(MD_vcall_visibility, 28)
+FIXED_MD_KIND(MD_noundef, 29)
+FIXED_MD_KIND(MD_annotation, 30)
+FIXED_MD_KIND(MD_nosanitize, 31)
+FIXED_MD_KIND(MD_func_sanitize, 32)
+FIXED_MD_KIND(MD_exclude, 33)
+FIXED_MD_KIND(MD_memprof, 34)
+FIXED_MD_KIND(MD_callsite, 35)
+FIXED_MD_KIND(MD_kcfi_type, 36)
+FIXED_MD_KIND(MD_pcsections, 37)
+FIXED_MD_KIND(MD_DIAssignID, 38)
+FIXED_MD_KIND(MD_coro_outside_frame, 39)
+FIXED_MD_KIND(MD_mmra, 40)
+FIXED_MD_KIND(MD_noalias_addrspace, 41)
+// If some fixed metadata kinds are not present and consistent in all supported
+// LLVM versions, it's fine to omit them from this list; in that case Rust-side
+// code cannot declare them as fixed IDs and must look them up by name instead.
+#undef FIXED_MD_KIND
+
+class RustSanitizerSpecialCaseList : public llvm::SpecialCaseList {
+public:
+  static std::unique_ptr<RustSanitizerSpecialCaseList>
+  create(const std::vector<std::string> &Paths, llvm::vfs::FileSystem &VFS,
+         std::string &Error) {
+    std::unique_ptr<RustSanitizerSpecialCaseList> SSCL(
+        new RustSanitizerSpecialCaseList());
+    if (SSCL->createInternal(Paths, VFS, Error)) {
+      SSCL->createSanitizerSections();
+      return SSCL;
+    }
+    return nullptr;
+  }
+
+  std::pair<unsigned, unsigned>
+  inSectionBlame(uint32_t Mask, llvm::StringRef SectionName,
+                 llvm::StringRef Prefix, llvm::StringRef Query,
+                 llvm::StringRef Category = llvm::StringRef()) const {
+    for (auto It = SanitizerSections.rbegin(); It != SanitizerSections.rend();
+         ++It) {
+      bool Matches = false;
+      if (Mask != 0 && (It->Mask & Mask) != 0) {
+        Matches = true;
+      } else if (!SectionName.empty() && matchSection(It->S, SectionName)) {
+        Matches = true;
+      }
+      if (Matches) {
+        unsigned LineNum = getLastMatch(It->S, Prefix, Query, Category);
+        if (LineNum > 0)
+          return {getFileIndex(It->S), LineNum};
+      }
+    }
+    return NotFound;
+  }
+
+private:
+  struct SanitizerSection {
+    uint32_t Mask;
+    const Section &S;
+    SanitizerSection(uint32_t Mask, const Section &S) : Mask(Mask), S(S) {}
+  };
+
+  std::vector<SanitizerSection> SanitizerSections;
+
+#if LLVM_VERSION_GE(22, 0)
+  static bool matchSection(const Section &S, llvm::StringRef Name) {
+    return S.matchName(Name);
+  }
+  unsigned getLastMatch(const Section &S, llvm::StringRef Prefix,
+                        llvm::StringRef Query, llvm::StringRef Category) const {
+    return S.getLastMatch(Prefix, Query, Category);
+  }
+  static unsigned getFileIndex(const Section &S) { return S.fileIndex(); }
+#else
+  static bool matchSection(const Section &S, llvm::StringRef Name) {
+    return S.SectionMatcher && S.SectionMatcher->match(Name) != 0;
+  }
+  unsigned getLastMatch(const Section &S, llvm::StringRef Prefix,
+                        llvm::StringRef Query, llvm::StringRef Category) const {
+    return llvm::SpecialCaseList::inSectionBlame(S.Entries, Prefix, Query,
+                                                 Category);
+  }
+  static unsigned getFileIndex(const Section &S) { return S.FileIdx; }
+#endif
+
+  void createSanitizerSections() {
+#if LLVM_VERSION_GE(22, 0)
+    const auto &SecList = sections();
+#else
+    const auto &SecList = Sections;
+#endif
+    for (const auto &S : SecList) {
+      uint32_t Mask = 0;
+
+      // All sanitizers: [all]
+      if (matchSection(S, "all"))
+        Mask |= ~0u;
+
+      // Address: [address]
+      if (matchSection(S, "address"))
+        Mask |= (1 << 0);
+      // Leak: [leak]
+      if (matchSection(S, "leak"))
+        Mask |= (1 << 1);
+      // Memory: [memory]
+      if (matchSection(S, "memory"))
+        Mask |= (1 << 2);
+      // Thread: [thread]
+      if (matchSection(S, "thread"))
+        Mask |= (1 << 3);
+      // HWAddress: [hwaddress]
+      if (matchSection(S, "hwaddress"))
+        Mask |= (1 << 4);
+
+      // CFI (indirect call checking): [cfi], [cfi-icall]
+      if (matchSection(S, "cfi") || matchSection(S, "cfi-icall"))
+        Mask |= (1 << 5);
+
+      // MemTag: [memtag], [memtag-stack], [memtag-heap], [memtag-globals]
+      if (matchSection(S, "memtag") || matchSection(S, "memtag-stack") ||
+          matchSection(S, "memtag-heap") || matchSection(S, "memtag-globals"))
+        Mask |= (1 << 6);
+      // ShadowCallStack: [shadow-call-stack], [shadowcallstack]
+      if (matchSection(S, "shadow-call-stack") ||
+          matchSection(S, "shadowcallstack"))
+        Mask |= (1 << 7);
+      // KCFI: [kcfi]
+      if (matchSection(S, "kcfi"))
+        Mask |= (1 << 8);
+      // KernelAddress: [kernel-address], [kasan]
+      if (matchSection(S, "kernel-address") || matchSection(S, "kasan"))
+        Mask |= (1 << 9);
+      // KernelHWAddress: [kernel-hwaddress], [khwasan]
+      if (matchSection(S, "kernel-hwaddress") || matchSection(S, "khwasan"))
+        Mask |= (1 << 10);
+      // SafeStack: [safe-stack] (Clang standard), [safestack]
+      if (matchSection(S, "safe-stack") || matchSection(S, "safestack"))
+        Mask |= (1 << 11);
+      // DataFlow: [dataflow]
+      if (matchSection(S, "dataflow"))
+        Mask |= (1 << 12);
+      // Realtime: [realtime]
+      if (matchSection(S, "realtime"))
+        Mask |= (1 << 13);
+
+      SanitizerSections.emplace_back(Mask, S);
+    }
+  }
+};
+
+extern "C" LLVMSpecialCaseListRef
+LLVMRustSpecialCaseListCreate(const char **Paths, size_t NumPaths,
+                              RustStringRef ErrorMsg) {
+  std::string Error;
+  std::vector<std::string> PathsVec(Paths, Paths + NumPaths);
+  std::unique_ptr<RustSanitizerSpecialCaseList> SCL =
+      RustSanitizerSpecialCaseList::create(
+          PathsVec, *llvm::vfs::getRealFileSystem(), Error);
+  if (!SCL) {
+    LLVMRustStringWriteImpl(ErrorMsg, Error.data(), Error.size());
+    return nullptr;
+  }
+  return reinterpret_cast<LLVMSpecialCaseListRef>(SCL.release());
+}
+
+extern "C" void LLVMRustSpecialCaseListDestroy(LLVMSpecialCaseListRef List) {
+  delete reinterpret_cast<RustSanitizerSpecialCaseList *>(List);
+}
+
+struct LLVMRustSpecialCaseListBlame {
+  uint32_t FileIdx;
+  uint32_t LineNo;
+};
+
+extern "C" void
+LLVMRustSpecialCaseListInSectionBlame(LLVMSpecialCaseListRef List,
+                                      uint32_t Mask, const char *Section,
+                                      const char *Prefix, const char *Query,
+                                      LLVMRustSpecialCaseListBlame *OutNoSan,
+                                      LLVMRustSpecialCaseListBlame *OutSan) {
+  auto *SSCL = reinterpret_cast<RustSanitizerSpecialCaseList *>(List);
+  llvm::StringRef SectionStr = Section ? Section : "";
+  std::pair<unsigned, unsigned> NoSan =
+      SSCL->inSectionBlame(Mask, SectionStr, Prefix, Query);
+  OutNoSan->FileIdx = NoSan.first;
+  OutNoSan->LineNo = NoSan.second;
+
+  std::pair<unsigned, unsigned> San =
+      SSCL->inSectionBlame(Mask, SectionStr, Prefix, Query, "sanitize");
+  OutSan->FileIdx = San.first;
+  OutSan->LineNo = San.second;
 }

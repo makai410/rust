@@ -8,15 +8,17 @@
 //@ revisions: ok ok_explicit error error_explicit
 //@[ok] compile-flags: -Zreg-struct-return
 //@[ok_explicit] compile-flags: -Zreg-struct-return=true
-//@[error] compile-flags:
+// [error] no extra compile-flags
 //@[error_explicit] compile-flags: -Zreg-struct-return=false
 //@[ok] check-pass
 //@[ok_explicit] check-pass
+//@ ignore-backends: gcc
 
 #![feature(no_core)]
-//[error]~^ ERROR mixing `-Zreg-struct-return` will cause an ABI mismatch in crate `no_value_bool`
-//[error_explicit]~^^ ERROR mixing `-Zreg-struct-return` will cause an ABI mismatch in crate `no_value_bool`
 #![crate_type = "rlib"]
 #![no_core]
 
 extern crate enabled_reg_struct_return;
+
+//[error]~? ERROR mixing `-Zreg-struct-return` will cause an ABI mismatch in crate `no_value_bool`
+//[error_explicit]~? ERROR mixing `-Zreg-struct-return` will cause an ABI mismatch in crate `no_value_bool`

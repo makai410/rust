@@ -1,5 +1,5 @@
-// skip-filecheck
-#![feature(never_type)]
+//@ compile-flags: -Zmir-opt-level=0
+//@ skip-filecheck
 #![allow(unreachable_code)]
 
 // EMIT_MIR eq_never_type._f.built.after.mir

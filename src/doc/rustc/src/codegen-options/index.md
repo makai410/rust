@@ -3,10 +3,6 @@
 All of these options are passed to `rustc` via the `-C` flag, short for "codegen." You can see
 a version of this list for your exact compiler by running `rustc -C help`.
 
-## ar
-
-This option is deprecated and does nothing.
-
 ## code-model
 
 This option lets you choose which code model to use. \
@@ -16,7 +12,7 @@ may be able to use more compact addressing modes.
 
 The specific ranges depend on target architectures and addressing modes available to them. \
 For x86 more detailed description of its code models can be found in
-[System V Application Binary Interface](https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf)
+[System V Application Binary Interface](https://gitlab.com/x86-psABIs/x86-64-ABI/-/jobs/artifacts/master/raw/x86-64-ABI/abi.pdf?job=build)
 specification.
 
 Supported values for this option are:
@@ -194,12 +190,6 @@ incremental files will be stored.
 
 Using incremental compilation inhibits certain optimizations (for example by increasing the amount of codegen units) and is therefore not recommended for release builds.
 
-## inline-threshold
-
-This option is deprecated and does nothing.
-
-Consider using `-Cllvm-args=--inline-threshold=...`.
-
 ## instrument-coverage
 
 This option enables instrumentation-based code coverage support. See the
@@ -208,6 +198,27 @@ chapter on [instrumentation-based code coverage] for more information.
 Note that while the `-C instrument-coverage` option is stable, the profile data
 format produced by the resulting instrumentation may change, and may not work
 with coverage tools other than those built and shipped with the compiler.
+
+## jump-tables
+
+This option is used to allow or prevent the LLVM codegen backend from creating
+jump tables when lowering switches from Rust code.
+
+* `y`, `yes`, `on`, `true` or no value: allow jump tables (the default).
+* `n`, `no`, `off` or `false`: disable jump tables.
+
+To prevent jump tables being created from Rust code, a target must ensure
+all crates are compiled with jump tables disabled.
+
+Note, in many cases the Rust toolchain is distributed with precompiled
+crates, such as the core and std crates, which could possibly include
+jump tables. Furthermore, this option does not guarantee a target will
+be free of jump tables. They could arise from external dependencies,
+inline asm, or other complicated interactions when using crates which
+are compiled with jump table support.
+
+Disabling jump tables can be used to help provide protection against
+jump-oriented-programming (JOP) attacks.
 
 ## link-arg
 
@@ -375,12 +386,12 @@ linking time. It takes one of the following values:
 
 * `y`, `yes`, `on`, `true`, `fat`, or no value: perform "fat" LTO which attempts to
   perform optimizations across all crates within the dependency graph.
-* `n`, `no`, `off`, `false`: disables LTO.
 * `thin`: perform ["thin"
   LTO](http://blog.llvm.org/2016/06/thinlto-scalable-and-incremental-lto.html).
   This is similar to "fat", but takes substantially less time to run while
   still achieving performance gains similar to "fat".
   For larger projects like the Rust compiler, ThinLTO can even result in better performance than fat LTO.
+* `n`, `no`, `off`, `false`: disables LTO.
 
 If `-C lto` is not specified, then the compiler will attempt to perform "thin
 local LTO" which performs "thin" LTO on the local crate only across its
@@ -421,10 +432,6 @@ of the following values:
 * `n`, `no`, `off` or `false`: enable the red zone.
 
 The default behaviour, if the flag is not specified, depends on the target.
-
-## no-stack-check
-
-This option is deprecated and does nothing.
 
 ## no-vectorize-loops
 
@@ -471,11 +478,13 @@ If not specified, overflow checks are enabled if
 This option lets you control what happens when the code panics.
 
 * `abort`: terminate the process upon panic
+* `immediate-abort`: terminate the process upon panic, and do not call any panic hooks
 * `unwind`: unwind the stack upon panic
 
 If not specified, the default depends on the target.
 
 If any crate in the crate graph uses `abort`, the final binary (`bin`, `dylib`, `cdylib`, `staticlib`) must also use `abort`.
+If any crate in the crate graph uses `immediate-abort`, every crate in the graph must use `immediate-abort`.
 If `std` is used as a `dylib` with `unwind`, the final binary must also use `unwind`.
 
 ## passes
@@ -499,7 +508,7 @@ By default, `rustc` prefers to statically link dependencies. This option will
 indicate that dynamic linking should be used if possible if both a static and
 dynamic versions of a library are available.
 
-There is [an internal algorithm](https://github.com/rust-lang/rust/blob/master/compiler/rustc_metadata/src/dependency_format.rs)
+There is [an internal algorithm](https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_metadata/src/dependency_format.rs)
 for determining whether or not it is possible to statically or dynamically link
 with a dependency.
 
@@ -515,6 +524,15 @@ profiling data for use with profile-guided optimization (PGO). The flag takes
 an optional argument which is the path to a directory into which the
 instrumented binary will emit the collected data. See the chapter on
 [profile-guided optimization] for more information.
+
+## profile-sample-use
+
+This flag specifies the profiling data file to be used for sample-based
+profile-guided optimization (SPGO). The flag takes a mandatory argument which
+is the path to a valid `.prof` file. See the chapter on
+[profile-guided optimization] for more information.
+The `-Zdebuginfo-for-profiling` can be used to improve the quality of the
+profiling data.
 
 ## profile-use
 
@@ -631,16 +649,6 @@ deleted once compilation finishes. It takes one of the following values:
 
 * `y`, `yes`, `on`, `true` or no value: save temporary files.
 * `n`, `no`, `off` or `false`: delete temporary files (the default).
-
-## soft-float
-
-This option controls whether `rustc` generates code that emulates floating
-point instructions in software. It takes one of the following values:
-
-* `y`, `yes`, `on`, `true` or no value: use soft floats.
-* `n`, `no`, `off` or `false`: use hardware floats (the default).
-
-This flag only works on `*eabihf` targets and **is unsound and deprecated**.
 
 ## split-debuginfo
 
