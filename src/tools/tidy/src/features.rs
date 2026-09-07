@@ -9,19 +9,25 @@
 //! * All unstable lang features have tests to ensure they are actually unstable.
 //! * Language features in a group are sorted by feature name.
 
+use std::collections::BTreeSet;
 use std::collections::hash_map::{Entry, HashMap};
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::{fmt, fs};
 
+use regex::Regex;
+
+use crate::diagnostics::{RunningCheck, TidyCtx};
 use crate::walk::{filter_dirs, filter_not_rust, walk, walk_many};
 
 #[cfg(test)]
 mod tests;
 
 mod version;
-use version::Version;
+// Re-export Version. This means other crates can construct Versions from [u32;3] and from &str.
+// This is useful for filtering for features older/newer than a user-provided value.
+pub use version::Version;
 
 const FEATURE_GROUP_START_PREFIX: &str = "// feature-group-start";
 const FEATURE_GROUP_END_PREFIX: &str = "// feature-group-end";
@@ -89,13 +95,14 @@ pub fn check(
     tests_path: &Path,
     compiler_path: &Path,
     lib_path: &Path,
-    bad: &mut bool,
-    verbose: bool,
+    tidy_ctx: TidyCtx,
 ) -> CollectedFeatures {
-    let mut features = collect_lang_features(compiler_path, bad);
+    let mut check = tidy_ctx.start_check("features");
+
+    let mut features = collect_lang_features(compiler_path, &mut check);
     assert!(!features.is_empty());
 
-    let lib_features = get_and_check_lib_features(lib_path, bad, &features);
+    let lib_features = get_and_check_lib_features(lib_path, &mut check, &features);
     assert!(!lib_features.is_empty());
 
     walk_many(
@@ -103,7 +110,7 @@ pub fn check(
             &tests_path.join("ui"),
             &tests_path.join("ui-fulldeps"),
             &tests_path.join("rustdoc-ui"),
-            &tests_path.join("rustdoc"),
+            &tests_path.join("rustdoc-html"),
         ],
         |path, _is_dir| {
             filter_dirs(path)
@@ -119,7 +126,7 @@ pub fn check(
 
             for (i, line) in contents.lines().enumerate() {
                 let mut err = |msg: &str| {
-                    tidy_error!(bad, "{}:{}: {}", file.display(), i + 1, msg);
+                    check.error(format!("{}:{}: {}", file.display(), i + 1, msg));
                 };
 
                 let gate_test_str = "gate-test-";
@@ -173,7 +180,7 @@ pub fn check(
     }
 
     if !gate_untested.is_empty() {
-        tidy_error!(bad, "Found {} features without a gate test.", gate_untested.len());
+        check.error(format!("Found {} features without a gate test.", gate_untested.len()));
     }
 
     let (version, channel) = get_version_and_channel(src_path);
@@ -187,39 +194,32 @@ pub fn check(
         let file = feature.file.display();
         let line = feature.line;
         if since > version && since != Version::CurrentPlaceholder {
-            tidy_error!(
-                bad,
+            check.error(format!(
                 "{file}:{line}: The stabilization version {since} of {kind} feature `{feature_name}` is newer than the current {version}"
-            );
+            ));
         }
         if channel == "nightly" && since == version {
-            tidy_error!(
-                bad,
+            check.error(format!(
                 "{file}:{line}: The stabilization version {since} of {kind} feature `{feature_name}` is written out but should be {}",
                 version::VERSION_PLACEHOLDER
-            );
+            ));
         }
         if channel != "nightly" && since == Version::CurrentPlaceholder {
-            tidy_error!(
-                bad,
+            check.error(format!(
                 "{file}:{line}: The placeholder use of {kind} feature `{feature_name}` is not allowed on the {channel} channel",
-            );
+            ));
         }
     }
 
-    if *bad {
-        return CollectedFeatures { lib: lib_features, lang: features };
-    }
-
-    if verbose {
+    if !check.is_bad() && check.is_verbose_enabled() {
         let mut lines = Vec::new();
         lines.extend(format_features(&features, "lang"));
         lines.extend(format_features(&lib_features, "lib"));
-
         lines.sort();
-        for line in lines {
-            println!("* {line}");
-        }
+
+        check.verbose_msg(
+            lines.into_iter().map(|l| format!("* {l}")).collect::<Vec<String>>().join("\n"),
+        );
     }
 
     CollectedFeatures { lib: lib_features, lang: features }
@@ -273,15 +273,20 @@ fn test_filen_gate<'f>(filen_underscore: &'f str, features: &mut Features) -> Op
     None
 }
 
-pub fn collect_lang_features(base_compiler_path: &Path, bad: &mut bool) -> Features {
+pub fn collect_lang_features(base_compiler_path: &Path, check: &mut RunningCheck) -> Features {
     let mut features = Features::new();
-    collect_lang_features_in(&mut features, base_compiler_path, "accepted.rs", bad);
-    collect_lang_features_in(&mut features, base_compiler_path, "removed.rs", bad);
-    collect_lang_features_in(&mut features, base_compiler_path, "unstable.rs", bad);
+    collect_lang_features_in(&mut features, base_compiler_path, "accepted.rs", check);
+    collect_lang_features_in(&mut features, base_compiler_path, "removed.rs", check);
+    collect_lang_features_in(&mut features, base_compiler_path, "unstable.rs", check);
     features
 }
 
-fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, bad: &mut bool) {
+fn collect_lang_features_in(
+    features: &mut Features,
+    base: &Path,
+    file: &str,
+    check: &mut RunningCheck,
+) {
     let path = base.join("rustc_feature").join("src").join(file);
     let contents = t!(fs::read_to_string(&path));
 
@@ -313,13 +318,11 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
 
         if line.starts_with(FEATURE_GROUP_START_PREFIX) {
             if in_feature_group {
-                tidy_error!(
-                    bad,
-                    "{}:{}: \
+                check.error(format!(
+                    "{}:{line_number}: \
                         new feature group is started without ending the previous one",
-                    path.display(),
-                    line_number,
-                );
+                    path.display()
+                ));
             }
 
             in_feature_group = true;
@@ -331,11 +334,9 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
             continue;
         }
 
-        if in_feature_group {
-            if let Some(doc_comment) = line.strip_prefix("///") {
-                doc_comments.push(doc_comment.trim().to_string());
-                continue;
-            }
+        if in_feature_group && let Some(doc_comment) = line.strip_prefix("///") {
+            doc_comments.push(doc_comment.trim().to_string());
+            continue;
         }
 
         let mut parts = line.split(',');
@@ -353,14 +354,10 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
         let since = match since_str.parse() {
             Ok(since) => Some(since),
             Err(err) => {
-                tidy_error!(
-                    bad,
-                    "{}:{}: failed to parse since: {} ({:?})",
-                    path.display(),
-                    line_number,
-                    since_str,
-                    err,
-                );
+                check.error(format!(
+                    "{}:{line_number}: failed to parse since: {since_str} ({err:?})",
+                    path.display()
+                ));
                 None
             }
         };
@@ -371,13 +368,10 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
                 let correct_index = match prev_names.binary_search(&name) {
                     Ok(_) => {
                         // This only occurs when the feature name has already been declared.
-                        tidy_error!(
-                            bad,
-                            "{}:{}: duplicate feature {}",
-                            path.display(),
-                            line_number,
-                            name,
-                        );
+                        check.error(format!(
+                            "{}:{line_number}: duplicate feature {name}",
+                            path.display()
+                        ));
                         // skip any additional checks for this line
                         continue;
                     }
@@ -398,14 +392,10 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
                     )
                 };
 
-                tidy_error!(
-                    bad,
-                    "{}:{}: feature {} is not sorted by feature name (should be {})",
+                check.error(format!(
+                    "{}:{line_number}: feature {name} is not sorted by feature name (should be {correct_placement})",
                     path.display(),
-                    line_number,
-                    name,
-                    correct_placement,
-                );
+                ));
             }
             prev_names.push(name);
         }
@@ -413,13 +403,10 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
         let issue_str = parts.next().unwrap().trim();
         let tracking_issue = if issue_str.starts_with("None") {
             if level == Status::Unstable && !next_feature_omits_tracking_issue {
-                tidy_error!(
-                    bad,
-                    "{}:{}: no tracking issue for feature {}",
+                check.error(format!(
+                    "{}:{line_number}: no tracking issue for feature {name}",
                     path.display(),
-                    line_number,
-                    name,
-                );
+                ));
             }
             None
         } else {
@@ -428,13 +415,11 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
         };
         match features.entry(name.to_owned()) {
             Entry::Occupied(e) => {
-                tidy_error!(
-                    bad,
-                    "{}:{} feature {name} already specified with status '{}'",
+                check.error(format!(
+                    "{}:{line_number} feature {name} already specified with status '{}'",
                     path.display(),
-                    line_number,
                     e.get().level,
-                );
+                ));
             }
             Entry::Vacant(e) => {
                 e.insert(Feature {
@@ -458,26 +443,23 @@ fn collect_lang_features_in(features: &mut Features, base: &Path, file: &str, ba
 
 fn get_and_check_lib_features(
     base_src_path: &Path,
-    bad: &mut bool,
+    check: &mut RunningCheck,
     lang_features: &Features,
 ) -> Features {
     let mut lib_features = Features::new();
     map_lib_features(base_src_path, &mut |res, file, line| match res {
         Ok((name, f)) => {
             let mut check_features = |f: &Feature, list: &Features, display: &str| {
-                if let Some(s) = list.get(name) {
-                    if f.tracking_issue != s.tracking_issue && f.level != Status::Accepted {
-                        tidy_error!(
-                            bad,
-                            "{}:{}: feature gate {} has inconsistent `issue`: \"{}\" mismatches the {} `issue` of \"{}\"",
-                            file.display(),
-                            line,
-                            name,
-                            f.tracking_issue_display(),
-                            display,
-                            s.tracking_issue_display(),
-                        );
-                    }
+                if let Some(s) = list.get(name)
+                    && f.tracking_issue != s.tracking_issue
+                    && f.level != Status::Accepted
+                {
+                    check.error(format!(
+                        "{}:{line}: feature gate {name} has inconsistent `issue`: \"{}\" mismatches the {display} `issue` of \"{}\"",
+                        file.display(),
+                        f.tracking_issue_display(),
+                        s.tracking_issue_display(),
+                    ));
                 }
             };
             check_features(&f, lang_features, "corresponding lang feature");
@@ -485,10 +467,108 @@ fn get_and_check_lib_features(
             lib_features.insert(name.to_owned(), f);
         }
         Err(msg) => {
-            tidy_error!(bad, "{}:{}: {}", file.display(), line, msg);
+            check.error(format!("{}:{line}: {msg}", file.display()));
         }
     });
     lib_features
+}
+
+/// `mf` gets the feature or an error if it is invalid, the file path passed as `file`, and the attribute's line number.
+fn extract_lib_features<'c, 'p>(
+    contents: &'c str,
+    file: &'p Path,
+    mf: &mut (dyn Send + Sync + FnMut(Result<(&'c str, Feature), &'static str>, &'p Path, usize)),
+) {
+    let handle_issue_none = |s| match s {
+        "none" => None,
+        issue => {
+            let n = issue.parse().expect("issue number is not a valid integer");
+            assert_ne!(n, 0, "\"none\" should be used when there is no issue, not \"0\"");
+            NonZeroU32::new(n)
+        }
+    };
+    for attr in static_regex!(
+        r"#!?\[\s*(?<attr_name>rustc_const_unstable|unstable|stable)\s*(?<attr_meta>(\((?s).*?)\)|)\]"
+    )
+    .captures_iter(contents)
+    {
+        let match_index = attr.get_match().start();
+        let before_match = &contents[..match_index];
+        let before_match_line = match before_match.rsplit_once('\n') {
+            Some((_, it)) => it,
+            None => before_match,
+        };
+        if static_regex!(r"^\s*//").is_match(before_match_line) {
+            // It starts inside a comment, exclude (this does not handle block comments).
+            // Technically this will mis-handle things like:
+            // ```
+            // // #[stable
+            // #[stable(...)]
+            // ```
+            // Hopefully that's not a problem.
+            continue;
+        }
+
+        let line = before_match.bytes().filter(|b| *b == b'\n').count() + 1;
+
+        macro_rules! err {
+            ($msg:expr) => {{
+                mf(Err($msg), file, line);
+                continue;
+            }};
+        }
+
+        let attr_meta = attr.name("attr_meta").unwrap().as_str();
+        let level = match &attr["attr_name"] {
+            "rustc_const_unstable" => {
+                // `const fn` features are handled specially.
+                let feature_name = match find_attr_val(attr_meta, "feature") {
+                    Some(name) => name,
+                    None => err!("malformed stability attribute: missing `feature` key"),
+                };
+                let feature = Feature {
+                    level: Status::Unstable,
+                    since: None,
+                    has_gate_test: false,
+                    tracking_issue: find_attr_val(attr_meta, "issue").and_then(handle_issue_none),
+                    file: file.to_path_buf(),
+                    line,
+                    description: None,
+                };
+                mf(Ok((feature_name, feature)), file, line);
+                continue;
+            }
+            "unstable" => Status::Unstable,
+            "stable" => Status::Accepted,
+            _ => unreachable!("unexpected attribute name"),
+        };
+        let feature_name = match find_attr_val(attr_meta, "feature") {
+            Some(name) => name,
+            None => err!("malformed stability attribute: missing `feature` key"),
+        };
+        let since = match find_attr_val(attr_meta, "since").map(|x| x.parse()) {
+            Some(Ok(since)) => Some(since),
+            Some(Err(_err)) => {
+                err!("malformed stability attribute: can't parse `since` key");
+            }
+            None if level == Status::Accepted => {
+                err!("malformed stability attribute: missing the `since` key");
+            }
+            None => None,
+        };
+        let tracking_issue = find_attr_val(attr_meta, "issue").and_then(handle_issue_none);
+
+        let feature = Feature {
+            level,
+            since,
+            has_gate_test: false,
+            tracking_issue,
+            file: file.to_path_buf(),
+            line,
+            description: None,
+        };
+        mf(Ok((feature_name, feature)), file, line);
+    }
 }
 
 fn map_lib_features(
@@ -509,118 +589,40 @@ fn map_lib_features(
                 return;
             }
 
-            // This is an early exit -- all the attributes we're concerned with must contain this:
-            // * rustc_const_unstable(
-            // * unstable(
-            // * stable(
-            if !contents.contains("stable(") {
-                return;
-            }
+            extract_lib_features(contents, file, mf);
+        },
+    );
+}
 
-            let handle_issue_none = |s| match s {
-                "none" => None,
-                issue => {
-                    let n = issue.parse().expect("issue number is not a valid integer");
-                    assert_ne!(n, 0, "\"none\" should be used when there is no issue, not \"0\"");
-                    NonZeroU32::new(n)
-                }
-            };
-            let mut becoming_feature: Option<(&str, Feature)> = None;
-            let mut iter_lines = contents.lines().enumerate().peekable();
-            while let Some((i, line)) = iter_lines.next() {
-                macro_rules! err {
-                    ($msg:expr) => {{
-                        mf(Err($msg), file, i + 1);
-                        continue;
-                    }};
-                }
+fn should_document(var: &str) -> bool {
+    if var.starts_with("RUSTC_") || var.starts_with("RUST_") || var.starts_with("UNSTABLE_RUSTDOC_")
+    {
+        return true;
+    }
+    ["SDKROOT", "QNX_TARGET", "COLORTERM", "TERM"].contains(&var)
+}
 
-                // exclude commented out lines
-                if static_regex!(r"^\s*//").is_match(line) {
-                    continue;
-                }
+pub fn collect_env_vars(compiler: &Path) -> BTreeSet<String> {
+    let env_var_regex: Regex = Regex::new(r#"env::var(_os)?\("([^"]+)"#).unwrap();
 
-                if let Some((name, ref mut f)) = becoming_feature {
-                    if f.tracking_issue.is_none() {
-                        f.tracking_issue = find_attr_val(line, "issue").and_then(handle_issue_none);
-                    }
-                    if line.ends_with(']') {
-                        mf(Ok((name, f.clone())), file, i + 1);
-                    } else if !line.ends_with(',') && !line.ends_with('\\') && !line.ends_with('"')
-                    {
-                        // We need to bail here because we might have missed the
-                        // end of a stability attribute above because the ']'
-                        // might not have been at the end of the line.
-                        // We could then get into the very unfortunate situation that
-                        // we continue parsing the file assuming the current stability
-                        // attribute has not ended, and ignoring possible feature
-                        // attributes in the process.
-                        err!("malformed stability attribute");
-                    } else {
-                        continue;
-                    }
-                }
-                becoming_feature = None;
-                if line.contains("rustc_const_unstable(") {
-                    // `const fn` features are handled specially.
-                    let feature_name = match find_attr_val(line, "feature").or_else(|| {
-                        iter_lines.peek().and_then(|next| find_attr_val(next.1, "feature"))
-                    }) {
-                        Some(name) => name,
-                        None => err!("malformed stability attribute: missing `feature` key"),
-                    };
-                    let feature = Feature {
-                        level: Status::Unstable,
-                        since: None,
-                        has_gate_test: false,
-                        tracking_issue: find_attr_val(line, "issue").and_then(handle_issue_none),
-                        file: file.to_path_buf(),
-                        line: i + 1,
-                        description: None,
-                    };
-                    mf(Ok((feature_name, feature)), file, i + 1);
-                    continue;
-                }
-                let level = if line.contains("[unstable(") {
-                    Status::Unstable
-                } else if line.contains("[stable(") {
-                    Status::Accepted
-                } else {
-                    continue;
-                };
-                let feature_name = match find_attr_val(line, "feature")
-                    .or_else(|| iter_lines.peek().and_then(|next| find_attr_val(next.1, "feature")))
-                {
-                    Some(name) => name,
-                    None => err!("malformed stability attribute: missing `feature` key"),
-                };
-                let since = match find_attr_val(line, "since").map(|x| x.parse()) {
-                    Some(Ok(since)) => Some(since),
-                    Some(Err(_err)) => {
-                        err!("malformed stability attribute: can't parse `since` key");
-                    }
-                    None if level == Status::Accepted => {
-                        err!("malformed stability attribute: missing the `since` key");
-                    }
-                    None => None,
-                };
-                let tracking_issue = find_attr_val(line, "issue").and_then(handle_issue_none);
-
-                let feature = Feature {
-                    level,
-                    since,
-                    has_gate_test: false,
-                    tracking_issue,
-                    file: file.to_path_buf(),
-                    line: i + 1,
-                    description: None,
-                };
-                if line.contains(']') {
-                    mf(Ok((feature_name, feature)), file, i + 1);
-                } else {
-                    becoming_feature = Some((feature_name, feature));
+    let mut vars = BTreeSet::new();
+    walk(
+        compiler,
+        // skip build scripts, tests, and non-rust files
+        |path, _is_dir| {
+            filter_dirs(path)
+                || filter_not_rust(path)
+                || path.ends_with("build.rs")
+                || path.ends_with("tests.rs")
+        },
+        &mut |_entry, contents| {
+            for env_var in env_var_regex.captures_iter(contents).map(|c| c.get(2).unwrap().as_str())
+            {
+                if should_document(env_var) {
+                    vars.insert(env_var.to_owned());
                 }
             }
         },
     );
+    vars
 }

@@ -1,11 +1,11 @@
 //! Computing the size and alignment of a value.
 
-use rustc_abi::WrappingRange;
-use rustc_hir::LangItem;
+use rustc_abi::{Align, WrappingRange};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::bug;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_middle::ty::{self, Ty};
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, Span};
 use tracing::{debug, trace};
 
 use crate::common::IntPredicate;
@@ -16,12 +16,13 @@ pub fn size_and_align_of_dst<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx: &mut Bx,
     t: Ty<'tcx>,
     info: Option<Bx::Value>,
+    span: Span,
 ) -> (Bx::Value, Bx::Value) {
-    let layout = bx.layout_of(t);
+    let layout = bx.spanned_layout_of(t, span);
     trace!("size_and_align_of_dst(ty={}, info={:?}): layout: {:?}", t, info, layout);
     if layout.is_sized() {
         let size = bx.const_usize(layout.size.bytes());
-        let align = bx.const_usize(layout.align.abi.bytes());
+        let align = bx.const_usize(layout.align.bytes());
         return (size, align);
     }
     match t.kind() {
@@ -36,8 +37,10 @@ pub fn size_and_align_of_dst<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             // Size is always <= isize::MAX.
             let size_bound = bx.data_layout().ptr_sized_integer().signed_max() as u128;
             bx.range_metadata(size, WrappingRange { start: 0, end: size_bound });
-            // Alignment is always nonzero.
-            bx.range_metadata(align, WrappingRange { start: 1, end: !0 });
+            // Alignment is always a power of two, thus 1..=0x800…000,
+            // but also bounded by the maximum we support in type layout.
+            let align_bound = Align::max_for_target(bx.data_layout()).bytes().into();
+            bx.range_metadata(align, WrappingRange { start: 1, end: align_bound });
 
             (size, align)
         }
@@ -49,7 +52,7 @@ pub fn size_and_align_of_dst<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 // All slice sizes must fit into `isize`, so this multiplication cannot
                 // wrap -- neither signed nor unsigned.
                 bx.unchecked_sumul(info.unwrap(), bx.const_usize(unit.size.bytes())),
-                bx.const_usize(unit.align.abi.bytes()),
+                bx.const_usize(unit.align.bytes()),
             )
         }
         ty::Foreign(_) => {
@@ -82,7 +85,7 @@ pub fn size_and_align_of_dst<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
             // This function does not return so we can now return whatever we want.
             let size = bx.const_usize(layout.size.bytes());
-            let align = bx.const_usize(layout.align.abi.bytes());
+            let align = bx.const_usize(layout.align.bytes());
             (size, align)
         }
         ty::Adt(..) | ty::Tuple(..) => {
@@ -94,7 +97,7 @@ pub fn size_and_align_of_dst<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
             let i = layout.fields.count() - 1;
             let unsized_offset_unadjusted = layout.fields.offset(i).bytes();
-            let sized_align = layout.align.abi.bytes();
+            let sized_align = layout.align.bytes();
             debug!(
                 "DST {} offset of dyn field: {}, statically sized align: {}",
                 t, unsized_offset_unadjusted, sized_align
@@ -105,7 +108,7 @@ pub fn size_and_align_of_dst<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             // Recurse to get the size of the dynamically sized field (must be
             // the last field).
             let field_ty = layout.field(bx, i).ty;
-            let (unsized_size, mut unsized_align) = size_and_align_of_dst(bx, field_ty, info);
+            let (unsized_size, mut unsized_align) = size_and_align_of_dst(bx, field_ty, info, span);
 
             // # First compute the dynamic alignment
 

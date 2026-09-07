@@ -9,7 +9,7 @@
 # a custom configuration file can also be specified with `--config` to the build
 # system.
 #
-# Note that the following are equivelent, for more details see <https://toml.io/en/v1.0.0>.
+# Note that the following are equivalent, for more details see <https://toml.io/en/v1.0.0>.
 #
 #     build.verbose = 1
 #
@@ -59,7 +59,10 @@
 # toolchain or changing LLVM locally, you probably want to leave this enabled.
 #
 # Set this to `true` to download if CI llvm available otherwise it builds
-# from `src/llvm-project`.
+# from `src/llvm-project`. If you set it to `true`, it's safe and time-saving to run
+# `git submodule deinit src/llvm-project` to avoid git updating the llvm-project submodule
+# when building compiler locally.
+#
 #
 # Set this to `"if-unchanged"` to download only if the llvm-project has not
 # been modified. You can also use this if you are unsure whether you're on a
@@ -102,6 +105,9 @@
 
 # Whether to build LLVM with support for it's gpu offload runtime.
 #llvm.offload = false
+
+# Absolute path to the directory containing ClangConfig.cmake
+#llvm.offload-clang-dir = ""
 
 # When true, link libstdc++ statically into the rustc_llvm.
 # This is useful if you don't want to use the dynamic version of that
@@ -188,6 +194,31 @@
 # Currently, this is only supported for the `x86_64-unknown-linux-gnu` target.
 #gcc.download-ci-gcc = false
 
+# Provide a directory of prebuilt libgccjit.so dylibs for given (host, target) compilation pairs.
+# This is useful when you want to cross-compile `rustc` to another target since GCC is not a
+# multi-target compiler.
+# You have to use a directory structure that looks like this:
+# `<libgccjit-libs-dir>/<host>/<target>/libgccjit.so`.
+# For example:
+#
+# ```
+# <libgccjit-libs-dir>
+# ├── m68k-unknown-linux-gnu
+# │   └── m68k-unknown-linux-gnu
+# │       └── libgccjit.so
+# └── x86_64-unknown-linux-gnu
+#     ├── m68k-unknown-linux-gnu
+#     │   └── libgccjit.so
+#     └── x86_64-unknown-linux-gnu
+#         └── libgccjit.so
+# ```
+# The directory above would allow you to cross-compile rustc from x64 to m68k
+#
+# Note that this option has priority over `gcc.download-ci-gcc`.
+# If you set both, bootstrap will first try to load libgccjit.so from this directory.
+# Only if it isn't found, it will try to download it from CI or build it locally.
+#gcc.libgccjit-libs-dir = "/path/to/libgccjit-libs-dir"
+
 # =============================================================================
 # General build configuration options
 # =============================================================================
@@ -216,6 +247,11 @@
 # A descriptive string to be appended to version output (e.g., `rustc --version`),
 # which is also used in places like debuginfo `DW_AT_producer`. This may be useful for
 # supplementary build information, like distro-specific package versions.
+#
+# IMPORTANT: Changing this value changes crate IDs and symbol name mangling, making
+# compiled artifacts incompatible. PGO profiles cannot be reused across different
+# descriptions, and incremental compilation caches are invalidated. Keep this value
+# consistent when reusing build artifacts.
 #
 # The Rust compiler will differentiate between versions of itself, including
 # based on this string, which means that if you wish to be compatible with
@@ -266,6 +302,11 @@
 # If you set this, you likely want to set `cargo` as well.
 #build.rustc = "/path/to/rustc"
 
+# Use this rustdoc binary as the stage0 snapshot rustdoc.
+# If unspecified, then the binary "rustdoc" (with platform-specific extension, e.g. ".exe")
+# in the same directory as "rustc" will be used.
+#build.rustdoc = "/path/to/rustdoc"
+
 # Instead of downloading the src/stage0 version of rustfmt specified,
 # use this rustfmt binary instead as the stage0 snapshot rustfmt.
 #build.rustfmt = "/path/to/rustfmt"
@@ -302,28 +343,37 @@
 
 # The path to (or name of) the GDB executable to use. This is only used for
 # executing the debuginfo test suite.
+# Set this to "discover" to automatically discover GDB from the environment.
 #build.gdb = "gdb"
 
 # The path to (or name of) the LLDB executable to use. This is only used for
 # executing the debuginfo test suite.
+# Set this to "discover" to automatically discover LLDB from the environment.
 #build.lldb = "lldb"
+
+# The path to (or name of) the Intel SDE executable, used to run the
+# intrinsic-test suite for x86 target features the host CPU may not support.
+#build.sde = "sde64"
 
 # The node.js executable to use. Note that this is only used for the emscripten
 # target when running tests, otherwise this can be omitted.
 #build.nodejs = "node"
 
-# The npm executable to use. Note that this is used for rustdoc-gui tests,
-# otherwise this can be omitted.
+# The yarn executable to use. Note that this is used for rustdoc-gui tests and
+# tidy js extra-checks, otherwise this can be omitted.
 #
-# Under Windows this should be `npm.cmd` or path to it (verified on nodejs v18.06), or
+# Under Windows this should be `yarn.cmd` or path to it (verified on nodejs v18.06), or
 # error will be emitted.
-#build.npm = "npm"
+#build.yarn = "yarn"
 
 # Python interpreter to use for various tasks throughout the build, notably
-# rustdoc tests, the lldb python interpreter, and some dist bits and pieces.
+# rustdoc tests, and some dist bits and pieces.
 #
 # Defaults to the Python interpreter used to execute x.py.
 #build.python = "python"
+
+# The path to (or name of) the resource compiler executable to use on Windows.
+#build.windows-rc = "rc.exe"
 
 # The path to the REUSE executable to use. Note that REUSE is not required in
 # most cases, as our tooling relies on a cached (and shrunk) copy of the
@@ -345,9 +395,9 @@
 # want to use vendoring. See https://forge.rust-lang.org/infra/other-installation-methods.html#source-code.
 #build.vendor = if "is a tarball source" && "vendor" dir exists && ".cargo/config.toml" file exists { true } else { false }
 
-# Typically the build system will build the Rust compiler twice. The second
-# compiler, however, will simply use its own libraries to link against. If you
-# would rather to perform a full bootstrap, compiling the compiler three times,
+# If you build the compiler more than twice (stage3+) or the standard library more than once
+# (stage 2+), the third compiler and second library will get uplifted from stage2 and stage1,
+# respectively. If you would like to disable this uplifting, and rather perform a full bootstrap,
 # then you can set this option to true.
 #
 # This is only useful for verifying that rustc generates reproducible builds.
@@ -407,8 +457,11 @@
 #build.profiler = false
 
 # Use the optimized LLVM C intrinsics for `compiler_builtins`, rather than Rust intrinsics.
-# Requires the LLVM submodule to be managed by bootstrap (i.e. not external) so that `compiler-rt`
-# sources are available.
+# Choosing true requires the LLVM submodule to be managed by bootstrap (i.e. not external)
+# so that `compiler-rt` sources are available.
+#
+# Setting this to a path removes the requirement for a C toolchain, but requires setting the
+# path to an existing library containing the builtins library from LLVM's compiler-rt.
 #
 # Setting this to `false` generates slower code, but removes the requirement for a C toolchain in
 # order to run `x check`.
@@ -465,8 +518,10 @@
 # What custom diff tool to use for displaying compiletest tests.
 #build.compiletest-diff-tool = <none>
 
-# Whether to use the precompiled stage0 libtest with compiletest.
-#build.compiletest-use-stage0-libtest = true
+# Whether to allow `compiletest` self-tests and `compiletest`-managed test
+# suites to be run against the stage 0 rustc. This is only intended to be used
+# when the stage 0 compiler is actually built from in-tree sources.
+#build.compiletest-allow-stage0 = false
 
 # Default value for the `--extra-checks` flag of tidy.
 #
@@ -475,6 +530,9 @@
 # Note that if any value is manually given to bootstrap such as
 # `./x test tidy --extra-checks=js`, this value is ignored.
 # Use `--extra-checks=''` to temporarily disable all extra checks.
+#
+# Automatically enabled in the "tools" profile.
+# Set to the empty string to force disable (recommended for hdd systems).
 #build.tidy-extra-checks = ""
 
 # Indicates whether ccache is used when building certain artifacts (e.g. LLVM).
@@ -485,6 +543,12 @@
 # List of paths to exclude from the build and test processes.
 # For example, exclude = ["tests/ui", "src/tools/tidy"].
 #build.exclude = []
+
+# Link the compiler and LLVM against the specified allocator instead of the default libc allocator.
+# This option is only tested on Linux and OSX. It can also be configured per-target in the
+# [target.<tuple>] section.
+# Possible options: "system" (default), "jemalloc"
+#build.allocator = "jemalloc"
 
 # =============================================================================
 # General install configuration options
@@ -645,6 +709,14 @@
 # FIXME(#61117): Some tests fail when this option is enabled.
 #rust.debuginfo-level-tests = 0
 
+# Compress debuginfo of Rust and C/C++ code.
+# Currently, this only works on Linux.
+# Valid options:
+# - "off" or false: disable compression
+# - true: compress debuginfo with the default compression method (currently zlib)
+# - "zlib": compress debuginfo with zlib
+#rust.compress-debuginfo = "off"
+
 # Should rustc and the standard library be built with split debuginfo? Default
 # is platform dependent.
 #
@@ -694,6 +766,12 @@
 # desired in distributions, for example.
 #rust.rpath = true
 
+# Additional flags to pass to `rustc`.
+# Takes precedence over bootstrap's own flags but not over per target rustflags nor env. vars. like RUSTFLAGS.
+# Applies to all stages and targets.
+#
+#rust.rustflags = []
+
 # Indicates whether symbols should be stripped using `-Cstrip=symbols`.
 #rust.strip = false
 
@@ -732,22 +810,25 @@
 # result (broken, compiling, testing) into this JSON file.
 #rust.save-toolstates = <none> (path)
 
-# This is an array of the codegen backends that will be compiled for the rustc
-# that's being compiled. The default is to only build the LLVM codegen backend,
-# and currently the only standard options supported are `"llvm"`, `"cranelift"`
-# and `"gcc"`. The first backend in this list will be used as default by rustc
-# when no explicit backend is specified.
+# This array serves three distinct purposes:
+# - Backends in this list will be automatically compiled and included in the sysroot of each
+# rustc compiled by bootstrap.
+# - The first backend in this list will be configured as the **default codegen backend** by each
+# rustc compiled by bootstrap. In other words, if the first backend is e.g. cranelift, then when
+# we build a stage 1 rustc, it will by default compile Rust programs using the Cranelift backend.
+# This also means that stage 2 rustc would get built by the Cranelift backend.
+# - Running `x dist` (without additional arguments, or with `--include-default-paths`) will produce
+# a dist component/tarball for the Cranelift backend if it is included in this array.
+#
+# Note that the LLVM codegen backend is special and will always be built and distributed.
+#
+# Currently, the only standard options supported here are `"llvm"`, `"cranelift"` and `"gcc"`.
 #rust.codegen-backends = ["llvm"]
 
-# Indicates whether LLD will be compiled and made available in the sysroot for rustc to execute, and
-# whether to set it as rustc's default linker on `x86_64-unknown-linux-gnu`. This will also only be
-# when *not* building an external LLVM (so only when using `download-ci-llvm` or building LLVM from
-# the in-tree source): setting `llvm-config` in the `[target.x86_64-unknown-linux-gnu]` section will
-# make this default to false.
-#rust.lld = false in all cases, except on `x86_64-unknown-linux-gnu` as described above, where it is true
+# Indicates whether LLD will be compiled and made available in the sysroot for rustc to execute,
+#rust.lld = false, except for targets that opt into LLD (see `target.default-linker-linux-override`)
 
-# Indicates whether LLD will be used to link Rust crates during bootstrap on
-# supported platforms.
+# Indicates if we should override the linker used to link Rust crates during bootstrap to be LLD.
 # If set to `true` or `"external"`, a global `lld` binary that has to be in $PATH
 # will be used.
 # If set to `"self-contained"`, rust-lld from the snapshot compiler will be used.
@@ -755,7 +836,7 @@
 # On MSVC, LLD will not be used if we're cross linking.
 #
 # Explicitly setting the linker for a target will override this option when targeting MSVC.
-#rust.use-lld = false
+#rust.bootstrap-override-lld = false
 
 # Indicates whether some LLVM tools, like llvm-objdump, will be made available in the
 # sysroot.
@@ -765,7 +846,8 @@
 # in the sysroot. It is required for running nvptx tests.
 #rust.llvm-bitcode-linker = false
 
-# Whether to deny warnings in crates
+# Whether to deny warnings in crates. Set to `false` to avoid
+# error: warnings are denied by `build.warnings` configuration
 #rust.deny-warnings = true
 
 # Print backtrace on internal compiler errors during bootstrap
@@ -783,9 +865,9 @@
 # Useful for reproducible builds. Generally only set for releases
 #rust.remap-debuginfo = false
 
-# Link the compiler and LLVM against `jemalloc` instead of the default libc allocator.
-# This option is only tested on Linux and OSX. It can also be configured per-target in the
-# [target.<tuple>] section.
+# Deprecated alias for `build.allocator`. Setting this to `true` is
+# equivalent to `build.allocator = "jemalloc"`. Both cannot be set in the same section
+# (`rust` or `target.[target]`)
 #rust.jemalloc = false
 
 # Run tests in various test suites with the "nll compare mode" in addition to
@@ -814,6 +896,11 @@
 # If an explicit setting is given, it will be used for all parts of the codebase.
 #rust.new-symbol-mangling = true|false (see comment)
 
+# Size limit in bytes for move/copy annotations (-Zannotate-moves). Only types
+# at or above this size will be annotated. If not specified, uses the default
+# limit (65 bytes).
+#rust.annotate-moves-size-limit = 65
+
 # Select LTO mode that will be used for compiling rustc. By default, thin local LTO
 # (LTO within a single crate) is used (like for any Rust crate). You can also select
 # "thin" or "fat" to apply Thin/Fat LTO to the `rustc_driver` dylib, or "off" to disable
@@ -835,7 +922,39 @@
 #
 # Since libstd also builds libcore and liballoc as dependencies and all their features are mirrored
 # as libstd features, this option can also be used to configure features such as optimize_for_size.
-#rust.std-features = ["panic_unwind"]
+#rust.std-features = ["panic-unwind"]
+
+# Trigger a `DebugBreak` after an internal compiler error during bootstrap on Windows
+#rust.break-on-ice = true
+
+# Set the number of threads for the compiler frontend used during compilation of Rust code (passed to `-Zthreads`).
+# The valid options are:
+# 0 - Set the number of threads according to the detected number of threads of the host system
+# 1 - Use a single thread for compilation of Rust code (the default)
+# N - Number of threads used for compilation of Rust code
+#
+#rust.parallel-frontend-threads = 1
+
+# Baseline commit SHA for comparing semver breakages in the Rust standard library.
+# The in-tree stdlib API will be evaluated for semver breakages against this commit.
+# Used for the `./x test std-semver-check` command.
+# If unset, the first upstream parent commit will be used.
+#
+# The SHA must point to a merge commit merged into the mainline rust-lang/rust `main` branch,
+# because bootstrap will attempt to download the JSON docs data for this commit from its CI.
+#rust.stdlib-semver-baseline = "<commit-sha>"
+
+# Enables building a wasm proc macro compatible toolchain.
+#
+# This requires building an additional standard library for a different target and adding it
+# to the sysroot before running tests, and so needs special handling in bootstrap. Currently
+# off by default.
+#
+# This currently opts compiletest into running/building proc-macro tests via wasm.
+#
+# The implementation for this has not finished landing, so you probably don't
+# want to enable this right now.
+#rust.wasm-proc-macros = false
 
 # =============================================================================
 # Distribution options
@@ -888,6 +1007,39 @@
 
 
 # =============================================================================
+# Profile-guided optimization options
+#
+# Configure the PGO profile to be used for compilation, or a path where the
+# profile will be written by an instrumented binary, for individual components
+# =============================================================================
+
+# Use the following profile to PGO optimize the Rust compiler.
+#pgo.rustc.use = "/tmp/profiles/foo.profraw"
+# Instrument the Rust compiler, so that when executed, it will gather profiles
+# to this path.
+#pgo.rustc.generate = "/tmp/profiles/foo.profraw"
+# Use the following profile to PGO optimize rustdoc.
+#pgo.rustdoc.use = "/tmp/profiles/foo.profraw"
+# Instrument rustdoc, so that when executed, it will gather profiles
+# to this path.
+#pgo.rustdoc.generate = "/tmp/profiles/foo.profraw"
+# Use the following profile to PGO optimize cargo.
+#pgo.cargo.use = "/tmp/profiles/foo.profraw"
+# Instrument cargo, so that when executed, it will gather profiles
+# to this path.
+#pgo.cargo.generate = "/tmp/profiles/foo.profraw"
+# Use the following profile to PGO optimize clippy.
+#pgo.clippy.use = "/tmp/profiles/foo.profraw"
+# Instrument clippy, so that when executed, it will gather profiles
+# to this path.
+#pgo.clippy.generate = "/tmp/profiles/foo.profraw"
+# Use the following profile to PGO optimize LLVM.
+#pgo.llvm.use = "/tmp/profiles/foo.profraw"
+# Instrument LLVM, so that when executed, it will gather profiles
+# Note: for LLVM specifically, this should be a directory, not a file path.
+#pgo.llvm.generate = "/tmp/profiles"
+
+# =============================================================================
 # Options for specific targets
 #
 # Each of the following options is scoped to the specific target triple in
@@ -917,7 +1069,7 @@
 # Linker to be used to bootstrap Rust code. Note that the
 # default value is platform specific, and if not specified it may also depend on
 # what platform is crossing to what platform.
-# Setting this will override the `use-lld` option for Rust code when targeting MSVC.
+# Setting this will override the `bootstrap-override-lld` option for Rust code when targeting MSVC.
 #linker = "cc" (path)
 
 # Should rustc and the standard library be built with split debuginfo? Default
@@ -936,9 +1088,18 @@
 # its historical default, but when compiling the compiler itself, we skip it by
 # default since we know it's safe to do so in that case.
 #
-# On Windows platforms, packed debuginfo is the only supported option,
-# producing a `.pdb` file.
-#split-debuginfo = if linux { off } else if windows { packed } else if apple { unpacked }
+# On Windows MSVC platforms, packed debuginfo is the only supported option,
+# producing a `.pdb` file. On Windows GNU rustc doesn't support splitting debuginfo,
+# and enabling it causes issues.
+#split-debuginfo = if linux || windows-gnu { off } else if windows-msvc { packed } else if apple { unpacked }
+
+# Compress debuginfo for Rust and C/C++ code of this target.
+# Currently, this only works on Linux.
+# Valid options:
+# - "off" or false: disable compression
+# - true: compress debuginfo with the default compression method (currently zlib)
+# - "zlib": compress debuginfo with zlib
+#compress-debuginfo = "off"
 
 # Path to the `llvm-config` binary of the installation of a custom LLVM to link
 # against. Note that if this is specified we don't compile LLVM at all for this
@@ -979,6 +1140,12 @@
 # This option supports enable `rpath` in each target independently,
 # and will override the same option under [rust] section. It only works on Unix platforms
 #rpath = rust.rpath (bool)
+
+# Additional flags to pass to `rustc`.
+# Takes precedence over bootstrap's own flags and `rust.rustflags` but not over env. vars. like RUSTFLAGS.
+# Applies to all stages.
+#
+#rustflags = rust.rustflags
 
 # Force static or dynamic linkage of the standard library for this target. If
 # this target is a host for rustc, this will also affect the linkage of the
@@ -1025,14 +1192,33 @@
 #runner = <none> (string)
 
 # Use the optimized LLVM C intrinsics for `compiler_builtins`, rather than Rust intrinsics
-# on this target.
-# Requires the LLVM submodule to be managed by bootstrap (i.e. not external) so that `compiler-rt`
-# sources are available.
+# on this target. Choosing true requires the LLVM submodule to be managed by bootstrap
+# (i.e. not external) so that `compiler-rt` sources are available.
+#
+# Setting this to a path removes the requirement for a C toolchain, but requires setting the
+# path to an existing library containing the builtins library from LLVM's compiler-rt.
 #
 # Setting this to `false` generates slower code, but removes the requirement for a C toolchain in
 # order to run `x check`.
-#optimized-compiler-builtins = build.optimized-compiler-builtins (bool)
+#optimized-compiler-builtins = build.optimized-compiler-builtins (bool or path)
 
-# Link the compiler and LLVM against `jemalloc` instead of the default libc allocator.
-# This overrides the global `rust.jemalloc` option. See that option for more info.
+# Link the compiler and LLVM against the specified allocator instead of the default libc allocator.
+# This overrides the global `build.allocator` option. See that option for more info.
+#allocator = build.allocator (string)
+
+# Deprecated alias for `allocator`. See `rust.jemalloc` for more info.
 #jemalloc = rust.jemalloc (bool)
+
+# The linker configuration that will *override* the default linker used for Linux
+# targets in the built compiler.
+#
+# The following values are supported:
+# - `off` => do not apply any override and use the default linker. This can be used to opt out of
+#   linker overrides set by bootstrap for specific targets (see below).
+# - `self-contained-lld-cc` => override the default linker to be self-contained LLD (`rust-lld`)
+#   that is invoked through `cc`.
+#
+# Currently, the following targets automatically opt into the self-contained LLD linker, unless you
+# pass `off`:
+# - x86_64-unknown-linux-gnu
+#default-linker-linux-override = "off" (for most targets)

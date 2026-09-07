@@ -1,12 +1,10 @@
 // tidy-alphabetical-start
-#![feature(array_windows)]
 #![feature(file_buffered)]
-#![feature(if_let_guard)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(once_cell_get_mut)]
 // tidy-alphabetical-end
 
-use rustc_hir::lang_items::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::adjustment::CustomCoerceUnsized;
 use rustc_middle::ty::{self, Ty};
@@ -15,12 +13,16 @@ use rustc_middle::{bug, traits};
 use rustc_span::ErrorGuaranteed;
 
 mod collector;
-mod errors;
+mod diagnostics;
+mod graph_checks;
 mod mono_checks;
+mod offload;
 mod partitioning;
 mod util;
 
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
+// Exposed so `rustc_codegen_ssa::base::codegen_crate` can trigger the
+// host-metadata manifest write.
+pub use offload::manifest::write_host_metadata_offload_manifest;
 
 fn custom_coerce_unsize_info<'tcx>(
     tcx: TyCtxtAt<'tcx>,
@@ -39,7 +41,7 @@ fn custom_coerce_unsize_info<'tcx>(
         Ok(traits::ImplSource::UserDefined(traits::ImplSourceUserDefinedData {
             impl_def_id,
             ..
-        })) => Ok(tcx.coerce_unsized_info(impl_def_id)?.custom_kind.unwrap()),
+        })) => Ok(tcx.coerce_unsized_info(*impl_def_id)?.custom_kind.unwrap()),
         impl_source => {
             bug!(
                 "invalid `CoerceUnsized` from {source_ty} to {target_ty}: impl_source: {:?}",
@@ -51,5 +53,5 @@ fn custom_coerce_unsize_info<'tcx>(
 
 pub fn provide(providers: &mut Providers) {
     partitioning::provide(providers);
-    mono_checks::provide(providers);
+    mono_checks::provide(&mut providers.queries);
 }

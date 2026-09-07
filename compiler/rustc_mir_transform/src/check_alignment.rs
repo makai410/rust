@@ -1,18 +1,20 @@
 use rustc_abi::Align;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_index::IndexVec;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::visit::PlaceContext;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{Ty, TyCtxt};
-use rustc_session::Session;
 
+use crate::PassPolicy;
 use crate::check_pointers::{BorrowedFieldProjectionMode, PointerCheck, check_pointers};
 
 pub(super) struct CheckAlignment;
 
 impl<'tcx> crate::MirPass<'tcx> for CheckAlignment {
-    fn is_enabled(&self, sess: &Session) -> bool {
-        sess.ub_checks()
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // When UB checks are enabled this is part of their semantics, not an optimization.
+        PassPolicy::optional(ctx.ub_checks())
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -29,10 +31,6 @@ impl<'tcx> crate::MirPass<'tcx> for CheckAlignment {
             insert_alignment_check,
             BorrowedFieldProjectionMode::FollowProjections,
         );
-    }
-
-    fn is_required(&self) -> bool {
-        true
     }
 }
 
@@ -59,10 +57,9 @@ fn insert_alignment_check<'tcx>(
     stmts.push(Statement::new(source_info, StatementKind::Assign(Box::new((addr, rvalue)))));
 
     // Get the alignment of the pointee
+    let align_def_id = tcx.require_lang_item(LangItem::AlignOf, source_info.span);
     let alignment =
-        local_decls.push(LocalDecl::with_source_info(tcx.types.usize, source_info)).into();
-    let rvalue = Rvalue::NullaryOp(NullOp::AlignOf, pointee_ty);
-    stmts.push(Statement::new(source_info, StatementKind::Assign(Box::new((alignment, rvalue)))));
+        Operand::unevaluated_constant(tcx, align_def_id, &[pointee_ty.into()], source_info.span);
 
     // Subtract 1 from the alignment to get the alignment mask
     let alignment_mask =
@@ -76,13 +73,12 @@ fn insert_alignment_check<'tcx>(
         source_info,
         StatementKind::Assign(Box::new((
             alignment_mask,
-            Rvalue::BinaryOp(BinOp::Sub, Box::new((Operand::Copy(alignment), one))),
+            Rvalue::BinaryOp(BinOp::Sub, Box::new((alignment.clone(), one))),
         ))),
     ));
 
     // If this target does not have reliable alignment, further limit the mask by anding it with
     // the mask for the highest reliable alignment.
-    #[allow(irrefutable_let_patterns)]
     if let max_align = tcx.sess.target.max_reliable_alignment()
         && max_align < Align::MAX
     {
@@ -141,7 +137,7 @@ fn insert_alignment_check<'tcx>(
     PointerCheck {
         cond: Operand::Copy(is_ok),
         assert_kind: Box::new(AssertKind::MisalignedPointerDereference {
-            required: Operand::Copy(alignment),
+            required: alignment,
             found: Operand::Copy(addr),
         }),
     }

@@ -26,7 +26,7 @@ const S4PIO2: f64 = 4.0 * PI_2; /* 0x401921FB, 0x54442D18 */
 /// Both the sine and cosine of `x` (f32).
 ///
 /// `x` is specified in radians and the return value is (sin(x), cos(x)).
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn sincosf(x: f32) -> (f32, f32) {
     let s: f32;
     let c: f32;
@@ -122,8 +122,6 @@ pub fn sincosf(x: f32) -> (f32, f32) {
     }
 }
 
-// PowerPC tests are failing on LLVM 13: https://github.com/rust-lang/rust/issues/88520
-#[cfg(not(target_arch = "powerpc64"))]
 #[cfg(test)]
 mod tests {
     use super::sincosf;

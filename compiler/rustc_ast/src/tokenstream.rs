@@ -3,35 +3,30 @@
 //! `TokenStream`s represent syntactic objects before they are converted into ASTs.
 //! A `TokenStream` is, roughly speaking, a sequence of [`TokenTree`]s,
 //! which are themselves a single [`Token`] or a `Delimited` subsequence of tokens.
-//!
-//! ## Ownership
-//!
-//! `TokenStream`s are persistent data structures constructed as ropes with reference
-//! counted-children. In general, this means that calling an operation on a `TokenStream`
-//! (such as `slice`) produces an entirely new `TokenStream` from the borrowed reference to
-//! the original. This essentially coerces `TokenStream`s into "views" of their subparts,
-//! and a borrowed `TokenStream` is sufficient to build an owned `TokenStream` without taking
-//! ownership of the original.
 
 use std::borrow::Cow;
+use std::hash::Hash;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::{cmp, fmt, iter, mem};
 
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 use rustc_data_structures::sync;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_macros::{Decodable, Encodable, StableHash, Walkable};
 use rustc_serialize::{Decodable, Encodable};
 use rustc_span::{DUMMY_SP, Span, SpanDecoder, SpanEncoder, Symbol, sym};
 use thin_vec::ThinVec;
 
 use crate::ast::AttrStyle;
-use crate::ast_traits::{HasAttrs, HasTokens};
+use crate::ast_traits::HasTokens;
 use crate::token::{self, Delimiter, Token, TokenKind};
 use crate::{AttrVec, Attribute};
 
+#[cfg(test)]
+mod tests;
+
 /// Part of a `TokenStream`.
-#[derive(Debug, Clone, PartialEq, Encodable, Decodable, HashStable_Generic)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
 pub enum TokenTree {
     /// A single token. Should never be `OpenDelim` or `CloseDelim`, because
     /// delimiters are implicitly represented by `Delimited`.
@@ -57,9 +52,7 @@ impl TokenTree {
         match (self, other) {
             (TokenTree::Token(token, _), TokenTree::Token(token2, _)) => token.kind == token2.kind,
             (TokenTree::Delimited(.., delim, tts), TokenTree::Delimited(.., delim2, tts2)) => {
-                delim == delim2
-                    && tts.len() == tts2.len()
-                    && tts.iter().zip(tts2.iter()).all(|(a, b)| a.eq_unspanned(b))
+                delim == delim2 && tts.iter().eq_by(tts2.iter(), |a, b| a.eq_unspanned(b))
             }
             _ => false,
         }
@@ -99,14 +92,19 @@ impl TokenTree {
     }
 }
 
-impl<CTX> HashStable<CTX> for TokenStream
-where
-    CTX: crate::HashStableContext,
-{
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
-        for sub_tt in self.iter() {
-            sub_tt.hash_stable(hcx, hasher);
-        }
+#[derive(Clone, Debug)]
+pub struct WithTokens<T> {
+    pub node: T,
+    pub tokens: Option<LazyAttrTokenStream>,
+}
+
+impl<T> WithTokens<T> {
+    pub fn new(node: T) -> WithTokens<T> {
+        WithTokens { node, tokens: None }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> WithTokens<U> {
+        WithTokens { node: f(self.node), tokens: self.tokens }
     }
 }
 
@@ -159,8 +157,8 @@ impl<D: SpanDecoder> Decodable<D> for LazyAttrTokenStream {
     }
 }
 
-impl<CTX> HashStable<CTX> for LazyAttrTokenStream {
-    fn hash_stable(&self, _hcx: &mut CTX, _hasher: &mut StableHasher) {
+impl StableHash for LazyAttrTokenStream {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, _hcx: &mut Hcx, _hasher: &mut StableHasher) {
         panic!("Attempted to compute stable hash for LazyAttrTokenStream");
     }
 }
@@ -251,14 +249,14 @@ impl LazyAttrTokenStreamInner {
                 break_last_token,
                 node_replacements,
             } => {
-                // The token produced by the final call to `{,inlined_}next` was not
+                // The token produced by the final call to `{,inlined_}next_and_bump` was not
                 // actually consumed by the callback. The combination of chaining the
                 // initial token and using `take` produces the desired result - we
                 // produce an empty `TokenStream` if no calls were made, and omit the
                 // final token otherwise.
                 let mut cursor_snapshot = cursor_snapshot.clone();
                 let tokens = iter::once(FlatToken::Token(*start_token))
-                    .chain(iter::repeat_with(|| FlatToken::Token(cursor_snapshot.next())))
+                    .chain(iter::repeat_with(|| FlatToken::Token(cursor_snapshot.next_and_bump())))
                     .take(*num_calls as usize);
 
                 if node_replacements.is_empty() {
@@ -375,7 +373,13 @@ fn make_attr_token_stream(
                         FrameData { open_delim_sp: Some((delim, span, spacing)), inner: vec![] },
                     ));
                 } else if let Some(delim) = kind.close_delim() {
-                    let frame_data = mem::replace(&mut stack_top, stack_rest.pop().unwrap());
+                    // If there's no matching opening delimiter, the token stream is malformed,
+                    // likely due to a improper delimiter positions in the source code.
+                    // It's not delimiter mismatch, and lexer can not detect it, so we just ignore it here.
+                    let Some(frame) = stack_rest.pop() else {
+                        return AttrTokenStream::new(stack_top.inner);
+                    };
+                    let frame_data = mem::replace(&mut stack_top, frame);
                     let (open_delim, open_sp, open_spacing) = frame_data.open_delim_sp.unwrap();
                     assert!(
                         open_delim.eq_ignoring_invisible_origin(&delim),
@@ -415,6 +419,11 @@ fn make_attr_token_stream(
     AttrTokenStream::new(stack_top.inner)
 }
 
+/// A shared empty attr token stream, used to avoid an unnecessary `Arc` allocation for every empty
+/// token stream.
+static EMPTY_ATTR_TOKEN_STREAM: LazyLock<AttrTokenStream> =
+    LazyLock::new(|| AttrTokenStream(Arc::new(Vec::new())));
+
 /// Like `TokenTree`, but for `AttrTokenStream`.
 #[derive(Clone, Debug, Encodable, Decodable)]
 pub enum AttrTokenTree {
@@ -427,8 +436,12 @@ pub enum AttrTokenTree {
 }
 
 impl AttrTokenStream {
-    pub fn new(tokens: Vec<AttrTokenTree>) -> AttrTokenStream {
-        AttrTokenStream(Arc::new(tokens))
+    pub fn new(tts: Vec<AttrTokenTree>) -> AttrTokenStream {
+        if tts.is_empty() {
+            EMPTY_ATTR_TOKEN_STREAM.clone()
+        } else {
+            AttrTokenStream(Arc::new(tts))
+        }
     }
 
     /// Converts this `AttrTokenStream` to a plain `Vec<TokenTree>`. During
@@ -556,15 +569,11 @@ pub struct AttrsTarget {
     pub tokens: LazyAttrTokenStream,
 }
 
-/// A `TokenStream` is an abstract sequence of tokens, organized into [`TokenTree`]s.
-#[derive(Clone, Debug, Default, Encodable, Decodable)]
-pub struct TokenStream(pub(crate) Arc<Vec<TokenTree>>);
-
 /// Indicates whether a token can join with the following token to form a
 /// compound token. Used for conversions to `proc_macro::Spacing`. Also used to
 /// guide pretty-printing, which is where the `JointHidden` value (which isn't
 /// part of `proc_macro::Spacing`) comes in useful.
-#[derive(Clone, Copy, Debug, PartialEq, Encodable, Decodable, HashStable_Generic)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
 pub enum Spacing {
     /// The token cannot join with the following token to form a compound
     /// token.
@@ -620,62 +629,18 @@ pub enum Spacing {
     JointHidden,
 }
 
-impl TokenStream {
-    /// Given a `TokenStream` with a `Stream` of only two arguments, return a new `TokenStream`
-    /// separating the two arguments with a comma for diagnostic suggestions.
-    pub fn add_comma(&self) -> Option<(TokenStream, Span)> {
-        // Used to suggest if a user writes `foo!(a b);`
-        let mut suggestion = None;
-        let mut iter = self.0.iter().enumerate().peekable();
-        while let Some((pos, ts)) = iter.next() {
-            if let Some((_, next)) = iter.peek() {
-                let sp = match (&ts, &next) {
-                    (_, TokenTree::Token(Token { kind: token::Comma, .. }, _)) => continue,
-                    (
-                        TokenTree::Token(token_left, Spacing::Alone),
-                        TokenTree::Token(token_right, _),
-                    ) if (token_left.is_non_reserved_ident() || token_left.is_lit())
-                        && (token_right.is_non_reserved_ident() || token_right.is_lit()) =>
-                    {
-                        token_left.span
-                    }
-                    (TokenTree::Delimited(sp, ..), _) => sp.entire(),
-                    _ => continue,
-                };
-                let sp = sp.shrink_to_hi();
-                let comma = TokenTree::token_alone(token::Comma, sp);
-                suggestion = Some((pos, comma, sp));
-            }
-        }
-        if let Some((pos, comma, sp)) = suggestion {
-            let mut new_stream = Vec::with_capacity(self.0.len() + 1);
-            let parts = self.0.split_at(pos + 1);
-            new_stream.extend_from_slice(parts.0);
-            new_stream.push(comma);
-            new_stream.extend_from_slice(parts.1);
-            return Some((TokenStream::new(new_stream), sp));
-        }
-        None
-    }
-}
+/// A shared empty token stream, used to avoid an unnecessary `Arc` allocation for every empty
+/// token stream.
+static EMPTY_TOKEN_STREAM: LazyLock<TokenStream> =
+    LazyLock::new(|| TokenStream(Arc::new(Vec::new())));
 
-impl FromIterator<TokenTree> for TokenStream {
-    fn from_iter<I: IntoIterator<Item = TokenTree>>(iter: I) -> Self {
-        TokenStream::new(iter.into_iter().collect::<Vec<TokenTree>>())
-    }
-}
-
-impl Eq for TokenStream {}
-
-impl PartialEq<TokenStream> for TokenStream {
-    fn eq(&self, other: &TokenStream) -> bool {
-        self.iter().eq(other.iter())
-    }
-}
+/// A `TokenStream` is an abstract sequence of tokens, organized into [`TokenTree`]s.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable)]
+pub struct TokenStream(Arc<Vec<TokenTree>>);
 
 impl TokenStream {
     pub fn new(tts: Vec<TokenTree>) -> TokenStream {
-        TokenStream(Arc::new(tts))
+        if tts.is_empty() { TokenStream::default() } else { TokenStream(Arc::new(tts)) }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -702,7 +667,7 @@ impl TokenStream {
         TokenStream::new(vec![TokenTree::token_alone(kind, span)])
     }
 
-    pub fn from_ast(node: &(impl HasAttrs + HasTokens + fmt::Debug)) -> TokenStream {
+    pub fn from_ast(node: &(impl HasTokens + fmt::Debug)) -> TokenStream {
         let tokens = node.tokens().unwrap_or_else(|| panic!("missing tokens for node: {:?}", node));
         let mut tts = vec![];
         attrs_and_tokens_to_token_trees(node.attrs(), tokens, &mut tts);
@@ -711,13 +676,12 @@ impl TokenStream {
 
     // If `vec` is not empty, try to glue `tt` onto its last token. The return
     // value indicates if gluing took place.
-    fn try_glue_to_last(vec: &mut Vec<TokenTree>, tt: &TokenTree) -> bool {
+    fn try_glue_to_last(vec: &mut [TokenTree], tt: &TokenTree) -> bool {
         if let Some(TokenTree::Token(last_tok, Spacing::Joint | Spacing::JointHidden)) = vec.last()
             && let TokenTree::Token(tok, spacing) = tt
             && let Some(glued_tok) = last_tok.glue(tok)
         {
-            // ...then overwrite the last token tree in `vec` with the
-            // glued token, and skip the first token tree from `stream`.
+            // ...then overwrite the last token tree in `vec` with the glued token.
             *vec.last_mut().unwrap() = TokenTree::Token(glued_tok, *spacing);
             true
         } else {
@@ -727,7 +691,11 @@ impl TokenStream {
 
     /// Push `tt` onto the end of the stream, possibly gluing it to the last
     /// token. Uses `make_mut` to maximize efficiency.
-    pub fn push_tree(&mut self, tt: TokenTree) {
+    ///
+    /// This is intended for specific proc macro use. For general `TokenStream`
+    /// construction within the compiler just build a `Vec<TokenTree>` with
+    /// normal `Vec` operations and then do `TokenStream::new`.
+    pub fn push_tree_with_gluing(&mut self, tt: TokenTree) {
         let vec_mut = Arc::make_mut(&mut self.0);
 
         if Self::try_glue_to_last(vec_mut, &tt) {
@@ -740,7 +708,11 @@ impl TokenStream {
     /// Push `stream` onto the end of the stream, possibly gluing the first
     /// token tree to the last token. (No other token trees will be glued.)
     /// Uses `make_mut` to maximize efficiency.
-    pub fn push_stream(&mut self, stream: TokenStream) {
+    ///
+    /// This is intended for specific proc macro use. For general `TokenStream`
+    /// construction within the compiler just build a `Vec<TokenTree>` with
+    /// normal `Vec` operations and then do `TokenStream::new`.
+    pub fn push_stream_with_gluing(&mut self, stream: TokenStream) {
         let vec_mut = Arc::make_mut(&mut self.0);
 
         let stream_iter = stream.0.iter().cloned();
@@ -754,10 +726,6 @@ impl TokenStream {
             // Append all of `stream`.
             vec_mut.extend(stream_iter);
         }
-    }
-
-    pub fn chunks(&self, chunk_size: usize) -> core::slice::Chunks<'_, TokenTree> {
-        self.0.chunks(chunk_size)
     }
 
     /// Desugar doc comments like `/// foo` in the stream into `#[doc =
@@ -847,24 +815,76 @@ impl TokenStream {
             }
         }
     }
+
+    /// Given a `TokenStream` with a `Stream` of only two arguments, return a new `TokenStream`
+    /// separating the two arguments with a comma for diagnostic suggestions.
+    pub fn add_comma(&self) -> Option<(TokenStream, Span)> {
+        // Used to suggest if a user writes `foo!(a b);`
+        let mut suggestion = None;
+        let mut iter = self.0.iter().enumerate().peekable();
+        while let Some((pos, ts)) = iter.next() {
+            if let Some((_, next)) = iter.peek() {
+                let sp = match (&ts, &next) {
+                    (_, TokenTree::Token(Token { kind: token::Comma, .. }, _)) => continue,
+                    (
+                        TokenTree::Token(token_left, Spacing::Alone),
+                        TokenTree::Token(token_right, _),
+                    ) if (token_left.is_non_reserved_ident() || token_left.is_lit())
+                        && (token_right.is_non_reserved_ident() || token_right.is_lit()) =>
+                    {
+                        token_left.span
+                    }
+                    (TokenTree::Delimited(sp, ..), _) => sp.entire(),
+                    _ => continue,
+                };
+                let sp = sp.shrink_to_hi();
+                let comma = TokenTree::token_alone(token::Comma, sp);
+                suggestion = Some((pos, comma, sp));
+            }
+        }
+        if let Some((pos, comma, sp)) = suggestion {
+            let mut new_stream = Vec::with_capacity(self.0.len() + 1);
+            let parts = self.0.split_at(pos + 1);
+            new_stream.extend_from_slice(parts.0);
+            new_stream.push(comma);
+            new_stream.extend_from_slice(parts.1);
+            return Some((TokenStream::new(new_stream), sp));
+        }
+        None
+    }
+}
+
+impl Default for TokenStream {
+    fn default() -> TokenStream {
+        EMPTY_TOKEN_STREAM.clone()
+    }
+}
+
+impl FromIterator<TokenTree> for TokenStream {
+    fn from_iter<I: IntoIterator<Item = TokenTree>>(iter: I) -> Self {
+        TokenStream::new(iter.into_iter().collect::<Vec<TokenTree>>())
+    }
+}
+
+impl StableHash for TokenStream {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        self.0.as_slice().stable_hash(hcx, hasher);
+    }
 }
 
 #[derive(Clone)]
-pub struct TokenStreamIter<'t> {
-    stream: &'t TokenStream,
-    index: usize,
-}
+pub struct TokenStreamIter<'t>(std::slice::Iter<'t, TokenTree>);
 
 impl<'t> TokenStreamIter<'t> {
     fn new(stream: &'t TokenStream) -> Self {
-        TokenStreamIter { stream, index: 0 }
+        TokenStreamIter(stream.0.as_slice().iter())
     }
 
     // Peeking could be done via `Peekable`, but most iterators need peeking,
     // and this is simple and avoids the need to use `peekable` and `Peekable`
     // at all the use sites.
     pub fn peek(&self) -> Option<&'t TokenTree> {
-        self.stream.0.get(self.index)
+        self.0.as_slice().first()
     }
 }
 
@@ -872,40 +892,59 @@ impl<'t> Iterator for TokenStreamIter<'t> {
     type Item = &'t TokenTree;
 
     fn next(&mut self) -> Option<&'t TokenTree> {
-        self.stream.0.get(self.index).map(|tree| {
-            self.index += 1;
-            tree
-        })
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct TokenTreeCursor {
+struct TokenTreeCursor {
     stream: TokenStream,
-    /// Points to the current token tree in the stream. In `TokenCursor::curr`,
-    /// this can be any token tree. In `TokenCursor::stack`, this is always a
-    /// `TokenTree::Delimited`.
-    index: usize,
+    /// Points to the next token tree (or one past the end of the stream).
+    next_idx: usize,
 }
 
 impl TokenTreeCursor {
     #[inline]
-    pub fn new(stream: TokenStream) -> Self {
-        TokenTreeCursor { stream, index: 0 }
+    fn new(stream: TokenStream) -> Self {
+        TokenTreeCursor { stream, next_idx: 0 }
     }
 
+    /// Gets the current token tree within this cursor. In a debug build it panics on a cursor that
+    /// hasn't been bumped; in a release build it will return `None`.
     #[inline]
-    pub fn curr(&self) -> Option<&TokenTree> {
-        self.stream.get(self.index)
+    fn curr(&self) -> Option<&TokenTree> {
+        debug_assert!(self.next_idx > 0);
+        self.stream.get(self.next_idx - 1)
     }
 
-    pub fn look_ahead(&self, n: usize) -> Option<&TokenTree> {
-        self.stream.get(self.index + n)
-    }
-
+    /// Gets the next token tree without advancing.
     #[inline]
-    pub fn bump(&mut self) {
-        self.index += 1;
+    fn next(&self) -> Option<&TokenTree> {
+        self.stream.get(self.next_idx)
+    }
+
+    /// Gets the token tree `n` ahead. `look_ahead(1)` is equivalent to `next()`. `look_ahead(0)`
+    /// isn't allowed and will panic.
+    #[inline]
+    fn look_ahead(&self, n: usize) -> Option<&TokenTree> {
+        assert_ne!(n, 0);
+        self.stream.get(self.next_idx + (n - 1))
+    }
+
+    /// Move the cursor to the next token tree.
+    #[inline]
+    fn bump(&mut self) {
+        self.next_idx += 1;
+    }
+
+    /// For skipping ahead in rare circumstances.
+    #[inline]
+    fn bump_to_end(&mut self) {
+        self.next_idx = self.stream.len();
     }
 }
 
@@ -915,31 +954,83 @@ impl TokenTreeCursor {
 /// what the parser expects, for the most part.
 #[derive(Clone, Debug)]
 pub struct TokenCursor {
-    // Cursor for the current (innermost) token stream. The index within the
+    // Cursor for the current (innermost) token stream. The `next_idx` within the
     // cursor can point to any token tree in the stream (or one past the end).
-    // The delimiters for this token stream are found in `self.stack.last()`;
-    // if that is `None` we are in the outermost token stream which never has
-    // delimiters.
-    pub curr: TokenTreeCursor,
+    // The delimiters for this token stream are found in the current token tree
+    // in `self.stack.last()`; if that is `None` we are in the outermost token
+    // stream which never has delimiters.
+    curr: TokenTreeCursor,
 
-    // Token streams surrounding the current one. The index within each cursor
-    // always points to a `TokenTree::Delimited`.
-    pub stack: Vec<TokenTreeCursor>,
+    // Token streams surrounding the current one. The `next_idx` within each cursor
+    // is always greater than zero and always points one past the current
+    // `TokenTree::Delimited`.
+    stack: Vec<TokenTreeCursor>,
 }
 
 impl TokenCursor {
-    pub fn next(&mut self) -> (Token, Spacing) {
-        self.inlined_next()
+    #[inline]
+    pub fn new(stream: TokenStream) -> Self {
+        TokenCursor { curr: TokenTreeCursor::new(stream), stack: vec![] }
+    }
+
+    /// Gets the next token and advances the cursor by one.
+    pub fn next_and_bump(&mut self) -> (Token, Spacing) {
+        self.inlined_next_and_bump()
+    }
+
+    /// An `n` of 1 is the next token tree in the current token stream; won't look outside the
+    /// current token stream. `look_ahead(0)` isn't allowed and will panic.
+    #[inline]
+    pub fn look_ahead(&self, n: usize) -> Option<&TokenTree> {
+        self.curr.look_ahead(n)
+    }
+
+    /// Returns the first token tree (if there is one) past the close delimiter of the enclosing
+    /// delimited sequence. Panics if we are not within a delimited sequence.
+    #[inline]
+    pub fn look_ahead_past_close_delim(&self) -> Option<&TokenTree> {
+        self.stack.last().unwrap().next()
+    }
+
+    /// Clones the `TokenTree::Delimited` that we are currently within. Panics if we are not within
+    /// a delimited sequence.
+    #[inline]
+    pub fn clone_enclosing_delim(&self) -> TokenTree {
+        self.stack.last().unwrap().curr().unwrap().clone()
+    }
+
+    /// For skipping to the end of the current sequence, in rare circumstances.
+    #[inline]
+    pub fn bump_to_end(&mut self) {
+        self.curr.bump_to_end()
+    }
+
+    /// Note: the outermost stream has depth of 0.
+    #[inline]
+    pub fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Returns details about the parent delimited sequence, if there is one.
+    #[inline]
+    pub fn parent_delim_and_span(&self) -> Option<(Delimiter, DelimSpan)> {
+        if let Some(last) = self.stack.last()
+            && let Some(TokenTree::Delimited(span, _, delim, _)) = last.curr()
+        {
+            Some((*delim, *span))
+        } else {
+            None
+        }
     }
 
     /// This always-inlined version should only be used on hot code paths.
     #[inline(always)]
-    pub fn inlined_next(&mut self) -> (Token, Spacing) {
+    pub fn inlined_next_and_bump(&mut self) -> (Token, Spacing) {
         loop {
             // FIXME: we currently don't return `Delimiter::Invisible` open/close delims. To fix
             // #67062 we will need to, whereupon the `delim != Delimiter::Invisible` conditions
             // below can be removed.
-            if let Some(tree) = self.curr.curr() {
+            if let Some(tree) = self.curr.next() {
                 match tree {
                     &TokenTree::Token(token, spacing) => {
                         debug_assert!(!token.kind.is_delim());
@@ -949,6 +1040,7 @@ impl TokenCursor {
                     }
                     &TokenTree::Delimited(sp, spacing, delim, ref tts) => {
                         let trees = TokenTreeCursor::new(tts.clone());
+                        self.curr.bump(); // move past the `Delimited`
                         self.stack.push(mem::replace(&mut self.curr, trees));
                         if !delim.skip() {
                             return (Token::new(delim.as_open_token_kind(), sp.open), spacing.open);
@@ -962,7 +1054,6 @@ impl TokenCursor {
                     panic!("parent should be Delimited")
                 };
                 self.curr = parent;
-                self.curr.bump(); // move past the `Delimited`
                 if !delim.skip() {
                     return (Token::new(delim.as_close_token_kind(), span.close), spacing.close);
                 }
@@ -977,7 +1068,8 @@ impl TokenCursor {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Encodable, Decodable, HashStable_Generic)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Encodable, Decodable, StableHash, Walkable)]
 pub struct DelimSpan {
     pub open: Span,
     pub close: Span,
@@ -1001,7 +1093,7 @@ impl DelimSpan {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Encodable, Decodable, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
 pub struct DelimSpacing {
     pub open: Spacing,
     pub close: Spacing,

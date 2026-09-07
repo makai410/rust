@@ -4,7 +4,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 #[allow(improper_ctypes)]
-unsafe extern "unadjusted" {
+unsafe extern "llvm-intrinsic" {
     #[link_name = "llvm.x86.rdrand.16"]
     fn x86_rdrand16_step() -> (u16, i32);
     #[link_name = "llvm.x86.rdrand.32"]
@@ -26,8 +26,8 @@ use stdarch_test::assert_instr;
 #[target_feature(enable = "rdrand")]
 #[cfg_attr(test, assert_instr(rdrand))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
-pub unsafe fn _rdrand16_step(val: &mut u16) -> i32 {
-    let (v, flag) = x86_rdrand16_step();
+pub fn _rdrand16_step(val: &mut u16) -> i32 {
+    let (v, flag) = unsafe { x86_rdrand16_step() };
     *val = v;
     flag
 }
@@ -40,8 +40,8 @@ pub unsafe fn _rdrand16_step(val: &mut u16) -> i32 {
 #[target_feature(enable = "rdrand")]
 #[cfg_attr(test, assert_instr(rdrand))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
-pub unsafe fn _rdrand32_step(val: &mut u32) -> i32 {
-    let (v, flag) = x86_rdrand32_step();
+pub fn _rdrand32_step(val: &mut u32) -> i32 {
+    let (v, flag) = unsafe { x86_rdrand32_step() };
     *val = v;
     flag
 }
@@ -54,8 +54,8 @@ pub unsafe fn _rdrand32_step(val: &mut u32) -> i32 {
 #[target_feature(enable = "rdseed")]
 #[cfg_attr(test, assert_instr(rdseed))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
-pub unsafe fn _rdseed16_step(val: &mut u16) -> i32 {
-    let (v, flag) = x86_rdseed16_step();
+pub fn _rdseed16_step(val: &mut u16) -> i32 {
+    let (v, flag) = unsafe { x86_rdseed16_step() };
     *val = v;
     flag
 }
@@ -68,8 +68,8 @@ pub unsafe fn _rdseed16_step(val: &mut u16) -> i32 {
 #[target_feature(enable = "rdseed")]
 #[cfg_attr(test, assert_instr(rdseed))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
-pub unsafe fn _rdseed32_step(val: &mut u32) -> i32 {
-    let (v, flag) = x86_rdseed32_step();
+pub fn _rdseed32_step(val: &mut u32) -> i32 {
+    let (v, flag) = unsafe { x86_rdseed32_step() };
     *val = v;
     flag
 }

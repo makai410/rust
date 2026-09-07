@@ -3,7 +3,7 @@ use std::num::NonZero;
 
 use rustc_abi::{HasDataLayout, Size};
 use rustc_data_structures::static_assert_size;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 
 use super::AllocId;
 
@@ -56,7 +56,7 @@ impl<T: HasDataLayout> PointerArithmetic for T {}
 /// mostly opaque; the `Machine` trait extends it with some more operations that also have access to
 /// some global state.
 /// The `Debug` rendering is used to display bare provenance, and for the default impl of `fmt`.
-pub trait Provenance: Copy + fmt::Debug + 'static {
+pub trait Provenance: Copy + PartialEq + fmt::Debug + 'static {
     /// Says whether the `offset` field of `Pointer`s with this provenance is the actual physical address.
     /// - If `false`, the offset *must* be relative. This means the bytes representing a pointer are
     ///   different from what the Abstract Machine prescribes, so the interpreter must prevent any
@@ -77,9 +77,6 @@ pub trait Provenance: Copy + fmt::Debug + 'static {
     /// Otherwise this function is best-effort (but must agree with `Machine::ptr_get_alloc`).
     /// (Identifying the offset in that allocation, however, is harder -- use `Memory::ptr_get_alloc` for that.)
     fn get_alloc_id(self) -> Option<AllocId>;
-
-    /// Defines the 'join' of provenance: what happens when doing a pointer load and different bytes have different provenance.
-    fn join(left: Option<Self>, right: Option<Self>) -> Option<Self>;
 }
 
 /// The type of provenance in the compile-time interpreter.
@@ -167,7 +164,7 @@ impl CtfeProvenance {
 }
 
 impl Provenance for CtfeProvenance {
-    // With the `AllocId` as provenance, the `offset` is interpreted *relative to the allocation*,
+    // With the `CtfeProvenance` as provenance, the `offset` is interpreted *relative to the allocation*,
     // so ptr-to-int casts are not possible (since we do not know the global physical offset).
     const OFFSET_IS_ADDR: bool = false;
 
@@ -190,10 +187,6 @@ impl Provenance for CtfeProvenance {
 
     fn get_alloc_id(self) -> Option<AllocId> {
         Some(self.alloc_id())
-    }
-
-    fn join(_left: Option<Self>, _right: Option<Self>) -> Option<Self> {
-        panic!("merging provenance is not supported when `OFFSET_IS_ADDR` is false")
     }
 }
 
@@ -223,17 +216,13 @@ impl Provenance for AllocId {
     fn get_alloc_id(self) -> Option<AllocId> {
         Some(self)
     }
-
-    fn join(_left: Option<Self>, _right: Option<Self>) -> Option<Self> {
-        panic!("merging provenance is not supported when `OFFSET_IS_ADDR` is false")
-    }
 }
 
 /// Represents a pointer in the Miri engine.
 ///
 /// Pointers are "tagged" with provenance information; typically the `AllocId` they belong to.
 #[derive(Copy, Clone, Eq, PartialEq, TyEncodable, TyDecodable, Hash)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub struct Pointer<Prov = CtfeProvenance> {
     pub(super) offset: Size, // kept private to avoid accidental misinterpretation (meaning depends on `Prov` type)
     pub provenance: Prov,
@@ -247,6 +236,12 @@ static_assert_size!(Pointer<Option<CtfeProvenance>>, 16);
 // We want the `Debug` output to be readable as it is used by `derive(Debug)` for
 // all the Miri types.
 impl<Prov: Provenance> fmt::Debug for Pointer<Prov> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Provenance::fmt(self, f)
+    }
+}
+
+impl<Prov: Provenance> fmt::Display for Pointer<Prov> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Provenance::fmt(self, f)
     }

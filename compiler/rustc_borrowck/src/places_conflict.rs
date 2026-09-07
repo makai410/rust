@@ -234,6 +234,13 @@ fn place_components_conflict<'tcx>(
                     return false;
                 }
 
+                (ProjectionElem::PhantomDeref, _, Shallow(None)) => {
+                    // e.g., a reborrow of `x.y` while we shallowly access `x.y` or some prefix
+                    // thereof - the shallow access cannot invalidate the reborrowed copy.
+                    debug!("borrow_conflicts_with_place: shallow access behind reborrow");
+                    return false;
+                }
+
                 (ProjectionElem::Field { .. }, ty::Adt(def, _), AccessDepth::Drop) => {
                     // Drop can read/write arbitrary projections, so places
                     // conflict regardless of further projections.
@@ -244,12 +251,12 @@ fn place_components_conflict<'tcx>(
 
                 (ProjectionElem::Deref, _, Deep)
                 | (ProjectionElem::Deref, _, AccessDepth::Drop)
+                | (ProjectionElem::PhantomDeref, _, _)
                 | (ProjectionElem::Field { .. }, _, _)
                 | (ProjectionElem::Index { .. }, _, _)
                 | (ProjectionElem::ConstantIndex { .. }, _, _)
                 | (ProjectionElem::Subslice { .. }, _, _)
                 | (ProjectionElem::OpaqueCast { .. }, _, _)
-                | (ProjectionElem::Subtype(_), _, _)
                 | (ProjectionElem::Downcast { .. }, _, _)
                 | (ProjectionElem::UnwrapUnsafeBinder(_), _, _) => {
                     // Recursive case. This can still be disjoint on a
@@ -300,6 +307,11 @@ fn place_projection_conflict<'tcx>(
         (ProjectionElem::Deref, ProjectionElem::Deref) => {
             // derefs (e.g., `*x` vs. `*x`) - recur.
             debug!("place_element_conflict: DISJOINT-OR-EQ-DEREF");
+            Overlap::EqualOrDisjoint
+        }
+        (ProjectionElem::PhantomDeref, ProjectionElem::PhantomDeref) => {
+            // phantom derefs (e.g., `x` vs. `x`) - recur.
+            debug!("place_element_conflict: DISJOINT-OR-EQ-PHANTOM-DEREF");
             Overlap::EqualOrDisjoint
         }
         (ProjectionElem::OpaqueCast(_), ProjectionElem::OpaqueCast(_)) => {
@@ -507,10 +519,10 @@ fn place_projection_conflict<'tcx>(
         }
         (
             ProjectionElem::Deref
+            | ProjectionElem::PhantomDeref
             | ProjectionElem::Field(..)
             | ProjectionElem::Index(..)
             | ProjectionElem::ConstantIndex { .. }
-            | ProjectionElem::Subtype(_)
             | ProjectionElem::OpaqueCast { .. }
             | ProjectionElem::Subslice { .. }
             | ProjectionElem::Downcast(..),
@@ -522,7 +534,7 @@ fn place_projection_conflict<'tcx>(
         ),
 
         (ProjectionElem::UnwrapUnsafeBinder(_), _) => {
-            todo!()
+            unimplemented!()
         }
     }
 }

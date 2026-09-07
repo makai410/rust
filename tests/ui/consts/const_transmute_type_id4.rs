@@ -1,4 +1,4 @@
-#![feature(const_type_id, const_trait_impl, const_cmp)]
+#![feature(const_trait_impl, const_cmp)]
 
 use std::any::TypeId;
 
@@ -10,7 +10,7 @@ const _: () = {
         std::ptr::write(ptr.offset(0), main as fn() as *const ());
     }
     assert!(a == b);
-    //~^ ERROR: type_id_eq: `TypeId` provenance is not a type id
+    //~^ ERROR: invalid `TypeId` value
 };
 
 fn main() {}

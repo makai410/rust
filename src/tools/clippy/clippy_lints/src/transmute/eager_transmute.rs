@@ -1,10 +1,11 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::{eq_expr_value, path_to_local, sym};
+use clippy_utils::{eq_expr_value, path_to_local_with_projections, sym};
 use rustc_abi::WrappingRange;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, Node};
 use rustc_lint::LateContext;
 use rustc_middle::ty::Ty;
+use rustc_span::SyntaxContext;
 
 use super::EAGER_TRANSMUTE;
 
@@ -54,20 +55,16 @@ fn binops_with_local(cx: &LateContext<'_>, local_expr: &Expr<'_>, expr: &Expr<'_
                     lang_items.range_to_struct()
                 ].into_iter().any(|did| did == Some(receiver_adt.did())) =>
         {
-            eq_expr_value(cx, local_expr, arg.peel_borrows())
+            eq_expr_value(cx, SyntaxContext::root(), local_expr, arg.peel_borrows())
         },
-        _ => eq_expr_value(cx, local_expr, expr),
+        _ => eq_expr_value(cx, SyntaxContext::root(), local_expr, expr),
     }
 }
 
 /// Checks if an expression is a path to a local variable (with optional projections), e.g.
 /// `x.field[0].field2` would return true.
 fn is_local_with_projections(expr: &Expr<'_>) -> bool {
-    match expr.kind {
-        ExprKind::Path(_) => path_to_local(expr).is_some(),
-        ExprKind::Field(expr, _) | ExprKind::Index(expr, ..) => is_local_with_projections(expr),
-        _ => false,
-    }
+    path_to_local_with_projections(expr).is_some()
 }
 
 pub(super) fn check<'tcx>(

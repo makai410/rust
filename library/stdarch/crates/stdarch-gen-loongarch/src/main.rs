@@ -1,9 +1,12 @@
+use std::collections::HashSet;
 use std::env;
 use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{self, BufReader};
+use std::path::Path;
 use std::path::PathBuf;
+use stdarch_gen_common::{Mode, run_generator};
 
 /// Complete lines of generated source.
 ///
@@ -90,6 +93,14 @@ impl TargetFeature {
     }
 }
 
+fn portable_intrinsics() -> HashSet<&'static str> {
+    include_str!("portable-intrinsics.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
 fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
     let f = File::open(in_file.clone()).unwrap_or_else(|_| panic!("Failed to open {in_file}"));
     let f = BufReader::new(f);
@@ -105,6 +116,7 @@ fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
     let mut asm_fmts = String::new();
     let mut data_types = String::new();
     let fn_pat = format!("__{ext_name}_");
+    let portable_intrinsics = portable_intrinsics();
     for line in f.lines() {
         let line = line.unwrap();
         if line.is_empty() {
@@ -121,6 +133,9 @@ fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
             let e = line.find('(').unwrap();
             let name = line.get(s + 2..e).unwrap().trim().to_string();
             out.push_str(&format!("/// {name}\n"));
+            if portable_intrinsics.contains(name.as_str()) {
+                out.push_str("impl = portable\n");
+            }
             out.push_str(&format!("name = {name}\n"));
             out.push_str(&format!("asm-fmts = {asm_fmts}\n"));
             out.push_str(&format!("data-types = {data_types}\n"));
@@ -135,8 +150,8 @@ fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn gen_bind(in_file: String, ext_name: &str) -> io::Result<()> {
-    let f = File::open(in_file.clone()).unwrap_or_else(|_| panic!("Failed to open {in_file}"));
+fn gen_bind(in_file: &str, ext_name: &str, out_path: &Path) -> io::Result<()> {
+    let f = File::open(in_file).unwrap_or_else(|_| panic!("Failed to open {in_file}"));
     let f = BufReader::new(f);
 
     let target: TargetFeature = TargetFeature::new(ext_name);
@@ -146,6 +161,7 @@ fn gen_bind(in_file: String, ext_name: &str) -> io::Result<()> {
     let mut link_function_str = String::new();
     let mut function_str = String::new();
     let mut out = String::new();
+    let mut skip = false;
 
     out.push_str(&format!(
         r#"// This code is automatically generated. DO NOT MODIFY.
@@ -156,14 +172,15 @@ fn gen_bind(in_file: String, ext_name: &str) -> io::Result<()> {
 // OUT_DIR=`pwd`/crates/core_arch cargo run -p stdarch-gen-loongarch -- {in_file}
 // ```
 
-use super::types::*;
+use crate::mem::transmute;
+use super::super::*;
 "#
     ));
 
     out.push_str(
         r#"
 #[allow(improper_ctypes)]
-unsafe extern "unadjusted" {
+unsafe extern "llvm-intrinsic" {
 "#,
     );
 
@@ -172,7 +189,9 @@ unsafe extern "unadjusted" {
         if line.is_empty() {
             continue;
         }
-        if let Some(name) = line.strip_prefix("name = ") {
+        if line.starts_with("impl = portable") {
+            skip = true;
+        } else if let Some(name) = line.strip_prefix("name = ") {
             current_name = Some(String::from(name));
         } else if line.starts_with("asm-fmts = ") {
             asm_fmts = line[10..]
@@ -209,6 +228,11 @@ unsafe extern "unadjusted" {
                 panic!("DEBUG: line: {0} len: {1}", line, data_types.len());
             }
 
+            if skip {
+                skip = false;
+                continue;
+            }
+
             let (link_function, function) =
                 gen_bind_body(&current_name, &asm_fmts, &in_t, out_t, para_num, target);
             link_function_str.push_str(&link_function);
@@ -219,13 +243,7 @@ unsafe extern "unadjusted" {
     out.push_str("}\n");
     out.push_str(&function_str);
 
-    let out_path: PathBuf =
-        PathBuf::from(env::var("OUT_DIR").unwrap_or("crates/core_arch".to_string()))
-            .join("src")
-            .join("loongarch64")
-            .join(ext_name);
-    std::fs::create_dir_all(&out_path)?;
-
+    std::fs::create_dir_all(out_path)?;
     let mut file = File::create(out_path.join("generated.rs"))?;
     file.write_all(out.as_bytes())?;
     Ok(())
@@ -239,72 +257,98 @@ fn gen_bind_body(
     para_num: i32,
     target: TargetFeature,
 ) -> (String, String) {
-    let type_to_rst = |t: &str, s: bool| -> &str {
-        match (t, s) {
-            ("V16QI", _) => "v16i8",
-            ("V32QI", _) => "v32i8",
-            ("V8HI", _) => "v8i16",
-            ("V16HI", _) => "v16i16",
-            ("V4SI", _) => "v4i32",
-            ("V8SI", _) => "v8i32",
-            ("V2DI", _) => "v2i64",
-            ("V4DI", _) => "v4i64",
-            ("UV16QI", _) => "v16u8",
-            ("UV32QI", _) => "v32u8",
-            ("UV8HI", _) => "v8u16",
-            ("UV16HI", _) => "v16u16",
-            ("UV4SI", _) => "v4u32",
-            ("UV8SI", _) => "v8u32",
-            ("UV2DI", _) => "v2u64",
-            ("UV4DI", _) => "v4u64",
-            ("SI", _) => "i32",
-            ("DI", _) => "i64",
-            ("USI", _) => "u32",
-            ("UDI", _) => "u64",
-            ("V4SF", _) => "v4f32",
-            ("V8SF", _) => "v8f32",
-            ("V2DF", _) => "v2f64",
-            ("V4DF", _) => "v4f64",
-            ("UQI", _) => "u32",
-            ("QI", _) => "i32",
-            ("CVPOINTER", false) => "*const i8",
-            ("CVPOINTER", true) => "*mut i8",
-            ("HI", _) => "i32",
-            (_, _) => panic!("unknown type: {t}"),
+    enum TypeKind {
+        Vector,
+        Intrinsic,
+    }
+    use TypeKind::*;
+    let type_to_rst = |t: &str, s: bool, k: TypeKind| -> &str {
+        match (t, s, k) {
+            ("V16QI", _, Vector) => "__v16i8",
+            ("V16QI", _, Intrinsic) => "m128i",
+            ("V32QI", _, Vector) => "__v32i8",
+            ("V32QI", _, Intrinsic) => "m256i",
+            ("V8HI", _, Vector) => "__v8i16",
+            ("V8HI", _, Intrinsic) => "m128i",
+            ("V16HI", _, Vector) => "__v16i16",
+            ("V16HI", _, Intrinsic) => "m256i",
+            ("V4SI", _, Vector) => "__v4i32",
+            ("V4SI", _, Intrinsic) => "m128i",
+            ("V8SI", _, Vector) => "__v8i32",
+            ("V8SI", _, Intrinsic) => "m256i",
+            ("V2DI", _, Vector) => "__v2i64",
+            ("V2DI", _, Intrinsic) => "m128i",
+            ("V4DI", _, Vector) => "__v4i64",
+            ("V4DI", _, Intrinsic) => "m256i",
+            ("UV16QI", _, Vector) => "__v16u8",
+            ("UV16QI", _, Intrinsic) => "m128i",
+            ("UV32QI", _, Vector) => "__v32u8",
+            ("UV32QI", _, Intrinsic) => "m256i",
+            ("UV8HI", _, Vector) => "__v8u16",
+            ("UV8HI", _, Intrinsic) => "m128i",
+            ("UV16HI", _, Vector) => "__v16u16",
+            ("UV16HI", _, Intrinsic) => "m256i",
+            ("UV4SI", _, Vector) => "__v4u32",
+            ("UV4SI", _, Intrinsic) => "m128i",
+            ("UV8SI", _, Vector) => "__v8u32",
+            ("UV8SI", _, Intrinsic) => "m256i",
+            ("UV2DI", _, Vector) => "__v2u64",
+            ("UV2DI", _, Intrinsic) => "m128i",
+            ("UV4DI", _, Vector) => "__v4u64",
+            ("UV4DI", _, Intrinsic) => "m256i",
+            ("SI", _, _) => "i32",
+            ("DI", _, _) => "i64",
+            ("USI", _, _) => "u32",
+            ("UDI", _, _) => "u64",
+            ("V4SF", _, Vector) => "__v4f32",
+            ("V4SF", _, Intrinsic) => "m128",
+            ("V8SF", _, Vector) => "__v8f32",
+            ("V8SF", _, Intrinsic) => "m256",
+            ("V2DF", _, Vector) => "__v2f64",
+            ("V2DF", _, Intrinsic) => "m128d",
+            ("V4DF", _, Vector) => "__v4f64",
+            ("V4DF", _, Intrinsic) => "m256d",
+            ("UQI", _, _) => "u32",
+            ("QI", _, _) => "i32",
+            ("CVPOINTER", false, _) => "*const i8",
+            ("CVPOINTER", true, _) => "*mut i8",
+            ("HI", _, _) => "i32",
+            (_, _, _) => panic!("unknown type: {t}"),
         }
     };
 
+    let is_mem = in_t.iter().any(|s| s.contains("POINTER"));
     let is_store = current_name.to_string().contains("vst");
     let link_function = {
         let fn_decl = {
             let fn_output = if out_t.to_lowercase() == "void" {
                 String::new()
             } else {
-                format!("-> {}", type_to_rst(out_t, is_store))
+                format!(" -> {}", type_to_rst(out_t, is_store, Vector))
             };
             let fn_inputs = match para_num {
-                1 => format!("(a: {})", type_to_rst(in_t[0], is_store)),
+                1 => format!("(a: {})", type_to_rst(in_t[0], is_store, Vector)),
                 2 => format!(
                     "(a: {}, b: {})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store)
+                    type_to_rst(in_t[0], is_store, Vector),
+                    type_to_rst(in_t[1], is_store, Vector)
                 ),
                 3 => format!(
                     "(a: {}, b: {}, c: {})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
-                    type_to_rst(in_t[2], is_store)
+                    type_to_rst(in_t[0], is_store, Vector),
+                    type_to_rst(in_t[1], is_store, Vector),
+                    type_to_rst(in_t[2], is_store, Vector)
                 ),
                 4 => format!(
                     "(a: {}, b: {}, c: {}, d: {})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
-                    type_to_rst(in_t[2], is_store),
-                    type_to_rst(in_t[3], is_store)
+                    type_to_rst(in_t[0], is_store, Vector),
+                    type_to_rst(in_t[1], is_store, Vector),
+                    type_to_rst(in_t[2], is_store, Vector),
+                    type_to_rst(in_t[3], is_store, Vector)
                 ),
                 _ => panic!("unsupported parameter number"),
             };
-            format!("fn __{current_name}{fn_inputs} {fn_output};")
+            format!("fn __{current_name}{fn_inputs}{fn_output};")
         };
         let function = format!(
             r#"    #[link_name = "llvm.loongarch.{}"]
@@ -329,34 +373,40 @@ fn gen_bind_body(
         let fn_output = if out_t.to_lowercase() == "void" {
             String::new()
         } else {
-            format!("-> {} ", type_to_rst(out_t, is_store))
+            format!("-> {} ", type_to_rst(out_t, is_store, Intrinsic))
         };
         let mut fn_inputs = match para_num {
-            1 => format!("(a: {})", type_to_rst(in_t[0], is_store)),
+            1 => format!("(a: {})", type_to_rst(in_t[0], is_store, Intrinsic)),
             2 => format!(
                 "(a: {}, b: {})",
-                type_to_rst(in_t[0], is_store),
-                type_to_rst(in_t[1], is_store)
+                type_to_rst(in_t[0], is_store, Intrinsic),
+                type_to_rst(in_t[1], is_store, Intrinsic)
             ),
             3 => format!(
                 "(a: {}, b: {}, c: {})",
-                type_to_rst(in_t[0], is_store),
-                type_to_rst(in_t[1], is_store),
-                type_to_rst(in_t[2], is_store)
+                type_to_rst(in_t[0], is_store, Intrinsic),
+                type_to_rst(in_t[1], is_store, Intrinsic),
+                type_to_rst(in_t[2], is_store, Intrinsic)
             ),
             4 => format!(
                 "(a: {}, b: {}, c: {}, d: {})",
-                type_to_rst(in_t[0], is_store),
-                type_to_rst(in_t[1], is_store),
-                type_to_rst(in_t[2], is_store),
-                type_to_rst(in_t[3], is_store)
+                type_to_rst(in_t[0], is_store, Intrinsic),
+                type_to_rst(in_t[1], is_store, Intrinsic),
+                type_to_rst(in_t[2], is_store, Intrinsic),
+                type_to_rst(in_t[3], is_store, Intrinsic)
             ),
             _ => panic!("unsupported parameter number"),
         };
         if para_num == 1 && in_t[0] == "HI" {
             fn_inputs = match asm_fmts[1].as_str() {
-                "si13" | "i13" => format!("<const IMM_S13: {}>()", type_to_rst(in_t[0], is_store)),
-                "si10" => format!("<const IMM_S10: {}>()", type_to_rst(in_t[0], is_store)),
+                "si13" | "i13" => format!(
+                    "<const IMM_S13: {}>()",
+                    type_to_rst(in_t[0], is_store, Intrinsic)
+                ),
+                "si10" => format!(
+                    "<const IMM_S10: {}>()",
+                    type_to_rst(in_t[0], is_store, Intrinsic)
+                ),
                 _ => panic!("unsupported assembly format: {}", asm_fmts[1]),
             };
             rustc_legacy_const_generics = "rustc_legacy_const_generics(0)";
@@ -364,8 +414,8 @@ fn gen_bind_body(
             fn_inputs = if asm_fmts[2].starts_with("ui") {
                 format!(
                     "<const IMM{2}: {1}>(a: {0})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
+                    type_to_rst(in_t[0], is_store, Intrinsic),
+                    type_to_rst(in_t[1], is_store, Intrinsic),
                     asm_fmts[2].get(2..).unwrap()
                 )
             } else {
@@ -376,8 +426,8 @@ fn gen_bind_body(
             fn_inputs = if asm_fmts[2].starts_with("si") {
                 format!(
                     "<const IMM_S{2}: {1}>(a: {0})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
+                    type_to_rst(in_t[0], is_store, Intrinsic),
+                    type_to_rst(in_t[1], is_store, Intrinsic),
                     asm_fmts[2].get(2..).unwrap()
                 )
             } else {
@@ -388,8 +438,8 @@ fn gen_bind_body(
             fn_inputs = if asm_fmts[2].starts_with("si") {
                 format!(
                     "<const IMM_S{2}: {1}>(mem_addr: {0})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
+                    type_to_rst(in_t[0], is_store, Intrinsic),
+                    type_to_rst(in_t[1], is_store, Intrinsic),
                     asm_fmts[2].get(2..).unwrap()
                 )
             } else {
@@ -400,8 +450,8 @@ fn gen_bind_body(
             fn_inputs = match asm_fmts[2].as_str() {
                 "rk" => format!(
                     "(mem_addr: {}, b: {})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store)
+                    type_to_rst(in_t[0], is_store, Intrinsic),
+                    type_to_rst(in_t[1], is_store, Intrinsic)
                 ),
                 _ => panic!("unsupported assembly format: {}", asm_fmts[2]),
             };
@@ -409,9 +459,9 @@ fn gen_bind_body(
             fn_inputs = if asm_fmts[2].starts_with("ui") {
                 format!(
                     "<const IMM{3}: {2}>(a: {0}, b: {1})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
-                    type_to_rst(in_t[2], is_store),
+                    type_to_rst(in_t[0], is_store, Intrinsic),
+                    type_to_rst(in_t[1], is_store, Intrinsic),
+                    type_to_rst(in_t[2], is_store, Intrinsic),
                     asm_fmts[2].get(2..).unwrap()
                 )
             } else {
@@ -422,9 +472,9 @@ fn gen_bind_body(
             fn_inputs = match asm_fmts[2].as_str() {
                 "si12" => format!(
                     "<const IMM_S12: {2}>(a: {0}, mem_addr: {1})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
-                    type_to_rst(in_t[2], is_store)
+                    type_to_rst(in_t[0], is_store, Intrinsic),
+                    type_to_rst(in_t[1], is_store, Intrinsic),
+                    type_to_rst(in_t[2], is_store, Intrinsic)
                 ),
                 _ => panic!("unsupported assembly format: {}", asm_fmts[2]),
             };
@@ -433,9 +483,9 @@ fn gen_bind_body(
             fn_inputs = match asm_fmts[2].as_str() {
                 "rk" => format!(
                     "(a: {}, mem_addr: {}, b: {})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
-                    type_to_rst(in_t[2], is_store)
+                    type_to_rst(in_t[0], is_store, Intrinsic),
+                    type_to_rst(in_t[1], is_store, Intrinsic),
+                    type_to_rst(in_t[2], is_store, Intrinsic)
                 ),
                 _ => panic!("unsupported assembly format: {}", asm_fmts[2]),
             };
@@ -443,10 +493,10 @@ fn gen_bind_body(
             fn_inputs = match (asm_fmts[2].as_str(), current_name.chars().last().unwrap()) {
                 ("si8", t) => format!(
                     "<const IMM_S8: {2}, const IMM{4}: {3}>(a: {0}, mem_addr: {1})",
-                    type_to_rst(in_t[0], is_store),
-                    type_to_rst(in_t[1], is_store),
-                    type_to_rst(in_t[2], is_store),
-                    type_to_rst(in_t[3], is_store),
+                    type_to_rst(in_t[0], is_store, Intrinsic),
+                    type_to_rst(in_t[1], is_store, Intrinsic),
+                    type_to_rst(in_t[2], is_store, Intrinsic),
+                    type_to_rst(in_t[3], is_store, Intrinsic),
                     type_to_imm(t),
                 ),
                 (_, _) => panic!(
@@ -456,31 +506,46 @@ fn gen_bind_body(
             };
             rustc_legacy_const_generics = "rustc_legacy_const_generics(2, 3)";
         }
-        format!("pub unsafe fn {current_name}{fn_inputs} {fn_output}")
+        format!(
+            "pub {}fn {current_name}{fn_inputs} {fn_output}",
+            if is_mem { "unsafe " } else { "" }
+        )
     };
+    let unsafe_start = if !is_mem { "unsafe { " } else { "" };
+    let unsafe_end = if !is_mem { " }" } else { "" };
     let mut call_params = {
         match para_num {
-            1 => format!("__{current_name}(a)"),
-            2 => format!("__{current_name}(a, b)"),
-            3 => format!("__{current_name}(a, b, c)"),
-            4 => format!("__{current_name}(a, b, c, d)"),
+            1 => format!("{unsafe_start}transmute(__{current_name}(transmute(a))){unsafe_end}"),
+            2 => format!(
+                "{unsafe_start}transmute(__{current_name}(transmute(a), transmute(b))){unsafe_end}"
+            ),
+            3 => format!(
+                "{unsafe_start}transmute(__{current_name}(transmute(a), transmute(b), transmute(c))){unsafe_end}"
+            ),
+            4 => format!(
+                "{unsafe_start}transmute(__{current_name}(transmute(a), transmute(b), transmute(c), transmute(d))){unsafe_end}"
+            ),
             _ => panic!("unsupported parameter number"),
         }
     };
     if para_num == 1 && in_t[0] == "HI" {
         call_params = match asm_fmts[1].as_str() {
             "si10" => {
-                format!("static_assert_simm_bits!(IMM_S10, 10);\n    __{current_name}(IMM_S10)")
+                format!(
+                    "static_assert_simm_bits!(IMM_S10, 10);\n    {unsafe_start}transmute(__{current_name}(IMM_S10)){unsafe_end}"
+                )
             }
             "i13" => {
-                format!("static_assert_simm_bits!(IMM_S13, 13);\n    __{current_name}(IMM_S13)")
+                format!(
+                    "static_assert_simm_bits!(IMM_S13, 13);\n    {unsafe_start}transmute(__{current_name}(IMM_S13)){unsafe_end}"
+                )
             }
             _ => panic!("unsupported assembly format: {}", asm_fmts[2]),
         }
     } else if para_num == 2 && (in_t[1] == "UQI" || in_t[1] == "USI") {
         call_params = if asm_fmts[2].starts_with("ui") {
             format!(
-                "static_assert_uimm_bits!(IMM{0}, {0});\n    __{current_name}(a, IMM{0})",
+                "static_assert_uimm_bits!(IMM{0}, {0});\n    {unsafe_start}transmute(__{current_name}(transmute(a), IMM{0})){unsafe_end}",
                 asm_fmts[2].get(2..).unwrap()
             )
         } else {
@@ -489,14 +554,16 @@ fn gen_bind_body(
     } else if para_num == 2 && in_t[1] == "QI" {
         call_params = match asm_fmts[2].as_str() {
             "si5" => {
-                format!("static_assert_simm_bits!(IMM_S5, 5);\n    __{current_name}(a, IMM_S5)")
+                format!(
+                    "static_assert_simm_bits!(IMM_S5, 5);\n    {unsafe_start}transmute(__{current_name}(transmute(a), IMM_S5)){unsafe_end}"
+                )
             }
             _ => panic!("unsupported assembly format: {}", asm_fmts[2]),
         };
     } else if para_num == 2 && in_t[0] == "CVPOINTER" && in_t[1] == "SI" {
         call_params = if asm_fmts[2].starts_with("si") {
             format!(
-                "static_assert_simm_bits!(IMM_S{0}, {0});\n    __{current_name}(mem_addr, IMM_S{0})",
+                "static_assert_simm_bits!(IMM_S{0}, {0});\n    {unsafe_start}transmute(__{current_name}(mem_addr, IMM_S{0})){unsafe_end}",
                 asm_fmts[2].get(2..).unwrap()
             )
         } else {
@@ -504,13 +571,15 @@ fn gen_bind_body(
         }
     } else if para_num == 2 && in_t[0] == "CVPOINTER" && in_t[1] == "DI" {
         call_params = match asm_fmts[2].as_str() {
-            "rk" => format!("__{current_name}(mem_addr, b)"),
+            "rk" => format!(
+                "{unsafe_start}transmute(__{current_name}(mem_addr, transmute(b))){unsafe_end}"
+            ),
             _ => panic!("unsupported assembly format: {}", asm_fmts[2]),
         };
     } else if para_num == 3 && (in_t[2] == "USI" || in_t[2] == "UQI") {
         call_params = if asm_fmts[2].starts_with("ui") {
             format!(
-                "static_assert_uimm_bits!(IMM{0}, {0});\n    __{current_name}(a, b, IMM{0})",
+                "static_assert_uimm_bits!(IMM{0}, {0});\n    {unsafe_start}transmute(__{current_name}(transmute(a), transmute(b), IMM{0})){unsafe_end}",
                 asm_fmts[2].get(2..).unwrap()
             )
         } else {
@@ -519,19 +588,21 @@ fn gen_bind_body(
     } else if para_num == 3 && in_t[1] == "CVPOINTER" && in_t[2] == "SI" {
         call_params = match asm_fmts[2].as_str() {
             "si12" => format!(
-                "static_assert_simm_bits!(IMM_S12, 12);\n    __{current_name}(a, mem_addr, IMM_S12)"
+                "static_assert_simm_bits!(IMM_S12, 12);\n    {unsafe_start}__{current_name}(transmute(a), mem_addr, IMM_S12){unsafe_end}"
             ),
             _ => panic!("unsupported assembly format: {}", asm_fmts[2]),
         };
     } else if para_num == 3 && in_t[1] == "CVPOINTER" && in_t[2] == "DI" {
         call_params = match asm_fmts[2].as_str() {
-            "rk" => format!("__{current_name}(a, mem_addr, b)"),
+            "rk" => format!(
+                "{unsafe_start}__{current_name}(transmute(a), mem_addr, transmute(b)){unsafe_end}"
+            ),
             _ => panic!("unsupported assembly format: {}", asm_fmts[2]),
         };
     } else if para_num == 4 {
         call_params = match (asm_fmts[2].as_str(), current_name.chars().last().unwrap()) {
             ("si8", t) => format!(
-                "static_assert_simm_bits!(IMM_S8, 8);\n    static_assert_uimm_bits!(IMM{0}, {0});\n    __{current_name}(a, mem_addr, IMM_S8, IMM{0})",
+                "static_assert_simm_bits!(IMM_S8, 8);\n    static_assert_uimm_bits!(IMM{0}, {0});\n    {unsafe_start}__{current_name}(transmute(a), mem_addr, IMM_S8, IMM{0}){unsafe_end}",
                 type_to_imm(t)
             ),
             (_, _) => panic!(
@@ -787,12 +858,13 @@ union v4df
     out.push('\n');
     out.push_str("int main(int argc, char *argv[])\n");
     out.push_str("{\n");
-    out.push_str("    printf(\"// This code is automatically generated. DO NOT MODIFY.\\n\");\n");
+    out.push_str("    printf(\"// Auto-generated tests. DO NOT MODIFY.\\n\");\n");
     out.push_str("    printf(\"// See crates/stdarch-gen-loongarch/README.md\\n\\n\");\n");
     out.push_str("    printf(\"use crate::{\\n\");\n");
     out.push_str("    printf(\"    core_arch::{loongarch64::*, simd::*},\\n\");\n");
     out.push_str("    printf(\"    mem::transmute,\\n\");\n");
     out.push_str("    printf(\"};\\n\");\n");
+    out.push_str("    printf(\"use std::hint::black_box;\\n\");\n");
     out.push_str("    printf(\"use stdarch_test::simd_test;\\n\");\n");
     out.push_str(&call_function_str);
     out.push_str("    return 0;\n");
@@ -1269,10 +1341,10 @@ fn gen_test_body(
             _ => "unsupported parameter number".to_string(),
         };
         let mut as_params = match para_num {
-            1 => "(transmute(a))".to_string(),
-            2 => "(transmute(a), transmute(b))".to_string(),
-            3 => "(transmute(a), transmute(b), transmute(c))".to_string(),
-            4 => "(transmute(a), transmute(b), transmute(c), transmute(d))".to_string(),
+            1 => "(black_box(transmute(a)))".to_string(),
+            2 => "(black_box(transmute(a)), black_box(transmute(b)))".to_string(),
+            3 => "(black_box(transmute(a)), black_box(transmute(b)), black_box(transmute(c)))".to_string(),
+            4 => "(black_box(transmute(a)), black_box(transmute(b)), black_box(transmute(c)), black_box(transmute(d)))".to_string(),
             _ => panic!("unsupported parameter number"),
         };
         let mut as_args = String::new();
@@ -1302,9 +1374,9 @@ fn gen_test_body(
         {
             fn_params = "(a)".to_string();
             if in_t[0] == "SI" {
-                as_params = "(%d)".to_string();
+                as_params = "(black_box(%d))".to_string();
             } else {
-                as_params = "(%ld)".to_string();
+                as_params = "(black_box(%ld))".to_string();
             }
             as_args = ", a".to_string();
         } else if para_num == 2 && (in_t[1] == "UQI" || in_t[1] == "USI") {
@@ -1316,7 +1388,7 @@ fn gen_test_body(
                 );
                 let val = rand_u32(asm_fmts[2].get(2..).unwrap().parse::<u8>().unwrap());
                 fn_params = format!("(a.v, {val})");
-                as_params = format!("::<{val}>(transmute(a))");
+                as_params = format!("::<{val}>(black_box(transmute(a)))");
             } else {
                 panic!("unsupported assembly format: {}", asm_fmts[2]);
             }
@@ -1329,13 +1401,13 @@ fn gen_test_body(
                 );
                 let val = rand_i32(asm_fmts[2].get(2..).unwrap().parse::<u8>().unwrap());
                 fn_params = format!("(a.v, {val})");
-                as_params = format!("::<{val}>(transmute(a))");
+                as_params = format!("::<{val}>(black_box(transmute(a)))");
             } else {
                 panic!("unsupported assembly format: {}", asm_fmts[2]);
             }
         } else if para_num == 2 && in_t[1] == "SI" && asm_fmts[2].starts_with("rk") {
             fn_params = "(a.v, b)".to_string();
-            as_params = "(transmute(a), %d)".to_string();
+            as_params = "(black_box(transmute(a)), %d)".to_string();
             as_args = ", b".to_string();
         } else if para_num == 2 && in_t[0] == "CVPOINTER" && in_t[1] == "SI" {
             if asm_fmts[2].starts_with("si") {
@@ -1387,7 +1459,7 @@ fn gen_test_body(
                 let ival = rand_i32(32);
                 let uval = rand_u32(asm_fmts[2].get(2..).unwrap().parse::<u8>().unwrap());
                 fn_params = format!("(a.v, {ival}, {uval})");
-                as_params = format!("::<{uval}>(transmute(a), {ival})");
+                as_params = format!("::<{uval}>(black_box(transmute(a)), {ival})");
             } else {
                 panic!("unsupported assembly format: {}", asm_fmts[2]);
             }
@@ -1402,7 +1474,7 @@ fn gen_test_body(
                 );
                 let val = rand_u32(asm_fmts[2].get(2..).unwrap().parse::<u8>().unwrap());
                 fn_params = format!("(a.v, b.v, {val})");
-                as_params = format!("::<{val}>(transmute(a), transmute(b))");
+                as_params = format!("::<{val}>(black_box(transmute(a)), black_box(transmute(b)))");
             } else {
                 panic!("unsupported assembly format: {}", asm_fmts[2]);
             }
@@ -1424,7 +1496,7 @@ fn gen_test_body(
                     type_to_ct(in_t[1])
                 );
                 fn_params = "(a.v, b, 0)".to_string();
-                as_params = "::<0>(transmute(a), o.as_mut_ptr())".to_string();
+                as_params = "::<0>(black_box(transmute(a)), o.as_mut_ptr())".to_string();
             } else {
                 panic!("unsupported assembly format: {}", asm_fmts[2]);
             }
@@ -1446,7 +1518,7 @@ fn gen_test_body(
                     type_to_ct(in_t[1])
                 );
                 fn_params = "(a.v, b, 0)".to_string();
-                as_params = "(transmute(a), o.as_mut_ptr(), 0)".to_string();
+                as_params = "(black_box(transmute(a)), o.as_mut_ptr(), 0)".to_string();
             } else {
                 panic!("unsupported assembly format: {}", asm_fmts[2]);
             }
@@ -1470,7 +1542,7 @@ fn gen_test_body(
                     );
                     let val = rand_u32(type_to_imm(t).try_into().unwrap());
                     fn_params = format!("(a.v, b, 0, {val})");
-                    as_params = format!("::<0, {val}>(transmute(a), o.as_mut_ptr())");
+                    as_params = format!("::<0, {val}>(black_box(transmute(a)), o.as_mut_ptr())");
                 }
                 (_, _) => panic!(
                     "unsupported assembly format: {} for {}",
@@ -1496,6 +1568,10 @@ fn gen_test_body(
             if out_t.to_lowercase() == "void" {
                 format!(
                     "    printf(\"\\n    {current_name}{as_params};\\n    assert_eq!(r, transmute(o));\\n\"{as_args});"
+                )
+            } else if current_name.starts_with("lasx_cast_128") {
+                format!(
+                    "    printf(\"\\n    assert_eq!(r.as_array()[0..2], transmute::<_, i64x4>({current_name}{as_params}).as_array()[0..2]);\\n\"{as_args});"
                 )
             } else {
                 format!(
@@ -1524,28 +1600,53 @@ static void {current_name}(void)
     (impl_function, call_function)
 }
 
-pub fn main() -> io::Result<()> {
+/// Runs the check/bless harness for `lsx`/`lasx` when invoked with
+/// no args or a bare ext name.
+pub fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
-    let in_file = args.get(1).cloned().expect("Input file missing!");
-    let in_file_path = PathBuf::from(&in_file);
-    let in_file_name = in_file_path
+    let arg_strs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let harness_exts: Option<&[&str]> = match arg_strs.as_slice() {
+        [_] => Some(&["lsx", "lasx"]),
+        [_, "lsx"] => Some(&["lsx"]),
+        [_, "lasx"] => Some(&["lasx"]),
+        _ => None,
+    };
+    if let Some(exts) = harness_exts {
+        let crate_dir =
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+        let core_arch_src = crate_dir.join("../core_arch/src");
+        let mode = Mode::from_env();
+        for ext in exts {
+            let spec_rel = format!("crates/stdarch-gen-loongarch/{ext}.spec");
+            let committed = core_arch_src.join("loongarch64").join(ext);
+            run_generator(&committed, mode, |out_dir| {
+                gen_bind(&spec_rel, ext, out_dir)
+            })
+            .map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+
+    let in_file = args[1].clone();
+    let in_file_name = PathBuf::from(&in_file)
         .file_name()
         .unwrap()
-        .to_os_string()
-        .into_string()
-        .unwrap();
-
+        .to_string_lossy()
+        .into_owned();
     let ext_name = if in_file_name.starts_with("lasx") {
         "lasx"
     } else {
         "lsx"
     };
-
     if in_file_name.ends_with(".h") {
-        gen_spec(in_file, ext_name)
-    } else if args.get(2).is_some() {
-        gen_test(in_file, ext_name)
-    } else {
-        gen_bind(in_file, ext_name)
+        return gen_spec(in_file, ext_name).map_err(|e| e.to_string());
     }
+    if let [_, _lsx_or_lasx, "test"] = arg_strs.as_slice() {
+        return gen_test(in_file, ext_name).map_err(|e| e.to_string());
+    }
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap_or("crates/core_arch".to_string()))
+        .join("src")
+        .join("loongarch64")
+        .join(ext_name);
+    gen_bind(&in_file, ext_name, &out_path).map_err(|e| e.to_string())
 }

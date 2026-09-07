@@ -4,32 +4,36 @@ use std::fmt::Write;
 use std::ops::ControlFlow;
 
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_errors::{
-    Applicability, Diag, DiagArgValue, IntoDiagArg, into_diag_arg_using_display, listify, pluralize,
-};
-use rustc_hir::def::DefKind;
+use rustc_errors::{Applicability, Diag, DiagArgValue, IntoDiagArg, listify, pluralize};
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, AmbigArg, LangItem, PredicateOrigin, WherePredicateKind};
+use rustc_hir::{self as hir, AmbigArg, PredicateOrigin, WherePredicateKind};
 use rustc_span::{BytePos, Span};
 use rustc_type_ir::TyKind::*;
 
 use crate::ty::{
-    self, AliasTy, Const, ConstKind, FallibleTypeFolder, InferConst, InferTy, Opaque,
-    PolyTraitPredicate, Projection, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable,
-    TypeSuperVisitable, TypeVisitable, TypeVisitor,
+    self, AliasTy, Const, ConstKind, FallibleTypeFolder, InferConst, InferTy, Instance, Opaque,
+    PolyTraitClause, Projection, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable,
+    TypeVisitable, TypeVisitor,
 };
 
 impl IntoDiagArg for Ty<'_> {
     fn into_diag_arg(self, path: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
         ty::tls::with(|tcx| {
-            let ty = tcx.short_string(self, path);
-            rustc_errors::DiagArgValue::Str(std::borrow::Cow::Owned(ty))
+            let ty = tcx.short_string(tcx.lift(self), path);
+            DiagArgValue::Str(std::borrow::Cow::Owned(ty))
         })
     }
 }
 
-into_diag_arg_using_display! {
-    ty::Region<'_>,
+impl IntoDiagArg for Instance<'_> {
+    fn into_diag_arg(self, path: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
+        ty::tls::with(|tcx| {
+            let instance = tcx.short_string_namespace(tcx.lift(self), path, Namespace::ValueNS);
+            DiagArgValue::Str(std::borrow::Cow::Owned(instance))
+        })
+    }
 }
 
 impl<'tcx> Ty<'tcx> {
@@ -129,7 +133,7 @@ pub fn suggest_arbitrary_trait_bound<'tcx>(
     tcx: TyCtxt<'tcx>,
     generics: &hir::Generics<'_>,
     err: &mut Diag<'_>,
-    trait_pred: PolyTraitPredicate<'tcx>,
+    trait_pred: PolyTraitClause<'tcx>,
     associated_ty: Option<(&'static str, Ty<'tcx>)>,
 ) -> bool {
     if !trait_pred.is_suggestable(tcx, false) {
@@ -517,12 +521,15 @@ pub fn suggest_constraining_type_params<'a>(
         //
         //   fn foo<T>(t: T) { ... }
         //          - help: consider restricting this type parameter with `T: Foo`
-        suggestions.push((
-            param.span.shrink_to_hi(),
-            post,
-            format!(": {constraint}"),
-            SuggestChangingConstraintsMessage::RestrictType { ty: param_name },
-        ));
+        let span = param.span.shrink_to_hi();
+        if span.can_be_used_for_suggestions() {
+            suggestions.push((
+                span,
+                post,
+                format!(": {constraint}"),
+                SuggestChangingConstraintsMessage::RestrictType { ty: param_name },
+            ));
+        }
     }
 
     // FIXME: remove the suggestions that are from derive, as the span is not correct
@@ -560,7 +567,7 @@ pub fn suggest_constraining_type_params<'a>(
         err.span_suggestion_verbose(span, msg, suggestion, applicability);
     } else if suggestions.len() > 1 {
         let post = if unstable_suggestion { " (some of them are unstable traits)" } else { "" };
-        err.multipart_suggestion_verbose(
+        err.multipart_suggestion(
             format!("consider restricting type parameters{post}"),
             suggestions.into_iter().map(|(span, _, suggestion, _)| (span, suggestion)).collect(),
             applicability,
@@ -615,11 +622,11 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IsSuggestableVisitor<'tcx> {
                 return ControlFlow::Break(());
             }
 
-            Alias(Opaque, AliasTy { def_id, .. }) => {
+            Alias(_, AliasTy { kind: Opaque { def_id }, .. }) => {
                 let parent = self.tcx.parent(def_id);
-                let parent_ty = self.tcx.type_of(parent).instantiate_identity();
+                let parent_ty = self.tcx.type_of(parent).instantiate_identity().skip_norm_wip();
                 if let DefKind::TyAlias | DefKind::AssocTy = self.tcx.def_kind(parent)
-                    && let Alias(Opaque, AliasTy { def_id: parent_opaque_def_id, .. }) =
+                    && let Alias(_, AliasTy { kind: Opaque { def_id: parent_opaque_def_id }, .. }) =
                         *parent_ty.kind()
                     && parent_opaque_def_id == def_id
                 {
@@ -629,7 +636,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IsSuggestableVisitor<'tcx> {
                 }
             }
 
-            Alias(Projection, AliasTy { def_id, .. })
+            Alias(_, AliasTy { kind: Projection { def_id }, .. })
                 if self.tcx.def_kind(def_id) != DefKind::AssocTy =>
             {
                 return ControlFlow::Break(());
@@ -684,11 +691,16 @@ impl<'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for MakeSuggestableFolder<'tcx> {
         let t = match *t.kind() {
             Infer(InferTy::TyVar(_)) if self.infer_suggestable => t,
 
-            FnDef(def_id, args) if self.placeholder.is_none() => {
-                Ty::new_fn_ptr(self.tcx, self.tcx.fn_sig(def_id).instantiate(self.tcx, args))
-            }
+            FnDef(def_id, args) if self.placeholder.is_none() => Ty::new_fn_ptr(
+                self.tcx,
+                self.tcx
+                    .fn_sig(def_id)
+                    .instantiate(self.tcx, args.no_bound_vars().unwrap())
+                    .skip_norm_wip(),
+            ),
 
             Closure(..)
+            | CoroutineClosure(..)
             | FnDef(..)
             | Infer(..)
             | Coroutine(..)
@@ -696,20 +708,17 @@ impl<'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for MakeSuggestableFolder<'tcx> {
             | Bound(_, _)
             | Placeholder(_)
             | Error(_) => {
-                if let Some(placeholder) = self.placeholder {
-                    // We replace these with infer (which is passed in from an infcx).
-                    placeholder
-                } else {
-                    return Err(());
-                }
+                let Some(placeholder) = self.placeholder else { return Err(()) };
+                // We replace these with infer (which is passed in from an infcx).
+                placeholder
             }
 
-            Alias(Opaque, AliasTy { def_id, .. }) => {
+            Alias(_, AliasTy { kind: Opaque { def_id }, .. }) => {
                 let parent = self.tcx.parent(def_id);
-                let parent_ty = self.tcx.type_of(parent).instantiate_identity();
+                let parent_ty = self.tcx.type_of(parent).instantiate_identity().skip_norm_wip();
                 if let hir::def::DefKind::TyAlias | hir::def::DefKind::AssocTy =
                     self.tcx.def_kind(parent)
-                    && let Alias(Opaque, AliasTy { def_id: parent_opaque_def_id, .. }) =
+                    && let Alias(_, AliasTy { kind: Opaque { def_id: parent_opaque_def_id }, .. }) =
                         *parent_ty.kind()
                     && parent_opaque_def_id == def_id
                 {

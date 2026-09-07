@@ -1,10 +1,9 @@
 #![feature(prelude_import)]
 #![no_std]
 #![feature(postfix_match)]
+extern crate std;
 #[prelude_import]
 use ::std::prelude::rust_2015::*;
-#[macro_use]
-extern crate std;
 
 use std::ops::Add;
 

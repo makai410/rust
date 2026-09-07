@@ -1,6 +1,5 @@
-#![allow(clippy::needless_raw_strings)]
+#![allow(clippy::needless_raw_strings, clippy::useless_vec)]
 #![warn(clippy::disallowed_methods)]
-#![allow(clippy::useless_vec)]
 
 extern crate futures;
 extern crate regex;
@@ -79,4 +78,20 @@ fn main() {
     //~^ disallowed_methods
     renamed(1);
     //~^ disallowed_methods
+}
+
+mod issue16185 {
+    use std::pin::Pin;
+    use std::task::Context;
+
+    async fn test(f: impl Future<Output = ()>) {
+        // Should not lint even though desugaring uses
+        // disallowed method `std::future::Future::poll()`.
+        f.await
+    }
+
+    fn explicit<F: Future<Output = ()>>(f: Pin<&mut F>, cx: &mut Context<'_>) {
+        f.poll(cx);
+        //~^ disallowed_methods
+    }
 }

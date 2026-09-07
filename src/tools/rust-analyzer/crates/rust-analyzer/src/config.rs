@@ -8,14 +8,15 @@ use std::{env, fmt, iter, ops::Not, sync::OnceLock};
 use cfg::{CfgAtom, CfgDiff};
 use hir::Symbol;
 use ide::{
-    AssistConfig, CallHierarchyConfig, CallableSnippets, CompletionConfig,
-    CompletionFieldsToResolve, DiagnosticsConfig, GenericParameterHints, HighlightConfig,
-    HighlightRelatedConfig, HoverConfig, HoverDocFormat, InlayFieldsToResolve, InlayHintsConfig,
-    JoinLinesConfig, MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind, Snippet, SnippetScope,
+    AnnotationConfig, AssistConfig, CallHierarchyConfig, CallableSnippets, CompletionConfig,
+    CompletionFieldsToResolve, DiagnosticsConfig, GenericParameterHints, GotoDefinitionConfig,
+    GotoImplementationConfig, HighlightConfig, HighlightRelatedConfig, HoverConfig, HoverDocFormat,
+    InlayFieldsToResolve, InlayHintsConfig, JoinLinesConfig, MemoryLayoutHoverConfig,
+    MemoryLayoutHoverRenderKind, RaFixtureConfig, RenameConfig, Snippet, SnippetScope,
     SourceRootId,
 };
 use ide_db::{
-    SnippetCap,
+    MiniCore, SnippetCap,
     assists::ExprFillDefaultMode,
     imports::insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
 };
@@ -23,7 +24,7 @@ use itertools::{Either, Itertools};
 use paths::{Utf8Path, Utf8PathBuf};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectJson, ProjectJsonData, ProjectJsonFromCommand,
-    ProjectManifest, RustLibSource,
+    ProjectManifest, RustLibSource, TargetDirectoryConfig,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
@@ -61,233 +62,349 @@ pub enum MaxSubstitutionLength {
     Limit(usize),
 }
 
-// Defines the server-side configuration of the rust-analyzer. We generate
-// *parts* of VS Code's `package.json` config from this. Run `cargo test` to
-// re-generate that file.
+// Defines the server-side configuration of the rust-analyzer. We generate *parts* of VS Code's
+// `package.json` config from this. Run `cargo test` to re-generate that file.
 //
-// However, editor specific config, which the server doesn't know about, should
-// be specified directly in `package.json`.
+// However, editor specific config, which the server doesn't know about, should be specified
+// directly in `package.json`.
 //
-// To deprecate an option by replacing it with another name use `new_name` | `old_name` so that we keep
-// parsing the old name.
+// To deprecate an option by replacing it with another name use `new_name` | `old_name` so that we
+// keep parsing the old name.
 config_data! {
-    /// Configs that apply on a workspace-wide scope. There are 2 levels on which a global configuration can be configured
+    /// Configs that apply on a workspace-wide scope. There are 2 levels on which a global
+    /// configuration can be configured
     ///
-    /// 1. `rust-analyzer.toml` file under user's config directory (e.g ~/.config/rust-analyzer/rust-analyzer.toml)
+    /// 1. `rust-analyzer.toml` file under user's config directory (e.g
+    ///    ~/.config/rust-analyzer/rust-analyzer.toml)
     /// 2. Client's own configurations (e.g `settings.json` on VS Code)
     ///
-    /// A config is searched for by traversing a "config tree" in a bottom up fashion. It is chosen by the nearest first principle.
+    /// A config is searched for by traversing a "config tree" in a bottom up fashion. It is chosen
+    /// by the nearest first principle.
     global: struct GlobalDefaultConfigData <- GlobalConfigInput -> {
         /// Warm up caches on project load.
         cachePriming_enable: bool = true,
-        /// How many worker threads to handle priming caches. The default `0` means to pick automatically.
+
+        /// How many worker threads to handle priming caches. The default `0` means to pick
+        /// automatically.
         cachePriming_numThreads: NumThreads = NumThreads::Physical,
 
         /// Custom completion snippets.
-        completion_snippets_custom: FxIndexMap<String, SnippetDef> = Config::completion_snippets_default(),
+        completion_snippets_custom: FxIndexMap<String, SnippetDef> =
+            Config::completion_snippets_default(),
 
-
-        /// These paths (file/directories) will be ignored by rust-analyzer. They are
-        /// relative to the workspace root, and globs are not supported. You may
-        /// also need to add the folders to Code's `files.watcherExclude`.
+        /// List of files to ignore
+        ///
+        /// These paths (file/directories) will be ignored by rust-analyzer. They are relative to
+        /// the workspace root, and globs are not supported. You may also need to add the folders to
+        /// Code's `files.watcherExclude`.
         files_exclude | files_excludeDirs: Vec<Utf8PathBuf> = vec![],
 
+        /// If this is `true`, when "Goto Implementations" and in "Implementations" lens, are triggered on a `struct` or `enum` or `union`, we filter out trait implementations that originate from `derive`s above the type.
+        gotoImplementations_filterAdjacentDerives: bool = false,
 
-
-        /// Enables highlighting of related return values while the cursor is on any `match`, `if`, or match arm arrow (`=>`).
+        /// Highlight related return values while the cursor is on any `match`, `if`, or match arm
+        /// arrow (`=>`).
         highlightRelated_branchExitPoints_enable: bool = true,
-        /// Enables highlighting of related references while the cursor is on `break`, `loop`, `while`, or `for` keywords.
+
+        /// Highlight related references while the cursor is on `break`, `loop`, `while`, or `for`
+        /// keywords.
         highlightRelated_breakPoints_enable: bool = true,
-        /// Enables highlighting of all captures of a closure while the cursor is on the `|` or move keyword of a closure.
+
+        /// Highlight all captures of a closure while the cursor is on the `|` or move keyword of a closure.
         highlightRelated_closureCaptures_enable: bool = true,
-        /// Enables highlighting of all exit points while the cursor is on any `return`, `?`, `fn`, or return type arrow (`->`).
+
+        /// Highlight all exit points while the cursor is on any `return`, `?`, `fn`, or return type
+        /// arrow (`->`).
         highlightRelated_exitPoints_enable: bool = true,
-        /// Enables highlighting of related references while the cursor is on any identifier.
+
+        /// Highlight related references while the cursor is on any identifier.
         highlightRelated_references_enable: bool = true,
-        /// Enables highlighting of all break points for a loop or block context while the cursor is on any `async` or `await` keywords.
+
+        /// Highlight all break points for a loop or block context while the cursor is on any
+        /// `async` or `await` keywords.
         highlightRelated_yieldPoints_enable: bool = true,
 
-        /// Whether to show `Debug` action. Only applies when
-        /// `#rust-analyzer.hover.actions.enable#` is set.
-        hover_actions_debug_enable: bool           = true,
-        /// Whether to show HoverActions in Rust files.
-        hover_actions_enable: bool          = true,
-        /// Whether to show `Go to Type Definition` action. Only applies when
-        /// `#rust-analyzer.hover.actions.enable#` is set.
-        hover_actions_gotoTypeDef_enable: bool     = true,
-        /// Whether to show `Implementations` action. Only applies when
-        /// `#rust-analyzer.hover.actions.enable#` is set.
-        hover_actions_implementations_enable: bool = true,
-        /// Whether to show `References` action. Only applies when
-        /// `#rust-analyzer.hover.actions.enable#` is set.
-        hover_actions_references_enable: bool      = false,
-        /// Whether to show `Run` action. Only applies when
-        /// `#rust-analyzer.hover.actions.enable#` is set.
-        hover_actions_run_enable: bool             = true,
-        /// Whether to show `Update Test` action. Only applies when
-        /// `#rust-analyzer.hover.actions.enable#` and `#rust-analyzer.hover.actions.run.enable#` are set.
-        hover_actions_updateTest_enable: bool     = true,
+        /// Show `Debug` action. Only applies when `#rust-analyzer.hover.actions.enable#` is set.
+        hover_actions_debug_enable: bool = true,
 
-        /// Whether to show documentation on hover.
-        hover_documentation_enable: bool           = true,
-        /// Whether to show keyword hover popups. Only applies when
+        /// Show HoverActions in Rust files.
+        hover_actions_enable: bool = true,
+
+        /// Show `Go to Type Definition` action. Only applies when
+        /// `#rust-analyzer.hover.actions.enable#` is set.
+        hover_actions_gotoTypeDef_enable: bool = true,
+
+        /// Show `Implementations` action. Only applies when `#rust-analyzer.hover.actions.enable#`
+        /// is set.
+        hover_actions_implementations_enable: bool = true,
+
+        /// Show `References` action. Only applies when `#rust-analyzer.hover.actions.enable#` is
+        /// set.
+        hover_actions_references_enable: bool = false,
+
+        /// Show `Run` action. Only applies when `#rust-analyzer.hover.actions.enable#` is set.
+        hover_actions_run_enable: bool = true,
+
+        /// Show `Update Test` action. Only applies when `#rust-analyzer.hover.actions.enable#` and
+        /// `#rust-analyzer.hover.actions.run.enable#` are set.
+        hover_actions_updateTest_enable: bool = true,
+
+        /// Show documentation on hover.
+        hover_documentation_enable: bool = true,
+
+        /// Show keyword hover popups. Only applies when
         /// `#rust-analyzer.hover.documentation.enable#` is set.
-        hover_documentation_keywords_enable: bool  = true,
-        /// Whether to show drop glue information on hover.
-        hover_dropGlue_enable: bool                = true,
+        hover_documentation_keywords_enable: bool = true,
+
+        /// Show drop glue information on hover.
+        hover_dropGlue_enable: bool = true,
+
         /// Use markdown syntax for links on hover.
         hover_links_enable: bool = true,
-        /// Whether to show what types are used as generic arguments in calls etc. on hover, and what is their max length to show such types, beyond it they will be shown with ellipsis.
+
+        /// Show what types are used as generic arguments in calls etc. on hover, and limit the max
+        /// length to show such types, beyond which they will be shown with ellipsis.
         ///
-        /// This can take three values: `null` means "unlimited", the string `"hide"` means to not show generic substitutions at all, and a number means to limit them to X characters.
+        /// This can take three values: `null` means "unlimited", the string `"hide"` means to not
+        /// show generic substitutions at all, and a number means to limit them to X characters.
         ///
         /// The default is 20 characters.
-        hover_maxSubstitutionLength: Option<MaxSubstitutionLength> = Some(MaxSubstitutionLength::Limit(20)),
+        hover_maxSubstitutionLength: Option<MaxSubstitutionLength> =
+            Some(MaxSubstitutionLength::Limit(20)),
+
         /// How to render the align information in a memory layout hover.
-        hover_memoryLayout_alignment: Option<MemoryLayoutHoverRenderKindDef> = Some(MemoryLayoutHoverRenderKindDef::Hexadecimal),
-        /// Whether to show memory layout data on hover.
+        hover_memoryLayout_alignment: Option<MemoryLayoutHoverRenderKindDef> =
+            Some(MemoryLayoutHoverRenderKindDef::Hexadecimal),
+
+        /// Show memory layout data on hover.
         hover_memoryLayout_enable: bool = true,
+
         /// How to render the niche information in a memory layout hover.
         hover_memoryLayout_niches: Option<bool> = Some(false),
+
         /// How to render the offset information in a memory layout hover.
-        hover_memoryLayout_offset: Option<MemoryLayoutHoverRenderKindDef> = Some(MemoryLayoutHoverRenderKindDef::Hexadecimal),
+        hover_memoryLayout_offset: Option<MemoryLayoutHoverRenderKindDef> =
+            Some(MemoryLayoutHoverRenderKindDef::Hexadecimal),
+
         /// How to render the padding information in a memory layout hover.
         hover_memoryLayout_padding: Option<MemoryLayoutHoverRenderKindDef> = None,
+
         /// How to render the size information in a memory layout hover.
-        hover_memoryLayout_size: Option<MemoryLayoutHoverRenderKindDef> = Some(MemoryLayoutHoverRenderKindDef::Both),
+        hover_memoryLayout_size: Option<MemoryLayoutHoverRenderKindDef> =
+            Some(MemoryLayoutHoverRenderKindDef::Both),
 
         /// How many variants of an enum to display when hovering on. Show none if empty.
         hover_show_enumVariants: Option<usize> = Some(5),
-        /// How many fields of a struct, variant or union to display when hovering on. Show none if empty.
+
+        /// How many fields of a struct, variant or union to display when hovering on. Show none if
+        /// empty.
         hover_show_fields: Option<usize> = Some(5),
+
         /// How many associated items of a trait to display when hovering a trait.
         hover_show_traitAssocItems: Option<usize> = None,
 
-        /// Whether to show inlay type hints for binding modes.
-        inlayHints_bindingModeHints_enable: bool                   = false,
-        /// Whether to show inlay type hints for method chains.
-        inlayHints_chainingHints_enable: bool                      = true,
-        /// Whether to show inlay hints after a closing `}` to indicate what item it belongs to.
-        inlayHints_closingBraceHints_enable: bool                  = true,
+        /// Show inlay type hints for binding modes.
+        inlayHints_bindingModeHints_enable: bool = false,
+
+        /// Show inlay type hints for method chains.
+        inlayHints_chainingHints_enable: bool = true,
+
+        /// Show inlay hints after a closing `}` to indicate what item it belongs to.
+        inlayHints_closingBraceHints_enable: bool = true,
+
         /// Minimum number of lines required before the `}` until the hint is shown (set to 0 or 1
         /// to always show them).
-        inlayHints_closingBraceHints_minLines: usize               = 25,
-        /// Whether to show inlay hints for closure captures.
-        inlayHints_closureCaptureHints_enable: bool                          = false,
-        /// Whether to show inlay type hints for return types of closures.
-        inlayHints_closureReturnTypeHints_enable: ClosureReturnTypeHintsDef  = ClosureReturnTypeHintsDef::Never,
-        /// Closure notation in type and chaining inlay hints.
-        inlayHints_closureStyle: ClosureStyle                                = ClosureStyle::ImplFn,
-        /// Whether to show enum variant discriminant hints.
-        inlayHints_discriminantHints_enable: DiscriminantHintsDef            = DiscriminantHintsDef::Never,
-        /// Whether to show inlay hints for type adjustments.
-        inlayHints_expressionAdjustmentHints_enable: AdjustmentHintsDef = AdjustmentHintsDef::Never,
-        /// Whether to hide inlay hints for type adjustments outside of `unsafe` blocks.
-        inlayHints_expressionAdjustmentHints_hideOutsideUnsafe: bool = false,
-        /// Whether to show inlay hints as postfix ops (`.*` instead of `*`, etc).
-        inlayHints_expressionAdjustmentHints_mode: AdjustmentHintsModeDef = AdjustmentHintsModeDef::Prefix,
-        /// Whether to show const generic parameter name inlay hints.
-        inlayHints_genericParameterHints_const_enable: bool= true,
-        /// Whether to show generic lifetime parameter name inlay hints.
-        inlayHints_genericParameterHints_lifetime_enable: bool = false,
-        /// Whether to show generic type parameter name inlay hints.
-        inlayHints_genericParameterHints_type_enable: bool = false,
-        /// Whether to show implicit drop hints.
-        inlayHints_implicitDrops_enable: bool                      = false,
-        /// Whether to show inlay hints for the implied type parameter `Sized` bound.
-        inlayHints_implicitSizedBoundHints_enable: bool            = false,
-        /// Whether to show inlay type hints for elided lifetimes in function signatures.
-        inlayHints_lifetimeElisionHints_enable: LifetimeElisionDef = LifetimeElisionDef::Never,
-        /// Whether to prefer using parameter names as the name for elided lifetime hints if possible.
-        inlayHints_lifetimeElisionHints_useParameterNames: bool    = false,
-        /// Maximum length for inlay hints. Set to null to have an unlimited length.
-        inlayHints_maxLength: Option<usize>                        = Some(25),
-        /// Whether to show function parameter name inlay hints at the call
-        /// site.
-        inlayHints_parameterHints_enable: bool                     = true,
-        /// Whether to show exclusive range inlay hints.
-        inlayHints_rangeExclusiveHints_enable: bool                = false,
-        /// Whether to show inlay hints for compiler inserted reborrows.
-        /// This setting is deprecated in favor of #rust-analyzer.inlayHints.expressionAdjustmentHints.enable#.
-        inlayHints_reborrowHints_enable: ReborrowHintsDef          = ReborrowHintsDef::Never,
-        /// Whether to render leading colons for type hints, and trailing colons for parameter hints.
-        inlayHints_renderColons: bool                              = true,
-        /// Whether to show inlay type hints for variables.
-        inlayHints_typeHints_enable: bool                          = true,
-        /// Whether to hide inlay type hints for `let` statements that initialize to a closure.
-        /// Only applies to closures with blocks, same as `#rust-analyzer.inlayHints.closureReturnTypeHints.enable#`.
-        inlayHints_typeHints_hideClosureInitialization: bool       = false,
-        /// Whether to hide inlay parameter type hints for closures.
-        inlayHints_typeHints_hideClosureParameter:bool             = false,
-        /// Whether to hide inlay type hints for constructors.
-        inlayHints_typeHints_hideNamedConstructor: bool            = false,
+        inlayHints_closingBraceHints_minLines: usize = 25,
 
-        /// Enables the experimental support for interpreting tests.
+        /// Show inlay hints for closure and coroutine captures.
+        inlayHints_closureCaptureHints_enable: bool = false,
+
+        /// Show inlay type hints for return types of closures.
+        inlayHints_closureReturnTypeHints_enable: ClosureReturnTypeHintsDef =
+            ClosureReturnTypeHintsDef::Never,
+
+        /// Closure notation in type and chaining inlay hints.
+        inlayHints_closureStyle: ClosureStyle = ClosureStyle::ImplFn,
+
+        /// Show enum variant discriminant hints.
+        inlayHints_discriminantHints_enable: DiscriminantHintsDef =
+            DiscriminantHintsDef::Never,
+
+        /// Disable reborrows in expression adjustments inlay hints.
+        ///
+        /// Reborrows are a pair of a builtin deref then borrow, i.e. `&*`. They are inserted by the compiler but are mostly useless to the programmer.
+        ///
+        /// Note: if the deref is not builtin (an overloaded deref), or the borrow is `&raw const`/`&raw mut`, they are not removed.
+        inlayHints_expressionAdjustmentHints_disableReborrows: bool =
+            true,
+
+        /// Show inlay hints for type adjustments.
+        inlayHints_expressionAdjustmentHints_enable: AdjustmentHintsDef =
+            AdjustmentHintsDef::Never,
+
+        /// Hide inlay hints for type adjustments outside of `unsafe` blocks.
+        inlayHints_expressionAdjustmentHints_hideOutsideUnsafe: bool = false,
+
+        /// Show inlay hints as postfix ops (`.*` instead of `*`, etc).
+        inlayHints_expressionAdjustmentHints_mode: AdjustmentHintsModeDef =
+            AdjustmentHintsModeDef::Prefix,
+
+        /// Show const generic parameter name inlay hints.
+        inlayHints_genericParameterHints_const_enable: bool = true,
+
+        /// Show generic lifetime parameter name inlay hints.
+        inlayHints_genericParameterHints_lifetime_enable: bool = false,
+
+        /// Show generic type parameter name inlay hints.
+        inlayHints_genericParameterHints_type_enable: bool = false,
+
+        /// Show implicit drop hints.
+        inlayHints_implicitDrops_enable: bool = false,
+
+        /// Show inlay hints for the implied type parameter `Sized` bound.
+        inlayHints_implicitSizedBoundHints_enable: bool = false,
+
+        /// Show inlay hints for the implied `dyn` keyword in trait object types.
+        inlayHints_impliedDynTraitHints_enable: bool = true,
+
+        /// Show inlay type hints for elided lifetimes in function signatures.
+        inlayHints_lifetimeElisionHints_enable: LifetimeElisionDef = LifetimeElisionDef::Never,
+
+        /// Prefer using parameter names as the name for elided lifetime hints if possible.
+        inlayHints_lifetimeElisionHints_useParameterNames: bool = false,
+
+        /// Maximum length for inlay hints. Set to null to have an unlimited length.
+        ///
+        /// **Note:** This is mostly a hint, and we don't guarantee to strictly follow the limit.
+        inlayHints_maxLength: Option<usize> = Some(25),
+
+        /// Show function parameter name inlay hints at the call site.
+        inlayHints_parameterHints_enable: bool = true,
+
+        /// Show parameter name inlay hints for missing arguments at the call site.
+        inlayHints_parameterHints_missingArguments_enable: bool = false,
+
+        /// Show exclusive range inlay hints.
+        inlayHints_rangeExclusiveHints_enable: bool = false,
+
+        /// Show inlay hints for compiler inserted reborrows.
+        ///
+        /// This setting is deprecated in favor of
+        /// #rust-analyzer.inlayHints.expressionAdjustmentHints.enable#.
+        inlayHints_reborrowHints_enable: ReborrowHintsDef = ReborrowHintsDef::Never,
+
+        /// Whether to render leading colons for type hints, and trailing colons for parameter hints.
+        inlayHints_renderColons: bool = true,
+
+        /// Show inlay type hints for variables.
+        inlayHints_typeHints_enable: bool = true,
+
+        /// Hide inlay type hints for `let` statements that initialize to a closure.
+        ///
+        /// Only applies to closures with blocks, same as
+        /// `#rust-analyzer.inlayHints.closureReturnTypeHints.enable#`.
+        inlayHints_typeHints_hideClosureInitialization: bool = false,
+
+        /// Hide inlay parameter type hints for closures.
+        inlayHints_typeHints_hideClosureParameter: bool = false,
+
+        /// Hide inlay type hints for inferred types.
+        inlayHints_typeHints_hideInferredTypes: bool = false,
+
+        /// Hide inlay type hints for constructors.
+        inlayHints_typeHints_hideNamedConstructor: bool = false,
+
+        /// Where to render type hints relative to their binding pattern.
+        inlayHints_typeHints_location: TypeHintsLocation = TypeHintsLocation::Inline,
+
+        /// Enable the experimental support for interpreting tests.
         interpret_tests: bool = false,
 
         /// Join lines merges consecutive declaration and initialization of an assignment.
         joinLines_joinAssignments: bool = true,
+
         /// Join lines inserts else between consecutive ifs.
         joinLines_joinElseIf: bool = true,
+
         /// Join lines removes trailing commas.
         joinLines_removeTrailingComma: bool = true,
+
         /// Join lines unwraps trivial blocks.
         joinLines_unwrapTrivialBlock: bool = true,
 
-        /// Whether to show `Debug` lens. Only applies when
-        /// `#rust-analyzer.lens.enable#` is set.
-        lens_debug_enable: bool            = true,
-        /// Whether to show CodeLens in Rust files.
-        lens_enable: bool           = true,
-        /// Whether to show `Implementations` lens. Only applies when
-        /// `#rust-analyzer.lens.enable#` is set.
-        lens_implementations_enable: bool  = true,
+        /// Show `Debug` lens. Only applies when `#rust-analyzer.lens.enable#` is set.
+        lens_debug_enable: bool = true,
+
+        /// Show CodeLens in Rust files.
+        lens_enable: bool = true,
+
+        /// Show `Implementations` lens. Only applies when `#rust-analyzer.lens.enable#` is set.
+        lens_implementations_enable: bool = true,
+
         /// Where to render annotations.
         lens_location: AnnotationLocation = AnnotationLocation::AboveName,
-        /// Whether to show `References` lens for Struct, Enum, and Union.
-        /// Only applies when `#rust-analyzer.lens.enable#` is set.
+
+        /// Show `References` lens for Struct, Enum, and Union. Only applies when
+        /// `#rust-analyzer.lens.enable#` is set.
         lens_references_adt_enable: bool = false,
-        /// Whether to show `References` lens for Enum Variants.
-        /// Only applies when `#rust-analyzer.lens.enable#` is set.
+
+        /// Show `References` lens for Enum Variants. Only applies when
+        /// `#rust-analyzer.lens.enable#` is set.
         lens_references_enumVariant_enable: bool = false,
-        /// Whether to show `Method References` lens. Only applies when
-        /// `#rust-analyzer.lens.enable#` is set.
+
+        /// Show `Method References` lens. Only applies when `#rust-analyzer.lens.enable#` is set.
         lens_references_method_enable: bool = false,
-        /// Whether to show `References` lens for Trait.
-        /// Only applies when `#rust-analyzer.lens.enable#` is set.
+
+        /// Show `References` lens for Trait. Only applies when `#rust-analyzer.lens.enable#` is
+        /// set.
         lens_references_trait_enable: bool = false,
-        /// Whether to show `Run` lens. Only applies when
-        /// `#rust-analyzer.lens.enable#` is set.
-        lens_run_enable: bool              = true,
-        /// Whether to show `Update Test` lens. Only applies when
-        /// `#rust-analyzer.lens.enable#` and `#rust-analyzer.lens.run.enable#` are set.
+
+        /// Show `Run` lens. Only applies when `#rust-analyzer.lens.enable#` is set.
+        lens_run_enable: bool = true,
+
+        /// Show `Update Test` lens. Only applies when `#rust-analyzer.lens.enable#` and
+        /// `#rust-analyzer.lens.run.enable#` are set.
         lens_updateTest_enable: bool = true,
 
-        /// Disable project auto-discovery in favor of explicitly specified set
-        /// of projects.
+        /// Disable project auto-discovery in favor of explicitly specified set of projects.
         ///
-        /// Elements must be paths pointing to `Cargo.toml`,
-        /// `rust-project.json`, `.rs` files (which will be treated as standalone files) or JSON
-        /// objects in `rust-project.json` format.
+        /// Elements must be paths pointing to `Cargo.toml`, `rust-project.json`, `.rs` files (which
+        /// will be treated as standalone files) or JSON objects in `rust-project.json` format.
         linkedProjects: Vec<ManifestOrProjectJson> = vec![],
 
         /// Number of syntax trees rust-analyzer keeps in memory. Defaults to 128.
-        lru_capacity: Option<u16>                 = None,
-        /// Sets the LRU capacity of the specified queries.
+        lru_capacity: Option<u16> = None,
+
+        /// The LRU capacity of the specified queries.
         lru_query_capacities: FxHashMap<Box<str>, u16> = FxHashMap::default(),
 
-        /// Whether to show `can't find Cargo.toml` error message.
-        notifications_cargoTomlNotFound: bool      = true,
+        /// Show `can't find Cargo.toml` error message.
+        notifications_cargoTomlNotFound: bool = true,
 
-        /// How many worker threads in the main loop. The default `null` means to pick automatically.
+        /// The number of worker threads in the main loop. The default `null` means to pick
+        /// automatically.
         numThreads: Option<NumThreads> = None,
 
         /// Expand attribute macros. Requires `#rust-analyzer.procMacro.enable#` to be set.
         procMacro_attributes_enable: bool = true,
+
         /// Enable support for procedural macros, implies `#rust-analyzer.cargo.buildScripts.enable#`.
-        procMacro_enable: bool                     = true,
+        procMacro_enable: bool = true,
+
+        /// Number of proc-macro server processes to spawn.
+        ///
+        /// Controls how many independent `proc-macro-srv` processes rust-analyzer
+        /// runs in parallel to handle macro expansion.
+        procMacro_processes: NumProcesses = NumProcesses::Concrete(2),
+
         /// Internal config, path to proc-macro server executable.
-        procMacro_server: Option<Utf8PathBuf>          = None,
+        procMacro_server: Option<Utf8PathBuf> = None,
+
+        /// The path where to save memory profiling output.
+        ///
+        /// **Note:** Memory profiling is not enabled by default in rust-analyzer builds, you need to build
+        /// from source for it.
+        profiling_memoryProfile: Option<Utf8PathBuf> = None,
 
         /// Exclude imports from find-all-references.
         references_excludeImports: bool = false,
@@ -295,36 +412,53 @@ config_data! {
         /// Exclude tests from find-all-references and call-hierarchy.
         references_excludeTests: bool = false,
 
+        /// Use semantic tokens for comments.
+        ///
+        /// In some editors (e.g. vscode) semantic tokens override other highlighting grammars.
+        /// By disabling semantic tokens for comments, other grammars can be used to highlight
+        /// their contents.
+        semanticHighlighting_comments_enable: bool = true,
+
         /// Inject additional highlighting into doc comments.
         ///
         /// When enabled, rust-analyzer will highlight rust source in doc comments as well as intra
         /// doc links.
         semanticHighlighting_doc_comment_inject_enable: bool = true,
-        /// Whether the server is allowed to emit non-standard tokens and modifiers.
+
+        /// Emit non-standard tokens and modifiers
+        ///
+        /// When enabled, rust-analyzer will emit tokens and modifiers that are not part of the
+        /// standard set of semantic tokens.
         semanticHighlighting_nonStandardTokens: bool = true,
+
         /// Use semantic tokens for operators.
         ///
         /// When disabled, rust-analyzer will emit semantic tokens only for operator tokens when
         /// they are tagged with modifiers.
         semanticHighlighting_operator_enable: bool = true,
+
         /// Use specialized semantic tokens for operators.
         ///
         /// When enabled, rust-analyzer will emit special token types for operator tokens instead
         /// of the generic `operator` token type.
         semanticHighlighting_operator_specialization_enable: bool = false,
+
         /// Use semantic tokens for punctuation.
         ///
         /// When disabled, rust-analyzer will emit semantic tokens only for punctuation tokens when
         /// they are tagged with modifiers or have a special role.
         semanticHighlighting_punctuation_enable: bool = false,
+
         /// When enabled, rust-analyzer will emit a punctuation semantic token for the `!` of macro
         /// calls.
         semanticHighlighting_punctuation_separate_macro_bang: bool = false,
+
         /// Use specialized semantic tokens for punctuation.
         ///
         /// When enabled, rust-analyzer will emit special token types for punctuation tokens instead
         /// of the generic `punctuation` token type.
         semanticHighlighting_punctuation_specialization_enable: bool = false,
+
         /// Use semantic tokens for strings.
         ///
         /// In some editors (e.g. vscode) semantic tokens override other highlighting grammars.
@@ -333,49 +467,104 @@ config_data! {
         semanticHighlighting_strings_enable: bool = true,
 
         /// Show full signature of the callable. Only shows parameters if disabled.
-        signatureInfo_detail: SignatureDetail                           = SignatureDetail::Full,
+        signatureInfo_detail: SignatureDetail = SignatureDetail::Full,
+
         /// Show documentation.
-        signatureInfo_documentation_enable: bool                       = true,
+        signatureInfo_documentation_enable: bool = true,
 
         /// Specify the characters allowed to invoke special on typing triggers.
-        /// - typing `=` after `let` tries to smartly add `;` if `=` is followed by an existing expression
+        ///
+        /// - typing `=` after `let` tries to smartly add `;` if `=` is followed by an existing
+        ///   expression
         /// - typing `=` between two expressions adds `;` when in statement position
-        /// - typing `=` to turn an assignment into an equality comparison removes `;` when in expression position
+        /// - typing `=` to turn an assignment into an equality comparison removes `;` when in
+        ///   expression position
         /// - typing `.` in a chain method call auto-indents
-        /// - typing `{` or `(` in front of an expression inserts a closing `}` or `)` after the expression
+        /// - typing `{` or `(` in front of an expression inserts a closing `}` or `)` after the
+        ///   expression
         /// - typing `{` in a use item adds a closing `}` in the right place
         /// - typing `>` to complete a return type `->` will insert a whitespace after it
         /// - typing `<` in a path or type position inserts a closing `>` after the path or type.
         typing_triggerChars: Option<String> = Some("=.".to_owned()),
 
 
-        /// Enables automatic discovery of projects using [`DiscoverWorkspaceConfig::command`].
+        /// Configure a command that rust-analyzer can invoke to
+        /// obtain configuration.
         ///
-        /// [`DiscoverWorkspaceConfig`] also requires setting `progress_label` and `files_to_watch`.
-        /// `progress_label` is used for the title in progress indicators, whereas `files_to_watch`
-        /// is used to determine which build system-specific files should be watched in order to
-        /// reload rust-analyzer.
+        /// This is an alternative to manually generating
+        /// `rust-project.json`: it enables rust-analyzer to generate
+        /// rust-project.json on the fly, and regenerate it when
+        /// switching or modifying projects.
         ///
-        /// Below is an example of a valid configuration:
+        /// This is an object with three fields:
+        ///
+        /// * `command`: the shell command to invoke
+        ///
+        /// * `filesToWatch`: which build system-specific files should
+        /// be watched to trigger regenerating the configuration
+        ///
+        /// * `progressLabel`: the name of the command, used in
+        /// progress indicators in the IDE
+        ///
+        /// Here's an example of a valid configuration:
+        ///
         /// ```json
         /// "rust-analyzer.workspace.discoverConfig": {
         ///     "command": [
         ///         "rust-project",
-        ///         "develop-json"
+        ///         "develop-json",
+        ///         "{arg}"
         ///     ],
-        ///     "progressLabel": "rust-analyzer",
+        ///     "progressLabel": "buck2/rust-project",
         ///     "filesToWatch": [
         ///         "BUCK"
         ///     ]
         /// }
         /// ```
         ///
-        /// ## On `DiscoverWorkspaceConfig::command`
+        /// ## Argument Substitutions
+        ///
+        /// If `command` includes the argument `{arg}`, that argument will be substituted
+        /// with the JSON-serialized form of the following enum:
+        ///
+        /// ```norun
+        /// #[derive(PartialEq, Clone, Debug, Serialize)]
+        /// #[serde(rename_all = "camelCase")]
+        /// pub enum DiscoverArgument {
+        ///    Path(AbsPathBuf),
+        ///    Buildfile(AbsPathBuf),
+        /// }
+        /// ```
+        ///
+        /// rust-analyzer will use the path invocation to find and
+        /// generate a `rust-project.json` and therefore a
+        /// workspace. Example:
+        ///
+        ///
+        /// ```norun
+        /// rust-project develop-json '{ "path": "myproject/src/main.rs" }'
+        /// ```
+        ///
+        /// rust-analyzer will use build file invocations to update an
+        /// existing workspace. Example:
+        ///
+        /// Or with a build file and the configuration above:
+        ///
+        /// ```norun
+        /// rust-project develop-json '{ "buildfile": "myproject/BUCK" }'
+        /// ```
+        ///
+        /// As a reference for implementors, buck2's `rust-project`
+        /// will likely be useful:
+        /// <https://github.com/facebook/buck2/tree/main/integrations/rust-project>.
+        ///
+        /// ## Discover Command Output
         ///
         /// **Warning**: This format is provisional and subject to change.
         ///
-        /// [`DiscoverWorkspaceConfig::command`] *must* return a JSON object
-        /// corresponding to `DiscoverProjectData::Finished`:
+        /// The discover command should output JSON objects to stdout,
+        /// one per line (JSONL format). These objects should correspond
+        /// to this Rust data type:
         ///
         /// ```norun
         /// #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -388,7 +577,14 @@ config_data! {
         /// }
         /// ```
         ///
-        /// As JSON, `DiscoverProjectData::Finished` is:
+        /// For example, a progress event:
+        ///
+        /// ```json
+        /// {"kind":"progress","message":"generating rust-project.json"}
+        /// ```
+        ///
+        /// A finished event can look like this (expanded and
+        /// commented for readability):
         ///
         /// ```json
         /// {
@@ -396,7 +592,7 @@ config_data! {
         ///     "kind": "finished",
         ///     // the file used by a non-Cargo build system to define
         ///     // a package or target.
-        ///     "buildfile": "rust-analyzer/BUILD",
+        ///     "buildfile": "rust-analyzer/BUCK",
         ///     // the contents of a rust-project.json, elided for brevity
         ///     "project": {
         ///         "sysroot": "foo",
@@ -405,43 +601,12 @@ config_data! {
         /// }
         /// ```
         ///
-        /// It is encouraged, but not required, to use the other variants on
-        /// `DiscoverProjectData` to provide a more polished end-user experience.
+        /// Only the finished event is required, but the other
+        /// variants are encouraged to give users more feedback about
+        /// progress or errors.
         ///
-        /// `DiscoverWorkspaceConfig::command` may *optionally* include an `{arg}`,
-        /// which will be substituted with the JSON-serialized form of the following
-        /// enum:
-        ///
-        /// ```norun
-        /// #[derive(PartialEq, Clone, Debug, Serialize)]
-        /// #[serde(rename_all = "camelCase")]
-        /// pub enum DiscoverArgument {
-        ///    Path(AbsPathBuf),
-        ///    Buildfile(AbsPathBuf),
-        /// }
-        /// ```
-        ///
-        /// The JSON representation of `DiscoverArgument::Path` is:
-        ///
-        /// ```json
-        /// {
-        ///     "path": "src/main.rs"
-        /// }
-        /// ```
-        ///
-        /// Similarly, the JSON representation of `DiscoverArgument::Buildfile` is:
-        ///
-        /// ```json
-        /// {
-        ///     "buildfile": "BUILD"
-        /// }
-        /// ```
-        ///
-        /// `DiscoverArgument::Path` is used to find and generate a `rust-project.json`,
-        /// and therefore, a workspace, whereas `DiscoverArgument::buildfile` is used to
-        /// to update an existing workspace. As a reference for implementors,
-        /// buck2's `rust-project` will likely be useful:
-        /// https://github.com/facebook/buck2/tree/main/integrations/rust-project.
+        /// Stderr is not parsed as JSONL. It is treated as command log
+        /// output and forwarded to rust-analyzer's own logs.
         workspace_discoverConfig: Option<DiscoverWorkspaceConfig> = None,
     }
 }
@@ -449,110 +614,170 @@ config_data! {
 config_data! {
     /// Local configurations can be defined per `SourceRoot`. This almost always corresponds to a `Crate`.
     local: struct LocalDefaultConfigData <- LocalConfigInput ->  {
-        /// Whether to insert #[must_use] when generating `as_` methods
-        /// for enum variants.
-        assist_emitMustUse: bool               = false,
+        /// Insert #[must_use] when generating `as_` methods for enum variants.
+        assist_emitMustUse: bool = false,
+
         /// Placeholder expression to use for missing expressions in assists.
-        assist_expressionFillDefault: ExprFillDefaultDef              = ExprFillDefaultDef::Todo,
-        /// When inserting a type (e.g. in "fill match arms" assist), prefer to use `Self` over the type name where possible.
+        assist_expressionFillDefault: ExprFillDefaultDef = ExprFillDefaultDef::Todo,
+
+        /// Prefer to use `Self` over the type name when inserting a type (e.g. in "fill match arms" assist).
         assist_preferSelf: bool = false,
-        /// Enable borrow checking for term search code assists. If set to false, also there will be more suggestions, but some of them may not borrow-check.
-        assist_termSearch_borrowcheck: bool = true,
+
         /// Term search fuel in "units of work" for assists (Defaults to 1800).
         assist_termSearch_fuel: usize = 1800,
 
+        /// Automatically add `::` when completing the module.
+        ///
+        /// Will not be completed in `use`.
+        completion_addColonsToModule: bool = true,
 
-        /// Whether to automatically add a semicolon when completing unit-returning functions.
+        /// Automatically add a semicolon when completing unit-returning functions.
         ///
         /// In `match` arms it completes a comma instead.
         completion_addSemicolonToUnit: bool = true,
-        /// Toggles the additional completions that automatically show method calls and field accesses with `await` prefixed to them when completing on a future.
-        completion_autoAwait_enable: bool        = true,
-        /// Toggles the additional completions that automatically show method calls with `iter()` or `into_iter()` prefixed to them when completing on a type that has them.
-        completion_autoIter_enable: bool        = true,
-        /// Toggles the additional completions that automatically add imports when completed.
-        /// Note that your client must specify the `additionalTextEdits` LSP client capability to truly have this feature enabled.
-        completion_autoimport_enable: bool       = true,
+
+        /// Show method calls and field accesses completions with `await` prefixed to them when
+        /// completing on a future.
+        completion_autoAwait_enable: bool = true,
+
+        /// Show method call completions with `iter()` or `into_iter()` prefixed to them when
+        /// completing on a type that has them.
+        completion_autoIter_enable: bool = true,
+
+        /// Show completions that automatically add imports when completed.
+        ///
+        /// Note that your client must specify the `additionalTextEdits` LSP client capability to
+        /// truly have this feature enabled.
+        completion_autoimport_enable: bool = true,
+
         /// A list of full paths to items to exclude from auto-importing completions.
         ///
         /// Traits in this list won't have their methods suggested in completions unless the trait
         /// is in scope.
         ///
-        /// You can either specify a string path which defaults to type "always" or use the more verbose
-        /// form `{ "path": "path::to::item", type: "always" }`.
+        /// You can either specify a string path which defaults to type "always" or use the more
+        /// verbose form `{ "path": "path::to::item", type: "always" }`.
         ///
-        /// For traits the type "methods" can be used to only exclude the methods but not the trait itself.
+        /// For traits the type "methods" can be used to only exclude the methods but not the trait
+        /// itself.
+        ///
+        /// For modules the type "sub_items" can be used to only exclude the all items in it but not the module
+        /// itself. This does not include items defined in nested modules.
+        ///
+        /// For enums the type "variants" can be used to only exclude the all variants in it but not the enum
+        /// itself.
         ///
         /// This setting also inherits `#rust-analyzer.completion.excludeTraits#`.
         completion_autoimport_exclude: Vec<AutoImportExclusion> = vec![
             AutoImportExclusion::Verbose { path: "core::borrow::Borrow".to_owned(), r#type: AutoImportExclusionType::Methods },
             AutoImportExclusion::Verbose { path: "core::borrow::BorrowMut".to_owned(), r#type: AutoImportExclusionType::Methods },
         ],
-        /// Toggles the additional completions that automatically show method calls and field accesses
-        /// with `self` prefixed to them when inside a method.
-        completion_autoself_enable: bool        = true,
-        /// Whether to add parenthesis and argument snippets when completing function.
-        completion_callable_snippets: CallableCompletionDef  = CallableCompletionDef::FillArguments,
+
+        /// Show method calls and field access completions with `self` prefixed to them when
+        /// inside a method.
+        completion_autoself_enable: bool = true,
+
+        /// Add parenthesis and argument snippets when completing function.
+        completion_callable_snippets: CallableCompletionDef = CallableCompletionDef::FillArguments,
+
         /// A list of full paths to traits whose methods to exclude from completion.
         ///
-        /// Methods from these traits won't be completed, even if the trait is in scope. However, they will still be suggested on expressions whose type is `dyn Trait`, `impl Trait` or `T where T: Trait`.
+        /// Methods from these traits won't be completed, even if the trait is in scope. However,
+        /// they will still be suggested on expressions whose type is `dyn Trait`, `impl Trait` or
+        /// `T where T: Trait`.
         ///
         /// Note that the trait themselves can still be completed.
         completion_excludeTraits: Vec<String> = Vec::new(),
-        /// Whether to show full function/method signatures in completion docs.
+
+        /// Show full function / method signatures in completion docs.
         completion_fullFunctionSignatures_enable: bool = false,
-        /// Whether to omit deprecated items from autocompletion. By default they are marked as deprecated but not hidden.
+
+        /// Omit deprecated items from completions. By default they are marked as deprecated but not
+        /// hidden.
         completion_hideDeprecated: bool = false,
+
         /// Maximum number of completions to return. If `None`, the limit is infinite.
         completion_limit: Option<usize> = None,
-        /// Whether to show postfix snippets like `dbg`, `if`, `not`, etc.
-        completion_postfix_enable: bool         = true,
-        /// Enables completions of private items and fields that are defined in the current workspace even if they are not visible at the current position.
+
+        /// Show postfix snippets like `dbg`, `if`, `not`, etc.
+        completion_postfix_enable: bool = true,
+
+        /// Show completions of private items and fields that are defined in the current workspace
+        /// even if they are not visible at the current position.
         completion_privateEditable_enable: bool = false,
-        /// Whether to enable term search based snippets like `Some(foo.bar().baz())`.
+
+        /// Enable term search based snippets like `Some(foo.bar().baz())`.
         completion_termSearch_enable: bool = false,
+
         /// Term search fuel in "units of work" for autocompletion (Defaults to 1000).
         completion_termSearch_fuel: usize = 1000,
 
         /// List of rust-analyzer diagnostics to disable.
         diagnostics_disabled: FxHashSet<String> = FxHashSet::default(),
-        /// Whether to show native rust-analyzer diagnostics.
-        diagnostics_enable: bool                = true,
-        /// Whether to show experimental rust-analyzer diagnostics that might
-        /// have more false positives than usual.
-        diagnostics_experimental_enable: bool    = false,
-        /// Map of prefixes to be substituted when parsing diagnostic file paths.
-        /// This should be the reverse mapping of what is passed to `rustc` as `--remap-path-prefix`.
+
+        /// Show native rust-analyzer diagnostics.
+        diagnostics_enable: bool = true,
+
+        /// Show experimental rust-analyzer diagnostics that might have more false positives than
+        /// usual.
+        diagnostics_experimental_enable: bool = false,
+
+        /// Map of prefixes to be substituted when parsing diagnostic file paths. This should be the
+        /// reverse mapping of what is passed to `rustc` as `--remap-path-prefix`.
         diagnostics_remapPrefix: FxHashMap<String, String> = FxHashMap::default(),
-        /// Whether to run additional style lints.
-        diagnostics_styleLints_enable: bool =    false,
+
+        /// Run additional style lints.
+        diagnostics_styleLints_enable: bool = false,
+
         /// List of warnings that should be displayed with hint severity.
         ///
-        /// The warnings will be indicated by faded text or three dots in code
-        /// and will not show up in the `Problems Panel`.
+        /// The warnings will be indicated by faded text or three dots in code and will not show up
+        /// in the `Problems Panel`.
         diagnostics_warningsAsHint: Vec<String> = vec![],
+
         /// List of warnings that should be displayed with info severity.
         ///
-        /// The warnings will be indicated by a blue squiggly underline in code
-        /// and a blue icon in the `Problems Panel`.
+        /// The warnings will be indicated by a blue squiggly underline in code and a blue icon in
+        /// the `Problems Panel`.
         diagnostics_warningsAsInfo: Vec<String> = vec![],
 
-        /// Whether to enforce the import granularity setting for all files. If set to false rust-analyzer will try to keep import styles consistent per file.
-        imports_granularity_enforce: bool              = false,
+        /// Disable support for `#[rust_analyzer::rust_fixture]` snippets.
+        ///
+        /// If you are not working on rust-analyzer itself, you should ignore this config.
+        disableFixtureSupport: bool = false,
+
+        /// Enforce the import granularity setting for all files. If set to false rust-analyzer will
+        /// try to keep import styles consistent per file.
+        imports_granularity_enforce: bool = false,
+
         /// How imports should be grouped into use statements.
-        imports_granularity_group: ImportGranularityDef  = ImportGranularityDef::Crate,
-        /// Group inserted imports by the [following order](https://rust-analyzer.github.io/book/features.html#auto-import). Groups are separated by newlines.
-        imports_group_enable: bool                           = true,
-        /// Whether to allow import insertion to merge new imports into single path glob imports like `use std::fmt::*;`.
-        imports_merge_glob: bool           = true,
+        imports_granularity_group: ImportGranularityDef = ImportGranularityDef::Crate,
+
+        /// Group inserted imports by the [following
+        /// order](https://rust-analyzer.github.io/book/features.html#auto-import). Groups are
+        /// separated by newlines.
+        imports_group_enable: bool = true,
+
+        /// Allow import insertion to merge new imports into single path glob imports like `use
+        /// std::fmt::*;`.
+        imports_merge_glob: bool = true,
+
         /// Prefer to unconditionally use imports of the core and alloc crate, over the std crate.
         imports_preferNoStd | imports_prefer_no_std: bool = false,
-         /// Whether to prefer import paths containing a `prelude` module.
-        imports_preferPrelude: bool                       = false,
+
+        /// Prefer import paths containing a `prelude` module.
+        imports_preferPrelude: bool = false,
+
         /// The path structure for newly inserted paths to use.
-        imports_prefix: ImportPrefixDef               = ImportPrefixDef::ByCrate,
-        /// Whether to prefix external (including std, core) crate imports with `::`. e.g. "use ::std::io::Read;".
+        imports_prefix: ImportPrefixDef = ImportPrefixDef::ByCrate,
+
+        /// Prefix external (including std, core) crate imports with `::`.
+        ///
+        /// E.g. `use ::std::io::Read;`.
         imports_prefixExternPrelude: bool = false,
+
+        /// Whether to warn when a rename will cause conflicts (change the meaning of the code).
+        rename_showConflicts: bool = true,
     }
 }
 
@@ -589,7 +814,9 @@ config_data! {
         /// ```bash
         /// cargo check --quiet --workspace --message-format=json --all-targets --keep-going
         /// ```
-        /// .
+        ///
+        /// Note: The option must be specified as an array of command line arguments, with
+        /// the first argument being the name of the command to run.
         cargo_buildScripts_overrideCommand: Option<Vec<String>> = None,
         /// Rerun proc-macros building/build-scripts running when proc-macro
         /// or build-script sources change and are saved.
@@ -605,6 +832,10 @@ config_data! {
         cargo_cfgs: Vec<String> = {
             vec!["debug_assertions".into(), "miri".into()]
         },
+        /// Path to a `.cargo/config.toml` style file to pass to cargo via `--config`
+        /// for every cargo invocation (metadata, build scripts, config discovery).
+        /// Useful to give rust-analyzer a consistent view of the project configuration.
+        cargo_configPath: Option<Utf8PathBuf> = None,
         /// Extra arguments that are passed to every cargo invocation.
         cargo_extraArgs: Vec<String> = vec![],
         /// Extra environment variables that will be set when running cargo, rustc
@@ -614,6 +845,9 @@ config_data! {
         ///
         /// Set this to `"all"` to pass `--all-features` to cargo.
         cargo_features: CargoFeaturesDef      = CargoFeaturesDef::Selected(vec![]),
+        /// Extra arguments passed only to `cargo metadata`, not to other cargo invocations.
+        /// Useful for flags like `--config` that `cargo metadata` supports.
+        cargo_metadataExtraArgs: Vec<String> = vec![],
         /// Whether to pass `--no-default-features` to cargo.
         cargo_noDefaultFeatures: bool    = false,
         /// Whether to skip fetching dependencies. If set to "true", the analysis is performed
@@ -693,17 +927,27 @@ config_data! {
         /// (i.e., the folder containing the `Cargo.toml`). This can be overwritten
         /// by changing `#rust-analyzer.check.invocationStrategy#`.
         ///
-        /// If `$saved_file` is part of the command, rust-analyzer will pass
-        /// the absolute path of the saved file to the provided command. This is
-        /// intended to be used with non-Cargo build systems.
-        /// Note that `$saved_file` is experimental and may be removed in the future.
+        /// It supports two interpolation syntaxes, both mainly intended to be used with
+        /// [non-Cargo build systems](./non_cargo_based_projects.md):
+        ///
+        /// - If `{saved_file}` is part of the command, rust-analyzer will pass
+        ///   the absolute path of the saved file to the provided command.
+        ///   (A previous version, `$saved_file`, also works.)
+        /// - If `{label}` is part of the command, rust-analyzer will pass the
+        ///   Cargo package ID, which can be used with `cargo check -p`, or a build label from
+        ///   `rust-project.json`. If `{label}` is included, rust-analyzer behaves much like
+        ///   [`"rust-analyzer.check.workspace": false`](#check.workspace).
+        ///
+        ///
         ///
         /// An example command would be:
         ///
         /// ```bash
         /// cargo check --workspace --message-format=json --all-targets
         /// ```
-        /// .
+        ///
+        /// Note: The option must be specified as an array of command line arguments, with
+        /// the first argument being the name of the command to run.
         check_overrideCommand | checkOnSave_overrideCommand: Option<Vec<String>>             = None,
         /// Check for specific targets. Defaults to `#rust-analyzer.cargo.target#` if empty.
         ///
@@ -717,13 +961,44 @@ config_data! {
         /// check will be performed.
         check_workspace: bool = true,
 
+        /// Exclude all locals from document symbol search.
+        document_symbol_search_excludeLocals: bool = true,
+
         /// These proc-macros will be ignored when trying to expand them.
         ///
         /// This config takes a map of crate names with the exported proc-macro names to ignore as values.
         procMacro_ignored: FxHashMap<Box<str>, Box<[Box<str>]>>          = FxHashMap::default(),
 
+        /// Subcommand used for bench runnables instead of `bench`.
+        runnables_bench_command: String = "bench".to_owned(),
+        /// Override the command used for bench runnables.
+        /// The first element of the array should be the program to execute (for example, `cargo`).
+        ///
+        /// Use the placeholders:
+        /// - `${package}`: package name.
+        /// - `${target_arg}`: target option such as `--bin`, `--test`, `--lib`, etc.
+        /// - `${target}`: target name (empty for `--lib`).
+        /// - `${test_name}`: the test path filter, e.g. `module::bench_func`.
+        /// - `${exact}`: `--exact` for single benchmarks, empty for modules.
+        /// - `${include_ignored}`: always empty for benchmarks.
+        /// - `${executable_args}`: all of the above binary args bundled together
+        ///   (includes `rust-analyzer.runnables.extraTestBinaryArgs`).
+        runnables_bench_overrideCommand: Option<Vec<String>> = None,
         /// Command to be executed instead of 'cargo' for runnables.
         runnables_command: Option<String> = None,
+        /// Override the command used for doc-test runnables.
+        /// The first element of the array should be the program to execute (for example, `cargo`).
+        ///
+        /// Use the placeholders:
+        /// - `${package}`: package name.
+        /// - `${target_arg}`: target option such as `--bin`, `--test`, `--lib`, etc.
+        /// - `${target}`: target name (empty for `--lib`).
+        /// - `${test_name}`: the test path filter, e.g. `module::func`.
+        /// - `${exact}`: always empty for doc-tests.
+        /// - `${include_ignored}`: always empty for doc-tests.
+        /// - `${executable_args}`: all of the above binary args bundled together
+        ///   (includes `rust-analyzer.runnables.extraTestBinaryArgs`).
+        runnables_doctest_overrideCommand: Option<Vec<String>> = None,
         /// Additional arguments to be passed to cargo for runnables such as
         /// tests or binaries. For example, it may be `--release`.
         runnables_extraArgs: Vec<String>   = vec![],
@@ -734,7 +1009,22 @@ config_data! {
         /// [custom test harness](https://doc.rust-lang.org/cargo/reference/cargo-targets.html#the-harness-field),
         /// they will end up being interpreted as options to
         /// [`rustc`’s built-in test harness (“libtest”)](https://doc.rust-lang.org/rustc/tests/index.html#cli-arguments).
-        runnables_extraTestBinaryArgs: Vec<String> = vec!["--show-output".to_owned()],
+        runnables_extraTestBinaryArgs: Vec<String> = vec!["--nocapture".to_owned()],
+        /// Subcommand used for test runnables instead of `test`.
+        runnables_test_command: String = "test".to_owned(),
+        /// Override the command used for test runnables.
+        /// The first element of the array should be the program to execute (for example, `cargo`).
+        ///
+        /// Available placeholders:
+        /// - `${package}`: package name.
+        /// - `${target_arg}`: target option such as `--bin`, `--test`, `--lib`, etc.
+        /// - `${target}`: target name (empty for `--lib`).
+        /// - `${test_name}`: the test path filter, e.g. `module::test_func`.
+        /// - `${exact}`: `--exact` for single tests, empty for modules.
+        /// - `${include_ignored}`: `--include-ignored` for single tests, empty otherwise.
+        /// - `${executable_args}`: all of the above binary args bundled together
+        ///   (includes `rust-analyzer.runnables.extraTestBinaryArgs`).
+        runnables_test_overrideCommand: Option<Vec<String>> = None,
 
         /// Path to the Cargo.toml of the rust compiler workspace, for usage in rustc_private
         /// projects, or "discover" to try to automatically find it if the `rustc-dev` component
@@ -753,6 +1043,9 @@ config_data! {
         /// not that of `cargo fmt`. The file contents will be passed on the
         /// standard input and the formatted result will be read from the
         /// standard output.
+        ///
+        /// Note: The option must be specified as an array of command line arguments, with
+        /// the first argument being the name of the command to run.
         rustfmt_overrideCommand: Option<Vec<String>> = None,
         /// Enables the use of rustfmt's unstable range formatting command for the
         /// `textDocument/rangeFormatting` request. The rustfmt option is unstable and only
@@ -812,6 +1105,7 @@ struct ClientInfo {
     version: Option<Version>,
 }
 
+/// The configuration of this rust-analyzer instance.
 #[derive(Clone)]
 pub struct Config {
     /// Projects that have a Cargo.toml or a rust-project.json in a
@@ -821,16 +1115,22 @@ pub struct Config {
     /// Projects whose configuration was generated by a command
     /// configured in discoverConfig.
     discovered_projects_from_command: Vec<ProjectJsonFromCommand>,
-    /// The workspace roots as registered by the LSP client
+    /// The workspace roots as registered by the LSP client.
     workspace_roots: Vec<AbsPathBuf>,
     caps: ClientCapabilities,
+
+    /// The root of the first project encountered. This is deprecated
+    /// because rust-analyzer might be handling multiple projects.
+    ///
+    /// Prefer `workspace_roots` and `workspace_root_for()`.
     root_path: AbsPathBuf,
+
     snippets: Vec<Snippet>,
     client_info: Option<ClientInfo>,
 
     default_config: &'static DefaultConfigData,
     /// Config node that obtains its initial value during the server initialization and
-    /// by receiving a `lsp_types::notification::DidChangeConfiguration`.
+    /// by receiving a [`lsp_types::DidChangeConfigurationNotification`].
     client_config: (FullConfigInput, ConfigErrors),
 
     /// Config node whose values apply to **every** Rust project.
@@ -1147,6 +1447,10 @@ impl Config {
 
         self.discovered_projects_from_command.push(ProjectJsonFromCommand { data, buildfile });
     }
+
+    pub fn workspace_roots(&self) -> &[AbsPathBuf] {
+        &self.workspace_roots
+    }
 }
 
 #[derive(Default, Debug)]
@@ -1247,8 +1551,14 @@ pub struct LensConfig {
     pub refs_trait: bool, // for Struct, Enum, Union and Trait
     pub enum_variant_refs: bool,
 
+    pub refs_exclude_imports: bool,
+    pub refs_exclude_tests: bool,
+
     // annotations
     pub location: AnnotationLocation,
+    pub filter_adjacent_derive_implementations: bool,
+
+    disable_ra_fixture: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1287,8 +1597,24 @@ impl LensConfig {
         self.run || self.debug || self.update_test
     }
 
-    pub fn references(&self) -> bool {
-        self.method_refs || self.refs_adt || self.refs_trait || self.enum_variant_refs
+    pub fn into_annotation_config<'a>(
+        self,
+        binary_target: bool,
+        minicore: MiniCore<'a>,
+    ) -> AnnotationConfig<'a> {
+        AnnotationConfig {
+            binary_target,
+            annotate_runnables: self.runnable(),
+            annotate_impls: self.implementations,
+            annotate_references: self.refs_adt,
+            annotate_method_references: self.method_refs,
+            annotate_enum_variant_references: self.enum_variant_refs,
+            references_exclude_imports: self.refs_exclude_imports,
+            references_exclude_tests: self.refs_exclude_tests,
+            location: self.location.into(),
+            ra_fixture: RaFixtureConfig { minicore, disable_ra_fixture: self.disable_ra_fixture },
+            filter_adjacent_derive_implementations: self.filter_adjacent_derive_implementations,
+        }
     }
 }
 
@@ -1337,6 +1663,13 @@ pub enum FilesWatcher {
     Server,
 }
 
+/// Configuration for document symbol search requests.
+#[derive(Debug, Clone)]
+pub struct DocumentSymbolConfig {
+    /// Should locals be excluded.
+    pub search_exclude_locals: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct NotificationsConfig {
     pub cargo_toml_not_found: bool,
@@ -1355,8 +1688,20 @@ pub struct RunnablesConfig {
     pub override_cargo: Option<String>,
     /// Additional arguments for the `cargo`, e.g. `--release`.
     pub cargo_extra_args: Vec<String>,
+    /// Path to an extra config file passed to cargo via `--config`.
+    pub config_path: Option<AbsPathBuf>,
     /// Additional arguments for the binary being run, if it is a test or benchmark.
     pub extra_test_binary_args: Vec<String>,
+    /// Subcommand used for doctest runnables instead of `test`.
+    pub test_command: String,
+    /// Override the command used for test runnables.
+    pub test_override_command: Option<Vec<String>>,
+    /// Subcommand used for doctest runnables instead of `bench`.
+    pub bench_command: String,
+    /// Override the command used for bench runnables.
+    pub bench_override_command: Option<Vec<String>>,
+    /// Override the command used for doctest runnables.
+    pub doc_test_override_command: Option<Vec<String>>,
 }
 
 /// Configuration for workspace symbol search requests.
@@ -1486,16 +1831,29 @@ impl Config {
         s
     }
 
-    pub fn root_path(&self) -> &AbsPathBuf {
-        &self.root_path
+    /// Find the workspace root that contains the given path, using the
+    /// longest prefix match.
+    pub fn workspace_root_for(&self, path: &AbsPath) -> &AbsPathBuf {
+        self.workspace_roots
+            .iter()
+            .filter(|root| path.starts_with(root.as_path()))
+            .max_by_key(|root| root.as_str().len())
+            .unwrap_or(self.default_root_path())
+    }
+
+    /// Best-effort root path for the current project.
+    ///
+    /// Use `workspace_root_for` where possible, because
+    /// `default_root_path` may return the wrong path when a user has
+    /// multiple workspaces.
+    pub fn default_root_path(&self) -> &AbsPathBuf {
+        self.workspace_roots.first().unwrap_or(&self.root_path)
     }
 
     pub fn caps(&self) -> &ClientCapabilities {
         &self.caps
     }
-}
 
-impl Config {
     pub fn assist(&self, source_root: Option<SourceRootId>) -> AssistConfig {
         AssistConfig {
             snippet_cap: self.snippet_cap(),
@@ -1506,7 +1864,6 @@ impl Config {
             prefer_prelude: self.imports_preferPrelude(source_root).to_owned(),
             prefer_absolute: self.imports_prefixExternPrelude(source_root).to_owned(),
             term_search_fuel: self.assist_termSearch_fuel(source_root).to_owned() as u64,
-            term_search_borrowck: self.assist_termSearch_borrowcheck(source_root).to_owned(),
             code_action_grouping: self.code_action_group(),
             expr_fill_default: match self.assist_expressionFillDefault(source_root) {
                 ExprFillDefaultDef::Todo => ExprFillDefaultMode::Todo,
@@ -1514,14 +1871,35 @@ impl Config {
                 ExprFillDefaultDef::Underscore => ExprFillDefaultMode::Underscore,
             },
             prefer_self_ty: *self.assist_preferSelf(source_root),
+            show_rename_conflicts: *self.rename_showConflicts(source_root),
         }
     }
 
-    pub fn call_hierarchy(&self) -> CallHierarchyConfig {
-        CallHierarchyConfig { exclude_tests: self.references_excludeTests().to_owned() }
+    pub fn rename(&self, source_root: Option<SourceRootId>) -> RenameConfig {
+        RenameConfig {
+            prefer_no_std: self.imports_preferNoStd(source_root).to_owned(),
+            prefer_prelude: self.imports_preferPrelude(source_root).to_owned(),
+            prefer_absolute: self.imports_prefixExternPrelude(source_root).to_owned(),
+            show_conflicts: *self.rename_showConflicts(source_root),
+        }
     }
 
-    pub fn completion(&self, source_root: Option<SourceRootId>) -> CompletionConfig<'_> {
+    pub fn ra_fixture<'a>(&self, minicore: MiniCore<'a>) -> RaFixtureConfig<'a> {
+        RaFixtureConfig { minicore, disable_ra_fixture: *self.disableFixtureSupport(None) }
+    }
+
+    pub fn call_hierarchy<'a>(&self, minicore: MiniCore<'a>) -> CallHierarchyConfig<'a> {
+        CallHierarchyConfig {
+            exclude_tests: self.references_excludeTests().to_owned(),
+            ra_fixture: self.ra_fixture(minicore),
+        }
+    }
+
+    pub fn completion<'a>(
+        &'a self,
+        source_root: Option<SourceRootId>,
+        minicore: MiniCore<'a>,
+    ) -> CompletionConfig<'a> {
         let client_capability_fields = self.completion_resolve_support_properties();
         CompletionConfig {
             enable_postfix_completions: self.completion_postfix_enable(source_root).to_owned(),
@@ -1539,6 +1917,7 @@ impl Config {
                 CallableCompletionDef::AddParentheses => Some(CallableSnippets::AddParentheses),
                 CallableCompletionDef::None => None,
             },
+            add_colons_to_module: *self.completion_addColonsToModule(source_root),
             add_semicolon_to_unit: *self.completion_addSemicolonToUnit(source_root),
             snippet_cap: SnippetCap::new(self.completion_snippet()),
             insert_use: self.insert_use_config(source_root),
@@ -1570,11 +1949,18 @@ impl Config {
                             AutoImportExclusionType::Methods => {
                                 ide_completion::AutoImportExclusionType::Methods
                             }
+                            AutoImportExclusionType::SubItems => {
+                                ide_completion::AutoImportExclusionType::SubItems
+                            }
+                            AutoImportExclusionType::Variants => {
+                                ide_completion::AutoImportExclusionType::Variants
+                            }
                         },
                     ),
                 })
                 .collect(),
             exclude_traits: self.completion_excludeTraits(source_root),
+            ra_fixture: self.ra_fixture(minicore),
         }
     }
 
@@ -1607,7 +1993,7 @@ impl Config {
             prefer_absolute: self.imports_prefixExternPrelude(source_root).to_owned(),
             style_lints: self.diagnostics_styleLints_enable(source_root).to_owned(),
             term_search_fuel: self.assist_termSearch_fuel(source_root).to_owned() as u64,
-            term_search_borrowck: self.assist_termSearch_borrowcheck(source_root).to_owned(),
+            show_rename_conflicts: *self.rename_showConflicts(source_root),
         }
     }
 
@@ -1649,7 +2035,7 @@ impl Config {
         }
     }
 
-    pub fn hover(&self) -> HoverConfig {
+    pub fn hover<'a>(&self, minicore: MiniCore<'a>) -> HoverConfig<'a> {
         let mem_kind = |kind| match kind {
             MemoryLayoutHoverRenderKindDef::Both => MemoryLayoutHoverRenderKind::Both,
             MemoryLayoutHoverRenderKindDef::Decimal => MemoryLayoutHoverRenderKind::Decimal,
@@ -1682,17 +2068,29 @@ impl Config {
                 None => ide::SubstTyLen::Unlimited,
             },
             show_drop_glue: *self.hover_dropGlue_enable(),
+            ra_fixture: self.ra_fixture(minicore),
         }
     }
 
-    pub fn inlay_hints(&self) -> InlayHintsConfig {
+    pub fn goto_definition<'a>(&self, minicore: MiniCore<'a>) -> GotoDefinitionConfig<'a> {
+        GotoDefinitionConfig { ra_fixture: self.ra_fixture(minicore) }
+    }
+
+    pub fn inlay_hints<'a>(&self, minicore: MiniCore<'a>) -> InlayHintsConfig<'a> {
         let client_capability_fields = self.inlay_hint_resolve_support_properties();
 
         InlayHintsConfig {
             render_colons: self.inlayHints_renderColons().to_owned(),
             type_hints: self.inlayHints_typeHints_enable().to_owned(),
+            type_hints_placement: match self.inlayHints_typeHints_location() {
+                TypeHintsLocation::Inline => ide::TypeHintsPlacement::Inline,
+                TypeHintsLocation::EndOfLine => ide::TypeHintsPlacement::EndOfLine,
+            },
             sized_bound: self.inlayHints_implicitSizedBoundHints_enable().to_owned(),
             parameter_hints: self.inlayHints_parameterHints_enable().to_owned(),
+            parameter_hints_for_missing_arguments: self
+                .inlayHints_parameterHints_missingArguments_enable()
+                .to_owned(),
             generic_parameter_hints: GenericParameterHints {
                 type_hints: self.inlayHints_genericParameterHints_type_enable().to_owned(),
                 lifetime_hints: self.inlayHints_genericParameterHints_lifetime_enable().to_owned(),
@@ -1717,6 +2115,7 @@ impl Config {
             hide_named_constructor_hints: self
                 .inlayHints_typeHints_hideNamedConstructor()
                 .to_owned(),
+            hide_inferred_type_hints: self.inlayHints_typeHints_hideInferredTypes().to_owned(),
             hide_closure_initialization_hints: self
                 .inlayHints_typeHints_hideClosureInitialization()
                 .to_owned(),
@@ -1734,12 +2133,14 @@ impl Config {
                 AdjustmentHintsDef::Always => ide::AdjustmentHints::Always,
                 AdjustmentHintsDef::Never => match self.inlayHints_reborrowHints_enable() {
                     ReborrowHintsDef::Always | ReborrowHintsDef::Mutable => {
-                        ide::AdjustmentHints::ReborrowOnly
+                        ide::AdjustmentHints::BorrowsOnly
                     }
                     ReborrowHintsDef::Never => ide::AdjustmentHints::Never,
                 },
-                AdjustmentHintsDef::Reborrow => ide::AdjustmentHints::ReborrowOnly,
+                AdjustmentHintsDef::Borrows => ide::AdjustmentHints::BorrowsOnly,
             },
+            adjustment_hints_disable_reborrows: *self
+                .inlayHints_expressionAdjustmentHints_disableReborrows(),
             adjustment_hints_mode: match self.inlayHints_expressionAdjustmentHints_mode() {
                 AdjustmentHintsModeDef::Prefix => ide::AdjustmentHintsMode::Prefix,
                 AdjustmentHintsModeDef::Postfix => ide::AdjustmentHintsMode::Postfix,
@@ -1764,15 +2165,18 @@ impl Config {
                 &client_capability_fields,
             ),
             implicit_drop_hints: self.inlayHints_implicitDrops_enable().to_owned(),
+            implied_dyn_trait_hints: self.inlayHints_impliedDynTraitHints_enable().to_owned(),
             range_exclusive_hints: self.inlayHints_rangeExclusiveHints_enable().to_owned(),
+            ra_fixture: self.ra_fixture(minicore),
         }
     }
 
     fn insert_use_config(&self, source_root: Option<SourceRootId>) -> InsertUseConfig {
         InsertUseConfig {
             granularity: match self.imports_granularity_group(source_root) {
-                ImportGranularityDef::Preserve => ImportGranularity::Preserve,
-                ImportGranularityDef::Item => ImportGranularity::Item,
+                ImportGranularityDef::Item | ImportGranularityDef::Preserve => {
+                    ImportGranularity::Item
+                }
                 ImportGranularityDef::Crate => ImportGranularity::Crate,
                 ImportGranularityDef::Module => ImportGranularity::Module,
                 ImportGranularityDef::One => ImportGranularity::One,
@@ -1801,9 +2205,10 @@ impl Config {
         self.semanticHighlighting_nonStandardTokens().to_owned()
     }
 
-    pub fn highlighting_config(&self) -> HighlightConfig {
+    pub fn highlighting_config<'a>(&self, minicore: MiniCore<'a>) -> HighlightConfig<'a> {
         HighlightConfig {
             strings: self.semanticHighlighting_strings_enable().to_owned(),
+            comments: self.semanticHighlighting_comments_enable().to_owned(),
             punctuation: self.semanticHighlighting_punctuation_enable().to_owned(),
             specialize_punctuation: self
                 .semanticHighlighting_punctuation_specialization_enable()
@@ -1815,6 +2220,7 @@ impl Config {
                 .to_owned(),
             inject_doc_comment: self.semanticHighlighting_doc_comment_inject_enable().to_owned(),
             syntactic_name_ref_highlighting: false,
+            ra_fixture: self.ra_fixture(minicore),
         }
     }
 
@@ -1953,6 +2359,11 @@ impl Config {
         Some(AbsPathBuf::try_from(path).unwrap_or_else(|path| self.root_path.join(path)))
     }
 
+    pub fn dhat_output_file(&self) -> Option<AbsPathBuf> {
+        let path = self.profiling_memoryProfile().clone()?;
+        Some(AbsPathBuf::try_from(path).unwrap_or_else(|path| self.root_path.join(path)))
+    }
+
     pub fn ignored_proc_macros(
         &self,
         source_root: Option<SourceRootId>,
@@ -2011,6 +2422,7 @@ impl Config {
         });
         let sysroot_src =
             self.cargo_sysrootSrc(source_root).as_ref().map(|sysroot| self.root_path.join(sysroot));
+        let config_path = self.cargo_config_path(source_root);
         let extra_includes = self
             .vfs_extraIncludes(source_root)
             .iter()
@@ -2073,9 +2485,11 @@ impl Config {
             run_build_script_command: self.cargo_buildScripts_overrideCommand(source_root).clone(),
             extra_args: self.cargo_extraArgs(source_root).clone(),
             extra_env: self.cargo_extraEnv(source_root).clone(),
-            target_dir: self.target_dir_from_config(source_root),
+            target_dir_config: self.target_dir_from_config(source_root),
             set_test: *self.cfg_setTest(source_root),
             no_deps: *self.cargo_noDeps(source_root),
+            metadata_extra_args: self.cargo_metadataExtraArgs(source_root).clone(),
+            config_path,
         }
     }
 
@@ -2150,6 +2564,8 @@ impl Config {
 
     pub(crate) fn cargo_test_options(&self, source_root: Option<SourceRootId>) -> CargoOptions {
         CargoOptions {
+            // Might be nice to allow users to specify test_command = "nextest"
+            subcommand: "test".into(),
             target_tuples: self.cargo_target(source_root).clone().into_iter().collect(),
             all_targets: false,
             no_default_features: *self.cargo_noDefaultFeatures(source_root),
@@ -2161,7 +2577,9 @@ impl Config {
             extra_args: self.extra_args(source_root).clone(),
             extra_test_bin_args: self.runnables_extraTestBinaryArgs(source_root).clone(),
             extra_env: self.extra_env(source_root).clone(),
-            target_dir: self.target_dir_from_config(source_root),
+            target_dir_config: self.target_dir_from_config(source_root),
+            set_test: true,
+            config_path: self.cargo_config_path(source_root),
         }
     }
 
@@ -2182,9 +2600,9 @@ impl Config {
                     },
                 }
             }
-            Some(_) | None => FlycheckConfig::CargoCommand {
-                command: self.check_command(source_root).clone(),
-                options: CargoOptions {
+            Some(_) | None => FlycheckConfig::Automatic {
+                cargo_options: CargoOptions {
+                    subcommand: self.check_command(source_root).clone(),
                     target_tuples: self
                         .check_targets(source_root)
                         .clone()
@@ -2218,24 +2636,25 @@ impl Config {
                     extra_args: self.check_extra_args(source_root),
                     extra_test_bin_args: self.runnables_extraTestBinaryArgs(source_root).clone(),
                     extra_env: self.check_extra_env(source_root),
-                    target_dir: self.target_dir_from_config(source_root),
+                    config_path: self.cargo_config_path(source_root),
+                    target_dir_config: self.target_dir_from_config(source_root),
+                    set_test: *self.cfg_setTest(source_root),
                 },
                 ansi_color_output: self.color_diagnostic_output(),
             },
         }
     }
 
-    fn target_dir_from_config(&self, source_root: Option<SourceRootId>) -> Option<Utf8PathBuf> {
-        self.cargo_targetDir(source_root).as_ref().and_then(|target_dir| match target_dir {
-            TargetDirectory::UseSubdirectory(true) => {
-                let env_var = env::var("CARGO_TARGET_DIR").ok();
-                let mut path = Utf8PathBuf::from(env_var.as_deref().unwrap_or("target"));
-                path.push("rust-analyzer");
-                Some(path)
-            }
-            TargetDirectory::UseSubdirectory(false) => None,
-            TargetDirectory::Directory(dir) => Some(dir.clone()),
-        })
+    fn cargo_config_path(&self, source_root: Option<SourceRootId>) -> Option<AbsPathBuf> {
+        self.cargo_configPath(source_root).as_ref().map(|path| self.root_path.join(path))
+    }
+
+    fn target_dir_from_config(&self, source_root: Option<SourceRootId>) -> TargetDirectoryConfig {
+        match &self.cargo_targetDir(source_root) {
+            Some(TargetDirectory::UseSubdirectory(true)) => TargetDirectoryConfig::UseSubdirectory,
+            Some(TargetDirectory::UseSubdirectory(false)) | None => TargetDirectoryConfig::None,
+            Some(TargetDirectory::Directory(dir)) => TargetDirectoryConfig::Directory(dir.clone()),
+        }
     }
 
     pub fn check_on_save(&self, source_root: Option<SourceRootId>) -> bool {
@@ -2250,7 +2669,13 @@ impl Config {
         RunnablesConfig {
             override_cargo: self.runnables_command(source_root).clone(),
             cargo_extra_args: self.runnables_extraArgs(source_root).clone(),
+            config_path: self.cargo_config_path(source_root),
             extra_test_binary_args: self.runnables_extraTestBinaryArgs(source_root).clone(),
+            test_command: self.runnables_test_command(source_root).clone(),
+            test_override_command: self.runnables_test_overrideCommand(source_root).clone(),
+            bench_command: self.runnables_bench_command(source_root).clone(),
+            bench_override_command: self.runnables_bench_overrideCommand(source_root).clone(),
+            doc_test_override_command: self.runnables_doctest_overrideCommand(source_root).clone(),
         }
     }
 
@@ -2276,19 +2701,36 @@ impl Config {
     }
 
     pub fn lens(&self) -> LensConfig {
+        let enable = *self.lens_enable();
         LensConfig {
-            run: *self.lens_enable() && *self.lens_run_enable(),
-            debug: *self.lens_enable() && *self.lens_debug_enable(),
-            update_test: *self.lens_enable()
-                && *self.lens_updateTest_enable()
-                && *self.lens_run_enable(),
-            interpret: *self.lens_enable() && *self.lens_run_enable() && *self.interpret_tests(),
-            implementations: *self.lens_enable() && *self.lens_implementations_enable(),
-            method_refs: *self.lens_enable() && *self.lens_references_method_enable(),
-            refs_adt: *self.lens_enable() && *self.lens_references_adt_enable(),
-            refs_trait: *self.lens_enable() && *self.lens_references_trait_enable(),
-            enum_variant_refs: *self.lens_enable() && *self.lens_references_enumVariant_enable(),
+            run: enable && *self.lens_run_enable(),
+            debug: enable && *self.lens_debug_enable(),
+            update_test: enable && *self.lens_updateTest_enable() && *self.lens_run_enable(),
+            interpret: enable && *self.lens_run_enable() && *self.interpret_tests(),
+            implementations: enable && *self.lens_implementations_enable(),
+            method_refs: enable && *self.lens_references_method_enable(),
+            refs_adt: enable && *self.lens_references_adt_enable(),
+            refs_trait: enable && *self.lens_references_trait_enable(),
+            enum_variant_refs: enable && *self.lens_references_enumVariant_enable(),
+            refs_exclude_imports: *self.references_excludeImports(),
+            refs_exclude_tests: *self.references_excludeTests(),
             location: *self.lens_location(),
+            filter_adjacent_derive_implementations: *self
+                .gotoImplementations_filterAdjacentDerives(),
+            disable_ra_fixture: *self.disableFixtureSupport(None),
+        }
+    }
+
+    pub fn goto_implementation(&self) -> GotoImplementationConfig {
+        GotoImplementationConfig {
+            filter_adjacent_derive_implementations: *self
+                .gotoImplementations_filterAdjacentDerives(),
+        }
+    }
+
+    pub fn document_symbol(&self, source_root: Option<SourceRootId>) -> DocumentSymbolConfig {
+        DocumentSymbolConfig {
+            search_exclude_locals: *self.document_symbol_search_excludeLocals(source_root),
         }
     }
 
@@ -2329,6 +2771,13 @@ impl Config {
             NumThreads::Concrete(0) | NumThreads::Physical => num_cpus::get_physical(),
             &NumThreads::Concrete(n) => n,
             NumThreads::Logical => num_cpus::get(),
+        }
+    }
+
+    pub fn proc_macro_num_processes(&self) -> usize {
+        match self.procMacro_processes() {
+            NumProcesses::Concrete(0) | NumProcesses::Physical => num_cpus::get_physical(),
+            &NumProcesses::Concrete(n) => n,
         }
     }
 
@@ -2453,6 +2902,7 @@ enum SnippetScopeDef {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
+#[serde(try_from = "SnippetDefRepr")]
 pub(crate) struct SnippetDef {
     #[serde(with = "single_or_array")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2474,6 +2924,46 @@ pub(crate) struct SnippetDef {
     description: Option<String>,
 
     scope: SnippetScopeDef,
+}
+
+/// Plain deserialization target for [`SnippetDef`]. Both the client JSON
+/// config and `rust-analyzer.toml` configs deserialize a `SnippetDef` per
+/// map entry, so validating the field combination here (via `TryFrom`)
+/// covers both config sources instead of only one.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SnippetDefRepr {
+    #[serde(with = "single_or_array")]
+    prefix: Vec<String>,
+    #[serde(with = "single_or_array")]
+    postfix: Vec<String>,
+    #[serde(with = "single_or_array")]
+    body: Vec<String>,
+    #[serde(with = "single_or_array")]
+    requires: Vec<String>,
+    description: Option<String>,
+    scope: SnippetScopeDef,
+}
+
+impl TryFrom<SnippetDefRepr> for SnippetDef {
+    type Error = String;
+
+    fn try_from(repr: SnippetDefRepr) -> Result<Self, Self::Error> {
+        if repr.scope == SnippetScopeDef::Item && !repr.postfix.is_empty() {
+            return Err(
+                "'postfix' is not supported together with '\"scope\": \"item\"'; postfix snippets are not supported in item scope"
+                    .to_owned(),
+            );
+        }
+        Ok(SnippetDef {
+            prefix: repr.prefix,
+            postfix: repr.postfix,
+            body: repr.body,
+            requires: repr.requires,
+            description: repr.description,
+            scope: repr.scope,
+        })
+    }
 }
 
 mod single_or_array {
@@ -2574,6 +3064,8 @@ pub enum AutoImportExclusion {
 pub enum AutoImportExclusionType {
     Always,
     Methods,
+    SubItems,
+    Variants,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2647,6 +3139,13 @@ enum ClosureStyle {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
+enum TypeHintsLocation {
+    Inline,
+    EndOfLine,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
 enum ReborrowHintsDef {
     Mutable,
     #[serde(with = "true_or_always")]
@@ -2660,7 +3159,8 @@ enum ReborrowHintsDef {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 enum AdjustmentHintsDef {
-    Reborrow,
+    #[serde(alias = "reborrow")]
+    Borrows,
     #[serde(with = "true_or_always")]
     #[serde(untagged)]
     Always,
@@ -2763,6 +3263,14 @@ pub enum TargetDirectory {
 pub enum NumThreads {
     Physical,
     Logical,
+    #[serde(untagged)]
+    Concrete(usize),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NumProcesses {
+    Physical,
     #[serde(untagged)]
     Concrete(usize),
 }
@@ -2921,7 +3429,7 @@ macro_rules! _config_data {
     }) => {
         /// Default config values for this grouping.
         #[allow(non_snake_case)]
-        #[derive(Debug, Clone )]
+        #[derive(Debug, Clone)]
         struct $name { $($field: $ty,)* }
 
         impl_for_config_data!{
@@ -3048,8 +3556,8 @@ impl FullConfigInput {
         fields.sort_by_key(|&(x, ..)| x);
         fields
             .iter()
-            .tuple_windows()
-            .for_each(|(a, b)| assert!(a.0 != b.0, "{a:?} duplicate field"));
+            .array_windows()
+            .for_each(|[a, b]| assert!(a.0 != b.0, "{a:?} duplicate field"));
         fields
     }
 
@@ -3199,8 +3707,10 @@ fn schema(fields: &[SchemaField]) -> serde_json::Value {
         .iter()
         .map(|(field, ty, doc, default)| {
             let name = field.replace('_', ".");
-            let category =
-                name.find('.').map(|end| String::from(&name[..end])).unwrap_or("general".into());
+            let category = name
+                .split_once(".")
+                .map(|(category, _name)| to_title_case(category))
+                .unwrap_or("rust-analyzer".into());
             let name = format!("rust-analyzer.{name}");
             let props = field_props(field, ty, doc, default);
             serde_json::json!({
@@ -3212,6 +3722,29 @@ fn schema(fields: &[SchemaField]) -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     map.into()
+}
+
+/// Translate a field name to a title case string suitable for use in the category names on the
+/// vscode settings page.
+///
+/// First letter of word should be uppercase, if an uppercase letter is encountered, add a space
+/// before it e.g. "fooBar" -> "Foo Bar", "fooBarBaz" -> "Foo Bar Baz", "foo" -> "Foo"
+///
+/// This likely should be in stdx (or just use heck instead), but it doesn't handle any edge cases
+/// and is intentionally simple.
+fn to_title_case(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    if let Some(first) = chars.next() {
+        result.push(first.to_ascii_uppercase());
+        for c in chars {
+            if c.is_uppercase() {
+                result.push(' ');
+            }
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json::Value {
@@ -3296,13 +3829,13 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
         },
         "ImportGranularityDef" => set! {
             "type": "string",
-            "enum": ["preserve", "crate", "module", "item", "one"],
+            "enum": ["crate", "module", "item", "one", "preserve"],
             "enumDescriptions": [
-                "Do not change the granularity of any imports and preserve the original structure written by the developer.",
                 "Merge imports from the same crate into a single use statement. Conversely, imports from different crates are split into separate statements.",
                 "Merge imports from the same module into a single use statement. Conversely, imports from different modules are split into separate statements.",
                 "Flatten imports so that each has its own use statement.",
-                "Merge all imports into a single use statement as long as they have the same visibility and attributes."
+                "Merge all imports into a single use statement as long as they have the same visibility and attributes.",
+                "Deprecated - unless `enforceGranularity` is `true`, the style of the current file is preferred over this setting. Behaves like `item`."
             ],
         },
         "ImportPrefixDef" => set! {
@@ -3495,7 +4028,9 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
             "enum": ["per_workspace", "once"],
             "enumDescriptions": [
                 "The command will be executed for each Rust workspace with the workspace as the working directory.",
-                "The command will be executed once with the opened project as the working directory."
+                "The command will be executed once with the opened project as the working directory.\
+                \n\n**Warning:** This can cause errors when the Cargo configuration of the opened workspaces is different \
+                or even only different than the default. Enabling this is not recommended."
             ],
         },
         "Option<CheckOnSaveTargets>" => set! {
@@ -3520,6 +4055,14 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                 "`rust_analyzer`: `|i32, u64| -> i8`",
                 "`with_id`: `{closure#14352}`, where that id is the unique number of the closure in r-a internals",
                 "`hide`: Shows `...` for every closure type",
+            ],
+        },
+        "TypeHintsLocation" => set! {
+            "type": "string",
+            "enum": ["inline", "end_of_line"],
+            "enumDescriptions": [
+                "Render type hints directly after the binding identifier.",
+                "Render type hints after the end of the containing `let` statement when possible.",
             ],
         },
         "Option<MemoryLayoutHoverRenderKindDef>" => set! {
@@ -3564,6 +4107,22 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                     "enumDescriptions": [
                         "Use the number of physical cores",
                         "Use the number of logical cores",
+                    ],
+                },
+            ],
+        },
+        "NumProcesses" => set! {
+            "anyOf": [
+                {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 255
+                },
+                {
+                    "type": "string",
+                    "enum": ["physical"],
+                    "enumDescriptions": [
+                        "Use the number of physical cores",
                     ],
                 },
             ],
@@ -3640,10 +4199,12 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                             },
                             "type": {
                                 "type": "string",
-                                "enum": ["always", "methods"],
+                                "enum": ["always", "methods", "sub_items", "variants"],
                                 "enumDescriptions": [
                                     "Do not show this item or its methods (if it is a trait) in auto-import completions.",
-                                    "Do not show this traits methods in auto-import completions."
+                                    "Do not show this trait's methods in auto-import completions.",
+                                    "Do not show this module's all items in it in auto-import completions.",
+                                    "Do not show this enum's variants in auto-import completions."
                                 ],
                             },
                         }
@@ -3710,7 +4271,7 @@ fn doc_comment_to_string(doc: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{borrow::Cow, fs};
 
     use test_utils::{ensure_file_contents, project_root};
 
@@ -3740,17 +4301,16 @@ mod tests {
         for idx in url_offsets {
             let link = &schema[idx..];
             // matching on whitespace to ignore normal links
-            if let Some(link_end) = link.find([' ', '[']) {
-                if link.chars().nth(link_end) == Some('[') {
-                    if let Some(link_text_end) = link.find(']') {
-                        let link_text = link[link_end..(link_text_end + 1)].to_string();
+            if let Some(link_end) = link.find([' ', '['])
+                && link.chars().nth(link_end) == Some('[')
+                && let Some(link_text_end) = link.find(']')
+            {
+                let link_text = link[link_end..(link_text_end + 1)].to_string();
 
-                        schema.replace_range((idx + link_end)..(idx + link_text_end + 1), "");
-                        schema.insert(idx, '(');
-                        schema.insert(idx + link_end + 1, ')');
-                        schema.insert_str(idx, &link_text);
-                    }
-                }
+                schema.replace_range((idx + link_end)..(idx + link_text_end + 1), "");
+                schema.insert(idx, '(');
+                schema.insert(idx + link_end + 1, ')');
+                schema.insert_str(idx, &link_text);
             }
         }
 
@@ -3846,9 +4406,13 @@ mod tests {
 
         (config, _, _) = config.apply_change(change);
         assert_eq!(config.cargo_targetDir(None), &None);
-        assert!(
-            matches!(config.flycheck(None), FlycheckConfig::CargoCommand { options, .. } if options.target_dir.is_none())
-        );
+        assert!(matches!(
+            config.flycheck(None),
+            FlycheckConfig::Automatic {
+                cargo_options: CargoOptions { target_dir_config: TargetDirectoryConfig::None, .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3864,11 +4428,16 @@ mod tests {
         (config, _, _) = config.apply_change(change);
 
         assert_eq!(config.cargo_targetDir(None), &Some(TargetDirectory::UseSubdirectory(true)));
-        let target =
+        let ws_target_dir =
             Utf8PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap_or("target".to_owned()));
-        assert!(
-            matches!(config.flycheck(None), FlycheckConfig::CargoCommand { options, .. } if options.target_dir == Some(target.join("rust-analyzer")))
-        );
+        assert!(matches!(
+            config.flycheck(None),
+            FlycheckConfig::Automatic {
+                cargo_options: CargoOptions { target_dir_config, .. },
+                ..
+            } if target_dir_config.target_dir(Some(&ws_target_dir)).map(Cow::into_owned)
+                == Some(ws_target_dir.join("rust-analyzer"))
+        ));
     }
 
     #[test]
@@ -3887,8 +4456,39 @@ mod tests {
             config.cargo_targetDir(None),
             &Some(TargetDirectory::Directory(Utf8PathBuf::from("other_folder")))
         );
+        assert!(matches!(
+            config.flycheck(None),
+            FlycheckConfig::Automatic {
+                cargo_options: CargoOptions { target_dir_config, .. },
+                ..
+            } if target_dir_config.target_dir(None).map(Cow::into_owned)
+                == Some(Utf8PathBuf::from("other_folder"))
+        ));
+    }
+    #[test]
+    fn postfix_snippet_item_scope_is_invalid() {
+        let mut config =
+            Config::new(AbsPathBuf::assert(project_root()), Default::default(), vec![], None);
+        let mut change = ConfigChange::default();
+        change.change_client_config(serde_json::json!({
+            "completion":{
+                "snippets": {
+                    "custom":{
+                        "foo": {
+                            "postfix": "foo",
+                            "body": "foo",
+                            "scope": "item"
+                        }
+                    }
+                }
+            }
+        }));
+        let errors;
+        (config, errors, _) = config.apply_change(change);
+        assert!(!errors.0.is_empty(), "expected a config error for postfix+item scope");
         assert!(
-            matches!(config.flycheck(None), FlycheckConfig::CargoCommand { options, .. } if options.target_dir == Some(Utf8PathBuf::from("other_folder")))
+            config.snippets.iter().all(|s| s.postfix_triggers.iter().all(|t| &**t != "foo")),
+            "invalid snippet should not have been registered"
         );
     }
 }

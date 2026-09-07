@@ -37,6 +37,19 @@ fn main() {
         .run()
         .assert_stderr_contains("warning: linker stdout: foo");
 
+    // Make sure it respects `-D linker-messages`
+    let out = run_rustc().link_arg("run_make_warn").arg("-Dlinker-messages").run_fail();
+    out.assert_stderr_contains("error: linker stderr: bar");
+    diff()
+        .expected_file("deny-linker-lint.txt")
+        .actual_text("(linker warning)", out.stderr())
+        .run();
+
+    // Make sure that linker warnings don't fail the build when `-D warnings` is present.
+    let out = run_rustc().link_arg("run_make_warn").arg("-Dwarnings").run();
+    out.assert_stderr_contains("warning: linker stderr: bar");
+    diff().expected_file("deny-warnings.txt").actual_text("(linker warning)", out.stderr()).run();
+
     // Make sure we short-circuit this new path if the linker exits with an error
     // (so the diagnostic is less verbose)
     run_rustc().link_arg("run_make_error").run_fail().assert_stderr_contains("note: error: baz");
@@ -61,12 +74,13 @@ fn main() {
         diff()
             .expected_file("short-error.txt")
             .actual_text("(linker error)", out.stderr())
-            .normalize(r#"/rustc[^/_-]*/"#, "/rustc/")
-            .normalize("libpanic_abort", "libpanic_unwind")
             .normalize(
-                regex::escape(run_make_support::build_root().to_str().unwrap()),
+                regex::escape(
+                    run_make_support::build_root().canonicalize().unwrap().to_str().unwrap(),
+                ),
                 "/build-root",
             )
+            .normalize("libpanic_abort", "libpanic_unwind")
             .normalize(r#""[^"]*\/symbols.o""#, "\"/symbols.o\"")
             .normalize(r#""[^"]*\/raw-dylibs""#, "\"/raw-dylibs\"")
             .run();

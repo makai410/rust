@@ -15,6 +15,7 @@ import os.path
 import re
 import shlex
 from collections import namedtuple
+from pathlib import Path
 
 try:
     from html.parser import HTMLParser
@@ -242,6 +243,11 @@ class CachedFiles(object):
             return self.last_path
 
     def get_absolute_path(self, path):
+        if "*" in path:
+            paths = list(Path(self.root).glob(path))
+            if len(paths) != 1:
+                raise FailedCheck("glob path does not resolve to one file")
+            return str(paths[0])
         return os.path.join(self.root, path)
 
     def get_file(self, path):
@@ -618,8 +624,16 @@ def check_command(c, cache):
 
 def check(target, commands):
     cache = CachedFiles(target)
+    run_commands = 0
     for c in commands:
         check_command(c, cache)
+        run_commands += 1
+    if run_commands == 0 and os.environ.get("IS_RMAKE") is None:
+        stderr(
+            "\nNo check, move this file in `rustdoc-ui` testsuite if you want to check "
+            + "it doesn't crash"
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

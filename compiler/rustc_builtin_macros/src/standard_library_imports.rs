@@ -43,11 +43,9 @@ pub fn inject(
 
     let item = cx.item(
         span,
-        thin_vec![cx.attr_word(sym::macro_use, span)],
+        ast::AttrVec::new(),
         ast::ItemKind::ExternCrate(None, Ident::new(name, ident_span)),
     );
-
-    krate.items.insert(0, item);
 
     let root = (edition == Edition2015).then_some(kw::PathRoot);
 
@@ -70,11 +68,10 @@ pub fn inject(
         thin_vec![cx.attr_word(sym::prelude_import, span)],
         ast::ItemKind::Use(ast::UseTree {
             prefix: cx.path(span, import_path),
-            kind: ast::UseTreeKind::Glob,
-            span,
+            kind: ast::UseTreeKind::Glob(span),
         }),
     );
 
-    krate.items.insert(0, use_item);
+    krate.items.splice(0..0, [item, use_item]);
     krate.items.len() - orig_num_items
 }

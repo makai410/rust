@@ -1,4 +1,4 @@
-error[E0080]: type_id_eq: `TypeId` provenance is not a type id
+error[E0080]: invalid `TypeId` value: not all bytes carry type id metadata
   --> $DIR/const_transmute_type_id4.rs:12:13
    |
 LL |     assert!(a == b);
@@ -6,9 +6,6 @@ LL |     assert!(a == b);
    |
 note: inside `<TypeId as PartialEq>::eq`
   --> $SRC_DIR/core/src/any.rs:LL:COL
-note: inside `<TypeId as PartialEq>::eq::compiletime`
-  --> $SRC_DIR/core/src/any.rs:LL:COL
-   = note: this error originates in the macro `$crate::intrinsics::const_eval_select` which comes from the expansion of the macro `crate::intrinsics::const_eval_select` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: aborting due to 1 previous error
 

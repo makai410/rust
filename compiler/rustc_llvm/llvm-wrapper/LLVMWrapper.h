@@ -21,6 +21,7 @@ enum class LLVMRustResult { Success, Failure };
 typedef struct OpaqueRustString *RustStringRef;
 typedef struct LLVMOpaqueTwine *LLVMTwineRef;
 typedef struct LLVMOpaqueSMDiagnostic *LLVMSMDiagnosticRef;
+typedef struct LLVMOpaqueSpecialCaseList *LLVMSpecialCaseListRef;
 
 extern "C" void LLVMRustStringWriteImpl(RustStringRef buf,
                                         const char *slice_ptr,
@@ -44,6 +45,10 @@ public:
     // LLVM requires this.
     flush();
   }
+};
+
+struct LLVMRustBuffer {
+  std::string data;
 };
 
 #endif // INCLUDED_RUSTC_LLVM_LLVMWRAPPER_H

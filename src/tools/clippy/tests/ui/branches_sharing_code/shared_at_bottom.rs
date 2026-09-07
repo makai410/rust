@@ -1,9 +1,8 @@
-#![deny(clippy::if_same_then_else, clippy::branches_sharing_code)]
-#![allow(
+#![deny(clippy::branches_sharing_code, clippy::if_same_then_else)]
+#![expect(
     clippy::equatable_if_let,
-    clippy::uninlined_format_args,
     clippy::redundant_pattern_matching,
-    dead_code
+    clippy::uninlined_format_args
 )]
 //@no-rustfix
 // This tests the branches_sharing_code lint at the end of blocks
@@ -299,4 +298,66 @@ fn issue15004() {
         1
         //~^ branches_sharing_code
     };
+}
+
+pub fn issue15347<T>() -> isize {
+    if false {
+        static A: isize = 4;
+        return A;
+    } else {
+        static A: isize = 5;
+        return A;
+    }
+
+    if false {
+        //~^ branches_sharing_code
+        type ISize = isize;
+        return ISize::MAX;
+    } else {
+        type ISize = isize;
+        return ISize::MAX;
+    }
+
+    if false {
+        //~^ branches_sharing_code
+        fn foo() -> isize {
+            4
+        }
+        return foo();
+    } else {
+        fn foo() -> isize {
+            4
+        }
+        return foo();
+    }
+
+    if false {
+        //~^ branches_sharing_code
+        use std::num::NonZeroIsize;
+        return NonZeroIsize::new(4).unwrap().get();
+    } else {
+        use std::num::NonZeroIsize;
+        return NonZeroIsize::new(4).unwrap().get();
+    }
+
+    if false {
+        //~^ branches_sharing_code
+        const B: isize = 5;
+        return B;
+    } else {
+        const B: isize = 5;
+        return B;
+    }
+
+    // Should not lint!
+    const A: isize = 1;
+    if false {
+        const B: isize = A;
+        return B;
+    } else {
+        const C: isize = A;
+        return C;
+    }
+
+    todo!()
 }

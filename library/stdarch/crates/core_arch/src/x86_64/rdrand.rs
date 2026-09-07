@@ -5,7 +5,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 #[allow(improper_ctypes)]
-unsafe extern "unadjusted" {
+unsafe extern "llvm-intrinsic" {
     #[link_name = "llvm.x86.rdrand.64"]
     fn x86_rdrand64_step() -> (u64, i32);
     #[link_name = "llvm.x86.rdseed.64"]
@@ -23,8 +23,8 @@ use stdarch_test::assert_instr;
 #[target_feature(enable = "rdrand")]
 #[cfg_attr(test, assert_instr(rdrand))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
-pub unsafe fn _rdrand64_step(val: &mut u64) -> i32 {
-    let (v, flag) = x86_rdrand64_step();
+pub fn _rdrand64_step(val: &mut u64) -> i32 {
+    let (v, flag) = unsafe { x86_rdrand64_step() };
     *val = v;
     flag
 }
@@ -37,8 +37,8 @@ pub unsafe fn _rdrand64_step(val: &mut u64) -> i32 {
 #[target_feature(enable = "rdseed")]
 #[cfg_attr(test, assert_instr(rdseed))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
-pub unsafe fn _rdseed64_step(val: &mut u64) -> i32 {
-    let (v, flag) = x86_rdseed64_step();
+pub fn _rdseed64_step(val: &mut u64) -> i32 {
+    let (v, flag) = unsafe { x86_rdseed64_step() };
     *val = v;
     flag
 }

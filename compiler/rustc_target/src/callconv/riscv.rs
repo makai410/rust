@@ -10,7 +10,7 @@ use rustc_abi::{
 };
 
 use crate::callconv::{ArgAbi, ArgExtension, CastTarget, FnAbi, PassMode, Uniform};
-use crate::spec::HasTargetSpec;
+use crate::spec::{HasTargetSpec, LlvmAbi};
 
 #[derive(Copy, Clone)]
 enum RegPassKind {
@@ -91,8 +91,10 @@ where
                 }
             }
         },
-        BackendRepr::SimdVector { .. } => return Err(CannotUseFpConv),
-        BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => match arg_layout.fields {
+        BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. } => {
+            return Err(CannotUseFpConv);
+        }
+        BackendRepr::ScalarPair { .. } | BackendRepr::Memory { .. } => match arg_layout.fields {
             FieldsShape::Primitive => {
                 unreachable!("aggregates can't have `FieldsShape::Primitive`")
             }
@@ -290,7 +292,13 @@ fn classify_arg<'a, Ty, C>(
     Ty: TyAbiInterface<'a, C> + Copy,
 {
     if !arg.layout.is_sized() {
+        // FIXME: Update avail_gprs?
         // Not touching this...
+        return;
+    }
+    if arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
+        arg.make_indirect();
+        *avail_gprs = (*avail_gprs).saturating_sub(1);
         return;
     }
     if !is_vararg {
@@ -328,7 +336,7 @@ fn classify_arg<'a, Ty, C>(
     }
 
     let total = arg.layout.size;
-    let align = arg.layout.align.abi.bits();
+    let align = arg.layout.align.bits();
 
     // "Scalars wider than 2✕XLEN are passed by reference and are replaced in
     // the argument list with the address."
@@ -393,16 +401,14 @@ fn classify_arg<'a, Ty, C>(
 }
 
 fn extend_integer_width<Ty>(arg: &mut ArgAbi<'_, Ty>, xlen: u64) {
-    if let BackendRepr::Scalar(scalar) = arg.layout.backend_repr {
-        if let Primitive::Int(i, _) = scalar.primitive() {
-            // 32-bit integers are always sign-extended
-            if i.size().bits() == 32 && xlen > 32 {
-                if let PassMode::Direct(ref mut attrs) = arg.mode {
-                    attrs.ext(ArgExtension::Sext);
-                    return;
-                }
-            }
-        }
+    if let BackendRepr::Scalar(scalar) = arg.layout.backend_repr
+        && let Primitive::Int(i, _) = scalar.primitive()
+        && i.size().bits() == 32
+        && xlen > 32
+        && let PassMode::Direct(ref mut attrs) = arg.mode
+    {
+        attrs.ext(ArgExtension::Sext);
+        return;
     }
 
     arg.extend_integer_width_to(xlen);
@@ -413,9 +419,9 @@ where
     Ty: TyAbiInterface<'a, C> + Copy,
     C: HasDataLayout + HasTargetSpec,
 {
-    let flen = match &cx.target_spec().llvm_abiname[..] {
-        "ilp32f" | "lp64f" => 32,
-        "ilp32d" | "lp64d" => 64,
+    let flen = match &cx.target_spec().llvm_abiname {
+        LlvmAbi::Ilp32f | LlvmAbi::Lp64f => 32,
+        LlvmAbi::Ilp32d | LlvmAbi::Lp64d => 64,
         _ => 0,
     };
     let xlen = cx.data_layout().pointer_size().bits();

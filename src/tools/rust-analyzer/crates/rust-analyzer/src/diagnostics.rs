@@ -1,20 +1,23 @@
 //! Book keeping for keeping diagnostics easily in sync with the client.
-pub(crate) mod to_proto;
+pub(crate) mod flycheck_to_proto;
 
 use std::mem;
 
-use cargo_metadata::PackageId;
 use ide::FileId;
 use ide_db::{FxHashMap, base_db::DbPanicContext};
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 use stdx::iter_eq_by;
 use triomphe::Arc;
 
-use crate::{global_state::GlobalStateSnapshot, lsp, lsp_ext, main_loop::DiagnosticsTaskKind};
+use crate::{
+    flycheck::PackageSpecifier, global_state::GlobalStateSnapshot, lsp, lsp_ext,
+    main_loop::DiagnosticsTaskKind,
+};
 
 pub(crate) type CheckFixes =
-    Arc<Vec<FxHashMap<Option<Arc<PackageId>>, FxHashMap<FileId, Vec<Fix>>>>>;
+    Arc<Vec<FxHashMap<Option<PackageSpecifier>, FxHashMap<FileId, Vec<Fix>>>>>;
 
 #[derive(Debug, Default, Clone)]
 pub struct DiagnosticsMapConfig {
@@ -26,6 +29,17 @@ pub struct DiagnosticsMapConfig {
 
 pub(crate) type DiagnosticsGeneration = usize;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkspaceFlycheckDiagnostic {
+    pub(crate) per_package: FxHashMap<Option<PackageSpecifier>, PackageFlycheckDiagnostic>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PackageFlycheckDiagnostic {
+    generation: DiagnosticsGeneration,
+    per_file: FxHashMap<FileId, Vec<lsp_types::Diagnostic>>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DiagnosticCollection {
     // FIXME: should be FxHashMap<FileId, Vec<ra_id::Diagnostic>>
@@ -33,9 +47,7 @@ pub(crate) struct DiagnosticCollection {
         FxHashMap<FileId, (DiagnosticsGeneration, Vec<lsp_types::Diagnostic>)>,
     pub(crate) native_semantic:
         FxHashMap<FileId, (DiagnosticsGeneration, Vec<lsp_types::Diagnostic>)>,
-    // FIXME: should be Vec<flycheck::Diagnostic>
-    pub(crate) check:
-        Vec<FxHashMap<Option<Arc<PackageId>>, FxHashMap<FileId, Vec<lsp_types::Diagnostic>>>>,
+    pub(crate) check: Vec<WorkspaceFlycheckDiagnostic>,
     pub(crate) check_fixes: CheckFixes,
     changes: FxHashSet<FileId>,
     /// Counter for supplying a new generation number for diagnostics.
@@ -48,7 +60,7 @@ pub(crate) struct DiagnosticCollection {
 #[derive(Debug, Clone)]
 pub(crate) struct Fix {
     // Fixes may be triggerable from multiple ranges.
-    pub(crate) ranges: Vec<lsp_types::Range>,
+    pub(crate) ranges: SmallVec<[lsp_types::Range; 2]>,
     pub(crate) action: lsp_ext::CodeAction,
 }
 
@@ -57,7 +69,7 @@ impl DiagnosticCollection {
         let Some(check) = self.check.get_mut(flycheck_id) else {
             return;
         };
-        self.changes.extend(check.drain().flat_map(|(_, v)| v.into_keys()));
+        self.changes.extend(check.per_package.drain().flat_map(|(_, v)| v.per_file.into_keys()));
         if let Some(fixes) = Arc::make_mut(&mut self.check_fixes).get_mut(flycheck_id) {
             fixes.clear();
         }
@@ -66,22 +78,69 @@ impl DiagnosticCollection {
     pub(crate) fn clear_check_all(&mut self) {
         Arc::make_mut(&mut self.check_fixes).clear();
         self.changes.extend(
-            self.check.iter_mut().flat_map(|it| it.drain().flat_map(|(_, v)| v.into_keys())),
+            self.check
+                .iter_mut()
+                .flat_map(|it| it.per_package.drain().flat_map(|(_, v)| v.per_file.into_keys())),
         )
     }
 
     pub(crate) fn clear_check_for_package(
         &mut self,
         flycheck_id: usize,
-        package_id: Arc<PackageId>,
+        package_id: PackageSpecifier,
     ) {
         let Some(check) = self.check.get_mut(flycheck_id) else {
             return;
         };
         let package_id = Some(package_id);
-        if let Some(checks) = check.remove(&package_id) {
-            self.changes.extend(checks.into_keys());
+        if let Some(checks) = check.per_package.remove(&package_id) {
+            self.changes.extend(checks.per_file.into_keys());
         }
+        if let Some(fixes) = Arc::make_mut(&mut self.check_fixes).get_mut(flycheck_id) {
+            fixes.remove(&package_id);
+        }
+    }
+
+    pub(crate) fn clear_check_older_than(
+        &mut self,
+        flycheck_id: usize,
+        generation: DiagnosticsGeneration,
+    ) {
+        if let Some(flycheck) = self.check.get_mut(flycheck_id) {
+            let mut packages = vec![];
+            self.changes.extend(
+                flycheck
+                    .per_package
+                    .extract_if(|_, v| v.generation < generation)
+                    .inspect(|(package_id, _)| packages.push(package_id.clone()))
+                    .flat_map(|(_, v)| v.per_file.into_keys()),
+            );
+            if let Some(fixes) = Arc::make_mut(&mut self.check_fixes).get_mut(flycheck_id) {
+                for package in packages {
+                    fixes.remove(&package);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn clear_check_older_than_for_package(
+        &mut self,
+        flycheck_id: usize,
+        package_id: PackageSpecifier,
+        generation: DiagnosticsGeneration,
+    ) {
+        let Some(check) = self.check.get_mut(flycheck_id) else {
+            return;
+        };
+        let package_id = Some(package_id);
+        let Some((_, checks)) = check
+            .per_package
+            .extract_if(|k, v| *k == package_id && v.generation < generation)
+            .next()
+        else {
+            return;
+        };
+        self.changes.extend(checks.per_file.into_keys());
         if let Some(fixes) = Arc::make_mut(&mut self.check_fixes).get_mut(flycheck_id) {
             fixes.remove(&package_id);
         }
@@ -96,30 +155,38 @@ impl DiagnosticCollection {
     pub(crate) fn add_check_diagnostic(
         &mut self,
         flycheck_id: usize,
-        package_id: &Option<Arc<PackageId>>,
+        generation: DiagnosticsGeneration,
+        package_id: &Option<PackageSpecifier>,
         file_id: FileId,
         diagnostic: lsp_types::Diagnostic,
         fix: Option<Box<Fix>>,
     ) {
         if self.check.len() <= flycheck_id {
-            self.check.resize_with(flycheck_id + 1, Default::default);
+            self.check.resize_with(flycheck_id + 1, WorkspaceFlycheckDiagnostic::default);
         }
-        let diagnostics = self.check[flycheck_id]
-            .entry(package_id.clone())
-            .or_default()
-            .entry(file_id)
-            .or_default();
+
+        let check = &mut self.check[flycheck_id];
+        let package = check.per_package.entry(package_id.clone()).or_insert_with(|| {
+            PackageFlycheckDiagnostic { generation, per_file: FxHashMap::default() }
+        });
+        // Getting message from old generation. Might happen in restarting checks.
+        if package.generation > generation {
+            return;
+        }
+        package.generation = generation;
+        let diagnostics = package.per_file.entry(file_id).or_default();
         for existing_diagnostic in diagnostics.iter() {
             if are_diagnostics_equal(existing_diagnostic, &diagnostic) {
                 return;
             }
         }
 
-        if let Some(fix) = fix {
+        if let Some(mut fix) = fix {
             let check_fixes = Arc::make_mut(&mut self.check_fixes);
             if check_fixes.len() <= flycheck_id {
                 check_fixes.resize_with(flycheck_id + 1, Default::default);
             }
+            fix.ranges.push(diagnostic.range);
             check_fixes[flycheck_id]
                 .entry(package_id.clone())
                 .or_default()
@@ -177,8 +244,8 @@ impl DiagnosticCollection {
         let check = self
             .check
             .iter()
-            .flat_map(|it| it.values())
-            .filter_map(move |it| it.get(&file_id))
+            .flat_map(|it| it.per_package.values())
+            .filter_map(move |it| it.per_file.get(&file_id))
             .flatten();
         native_syntax.chain(native_semantic).chain(check)
     }
@@ -223,34 +290,40 @@ pub(crate) fn fetch_native_diagnostics(
     let mut diagnostics = subscriptions[slice]
         .iter()
         .copied()
-        .filter_map(|file_id| {
-            let line_index = snapshot.file_line_index(file_id).ok()?;
-            let source_root = snapshot.analysis.source_root_id(file_id).ok()?;
+        .map(|file_id| {
+            let diagnostics = (|| {
+                let line_index = snapshot.file_line_index(file_id).ok()?;
+                let source_root = snapshot.analysis.source_root_id(file_id).ok()?;
 
-            let config = &snapshot.config.diagnostics(Some(source_root));
-            let diagnostics = match kind {
-                NativeDiagnosticsFetchKind::Syntax => {
-                    snapshot.analysis.syntax_diagnostics(config, file_id).ok()?
-                }
-
-                NativeDiagnosticsFetchKind::Semantic if config.enabled => snapshot
-                    .analysis
-                    .semantic_diagnostics(config, ide::AssistResolveStrategy::None, file_id)
-                    .ok()?,
-                NativeDiagnosticsFetchKind::Semantic => return None,
-            };
-            let diagnostics = diagnostics
-                .into_iter()
-                .filter_map(|d| {
-                    if d.range.file_id == file_id {
-                        Some(convert_diagnostic(&line_index, d))
-                    } else {
-                        odd_ones.push(d);
-                        None
+                let config = &snapshot.config.diagnostics(Some(source_root));
+                let diagnostics = match kind {
+                    NativeDiagnosticsFetchKind::Syntax => {
+                        snapshot.analysis.syntax_diagnostics(config, file_id).ok()?
                     }
-                })
-                .collect::<Vec<_>>();
-            Some((file_id, diagnostics))
+
+                    NativeDiagnosticsFetchKind::Semantic if config.enabled => snapshot
+                        .analysis
+                        .semantic_diagnostics(config, ide::AssistResolveStrategy::None, file_id)
+                        .ok()?,
+                    NativeDiagnosticsFetchKind::Semantic => return None,
+                };
+                Some(
+                    diagnostics
+                        .into_iter()
+                        .filter_map(|d| {
+                            if d.range.file_id == file_id {
+                                Some(convert_diagnostic(&line_index, d))
+                            } else {
+                                odd_ones.push(d);
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })()
+            .unwrap_or_default();
+
+            (file_id, diagnostics)
         })
         .collect::<Vec<_>>();
 
@@ -285,14 +358,14 @@ pub(crate) fn convert_diagnostic(
     lsp_types::Diagnostic {
         range: lsp::to_proto::range(line_index, d.range.range),
         severity: Some(lsp::to_proto::diagnostic_severity(d.severity)),
-        code: Some(lsp_types::NumberOrString::String(d.code.as_str().to_owned())),
+        code: Some(lsp_types::Code::String(d.code.as_str().to_owned())),
         code_description: Some(lsp_types::CodeDescription {
-            href: lsp_types::Url::parse(&d.code.url()).unwrap(),
+            href: lsp_types::Uri::parse(&d.code.url()).unwrap(),
         }),
         source: Some("rust-analyzer".to_owned()),
-        message: d.message,
+        message: lsp_types::Message::String(d.message),
         related_information: None,
-        tags: d.unused.then(|| vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+        tags: d.unused.then(|| vec![lsp_types::DiagnosticTag::Unnecessary]),
         data: None,
     }
 }

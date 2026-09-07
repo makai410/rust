@@ -7,17 +7,15 @@
 
 #![feature(iter_collect_into)]
 #![warn(
+    rust_2018_idioms,
     trivial_casts,
     trivial_numeric_casts,
-    rust_2018_idioms,
     unused_lifetimes,
     unused_qualifications
 )]
-#![allow(
-    clippy::collapsible_else_if,
-    clippy::needless_borrows_for_generic_args,
-    clippy::module_name_repetitions,
-    clippy::literal_string_with_formatting_args
+#![expect(
+    clippy::literal_string_with_formatting_args,
+    clippy::needless_borrows_for_generic_args
 )]
 
 mod config;
@@ -66,7 +64,7 @@ struct Crate {
 impl Crate {
     /// Run `cargo clippy` on the `Crate` and collect and return all the lint warnings that clippy
     /// issued
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn run_clippy_lints(
         &self,
         clippy_driver_path: &Path,
@@ -85,12 +83,12 @@ impl Crate {
         if config.max_jobs == 1 {
             println!(
                 "{index}/{total_crates_to_lint} {perc}% Linting {} {}",
-                &self.name, &self.version
+                self.name, self.version
             );
         } else {
             println!(
                 "{index}/{total_crates_to_lint} {perc}% Linting {} {} in target dir {thread_index:?}",
-                &self.name, &self.version
+                self.name, self.version
             );
         }
 
@@ -314,7 +312,7 @@ fn main() {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn lintcheck(config: LintcheckConfig) {
     let clippy_ver = build_clippy(config.perf);
     let clippy_driver_path = fs::canonicalize(format!(
@@ -521,7 +519,6 @@ fn lintcheck_test() {
         .args(args)
         .current_dir("..") // repo root
         .status();
-    //.output();
 
     assert!(status.unwrap().success());
 }

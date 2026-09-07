@@ -243,8 +243,7 @@ use in lambda calculus evaluation (see [this Wikipedia article][wikideb] for
 more). In `rustc`, we use de Bruijn indices to [represent generic types][sub].
 
 [wikideb]: https://en.wikipedia.org/wiki/De_Bruijn_index
-[sub]: ../ty_module/generic_arguments.md
-
+[sub]: ../ty-module/generic-arguments.md
 
 Here is a basic example of how de Bruijn indices might be used for closures (we
 don't actually do this in `rustc` though!):
@@ -265,7 +264,7 @@ don't actually do this in `rustc` though!):
 Check out the subtyping chapter from the
 [Rust Nomicon](https://doc.rust-lang.org/nomicon/subtyping.html).
 
-See the [variance](../variance.html) chapter of this guide for more info on how
+See the [variance](../variance.md) chapter of this guide for more info on how
 the type checker handles variance.
 
 <a id="free-vs-bound"></a>

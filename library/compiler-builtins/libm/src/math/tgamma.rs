@@ -23,6 +23,7 @@ Gamma(x)*Gamma(-x) = -pi/(x sin(pi x))
 most ideas and constants are from boost and python
 */
 use super::{exp, floor, k_cos, k_sin, pow};
+use crate::support::unchecked_div_isize;
 
 const PI: f64 = 3.141592653589793238462643383279502884;
 
@@ -37,7 +38,8 @@ fn sinpi(mut x: f64) -> f64 {
 
     /* reduce x into [-.25,.25] */
     n = (4.0 * x) as isize;
-    n = div!(n + 1, 2);
+    // SAFETY: nonzero divisor, nonnegative dividend (`n < 8`).
+    n = unsafe { unchecked_div_isize(n + 1, 2) };
     x -= (n as f64) * 0.5;
 
     x *= PI;
@@ -131,7 +133,7 @@ fn s(x: f64) -> f64 {
 }
 
 /// The [Gamma function](https://en.wikipedia.org/wiki/Gamma_function) (f64).
-#[cfg_attr(all(test, assert_no_panic), no_panic::no_panic)]
+#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn tgamma(mut x: f64) -> f64 {
     let u: u64 = x.to_bits();
     let absx: f64;

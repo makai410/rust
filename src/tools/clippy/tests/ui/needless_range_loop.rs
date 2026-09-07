@@ -1,10 +1,5 @@
 #![warn(clippy::needless_range_loop)]
-#![allow(
-    clippy::uninlined_format_args,
-    clippy::unnecessary_literal_unwrap,
-    clippy::useless_vec,
-    clippy::manual_slice_fill
-)]
+#![expect(clippy::unnecessary_literal_unwrap, clippy::useless_vec)]
 //@no-rustfix
 static STATIC: [usize; 4] = [0, 1, 8, 16];
 const CONST: [usize; 4] = [0, 1, 8, 16];
@@ -183,5 +178,102 @@ mod issue_2496 {
             println!("{}", next_handle.index());
         }
         unimplemented!()
+    }
+}
+
+fn needless_loop() {
+    use std::hint::black_box;
+    let x = [0; 64];
+    for i in 0..64 {
+        let y = [0; 64];
+
+        black_box(x[i]);
+        black_box(y[i]);
+    }
+
+    for i in 0..64 {
+        black_box(x[i]);
+        black_box([0; 64][i]);
+    }
+
+    for i in 0..64 {
+        black_box(x[i]);
+        black_box([1, 2, 3, 4, 5, 6, 7, 8][i]);
+    }
+
+    for i in 0..64 {
+        black_box([1, 2, 3, 4, 5, 6, 7, 8][i]);
+    }
+}
+
+fn issue_15068() {
+    let a = vec![vec![0u8; MAX_LEN]; MAX_LEN];
+    let b = vec![0u8; MAX_LEN];
+
+    for i in 0..MAX_LEN {
+        // no error
+        let _ = a[0][i];
+        let _ = b[i];
+    }
+
+    for i in 0..MAX_LEN {
+        // no error
+        let _ = a[i][0];
+        let _ = b[i];
+    }
+
+    for i in 0..MAX_LEN {
+        // no error
+        let _ = a[i][b[i] as usize];
+    }
+
+    for i in 0..MAX_LEN {
+        //~^ needless_range_loop
+        let _ = a[i][i];
+    }
+
+    for i in 0..MAX_LEN {
+        //~^ needless_range_loop
+        let _ = a[0][i];
+    }
+}
+
+fn issue16631() {
+    let mut matrix: Vec<Vec<bool>> = Vec::new();
+    for i in 0..=2 {
+        //~^ needless_range_loop
+        matrix[i][i] = true;
+    }
+
+    let values = [[0; 4]; 4];
+    let col = 2;
+    for i in 0..4 {
+        //~^ needless_range_loop
+        let _ = values[i][col];
+    }
+
+    let mut colors = [[0; 3]; 4];
+    for i in 0..3 {
+        colors[2][i] = ((u16::from(colors[0][i]) * 2 + u16::from(colors[1][i]) + 1) / 3) as u8;
+        colors[3][i] = ((u16::from(colors[0][i]) + u16::from(colors[1][i]) * 2 + 1) / 3) as u8;
+    }
+
+    let mut colors = [[0; 3]; 4];
+    let i = 0;
+    for j in 0..3 {
+        colors[i][j] = colors[0][j];
+    }
+
+    let mut colors = [[0; 3]; 4];
+    for j in 0..3 {
+        //~^ needless_range_loop
+        let _ = colors[0][j];
+    }
+
+    struct Wrapper<T>(T);
+    let mut wrapper = Wrapper([0; 3]);
+    for i in 0..3 {
+        //~^ needless_range_loop
+        let _ = wrapper.0[i];
     }
 }

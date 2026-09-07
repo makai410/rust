@@ -1,4 +1,4 @@
-use rustc_ast::{self as ast, EnumDef, MetaItem};
+use rustc_ast::{self as ast, EnumDef, MetaItem, Safety};
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_session::config::FmtDebug;
 use rustc_span::{Ident, Span, Symbol, sym};
@@ -24,23 +24,23 @@ pub(crate) fn expand_deriving_debug(
         path: path_std!(fmt::Debug),
         skip_path_as_bound: false,
         needs_copy_as_bound_if_packed: true,
-        additional_bounds: Vec::new(),
+        additional_bounds: SmallVec::new(),
         supports_unions: false,
-        methods: vec![MethodDef {
+        methods: smallvec![MethodDef {
             name: sym::fmt,
             generics: Bounds::empty(),
             explicit_self: true,
-            nonself_args: vec![(fmtr, sym::f)],
+            nonself_args: smallvec![(fmtr, sym::character('f'))],
             ret_ty: Path(path_std!(fmt::Result)),
             attributes: thin_vec![cx.attr_word(sym::inline, span)],
             fieldless_variants_strategy:
                 FieldlessVariantsStrategy::SpecializeIfAllVariantsFieldless,
-            combine_substructure: combine_substructure(Box::new(|a, b, c| {
-                show_substructure(a, b, c)
-            })),
+            combine_substructure: combine_substructure(show_substructure),
         }],
-        associated_types: Vec::new(),
+        associated_types: SmallVec::new(),
         is_const,
+        safety: Safety::Default,
+        document: true,
     };
     trait_def.expand(cx, mitem, item, push)
 }
@@ -93,7 +93,7 @@ fn show_substructure(cx: &ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) ->
         field: &FieldInfo,
         index: usize,
         len: usize,
-    ) -> ast::ptr::P<ast::Expr> {
+    ) -> Box<ast::Expr> {
         if index < len - 1 {
             field.self_expr.clone()
         } else {
@@ -164,7 +164,7 @@ fn show_substructure(cx: &ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) ->
         let ty_dyn_debug = cx.ty(
             span,
             ast::TyKind::TraitObject(
-                vec![cx.trait_bound(path_debug, false)],
+                thin_vec![cx.trait_bound(path_debug, false)],
                 ast::TraitObjectSyntax::Dyn,
             ),
         );

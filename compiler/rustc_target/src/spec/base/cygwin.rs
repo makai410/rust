@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
 use crate::spec::{
-    BinaryFormat, Cc, DebuginfoKind, LinkerFlavor, Lld, SplitDebuginfo, TargetOptions, TlsModel,
-    cvs,
+    BinaryFormat, Cc, DebuginfoKind, LinkerFlavor, Lld, Os, SplitDebuginfo, TargetOptions,
+    TlsModel, cvs,
 };
 
 pub(crate) fn opts() -> TargetOptions {
@@ -24,7 +24,7 @@ pub(crate) fn opts() -> TargetOptions {
         cygwin_libs,
     );
     TargetOptions {
-        os: "cygwin".into(),
+        os: Os::Cygwin,
         vendor: "pc".into(),
         // FIXME(#13846) this should be enabled for cygwin
         function_sections: false,
@@ -36,7 +36,6 @@ pub(crate) fn opts() -> TargetOptions {
         families: cvs!["unix"],
         is_like_windows: true,
         binary_format: BinaryFormat::Coff,
-        allows_weak_linkage: false,
         pre_link_args,
         late_link_args,
         abi_return_struct_as_int: true,

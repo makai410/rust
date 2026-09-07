@@ -1,5 +1,6 @@
 #![unstable(feature = "ptr_metadata", issue = "81513")]
 
+use crate::clone::TrivialClone;
 use crate::fmt;
 use crate::hash::{Hash, Hasher};
 use crate::intrinsics::{aggregate_raw_ptr, ptr_metadata};
@@ -54,7 +55,7 @@ use crate::ptr::NonNull;
 /// [`to_raw_parts`]: *const::to_raw_parts
 #[lang = "pointee_trait"]
 #[rustc_deny_explicit_impl]
-#[rustc_do_not_implement_via_object]
+#[rustc_dyn_incompatible_trait]
 pub trait Pointee: PointeeSized {
     /// The type for metadata in pointers and references to `Self`.
     #[lang = "metadata_type"]
@@ -105,6 +106,9 @@ pub const fn metadata<T: PointeeSized>(ptr: *const T) -> <T as Pointee>::Metadat
 /// This function is safe but the returned pointer is not necessarily safe to dereference.
 /// For slices, see the documentation of [`slice::from_raw_parts`] for safety requirements.
 /// For trait objects, the metadata must come from a pointer to the same underlying erased type.
+///
+/// If you are attempting to deconstruct a DST in a generic context to be reconstructed later,
+/// a thin pointer can always be obtained by casting `*const T` to `*const ()`.
 ///
 /// [`slice::from_raw_parts`]: crate::slice::from_raw_parts
 #[unstable(feature = "ptr_metadata", issue = "81513")]
@@ -227,6 +231,9 @@ impl<Dyn: PointeeSized> Clone for DynMetadata<Dyn> {
         *self
     }
 }
+
+#[doc(hidden)]
+unsafe impl<Dyn: PointeeSized> TrivialClone for DynMetadata<Dyn> {}
 
 impl<Dyn: PointeeSized> Eq for DynMetadata<Dyn> {}
 

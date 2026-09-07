@@ -1,9 +1,8 @@
 use clippy_utils::diagnostics::span_lint;
 use clippy_utils::higher::ForLoop;
-use clippy_utils::ty::is_type_diagnostic_item;
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
-use rustc_span::sym;
+use clippy_utils::res::MaybeDef as _;
+use clippy_utils::sym;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -55,9 +54,7 @@ impl LateLintPass<'_> for IterOverHashType {
         if let Some(for_loop) = ForLoop::hir(expr)
             && !for_loop.body.span.from_expansion()
             && let ty = cx.typeck_results().expr_ty(for_loop.arg).peel_refs()
-            && hash_iter_tys
-                .into_iter()
-                .any(|sym| is_type_diagnostic_item(cx, ty, sym))
+            && hash_iter_tys.into_iter().any(|sym| ty.is_diag_item(cx, sym))
         {
             span_lint(
                 cx,

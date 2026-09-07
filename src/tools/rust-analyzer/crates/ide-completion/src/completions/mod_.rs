@@ -14,7 +14,7 @@ use crate::{CompletionItem, Completions, context::CompletionContext};
 /// Complete mod declaration, i.e. `mod $0;`
 pub(crate) fn complete_mod(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     mod_under_caret: &ast::Module,
 ) -> Option<()> {
     if mod_under_caret.item_list().is_some() {
@@ -26,18 +26,17 @@ pub(crate) fn complete_mod(
     let mut current_module = ctx.module;
     // For `mod $0`, `ctx.module` is its parent, but for `mod f$0`, it's `mod f` itself, but we're
     // interested in its parent.
-    if ctx.original_token.kind() == SyntaxKind::IDENT {
-        if let Some(module) =
+    if ctx.original_token.kind() == SyntaxKind::IDENT
+        && let Some(module) =
             ctx.original_token.parent_ancestors().nth(1).and_then(ast::Module::cast)
-        {
-            match ctx.sema.to_def(&module) {
-                Some(module) if module == current_module => {
-                    if let Some(parent) = current_module.parent(ctx.db) {
-                        current_module = parent;
-                    }
+    {
+        match ctx.sema.to_def(&module) {
+            Some(module) if module == current_module => {
+                if let Some(parent) = current_module.parent(ctx.db) {
+                    current_module = parent;
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
 

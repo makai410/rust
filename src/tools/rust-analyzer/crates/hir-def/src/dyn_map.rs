@@ -27,14 +27,15 @@
 pub mod keys {
     use std::marker::PhantomData;
 
+    use either::Either;
     use hir_expand::{MacroCallId, attrs::AttrId};
     use rustc_hash::FxHashMap;
     use syntax::{AstNode, AstPtr, ast};
 
     use crate::{
-        BlockId, ConstId, EnumId, EnumVariantId, ExternBlockId, ExternCrateId, FieldId, FunctionId,
-        ImplId, LifetimeParamId, Macro2Id, MacroRulesId, ProcMacroId, StaticId, StructId,
-        TraitAliasId, TraitId, TypeAliasId, TypeOrConstParamId, UnionId, UseId,
+        BlockId, BuiltinDeriveImplId, ConstId, EnumId, EnumVariantId, ExternBlockId, ExternCrateId,
+        FieldId, FunctionId, ImplId, LifetimeParamId, Macro2Id, MacroRulesId, ProcMacroId,
+        StaticId, StructId, TraitId, TypeAliasId, TypeOrConstParamId, UnionId, UseId,
         dyn_map::{DynMap, Policy},
     };
 
@@ -48,7 +49,6 @@ pub mod keys {
     pub const IMPL: Key<ast::Impl, ImplId> = Key::new();
     pub const EXTERN_BLOCK: Key<ast::ExternBlock, ExternBlockId> = Key::new();
     pub const TRAIT: Key<ast::Trait, TraitId> = Key::new();
-    pub const TRAIT_ALIAS: Key<ast::TraitAlias, TraitAliasId> = Key::new();
     pub const STRUCT: Key<ast::Struct, StructId> = Key::new();
     pub const UNION: Key<ast::Union, UnionId> = Key::new();
     pub const ENUM: Key<ast::Enum, EnumId> = Key::new();
@@ -68,11 +68,12 @@ pub mod keys {
     pub const MACRO_CALL: Key<ast::MacroCall, MacroCallId> = Key::new();
     pub const ATTR_MACRO_CALL: Key<ast::Item, MacroCallId> = Key::new();
     pub const DERIVE_MACRO_CALL: Key<
-        ast::Attr,
+        ast::Meta,
         (
             AttrId,
             /* derive() */ MacroCallId,
-            /* actual derive macros */ Box<[Option<MacroCallId>]>,
+            /* actual derive macros */
+            Box<[Option<Either<MacroCallId, BuiltinDeriveImplId>>]>,
         ),
     > = Key::new();
 

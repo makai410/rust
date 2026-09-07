@@ -14,7 +14,7 @@ use std::io::{BufWriter, Write, stdout};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use rustc_data_structures::fx::FxHashSet;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdSet};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
@@ -28,12 +28,14 @@ use tracing::{debug, trace};
 
 use crate::clean::ItemKind;
 use crate::clean::types::{ExternalCrate, ExternalLocation};
-use crate::config::RenderOptions;
+use crate::config::{EmitType, RenderOptions};
 use crate::docfs::PathError;
 use crate::error::Error;
 use crate::formats::FormatRenderer;
 use crate::formats::cache::Cache;
+use crate::formats::item_type::ItemType;
 use crate::json::conversions::IntoJson;
+use crate::passes::collect_intra_doc_links::UrlFragment;
 use crate::{clean, try_err};
 
 pub(crate) struct JsonRenderer<'tcx> {
@@ -106,84 +108,100 @@ impl<'tcx> JsonRenderer<'tcx> {
             .unwrap_or_default()
     }
 
-    fn serialize_and_write<T: Write>(
-        &self,
-        output_crate: types::Crate,
-        mut writer: BufWriter<T>,
-        path: &str,
-    ) -> Result<(), Error> {
-        self.sess().time("rustdoc_json_serialize_and_write", || {
-            try_err!(
-                serde_json::ser::to_writer(&mut writer, &output_crate).map_err(|e| e.to_string()),
-                path
+    fn paths(&self) -> FxHashMap<types::Id, types::ItemSummary> {
+        let mut paths = self
+            .cache
+            .paths
+            .iter()
+            .chain(&self.cache.external_paths)
+            .map(|(&k, &(ref path, kind))| {
+                (
+                    self.id_from_item_default(k.into()),
+                    types::ItemSummary {
+                        crate_id: k.krate.as_u32(),
+                        path: path.iter().map(|s| s.to_string()).collect(),
+                        kind: kind.into_json(self),
+                    },
+                )
+            })
+            .collect();
+
+        self.add_intra_doc_link_paths(&mut paths);
+        paths
+    }
+
+    fn add_intra_doc_link_paths(&self, paths: &mut FxHashMap<types::Id, types::ItemSummary>) {
+        // The link target IDs were already interned when the `links` maps were emitted.
+        // This only fills missing summaries in `paths`, where JSON object order is not meaningful.
+        #[allow(rustc::potential_query_instability)]
+        let links = self.cache.intra_doc_links.values();
+        for link in links.flatten() {
+            let Some(UrlFragment::Item(item_id)) = link.fragment.as_ref() else {
+                continue;
+            };
+            let item_id = *item_id;
+            let id = self.id_from_item_default(item_id.into());
+
+            if paths.contains_key(&id) || (item_id.is_local() && !self.index.contains_key(&id)) {
+                continue;
+            }
+
+            let path = self.path_for_link_target(link.page_id, item_id);
+            let kind = ItemType::from_def_id(item_id, self.tcx);
+            paths.insert(
+                id,
+                types::ItemSummary {
+                    crate_id: item_id.krate.as_u32(),
+                    path,
+                    kind: kind.into_json(self),
+                },
             );
-            try_err!(writer.flush(), path);
-            Ok(())
+        }
+    }
+
+    fn path_for_link_target(&self, page_id: DefId, item_id: DefId) -> Vec<String> {
+        let parent_id = self.tcx.parent(item_id);
+        // Inherent items have an unnamed impl parent, while variant fields have one extra named
+        // parent between themselves and their page.
+        let (mut path, variant_id) = match self.tcx.def_kind(parent_id) {
+            DefKind::Impl { .. } => (
+                self.cached_path(page_id).expect("intra-doc link page should have a cached path"),
+                None,
+            ),
+            DefKind::Variant => {
+                (self.path_for_named_item(self.tcx.parent(parent_id)), Some(parent_id))
+            }
+            _ => (self.path_for_named_item(parent_id), None),
+        };
+
+        if let Some(variant_id) = variant_id {
+            path.push(self.tcx.item_name(variant_id).to_string());
+        }
+        path.push(self.tcx.item_name(item_id).to_string());
+        path
+    }
+
+    fn path_for_named_item(&self, item_id: DefId) -> Vec<String> {
+        self.cached_path(item_id).unwrap_or_else(|| {
+            let kind = ItemType::from_def_id(item_id, self.tcx);
+            clean::inline::get_item_path(self.tcx, item_id, kind)
+                .into_iter()
+                .map(|name| name.to_string())
+                .collect()
         })
     }
-}
 
-fn target(sess: &rustc_session::Session) -> types::Target {
-    // Build a set of which features are enabled on this target
-    let globally_enabled_features: FxHashSet<&str> =
-        sess.unstable_target_features.iter().map(|name| name.as_str()).collect();
-
-    // Build a map of target feature stability by feature name
-    use rustc_target::target_features::Stability;
-    let feature_stability: FxHashMap<&str, Stability> = sess
-        .target
-        .rust_target_features()
-        .into_iter()
-        .copied()
-        .map(|(name, stability, _)| (name, stability))
-        .collect();
-
-    types::Target {
-        triple: sess.opts.target_triple.tuple().into(),
-        target_features: sess
-            .target
-            .rust_target_features()
-            .into_iter()
-            .copied()
-            .filter(|(_, stability, _)| {
-                // Describe only target features which the user can toggle
-                stability.toggle_allowed().is_ok()
-            })
-            .map(|(name, stability, implied_features)| {
-                types::TargetFeature {
-                    name: name.into(),
-                    unstable_feature_gate: match stability {
-                        Stability::Unstable(feature_gate) => Some(feature_gate.as_str().into()),
-                        _ => None,
-                    },
-                    implies_features: implied_features
-                        .into_iter()
-                        .copied()
-                        .filter(|name| {
-                            // Imply only target features which the user can toggle
-                            feature_stability
-                                .get(name)
-                                .map(|stability| stability.toggle_allowed().is_ok())
-                                .unwrap_or(false)
-                        })
-                        .map(String::from)
-                        .collect(),
-                    globally_enabled: globally_enabled_features.contains(name),
-                }
-            })
-            .collect(),
+    fn cached_path(&self, item_id: DefId) -> Option<Vec<String>> {
+        self.cache
+            .paths
+            .get(&item_id)
+            .or_else(|| self.cache.external_paths.get(&item_id))
+            .map(|(path, _)| path.iter().map(|name| name.to_string()).collect())
     }
 }
 
-impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
-    fn descr() -> &'static str {
-        "json"
-    }
-
-    const RUN_ON_MODULE: bool = false;
-    type ModuleData = ();
-
-    fn init(
+impl<'tcx> JsonRenderer<'tcx> {
+    pub(crate) fn init(
         krate: clean::Crate,
         options: RenderOptions,
         cache: Cache,
@@ -205,6 +223,14 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
             krate,
         ))
     }
+}
+
+impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
+    const DESCR: &'static str = "json";
+    const RUN_ON_MODULE: bool = false;
+    const NON_STATIC_FILE_EMIT_TYPE: EmitType = EmitType::IrJsonFiles;
+
+    type ModuleData = ();
 
     fn save_module_data(&mut self) -> Self::ModuleData {
         unreachable!("RUN_ON_MODULE = false, should never call save_module_data")
@@ -303,42 +329,25 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
         unreachable!("RUN_ON_MODULE = false, should never call mod_item_in")
     }
 
-    fn after_krate(mut self) -> Result<(), Error> {
+    fn after_krate(self) -> Result<(), Error> {
         debug!("Done with crate");
 
         let e = ExternalCrate { crate_num: LOCAL_CRATE };
-
-        // We've finished using the index, and don't want to clone it, because it is big.
-        let index = std::mem::take(&mut self.index);
+        let sess = self.sess();
 
         // Note that tcx.rust_target_features is inappropriate here because rustdoc tries to run for
         // multiple targets: https://github.com/rust-lang/rust/pull/137632
         //
         // We want to describe a single target, so pass tcx.sess rather than tcx.
-        let target = target(self.tcx.sess);
+        let target = conversions::target(sess);
 
         debug!("Constructing Output");
+        let paths = self.paths();
         let output_crate = types::Crate {
             root: self.id_from_item_default(e.def_id().into()),
             crate_version: self.cache.crate_version.clone(),
             includes_private: self.cache.document_private,
-            index,
-            paths: self
-                .cache
-                .paths
-                .iter()
-                .chain(&self.cache.external_paths)
-                .map(|(&k, &(ref path, kind))| {
-                    (
-                        self.id_from_item_default(k.into()),
-                        types::ItemSummary {
-                            crate_id: k.krate.as_u32(),
-                            path: path.iter().map(|s| s.to_string()).collect(),
-                            kind: kind.into_json(&self),
-                        },
-                    )
-                })
-                .collect(),
+            paths,
             external_crates: self
                 .cache
                 .extern_locations
@@ -350,13 +359,23 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
                         types::ExternalCrate {
                             name: e.name(self.tcx).to_string(),
                             html_root_url: match external_location {
-                                ExternalLocation::Remote(s) => Some(s.clone()),
+                                // FIXME: relative extern URLs are not resolved here
+                                ExternalLocation::Remote { url, .. } => Some(url.clone()),
                                 _ => None,
                             },
+                            path: self
+                                .tcx
+                                .used_crate_source(*crate_num)
+                                .paths()
+                                .next()
+                                .expect("crate should have at least 1 path")
+                                .clone(),
                         },
                     )
                 })
                 .collect(),
+            // Be careful to not clone the `index`, it is big.
+            index: self.index,
             target,
             format_version: types::FORMAT_VERSION,
         };
@@ -367,15 +386,32 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
             p.push(output_crate.index.get(&output_crate.root).unwrap().name.clone().unwrap());
             p.set_extension("json");
 
-            self.serialize_and_write(
+            serialize_and_write(
+                sess,
                 output_crate,
                 try_err!(File::create_buffered(&p), p),
                 &p.display().to_string(),
             )
         } else {
-            self.serialize_and_write(output_crate, BufWriter::new(stdout().lock()), "<stdout>")
+            serialize_and_write(sess, output_crate, BufWriter::new(stdout().lock()), "<stdout>")
         }
     }
+}
+
+fn serialize_and_write<T: Write>(
+    sess: &Session,
+    output_crate: types::Crate,
+    mut writer: BufWriter<T>,
+    path: &str,
+) -> Result<(), Error> {
+    sess.time("rustdoc_json_serialize_and_write", || {
+        try_err!(
+            serde_json::ser::to_writer(&mut writer, &output_crate).map_err(|e| e.to_string()),
+            path
+        );
+        try_err!(writer.flush(), path);
+        Ok(())
+    })
 }
 
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
@@ -390,15 +426,12 @@ mod size_asserts {
     // tidy-alphabetical-start
     static_assert_size!(AssocItemConstraint, 112);
     static_assert_size!(Crate, 184);
-    static_assert_size!(ExternalCrate, 48);
     static_assert_size!(FunctionPointer, 168);
     static_assert_size!(GenericArg, 80);
     static_assert_size!(GenericArgs, 104);
     static_assert_size!(GenericBound, 72);
     static_assert_size!(GenericParamDef, 136);
     static_assert_size!(Impl, 304);
-    // `Item` contains a `PathBuf`, which is different sizes on different OSes.
-    static_assert_size!(Item, 528 + size_of::<std::path::PathBuf>());
     static_assert_size!(ItemSummary, 32);
     static_assert_size!(PolyTrait, 64);
     static_assert_size!(PreciseCapturingArg, 32);
@@ -406,4 +439,8 @@ mod size_asserts {
     static_assert_size!(Type, 80);
     static_assert_size!(WherePredicate, 160);
     // tidy-alphabetical-end
+
+    // These contains a `PathBuf`, which is different sizes on different OSes.
+    static_assert_size!(Item, 544 + size_of::<std::path::PathBuf>());
+    static_assert_size!(ExternalCrate, 48 + size_of::<std::path::PathBuf>());
 }

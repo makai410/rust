@@ -13,6 +13,7 @@ use std::iter;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::arena::ArenaAllocatable;
 use rustc_middle::bug;
+use rustc_middle::infer::canonical::{CanonicalVarKind, QueryRegionConstraint};
 use rustc_middle::ty::{self, BoundVar, GenericArg, GenericArgKind, Ty, TyCtxt, TypeFoldable};
 use tracing::{debug, instrument};
 
@@ -21,12 +22,15 @@ use crate::infer::canonical::{
     Canonical, CanonicalQueryResponse, CanonicalVarValues, Certainty, OriginalQueryValues,
     QueryRegionConstraints, QueryResponse,
 };
-use crate::infer::region_constraints::{Constraint, RegionConstraintData};
+use crate::infer::region_constraints::{ConstraintKind, RegionConstraintData};
 use crate::infer::{
-    DefineOpaqueTypes, InferCtxt, InferOk, InferResult, SubregionOrigin, TypeOutlivesConstraint,
+    DefineOpaqueTypes, InferCtxt, InferOk, InferResult, OpaqueTypeStorageEntries, SubregionOrigin,
+    TypeOutlivesConstraint,
 };
 use crate::traits::query::NoSolution;
-use crate::traits::{ObligationCause, PredicateObligations, ScrubbedTraitError, TraitEngine};
+use crate::traits::{
+    ObligationCause, PredicateObligations, ScrubbedTraitError, TraitEngine, TraitErrors,
+};
 
 impl<'tcx> InferCtxt<'tcx> {
     /// This method is meant to be invoked as the final step of a canonical query
@@ -80,15 +84,34 @@ impl<'tcx> InferCtxt<'tcx> {
         &self,
         inference_vars: CanonicalVarValues<'tcx>,
         answer: T,
+        prev_entries: OpaqueTypeStorageEntries,
     ) -> Canonical<'tcx, QueryResponse<'tcx, T>>
     where
         T: Debug + TypeFoldable<TyCtxt<'tcx>>,
     {
+        // While we ignore region constraints and pending obligations,
+        // we do return constrained opaque types to avoid unconstrained
+        // inference variables in the response. This is important as we want
+        // to check that opaques in deref steps stay unconstrained.
+        //
+        // This doesn't handle the more general case for non-opaques as
+        // ambiguous `Projection` obligations have same the issue.
+        let opaque_types = if self.next_trait_solver() {
+            self.inner
+                .borrow_mut()
+                .opaque_type_storage
+                .opaque_types_added_since(prev_entries)
+                .map(|(k, v)| (k, v.ty))
+                .collect()
+        } else {
+            vec![]
+        };
+
         self.canonicalize_response(QueryResponse {
             var_values: inference_vars,
             region_constraints: QueryRegionConstraints::default(),
             certainty: Certainty::Proven, // Ambiguities are OK!
-            opaque_types: vec![],
+            opaque_types,
             value: answer,
         })
     }
@@ -105,24 +128,32 @@ impl<'tcx> InferCtxt<'tcx> {
     where
         T: Debug + TypeFoldable<TyCtxt<'tcx>>,
     {
-        let tcx = self.tcx;
-
         // Select everything, returning errors.
-        let errors = fulfill_cx.select_all_or_error(self);
+        let errors = fulfill_cx.evaluate_obligations_error_on_ambiguity(self);
 
-        // True error!
-        if errors.iter().any(|e| e.is_true_error()) {
-            return Err(NoSolution);
-        }
+        let certainty = match errors {
+            TraitErrors::HasErrors(errors) => {
+                if errors.iter().any(|e| e.is_true_error()) {
+                    // True error!
+                    return Err(NoSolution);
+                } else {
+                    Certainty::Ambiguous
+                }
+            }
+            TraitErrors::NoErrors => Certainty::Proven,
+        };
 
         let region_obligations = self.take_registered_region_obligations();
+        let region_assumptions = self.take_registered_region_assumptions();
         debug!(?region_obligations);
         let region_constraints = self.with_region_constraints(|region_constraints| {
-            make_query_region_constraints(tcx, region_obligations, region_constraints)
+            make_query_region_constraints(
+                region_obligations,
+                region_constraints,
+                region_assumptions,
+            )
         });
         debug!(?region_constraints);
-
-        let certainty = if errors.is_empty() { Certainty::Proven } else { Certainty::Ambiguous };
 
         let opaque_types = self
             .inner
@@ -164,9 +195,23 @@ impl<'tcx> InferCtxt<'tcx> {
         let InferOk { value: result_args, obligations } =
             self.query_response_instantiation(cause, param_env, original_values, query_response)?;
 
-        for (predicate, _category) in &query_response.value.region_constraints.outlives {
-            let predicate = instantiate_value(self.tcx, &result_args, *predicate);
-            self.register_outlives_constraint(predicate, cause);
+        for QueryRegionConstraint { constraint, visible_for_leak_check: vis, .. } in
+            &query_response.value.region_constraints.constraints
+        {
+            let constraint = instantiate_value(self.tcx, &result_args, *constraint);
+            match constraint {
+                ty::RegionConstraint::Outlives(clause) => {
+                    self.register_outlives_constraint(clause, *vis, cause);
+                }
+                ty::RegionConstraint::Eq(clause) => {
+                    self.register_region_eq_constraint(clause, *vis, cause);
+                }
+            }
+        }
+
+        for assumption in &query_response.value.region_constraints.assumptions {
+            let assumption = instantiate_value(self.tcx, &result_args, *assumption);
+            self.register_region_assumption(assumption);
         }
 
         let user_result: R =
@@ -248,14 +293,13 @@ impl<'tcx> InferCtxt<'tcx> {
                 }
 
                 (GenericArgKind::Lifetime(v_o), GenericArgKind::Lifetime(v_r)) => {
-                    // To make `v_o = v_r`, we emit `v_o: v_r` and `v_r: v_o`.
                     if v_o != v_r {
-                        output_query_region_constraints
-                            .outlives
-                            .push((ty::OutlivesPredicate(v_o.into(), v_r), constraint_category));
-                        output_query_region_constraints
-                            .outlives
-                            .push((ty::OutlivesPredicate(v_r.into(), v_o), constraint_category));
+                        let constraint = QueryRegionConstraint {
+                            constraint: ty::RegionEqPredicate(v_o, v_r).into(),
+                            category: constraint_category,
+                            visible_for_leak_check: ty::VisibleForLeakCheck::Yes,
+                        };
+                        output_query_region_constraints.constraints.push(constraint);
                     }
                 }
 
@@ -282,14 +326,25 @@ impl<'tcx> InferCtxt<'tcx> {
         }
 
         // ...also include the other query region constraints from the query.
-        output_query_region_constraints.outlives.extend(
-            query_response.value.region_constraints.outlives.iter().filter_map(|&r_c| {
+        output_query_region_constraints.constraints.extend(
+            query_response.value.region_constraints.constraints.iter().filter_map(|&r_c| {
                 let r_c = instantiate_value(self.tcx, &result_args, r_c);
 
-                // Screen out `'a: 'a` cases.
-                let ty::OutlivesPredicate(k1, r2) = r_c.0;
-                if k1 != r2.into() { Some(r_c) } else { None }
+                // Screen out `'a: 'a` or `'a == 'a` cases.
+                if r_c.constraint.is_trivial() { None } else { Some(r_c) }
             }),
+        );
+
+        // FIXME(higher_ranked_auto): Optimize this to instantiate all assumptions
+        // at once, rather than calling `instantiate_value` repeatedly which may
+        // create more universes.
+        output_query_region_constraints.assumptions.extend(
+            query_response
+                .value
+                .region_constraints
+                .assumptions
+                .iter()
+                .map(|&r_c| instantiate_value(self.tcx, &result_args, r_c)),
         );
 
         let user_result: R =
@@ -391,40 +446,39 @@ impl<'tcx> InferCtxt<'tcx> {
         // result, then we can type the corresponding value from the
         // input. See the example above.
         let mut opt_values: IndexVec<BoundVar, Option<GenericArg<'tcx>>> =
-            IndexVec::from_elem_n(None, query_response.variables.len());
+            IndexVec::from_elem_n(None, query_response.var_kinds.len());
 
-        // In terms of our example above, we are iterating over pairs like:
-        // [(?A, Vec<?0>), ('static, '?1), (?B, ?0)]
         for (original_value, result_value) in iter::zip(&original_values.var_values, result_values)
         {
             match result_value.kind() {
                 GenericArgKind::Type(result_value) => {
-                    // e.g., here `result_value` might be `?0` in the example above...
-                    if let ty::Bound(debruijn, b) = *result_value.kind() {
-                        // ...in which case we would set `canonical_vars[0]` to `Some(?U)`.
-
-                        // We only allow a `ty::INNERMOST` index in generic parameters.
-                        assert_eq!(debruijn, ty::INNERMOST);
+                    // We disable the instantiation guess for inference variables
+                    // and only use it for placeholders. We need to handle the
+                    // `sub_root` of type inference variables which would make this
+                    // more involved. They are also a lot rarer than region variables.
+                    if let ty::Bound(index_kind, b) = *result_value.kind()
+                        && !matches!(
+                            query_response.var_kinds[b.var.as_usize()],
+                            CanonicalVarKind::Ty { .. }
+                        )
+                    {
+                        // We only allow a `Canonical` index in generic parameters.
+                        assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
                         opt_values[b.var] = Some(*original_value);
                     }
                 }
                 GenericArgKind::Lifetime(result_value) => {
-                    // e.g., here `result_value` might be `'?1` in the example above...
-                    if let ty::ReBound(debruijn, br) = result_value.kind() {
-                        // ... in which case we would set `canonical_vars[0]` to `Some('static)`.
-
-                        // We only allow a `ty::INNERMOST` index in generic parameters.
-                        assert_eq!(debruijn, ty::INNERMOST);
-                        opt_values[br.var] = Some(*original_value);
+                    if let ty::ReBound(index_kind, b) = result_value.kind() {
+                        // We only allow a `Canonical` index in generic parameters.
+                        assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
+                        opt_values[b.var] = Some(*original_value);
                     }
                 }
                 GenericArgKind::Const(result_value) => {
-                    if let ty::ConstKind::Bound(debruijn, b) = result_value.kind() {
-                        // ...in which case we would set `canonical_vars[0]` to `Some(const X)`.
-
-                        // We only allow a `ty::INNERMOST` index in generic parameters.
-                        assert_eq!(debruijn, ty::INNERMOST);
-                        opt_values[b] = Some(*original_value);
+                    if let ty::ConstKind::Bound(index_kind, b) = result_value.kind() {
+                        // We only allow a `Canonical` index in generic parameters.
+                        assert!(matches!(index_kind, ty::BoundVarIndexKind::Canonical));
+                        opt_values[b.var] = Some(*original_value);
                     }
                 }
             }
@@ -433,39 +487,36 @@ impl<'tcx> InferCtxt<'tcx> {
         // Create result arguments: if we found a value for a
         // given variable in the loop above, use that. Otherwise, use
         // a fresh inference variable.
-        let result_args = CanonicalVarValues {
-            var_values: self.tcx.mk_args_from_iter(
-                query_response.variables.iter().enumerate().map(|(index, var_kind)| {
-                    if var_kind.universe() != ty::UniverseIndex::ROOT {
-                        // A variable from inside a binder of the query. While ideally these shouldn't
-                        // exist at all, we have to deal with them for now.
-                        self.instantiate_canonical_var(cause.span, var_kind, |u| {
-                            universe_map[u.as_usize()]
-                        })
-                    } else if var_kind.is_existential() {
-                        match opt_values[BoundVar::new(index)] {
-                            Some(k) => k,
-                            None => self.instantiate_canonical_var(cause.span, var_kind, |u| {
-                                universe_map[u.as_usize()]
-                            }),
-                        }
-                    } else {
-                        // For placeholders which were already part of the input, we simply map this
-                        // universal bound variable back the placeholder of the input.
-                        opt_values[BoundVar::new(index)].expect(
-                            "expected placeholder to be unified with itself during response",
-                        )
-                    }
-                }),
-            ),
-        };
+        let tcx = self.tcx;
+        let var_kinds = query_response.var_kinds;
+        let var_values = CanonicalVarValues::instantiate(tcx, var_kinds, |var_values, kind| {
+            if kind.universe() != ty::UniverseIndex::ROOT {
+                // A variable from inside a binder of the query. While ideally these shouldn't
+                // exist at all, we have to deal with them for now.
+                self.instantiate_canonical_var(cause.span, kind, &var_values, |u| {
+                    universe_map[u.as_usize()]
+                })
+            } else if kind.is_existential() {
+                match opt_values[BoundVar::new(var_values.len())] {
+                    Some(k) => k,
+                    None => self.instantiate_canonical_var(cause.span, kind, &var_values, |u| {
+                        universe_map[u.as_usize()]
+                    }),
+                }
+            } else {
+                // For placeholders which were already part of the input, we simply map this
+                // universal bound variable back the placeholder of the input.
+                opt_values[BoundVar::new(var_values.len())]
+                    .expect("expected placeholder to be unified with itself during response")
+            }
+        });
 
         let mut obligations = PredicateObligations::new();
 
         // Carry all newly resolved opaque types to the caller's scope
         for &(a, b) in &query_response.value.opaque_types {
-            let a = instantiate_value(self.tcx, &result_args, a);
-            let b = instantiate_value(self.tcx, &result_args, b);
+            let a = instantiate_value(self.tcx, &var_values, a);
+            let b = instantiate_value(self.tcx, &var_values, b);
             debug!(?a, ?b, "constrain opaque type");
             // We use equate here instead of, for example, just registering the
             // opaque type's hidden value directly, because the hidden type may have been an inference
@@ -475,14 +526,14 @@ impl<'tcx> InferCtxt<'tcx> {
                 self.at(cause, param_env)
                     .eq(
                         DefineOpaqueTypes::Yes,
-                        Ty::new_opaque(self.tcx, a.def_id.to_def_id(), a.args),
+                        Ty::new_opaque(self.tcx, ty::IsRigid::No, a.def_id.to_def_id(), a.args),
                         b,
                     )?
                     .obligations,
             );
         }
 
-        Ok(InferOk { value: result_args, obligations })
+        Ok(InferOk { value: var_values, obligations })
     }
 
     /// Given a "guess" at the values for the canonical variables in
@@ -546,6 +597,7 @@ impl<'tcx> InferCtxt<'tcx> {
                         SubregionOrigin::RelateRegionParamBound(cause.span, None),
                         v1,
                         v2,
+                        ty::VisibleForLeakCheck::Yes,
                     );
                 }
                 (GenericArgKind::Const(v1), GenericArgKind::Const(v2)) => {
@@ -564,9 +616,9 @@ impl<'tcx> InferCtxt<'tcx> {
 /// Given the region obligations and constraints scraped from the infcx,
 /// creates query region constraints.
 pub fn make_query_region_constraints<'tcx>(
-    tcx: TyCtxt<'tcx>,
     outlives_obligations: Vec<TypeOutlivesConstraint<'tcx>>,
     region_constraints: &RegionConstraintData<'tcx>,
+    assumptions: Vec<ty::ArgOutlivesClause<'tcx>>,
 ) -> QueryRegionConstraints<'tcx> {
     let RegionConstraintData { constraints, verifys } = region_constraints;
 
@@ -574,33 +626,42 @@ pub fn make_query_region_constraints<'tcx>(
 
     debug!(?constraints);
 
-    let outlives: Vec<_> = constraints
+    let constraints: Vec<QueryRegionConstraint<'tcx>> = constraints
         .iter()
-        .map(|(k, origin)| {
-            let constraint = match *k {
-                // Swap regions because we are going from sub (<=) to outlives
-                // (>=).
-                Constraint::VarSubVar(v1, v2) => ty::OutlivesPredicate(
-                    ty::Region::new_var(tcx, v2).into(),
-                    ty::Region::new_var(tcx, v1),
-                ),
-                Constraint::VarSubReg(v1, r2) => {
-                    ty::OutlivesPredicate(r2.into(), ty::Region::new_var(tcx, v1))
+        .map(|(c, origin)| match c.kind {
+            ConstraintKind::VarSubVar
+            | ConstraintKind::RegSubVar
+            | ConstraintKind::VarSubReg
+            | ConstraintKind::RegSubReg => {
+                // Swap regions because we are going from sub (<=) to outlives (>=).
+                let constraint = ty::OutlivesClause(c.sup.into(), c.sub).into();
+                QueryRegionConstraint {
+                    constraint,
+                    category: origin.to_constraint_category(),
+                    visible_for_leak_check: c.visible_for_leak_check,
                 }
-                Constraint::RegSubVar(r1, v2) => {
-                    ty::OutlivesPredicate(ty::Region::new_var(tcx, v2).into(), r1)
+            }
+
+            ConstraintKind::VarEqVar | ConstraintKind::VarEqReg | ConstraintKind::RegEqReg => {
+                let constraint = ty::RegionEqPredicate(c.sup, c.sub).into();
+                QueryRegionConstraint {
+                    constraint,
+                    category: origin.to_constraint_category(),
+                    visible_for_leak_check: c.visible_for_leak_check,
                 }
-                Constraint::RegSubReg(r1, r2) => ty::OutlivesPredicate(r2.into(), r1),
-            };
-            (constraint, origin.to_constraint_category())
+            }
         })
-        .chain(outlives_obligations.into_iter().map(|obl| {
-            (
-                ty::OutlivesPredicate(obl.sup_type.into(), obl.sub_region),
-                obl.origin.to_constraint_category(),
-            )
-        }))
+        .chain(outlives_obligations.into_iter().map(
+            |TypeOutlivesConstraint { sub_region, sup_type, origin }| {
+                QueryRegionConstraint {
+                    constraint: ty::OutlivesClause(sup_type.into(), sub_region).into(),
+                    category: origin.to_constraint_category(),
+                    // We don't do leak checks for type outlives
+                    visible_for_leak_check: ty::VisibleForLeakCheck::Unreachable,
+                }
+            },
+        ))
         .collect();
 
-    QueryRegionConstraints { outlives }
+    QueryRegionConstraints { constraints, assumptions }
 }

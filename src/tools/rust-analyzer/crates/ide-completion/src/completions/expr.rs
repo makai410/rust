@@ -9,17 +9,17 @@ use syntax::ast;
 use crate::{
     CompletionContext, Completions,
     completions::record::add_default_update,
-    context::{BreakableKind, PathCompletionCtx, PathExprCtx, Qualified},
+    context::{PathCompletionCtx, PathExprCtx, Qualified},
 };
 
-struct PathCallback<'a, F> {
-    ctx: &'a CompletionContext<'a>,
+struct PathCallback<'a, 'db, F> {
+    ctx: &'a CompletionContext<'a, 'db>,
     acc: &'a mut Completions,
     add_assoc_item: F,
     seen: FxHashSet<hir::AssocItem>,
 }
 
-impl<F> PathCandidateCallback for PathCallback<'_, F>
+impl<F> PathCandidateCallback for PathCallback<'_, '_, F>
 where
     F: FnMut(&mut Completions, hir::AssocItem),
 {
@@ -44,9 +44,9 @@ where
     }
 }
 
-pub(crate) fn complete_expr_path(
+pub(crate) fn complete_expr_path<'db>(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, 'db>,
     path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
     expr_ctx: &PathExprCtx<'_>,
 ) {
@@ -57,14 +57,17 @@ pub(crate) fn complete_expr_path(
 
     let &PathExprCtx {
         in_block_expr,
-        in_breakable,
         after_if_expr,
+        before_else_kw,
         in_condition,
         incomplete_let,
+        after_incomplete_let,
+        in_value,
         ref ref_expr_parent,
         after_amp,
         ref is_func_update,
         ref innermost_ret_ty,
+        ref innermost_breakable_ty,
         ref impl_,
         in_match_guard,
         ..
@@ -84,7 +87,7 @@ pub(crate) fn complete_expr_path(
         false
     };
 
-    let scope_def_applicable = |def| match def {
+    let scope_def_applicable = |def: ScopeDef<'db>| match def {
         ScopeDef::GenericParam(hir::GenericParam::LifetimeParam(_)) | ScopeDef::Label(_) => false,
         ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => mac.is_fn_like(ctx.db),
         _ => true,
@@ -123,13 +126,12 @@ pub(crate) fn complete_expr_path(
                 ctx.db,
                 &ctx.scope,
                 &ctx.traits_in_scope(),
-                Some(ctx.module),
                 None,
                 PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
             );
 
             // Iterate assoc types separately
-            ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
+            ty.iterate_assoc_items(ctx.db, |item| {
                 if let hir::AssocItem::TypeAlias(ty) = item {
                     acc.add_type_alias(ctx, ty)
                 }
@@ -139,9 +141,8 @@ pub(crate) fn complete_expr_path(
         Qualified::With { resolution: None, .. } => {}
         Qualified::With { resolution: Some(resolution), .. } => {
             // Add associated types on type parameters and `Self`.
-            ctx.scope.assoc_type_shorthand_candidates(resolution, |_, alias| {
+            ctx.scope.assoc_type_shorthand_candidates(resolution, |alias| {
                 acc.add_type_alias(ctx, alias);
-                None::<()>
             });
             match resolution {
                 hir::PathResolution::Def(hir::ModuleDef::Module(module)) => {
@@ -181,6 +182,9 @@ pub(crate) fn complete_expr_path(
                         }
                         _ => return,
                     };
+                    // Note: this is not *required* here, we do it to also find methods that require
+                    // the type to be instantiated with specific types.
+                    let ty = ty.instantiate_with_errors();
 
                     if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
                         cov_mark::hit!(completes_variant_through_alias);
@@ -194,13 +198,12 @@ pub(crate) fn complete_expr_path(
                         ctx.db,
                         &ctx.scope,
                         &ctx.traits_in_scope(),
-                        Some(ctx.module),
                         None,
                         PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
                     );
 
                     // Iterate assoc types separately
-                    ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
+                    ty.iterate_assoc_items(ctx.db, |item| {
                         if let hir::AssocItem::TypeAlias(ty) = item {
                             acc.add_type_alias(ctx, ty)
                         }
@@ -230,7 +233,6 @@ pub(crate) fn complete_expr_path(
                         ctx.db,
                         &ctx.scope,
                         &ctx.traits_in_scope(),
-                        Some(ctx.module),
                         None,
                         PathCallback { ctx, acc, add_assoc_item, seen: FxHashSet::default() },
                     );
@@ -254,7 +256,7 @@ pub(crate) fn complete_expr_path(
                             .find_path(
                                 ctx.db,
                                 hir::ModuleDef::from(strukt),
-                                ctx.config.import_path_config(ctx.is_nightly),
+                                ctx.config.find_path_config(ctx.is_nightly),
                             )
                             .filter(|it| it.len() > 1);
 
@@ -276,7 +278,7 @@ pub(crate) fn complete_expr_path(
                             .find_path(
                                 ctx.db,
                                 hir::ModuleDef::from(un),
-                                ctx.config.import_path_config(ctx.is_nightly),
+                                ctx.config.find_path_config(ctx.is_nightly),
                             )
                             .filter(|it| it.len() > 1);
 
@@ -295,7 +297,7 @@ pub(crate) fn complete_expr_path(
                             acc,
                             ctx,
                             e,
-                            impl_,
+                            impl_.as_ref(),
                             |acc, ctx, variant, path| {
                                 acc.add_qualified_enum_variant(ctx, path_ctx, variant, path)
                             },
@@ -341,7 +343,7 @@ pub(crate) fn complete_expr_path(
                             let missing_fields =
                                 ctx.sema.record_literal_missing_fields(record_expr);
                             if !missing_fields.is_empty() {
-                                add_default_update(acc, ctx, ty);
+                                add_default_update(acc, ctx, ty.as_ref());
                             }
                         }
                     };
@@ -353,7 +355,10 @@ pub(crate) fn complete_expr_path(
 
                     if !in_block_expr {
                         add_keyword("unsafe", "unsafe {\n    $0\n}");
-                        add_keyword("const", "const {\n    $0\n}");
+                        if !wants_const_token {
+                            // Avoid having two `const` items in `&raw $0`
+                            add_keyword("const", "const {\n    $0\n}");
+                        }
                     }
                     add_keyword("match", "match $1 {\n    $0\n}");
                     add_keyword("while", "while $1 {\n    $0\n}");
@@ -361,10 +366,16 @@ pub(crate) fn complete_expr_path(
                     add_keyword("loop", "loop {\n    $0\n}");
                     if in_match_guard {
                         add_keyword("if", "if $0");
+                    } else if in_value {
+                        add_keyword("if", "if $1 {\n    $2\n} else {\n    $0\n}");
                     } else {
                         add_keyword("if", "if $1 {\n    $0\n}");
                     }
-                    add_keyword("if let", "if let $1 = $2 {\n    $0\n}");
+                    if in_value {
+                        add_keyword("if let", "if let $1 = $2 {\n    $3\n} else {\n    $0\n}");
+                    } else {
+                        add_keyword("if let", "if let $1 = $2 {\n    $0\n}");
+                    }
                     add_keyword("for", "for $1 in $2 {\n    $0\n}");
                     add_keyword("true", "true");
                     add_keyword("false", "false");
@@ -379,8 +390,11 @@ pub(crate) fn complete_expr_path(
                         add_keyword("let", "let $1 = $0;");
                     }
 
-                    if after_if_expr {
+                    if !before_else_kw && (after_if_expr || after_incomplete_let) {
                         add_keyword("else", "else {\n    $0\n}");
+                    }
+
+                    if after_if_expr {
                         add_keyword("else if", "else if $1 {\n    $0\n}");
                     }
 
@@ -394,14 +408,21 @@ pub(crate) fn complete_expr_path(
                         add_keyword("mut", "mut ");
                     }
 
-                    if in_breakable != BreakableKind::None {
+                    if let Some(loop_ty) = innermost_breakable_ty {
                         if in_block_expr {
                             add_keyword("continue", "continue;");
-                            add_keyword("break", "break;");
                         } else {
                             add_keyword("continue", "continue");
-                            add_keyword("break", "break");
                         }
+                        add_keyword(
+                            "break",
+                            match (loop_ty.is_unit(), in_block_expr) {
+                                (true, true) => "break;",
+                                (true, false) => "break",
+                                (false, true) => "break $0;",
+                                (false, false) => "break $0",
+                            },
+                        );
                     }
 
                     if let Some(ret_ty) = innermost_ret_ty {
@@ -433,7 +454,11 @@ pub(crate) fn complete_expr_path(
     }
 }
 
-pub(crate) fn complete_expr(acc: &mut Completions, ctx: &CompletionContext<'_>) {
+pub(crate) fn complete_expr(
+    acc: &mut Completions,
+    ctx: &CompletionContext<'_, '_>,
+    PathCompletionCtx { qualified, .. }: &PathCompletionCtx<'_>,
+) {
     let _p = tracing::info_span!("complete_expr").entered();
 
     if !ctx.config.enable_term_search {
@@ -441,6 +466,10 @@ pub(crate) fn complete_expr(acc: &mut Completions, ctx: &CompletionContext<'_>) 
     }
 
     if !ctx.qualifier_ctx.none() {
+        return;
+    }
+
+    if !matches!(qualified, Qualified::No) {
         return;
     }
 
@@ -455,7 +484,6 @@ pub(crate) fn complete_expr(acc: &mut Completions, ctx: &CompletionContext<'_>) 
             scope: &ctx.scope,
             goal: ty.clone(),
             config: hir::term_search::TermSearchConfig {
-                enable_borrowcheck: false,
                 many_alternatives_threshold: 1,
                 fuel: 200,
             },

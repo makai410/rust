@@ -10,8 +10,9 @@ use rustc_target::callconv;
 
 use crate::abi::{
     AddressSpace, ArgAbi, CallConvention, FieldsShape, FloatLength, FnAbi, IntegerLength,
-    IntegerType, Layout, LayoutShape, PassMode, Primitive, ReprFlags, ReprOptions, Scalar,
-    TagEncoding, TyAndLayout, ValueAbi, VariantsShape, WrappingRange,
+    IntegerType, Layout, LayoutShape, NumScalableVectors, PassMode, Primitive, ReprFlags,
+    ReprOptions, Scalar, TagEncoding, TyAndLayout, ValueAbi, VariantFields, VariantsShape,
+    WrappingRange,
 };
 use crate::compiler_interface::BridgeTys;
 use crate::target::MachineSize as Size;
@@ -57,7 +58,7 @@ impl<'tcx> Stable<'tcx> for rustc_abi::Layout<'tcx> {
         tables: &mut Tables<'cx, BridgeTys>,
         cx: &CompilerCtxt<'cx, BridgeTys>,
     ) -> Self::T {
-        tables.layout_id(cx.lift(*self).unwrap())
+        tables.layout_id(cx.lift(*self))
     }
 }
 
@@ -123,7 +124,10 @@ impl<'tcx> Stable<'tcx> for CanonAbi {
             CanonAbi::C => CallConvention::C,
             CanonAbi::Rust => CallConvention::Rust,
             CanonAbi::RustCold => CallConvention::Cold,
+            CanonAbi::RustPreserveNone => CallConvention::PreserveNone,
+            CanonAbi::RustTail => CallConvention::Tail,
             CanonAbi::Custom => CallConvention::Custom,
+            CanonAbi::Swift => CallConvention::Swift,
             CanonAbi::Arm(arm_call) => match arm_call {
                 ArmCall::Aapcs => CallConvention::ArmAapcs,
                 ArmCall::CCmseNonSecureCall => CallConvention::CCmseNonSecureCall,
@@ -161,8 +165,8 @@ impl<'tcx> Stable<'tcx> for callconv::PassMode {
             callconv::PassMode::Pair(first, second) => {
                 PassMode::Pair(opaque(first), opaque(second))
             }
-            callconv::PassMode::Cast { pad_i32, cast } => {
-                PassMode::Cast { pad_i32: *pad_i32, cast: opaque(cast) }
+            callconv::PassMode::Cast { pad_i32_count, cast } => {
+                PassMode::Cast { pad_i32_count: *pad_i32_count, cast: opaque(cast) }
             }
             callconv::PassMode::Indirect { attrs, meta_attrs, on_stack } => PassMode::Indirect {
                 attrs: opaque(attrs),
@@ -212,7 +216,12 @@ impl<'tcx> Stable<'tcx> for rustc_abi::Variants<rustc_abi::FieldIdx, rustc_abi::
                     tag: tag.stable(tables, cx),
                     tag_encoding: tag_encoding.stable(tables, cx),
                     tag_field: tag_field.stable(tables, cx),
-                    variants: variants.iter().as_slice().stable(tables, cx),
+                    variants: variants
+                        .iter()
+                        .map(|v| VariantFields {
+                            offsets: v.field_offsets.iter().as_slice().stable(tables, cx),
+                        })
+                        .collect(),
                 }
             }
         }
@@ -240,6 +249,30 @@ impl<'tcx> Stable<'tcx> for rustc_abi::TagEncoding<rustc_abi::VariantIdx> {
     }
 }
 
+impl<'tcx> Stable<'tcx> for rustc_abi::NumScalableVectors {
+    type T = NumScalableVectors;
+
+    fn stable<'cx>(
+        &self,
+        _tables: &mut Tables<'cx, BridgeTys>,
+        _cx: &CompilerCtxt<'cx, BridgeTys>,
+    ) -> Self::T {
+        NumScalableVectors(self.0)
+    }
+}
+
+impl<'tcx> Stable<'tcx> for rustc_abi::BackendLaneCount {
+    type T = u64;
+
+    fn stable<'cx>(
+        &self,
+        _tables: &mut Tables<'cx, BridgeTys>,
+        _cx: &CompilerCtxt<'cx, BridgeTys>,
+    ) -> Self::T {
+        self.as_u64()
+    }
+}
+
 impl<'tcx> Stable<'tcx> for rustc_abi::BackendRepr {
     type T = ValueAbi;
 
@@ -250,11 +283,23 @@ impl<'tcx> Stable<'tcx> for rustc_abi::BackendRepr {
     ) -> Self::T {
         match *self {
             rustc_abi::BackendRepr::Scalar(scalar) => ValueAbi::Scalar(scalar.stable(tables, cx)),
-            rustc_abi::BackendRepr::ScalarPair(first, second) => {
-                ValueAbi::ScalarPair(first.stable(tables, cx), second.stable(tables, cx))
+            rustc_abi::BackendRepr::ScalarPair { a: first, b: second, b_offset: second_offset } => {
+                ValueAbi::ScalarPair {
+                    a: first.stable(tables, cx),
+                    b: second.stable(tables, cx),
+                    b_offset: second_offset.stable(tables, cx),
+                }
             }
-            rustc_abi::BackendRepr::SimdVector { element, count } => {
-                ValueAbi::Vector { element: element.stable(tables, cx), count }
+            rustc_abi::BackendRepr::SimdVector { element, count } => ValueAbi::Vector {
+                element: element.stable(tables, cx),
+                count: count.stable(tables, cx),
+            },
+            rustc_abi::BackendRepr::SimdScalableVector { element, count, number_of_vectors } => {
+                ValueAbi::ScalableVector {
+                    element: element.stable(tables, cx),
+                    count: count.stable(tables, cx),
+                    number_of_vectors: number_of_vectors.stable(tables, cx),
+                }
             }
             rustc_abi::BackendRepr::Memory { sized } => ValueAbi::Aggregate { sized },
         }

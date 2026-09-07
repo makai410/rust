@@ -1,17 +1,18 @@
 pub mod ambiguity;
 pub mod call_kind;
-mod fulfillment_errors;
+pub mod fulfillment_errors;
 pub mod on_unimplemented;
-pub mod on_unimplemented_condition;
-pub mod on_unimplemented_format;
 mod overflow;
 pub mod suggestions;
 
 use std::{fmt, iter};
 
+use rustc_crate_store::{ExternCrate, ExternCrateSource};
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
+use rustc_data_structures::unord::UnordSet;
 use rustc_errors::{Applicability, Diag, E0038, E0276, MultiSpan, struct_span_code_err};
-use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{self as hir, AmbigArg};
 use rustc_infer::traits::solve::Goal;
@@ -20,8 +21,10 @@ use rustc_infer::traits::{
     PredicateObligation, SelectionError,
 };
 use rustc_middle::ty::print::{PrintTraitRefExt as _, with_no_trimmed_paths};
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::{ErrorGuaranteed, ExpnKind, Span};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt as _};
+use rustc_next_trait_solver::solve::TyOrConstInferVar;
+use rustc_span::{DesugaringKind, ErrorGuaranteed, ExpnKind, Span};
+use thin_vec::ThinVec;
 use tracing::{info, instrument};
 
 pub use self::overflow::*;
@@ -50,8 +53,6 @@ enum GetSafeTransmuteErrorAndReason {
     Default,
     Error { err_msg: String, safe_transmute_explanation: Option<String> },
 }
-
-struct UnsatisfiedConst(pub bool);
 
 /// Crude way of getting back an `Expr` from a `Span`.
 pub struct FindExprBySpan<'hir> {
@@ -139,12 +140,8 @@ pub enum DefIdOrName {
 impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     pub fn report_fulfillment_errors(
         &self,
-        mut errors: Vec<FulfillmentError<'tcx>>,
+        mut errors: ThinVec<FulfillmentError<'tcx>>,
     ) -> ErrorGuaranteed {
-        self.sub_relations
-            .borrow_mut()
-            .add_constraints(self, errors.iter().map(|e| e.obligation.predicate));
-
         #[derive(Debug)]
         struct ErrorDescriptor<'tcx> {
             goal: Goal<'tcx, ty::Predicate<'tcx>>,
@@ -160,9 +157,20 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             })
             .collect();
 
-        // Ensure `T: Sized`, `T: MetaSized`, `T: PointeeSized` and `T: WF` obligations come last.
+        // Ensure `T: Sized`, `T: MetaSized`, `T: PointeeSized` and `T: WF` obligations come last,
+        // and `Subtype` obligations from `FormatLiteral` desugarings come first.
         // This lets us display diagnostics with more relevant type information and hide redundant
         // E0282 errors.
+        #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+        enum ErrorSortKey {
+            SubtypeFormat(usize, usize),
+            OtherKind,
+            SizedTrait,
+            MetaSizedTrait,
+            PointeeSizedTrait,
+            Coerce,
+            WellFormed,
+        }
         errors.sort_by_key(|e| {
             let maybe_sizedness_did = match e.obligation.predicate.kind().skip_binder() {
                 ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) => Some(pred.def_id()),
@@ -171,12 +179,30 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             };
 
             match e.obligation.predicate.kind().skip_binder() {
-                _ if maybe_sizedness_did == self.tcx.lang_items().sized_trait() => 1,
-                _ if maybe_sizedness_did == self.tcx.lang_items().meta_sized_trait() => 2,
-                _ if maybe_sizedness_did == self.tcx.lang_items().pointee_sized_trait() => 3,
-                ty::PredicateKind::Coerce(_) => 4,
-                ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(_)) => 5,
-                _ => 0,
+                ty::PredicateKind::Subtype(_)
+                    if matches!(
+                        e.obligation.cause.span.desugaring_kind(),
+                        Some(DesugaringKind::FormatLiteral { .. })
+                    ) =>
+                {
+                    let (_, row, col, ..) =
+                        self.tcx.sess.source_map().span_to_location_info(e.obligation.cause.span);
+                    ErrorSortKey::SubtypeFormat(row, col)
+                }
+                _ if maybe_sizedness_did == self.tcx.lang_items().sized_trait() => {
+                    ErrorSortKey::SizedTrait
+                }
+                _ if maybe_sizedness_did == self.tcx.lang_items().meta_sized_trait() => {
+                    ErrorSortKey::MetaSizedTrait
+                }
+                _ if maybe_sizedness_did == self.tcx.lang_items().pointee_sized_trait() => {
+                    ErrorSortKey::PointeeSizedTrait
+                }
+                ty::PredicateKind::Coerce(_) => ErrorSortKey::Coerce,
+                ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(_)) => {
+                    ErrorSortKey::WellFormed
+                }
+                _ => ErrorSortKey::OtherKind,
             }
         });
 
@@ -198,6 +224,21 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         // We do this in 2 passes because we want to display errors in order, though
         // maybe it *is* better to sort errors by span or something.
         let mut is_suppressed = vec![false; errors.len()];
+        // A failing trait goal also fails every projection goal resting on it. Ambiguity
+        // errors are exempt: they get merged into a single diagnostic whose notes list all
+        // the constraints the annotation has to satisfy, so their projections still say
+        // something the trait error doesn't.
+        let covered_by_trait_error =
+            |cond: &ErrorDescriptor<'tcx>, error: &ErrorDescriptor<'tcx>| {
+                let is_definite = |error: &ErrorDescriptor<'tcx>| {
+                    error.index.is_some_and(|index| {
+                        !matches!(errors[index].code, FulfillmentErrorCode::Ambiguity { .. })
+                    })
+                };
+                is_definite(cond)
+                    && is_definite(error)
+                    && self.trait_error_implies_projection_error(cond.goal, error.goal)
+            };
         for (_, error_set) in error_map.iter() {
             // We want to suppress "duplicate" errors with the same span.
             for error in error_set {
@@ -213,9 +254,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             continue;
                         }
 
-                        if self.error_implies(error2.goal, error.goal)
+                        if (self.error_implies(error2.goal, error.goal)
                             && !(error2.index >= error.index
-                                && self.error_implies(error.goal, error2.goal))
+                                && self.error_implies(error.goal, error2.goal)))
+                            || covered_by_trait_error(error2, error)
                         {
                             info!("skipping {:?} (implied by {:?})", error, error2);
                             is_suppressed[index] = true;
@@ -226,27 +268,118 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             }
         }
 
-        let mut reported = None;
-
-        for from_expansion in [false, true] {
-            for (error, suppressed) in iter::zip(&errors, &is_suppressed) {
-                if !suppressed && error.obligation.cause.span.from_expansion() == from_expansion {
-                    let guar = self.report_fulfillment_error(error);
-                    self.infcx.set_tainted_by_errors(guar);
-                    reported = Some(guar);
-                    // We want to ignore desugarings here: spans are equivalent even
-                    // if one is the result of a desugaring and the other is not.
-                    let mut span = error.obligation.cause.span;
-                    let expn_data = span.ctxt().outer_expn_data();
-                    if let ExpnKind::Desugaring(_) = expn_data.kind {
-                        span = expn_data.call_site;
+        // Ambiguity errors blaming the same inference variable describe a single problem:
+        // annotating that one variable has to satisfy all of them at once. Reporting them
+        // separately loses all but the first, as the rest get canceled as duplicates once
+        // the `infcx` is tainted (see `maybe_report_ambiguity`), hiding their requirements
+        // from the user. Instead, report the first one (the sort above placed the most
+        // informative obligation first) and mention the requirements of the others in it.
+        //
+        // Type variables that are only related through a pending `Coerce` or `Subtype`
+        // obligation still concern the same annotation, so compare their sub-unification
+        // roots, like `need_type_info` does when looking for the annotation source.
+        let ambiguity_infer_var = |error: &FulfillmentError<'tcx>| match error.code {
+            FulfillmentErrorCode::Ambiguity { overflow: None } => self
+                .ambiguity_term(self.resolve_vars_if_possible(error.obligation.predicate))
+                .and_then(|term| {
+                    ty::GenericArg::from(term)
+                        .walk()
+                        .find_map(TyOrConstInferVar::maybe_from_generic_arg::<TyCtxt<'tcx>>)
+                })
+                .map(|var| match var {
+                    TyOrConstInferVar::Ty(vid) => {
+                        TyOrConstInferVar::Ty(self.sub_unification_table_root_var(vid))
                     }
-                    self.reported_trait_errors
-                        .borrow_mut()
-                        .entry(span)
-                        .or_insert_with(|| (vec![], guar))
-                        .0
-                        .push(error.obligation.as_goal());
+                    other => other,
+                }),
+            _ => None,
+        };
+        let infer_vars: Vec<_> = errors.iter().map(ambiguity_infer_var).collect();
+
+        let mut reported = None;
+        let mut merged = vec![None; errors.len()];
+        let mut reported_as_primary = vec![false; errors.len()];
+        for from_expansion in [false, true] {
+            for (index, (error, suppressed)) in iter::zip(&errors, &is_suppressed).enumerate() {
+                if !suppressed && error.obligation.cause.span.from_expansion() == from_expansion {
+                    if !error.references_error() {
+                        let guar = if let Some(guar) = merged[index] {
+                            guar
+                        } else {
+                            let group: Vec<usize> = match infer_vars[index] {
+                                Some(var) => (0..errors.len())
+                                    .filter(|&other| {
+                                        other != index && infer_vars[other] == Some(var)
+                                    })
+                                    .collect(),
+                                None => vec![],
+                            };
+                            // Only merge errors that a note on this diagnostic can fully
+                            // represent. An error blaming a different expression labels that
+                            // expression and suggests how to annotate it, and one whose
+                            // predicate we can't phrase as a note (e.g. const evaluatability)
+                            // says nothing here, so both keep their own error.
+                            let merges = |other: usize| {
+                                errors[other].obligation.cause.span == error.obligation.cause.span
+                                    && match errors[other].obligation.predicate.kind().skip_binder()
+                                    {
+                                        ty::PredicateKind::Clause(ty::ClauseKind::Trait(data)) => {
+                                            !matches!(
+                                                self.tcx.as_lang_item(data.def_id()),
+                                                Some(
+                                                    LangItem::Sized
+                                                        | LangItem::MetaSized
+                                                        | LangItem::PointeeSized
+                                                )
+                                            )
+                                        }
+                                        ty::PredicateKind::Clause(ty::ClauseKind::Projection(
+                                            _,
+                                        )) => true,
+                                        _ => false,
+                                    }
+                            };
+                            let related: Vec<_> = group
+                                .iter()
+                                .filter(|&&other| {
+                                    // Exclude already-reported primaries: they were their own
+                                    // canonical error and adding them as notes here would
+                                    // produce duplicate information.
+                                    merges(other)
+                                        && !is_suppressed[other]
+                                        && !errors[other].references_error()
+                                        && !reported_as_primary[other]
+                                })
+                                .map(|&other| &errors[other])
+                                .collect();
+                            let guar = self.report_fulfillment_error(error, &related);
+                            for &other in &group {
+                                if merges(other) {
+                                    merged[other] = Some(guar);
+                                }
+                            }
+                            reported_as_primary[index] = true;
+                            guar
+                        };
+                        self.infcx.set_tainted_by_errors(guar);
+                        reported = Some(guar);
+                        // We want to ignore desugarings here: spans are equivalent even
+                        // if one is the result of a desugaring and the other is not.
+                        let mut span = error.obligation.cause.span;
+                        let expn_data = span.ctxt().outer_expn_data();
+                        if let ExpnKind::Desugaring(_) = expn_data.kind {
+                            span = expn_data.call_site;
+                        }
+                        self.reported_trait_errors
+                            .borrow_mut()
+                            .entry(span)
+                            .or_insert_with(|| (vec![], guar))
+                            .0
+                            .push(error.obligation.as_goal());
+                    }
+                    if let Some(guar) = self.dcx().has_errors() {
+                        self.infcx.set_tainted_by_errors(guar);
+                    }
                 }
             }
         }
@@ -258,7 +391,11 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn report_fulfillment_error(&self, error: &FulfillmentError<'tcx>) -> ErrorGuaranteed {
+    fn report_fulfillment_error(
+        &self,
+        error: &FulfillmentError<'tcx>,
+        related: &[&FulfillmentError<'tcx>],
+    ) -> ErrorGuaranteed {
         let mut error = FulfillmentError {
             obligation: error.obligation.clone(),
             code: error.code.clone(),
@@ -268,7 +405,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             error.code,
             FulfillmentErrorCode::Select(crate::traits::SelectionError::Unimplemented)
                 | FulfillmentErrorCode::Project(_)
-        ) && self.apply_do_not_recommend(&mut error.obligation)
+        ) && self.apply_do_not_recommend(&mut error.obligation, &error.root_obligation)
         {
             error.code = FulfillmentErrorCode::Select(SelectionError::Unimplemented);
         }
@@ -282,8 +419,15 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             FulfillmentErrorCode::Project(ref e) => {
                 self.report_projection_error(&error.obligation, e)
             }
+            FulfillmentErrorCode::Outlives => self
+                .dcx()
+                .struct_span_err(
+                    error.obligation.cause.span,
+                    "higher-ranked lifetime bound could not be satisfied",
+                )
+                .emit(),
             FulfillmentErrorCode::Ambiguity { overflow: None } => {
-                self.maybe_report_ambiguity(&error.obligation)
+                self.maybe_report_ambiguity(&error.obligation, related)
             }
             FulfillmentErrorCode::Ambiguity { overflow: Some(suggest_increasing_limit) } => {
                 self.report_overflow_no_abort(error.obligation.clone(), suggest_increasing_limit)
@@ -310,7 +454,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 | ObligationCauseCode::WhereClauseInExpr(..) = code
                 {
                     self.note_obligation_cause_code(
-                        error.obligation.cause.body_id,
+                        error.obligation.cause.body_def_id,
                         &mut diag,
                         error.obligation.predicate,
                         error.obligation.param_env,
@@ -324,6 +468,100 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             FulfillmentErrorCode::Cycle(ref cycle) => self.report_overflow_obligation_cycle(cycle),
         }
     }
+
+    /// If the crates of `expected_def_id` and `trait_def_id` are imported as extern crate
+    /// under the same name (`extern crate foo as a` and `extern crate bar as a`) returns true,
+    /// otherwise returns false.
+    fn extern_crates_with_the_same_name(
+        &self,
+        expected_def_id: DefId,
+        trait_def_id: DefId,
+    ) -> bool {
+        if expected_def_id.is_local() || trait_def_id.is_local() {
+            return false;
+        }
+        // We only compare direct dependencies of the current crate, so it avoids unnecessary
+        // processing and excludes indirect dependencies, like `std` or `core`. In such a case
+        // both would be imported under the same name `std`.
+        match (
+            self.tcx.extern_crate(expected_def_id.krate),
+            self.tcx.extern_crate(trait_def_id.krate),
+        ) {
+            (
+                Some(&ExternCrate {
+                    src: ExternCrateSource::Extern(expected_def_id),
+                    dependency_of: LOCAL_CRATE,
+                    ..
+                }),
+                Some(&ExternCrate {
+                    src: ExternCrateSource::Extern(trait_def_id),
+                    dependency_of: LOCAL_CRATE,
+                    ..
+                }),
+            ) => self.tcx.item_name(expected_def_id) == self.tcx.item_name(trait_def_id),
+            _ => false,
+        }
+    }
+
+    pub fn check_same_definition_different_crate<F>(
+        &self,
+        err: &mut Diag<'_>,
+        expected_did: DefId,
+        found_dids: impl Iterator<Item = DefId>,
+        get_impls: F,
+        ty: &str,
+    ) -> bool
+    where
+        F: Fn(DefId) -> Vec<Span>,
+    {
+        let krate = self.tcx.crate_name(expected_did.krate);
+        let name = self.tcx.item_name(expected_did);
+        let definitions_with_same_path: UnordSet<_> = found_dids
+            .filter(|&def_id| {
+                def_id.krate != expected_did.krate
+                    && (self.extern_crates_with_the_same_name(expected_did, def_id)
+                        || self.tcx.crate_name(def_id.krate) == krate)
+                    && self.tcx.item_name(def_id) == name
+            })
+            .map(|def_id| (self.tcx.def_path_str(def_id), def_id))
+            .collect();
+
+        let definitions_with_same_path =
+            definitions_with_same_path.into_items().into_sorted_stable_ord_by_key(|(p, _)| p);
+        let mut suggested = false;
+        let mut trait_is_impl = false;
+
+        if !definitions_with_same_path.is_empty() {
+            let mut span: MultiSpan = self.tcx.def_span(expected_did).into();
+            span.push_span_label(
+                self.tcx.def_span(expected_did),
+                format!("this is the expected {ty}"),
+            );
+            suggested = true;
+            for (_, definition_with_same_path) in &definitions_with_same_path {
+                let definitions_impls = get_impls(*definition_with_same_path);
+                if definitions_impls.is_empty() {
+                    continue;
+                }
+
+                for candidate_span in definitions_impls {
+                    span.push_span_label(candidate_span, format!("this is the found {ty}"));
+                    trait_is_impl = true;
+                }
+            }
+            if !trait_is_impl {
+                for (_, def_id) in definitions_with_same_path {
+                    span.push_span_label(
+                        self.tcx.def_span(def_id),
+                        format!("this is the {ty} that was imported"),
+                    );
+                }
+            }
+            self.note_two_crate_versions(expected_did.krate, span, err);
+            err.help("you can use `cargo tree` to explore your dependency tree");
+        }
+        suggested
+    }
 }
 
 /// Recovers the "impl X for Y" signature from `impl_def_id` and returns it as a
@@ -331,7 +569,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Option<String> {
     use std::fmt::Write;
 
-    let trait_ref = tcx.impl_trait_ref(impl_def_id)?.instantiate_identity();
+    let trait_ref = tcx.impl_opt_trait_ref(impl_def_id)?.instantiate_identity().skip_norm_wip();
     let mut w = "impl".to_owned();
 
     #[derive(Debug, Default)]
@@ -361,19 +599,19 @@ pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Opti
         " {}{} for {}",
         tcx.impl_polarity(impl_def_id).as_str(),
         trait_ref.print_only_trait_path(),
-        tcx.type_of(impl_def_id).instantiate_identity()
+        tcx.type_of(impl_def_id).instantiate_identity().skip_norm_wip()
     )
     .unwrap();
 
-    let predicates = tcx.predicates_of(impl_def_id).predicates;
-    let mut pretty_predicates = Vec::with_capacity(predicates.len());
+    let clauses = tcx.clauses_of(impl_def_id).clauses;
+    let mut pretty_clauses = Vec::with_capacity(clauses.len());
 
     let sized_trait = tcx.lang_items().sized_trait();
     let meta_sized_trait = tcx.lang_items().meta_sized_trait();
 
-    for (p, _) in predicates {
+    for (c, _) in clauses {
         // Accumulate the sizedness bounds for each self ty.
-        if let Some(trait_clause) = p.as_trait_clause() {
+        if let Some(trait_clause) = c.as_trait_clause() {
             let self_ty = trait_clause.self_ty().skip_binder();
             let sizedness_of = types_with_sizedness_bounds.entry(self_ty).or_default();
             if Some(trait_clause.def_id()) == sized_trait {
@@ -385,7 +623,7 @@ pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Opti
             }
         }
 
-        pretty_predicates.push(p.to_string());
+        pretty_clauses.push(c.to_string());
     }
 
     for (ty, sizedness) in types_with_sizedness_bounds {
@@ -393,22 +631,22 @@ pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Opti
             if sizedness.sized {
                 // Maybe a default bound, don't write anything.
             } else {
-                pretty_predicates.push(format!("{ty}: ?Sized"));
+                pretty_clauses.push(format!("{ty}: ?Sized"));
             }
         } else {
             if sizedness.sized {
                 // Maybe a default bound, don't write anything.
-                pretty_predicates.push(format!("{ty}: Sized"));
+                pretty_clauses.push(format!("{ty}: Sized"));
             } else if sizedness.meta_sized {
-                pretty_predicates.push(format!("{ty}: MetaSized"));
+                pretty_clauses.push(format!("{ty}: MetaSized"));
             } else {
-                pretty_predicates.push(format!("{ty}: PointeeSized"));
+                pretty_clauses.push(format!("{ty}: PointeeSized"));
             }
         }
     }
 
-    if !pretty_predicates.is_empty() {
-        write!(w, "\n  where {}", pretty_predicates.join(", ")).unwrap();
+    if !pretty_clauses.is_empty() {
+        write!(w, "\n  where {}", pretty_clauses.join(", ")).unwrap();
     }
 
     w.push(';');
@@ -453,7 +691,7 @@ pub fn report_dyn_incompatibility<'tcx>(
     let trait_str = tcx.def_path_str(trait_def_id);
     let trait_span = tcx.hir_get_if_local(trait_def_id).and_then(|node| match node {
         hir::Node::Item(item) => match item.kind {
-            hir::ItemKind::Trait(_, _, ident, ..) | hir::ItemKind::TraitAlias(ident, _, _) => {
+            hir::ItemKind::Trait { ident, .. } | hir::ItemKind::TraitAlias(_, ident, _, _) => {
                 Some(ident.span)
             }
             _ => unreachable!(),
@@ -560,7 +798,7 @@ fn attempt_dyn_to_enum_suggestion(
             // defaults to assuming that things are *not* sized, whereas we want to
             // fall back to assuming that things may be sized.
             match impl_type.kind() {
-                ty::Str | ty::Slice(_) | ty::Dynamic(_, _, ty::DynKind::Dyn) => {
+                ty::Str | ty::Slice(_) | ty::Dynamic(_, _) => {
                     return None;
                 }
                 _ => {}

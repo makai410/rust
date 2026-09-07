@@ -384,7 +384,7 @@ fn align_offset_stride_one() {
 #[test]
 fn align_offset_various_strides() {
     unsafe fn test_stride<T>(ptr: *const T, align: usize) -> bool {
-        let numptr = ptr as usize;
+        let numptr = ptr.addr();
         let mut expected = usize::MAX;
         // Naive but definitely correct way to find the *first* aligned element of stride::<T>.
         for el in 0..align {
@@ -490,6 +490,14 @@ fn is_aligned() {
 }
 
 #[test]
+#[should_panic = "is_aligned_to: align is not a power-of-two"]
+fn invalid_is_aligned() {
+    let data = 42;
+    let ptr: *const i32 = &data;
+    assert!(ptr.is_aligned_to(3));
+}
+
+#[test]
 fn offset_from() {
     let mut a = [0; 5];
     let ptr1: *mut i32 = &mut a[1];
@@ -557,6 +565,7 @@ fn ptr_metadata() {
 
 #[test]
 fn ptr_metadata_bounds() {
+    #[allow(unknown_lints, function_casts_as_integer)]
     fn metadata_eq_method_address<T: ?Sized>() -> usize {
         // The `Metadata` associated type has an `Ord` bound, so this is valid:
         <<T as Pointee>::Metadata as PartialEq>::eq as usize
@@ -936,22 +945,18 @@ fn test_const_swap_ptr() {
         assert!(*s1.0.ptr == 666);
         assert!(*s2.0.ptr == 1);
 
-        // Swap them back, again as an array.
+        // Swap them back, byte-for-byte
         unsafe {
             ptr::swap_nonoverlapping(
-                ptr::from_mut(&mut s1).cast::<T>(),
-                ptr::from_mut(&mut s2).cast::<T>(),
-                1,
+                ptr::from_mut(&mut s1).cast::<u8>(),
+                ptr::from_mut(&mut s2).cast::<u8>(),
+                size_of::<A>(),
             );
         }
 
         // Make sure they still work.
         assert!(*s1.0.ptr == 1);
         assert!(*s2.0.ptr == 666);
-
-        // This is where we'd swap again using a `u8` type and a `count` of `size_of::<T>()` if it
-        // were not for the limitation of `swap_nonoverlapping` around pointers crossing multiple
-        // elements.
     };
 }
 

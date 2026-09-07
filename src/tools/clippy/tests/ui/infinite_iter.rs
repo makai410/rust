@@ -1,5 +1,3 @@
-#![allow(clippy::uninlined_format_args, clippy::double_ended_iterator_last)]
-
 use std::iter::repeat;
 fn square_is_lower_64(x: &u32) -> bool {
     x * x < 64
@@ -30,7 +28,7 @@ fn infinite_iters() {
         .rev()
         .cycle()
         .map(|x| x + 1_u32)
-        .for_each(|x| println!("{}", x));
+        .for_each(|x| println!("{x}"));
     // infinite iter
     (0..3_u32).flat_map(|x| x..).sum::<u32>();
     // infinite iter
@@ -87,10 +85,7 @@ fn potential_infinite_iters() {
     repeat(42).take_while(|x| *x == 42).next();
 }
 
-fn main() {
-    infinite_iters();
-    potential_infinite_iters();
-}
+fn main() {}
 
 mod finite_collect {
     use std::collections::HashSet;

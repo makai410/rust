@@ -150,8 +150,8 @@ cargo bench --no-default-features \
 ```
 
 There are also benchmarks that check instruction count behind the `icount`
-feature. These require [`iai-callgrind-runner`] (via Cargo) and [Valgrind]
-to be installed, which means these only run on limited platforms.
+feature. These require [`gungraun-runner`] (via Cargo) and [Valgrind] to be
+installed, which means these only run on limited platforms.
 
 Instruction count benchmarks are run as part of CI to flag performance
 regresions.
@@ -163,5 +163,14 @@ cargo bench --no-default-features \
     --bench icount --bench mem_icount
 ```
 
-[`iai-callgrind-runner`]: https://crates.io/crates/iai-callgrind-runner
+[`gungraun-runner`]: https://crates.io/crates/gungraun-runner
 [Valgrind]: https://valgrind.org/
+
+## Subtree synchronization
+
+`compiler-builtins` is included as a [Josh subtree] in the main compiler
+repository (`rust-lang/rust`). You can find a guide on how to create synchronization
+(pull and push) PRs at the [`rustc-dev-guide` page].
+
+[Josh subtree]: https://rustc-dev-guide.rust-lang.org/external-repos.html#josh-subtrees
+[`rustc-dev-guide` page]: https://rustc-dev-guide.rust-lang.org/external-repos.html#synchronizing-a-josh-subtree

@@ -659,6 +659,7 @@ fn generate_syntax_kinds(grammar: KindsSrc) -> String {
             }
         }
 
+        /// `T![]`
         #[macro_export]
         macro_rules! T_ {
             #([#punctuation_values] => { $crate::SyntaxKind::#punctuation };)*
@@ -706,7 +707,23 @@ fn generate_syntax_kinds(grammar: KindsSrc) -> String {
         }
     };
 
-    add_preamble(crate::flags::CodegenType::Grammar, reformat(ast.to_string()))
+    let result = add_preamble(crate::flags::CodegenType::Grammar, reformat(ast.to_string()));
+
+    if let Some(start) = result.find("macro_rules ! T_")
+        && let Some(macro_end) = result[start..].find("\nimpl ::core::marker::Copy")
+    {
+        let macro_section = &result[start..start + macro_end];
+        let formatted_macro = macro_section
+            .replace("T_ { [", "T_ {\n    [")
+            .replace(" ; [", ";\n    [")
+            .replace(" ; }", ";\n}")
+            .trim_end()
+            .to_owned()
+            + "\n";
+        return result.replace(macro_section, &formatted_macro);
+    }
+
+    result
 }
 
 fn to_upper_snake_case(s: &str) -> String {
@@ -763,7 +780,7 @@ impl Field {
     }
     fn token_kind(&self) -> Option<proc_macro2::TokenStream> {
         match self {
-            Field::Token(token) => {
+            Field::Token { token, .. } => {
                 let token: proc_macro2::TokenStream = token.parse().unwrap();
                 Some(quote! { T![#token] })
             }
@@ -772,8 +789,11 @@ impl Field {
     }
     fn method_name(&self) -> String {
         match self {
-            Field::Token(name) => {
-                let name = match name.as_str() {
+            Field::Token { name, token, .. } => {
+                if let Some(name) = name {
+                    return name.clone();
+                }
+                let name = match token.as_str() {
                     ";" => "semicolon",
                     "->" => "thin_arrow",
                     "'{'" => "l_curly",
@@ -803,7 +823,7 @@ impl Field {
                     "," => "comma",
                     "|" => "pipe",
                     "~" => "tilde",
-                    _ => name,
+                    _ => token,
                 };
                 format!("{name}_token",)
             }
@@ -818,7 +838,7 @@ impl Field {
     }
     fn ty(&self) -> proc_macro2::Ident {
         match self {
-            Field::Token(_) => format_ident!("SyntaxToken"),
+            Field::Token { .. } => format_ident!("SyntaxToken"),
             Field::Node { ty, .. } => format_ident!("{}", ty),
         }
     }
@@ -868,7 +888,7 @@ fn lower(grammar: &Grammar) -> AstSrc {
     res.nodes.iter_mut().for_each(|it| {
         it.traits.sort();
         it.fields.sort_by_key(|it| match it {
-            Field::Token(name) => (true, name.clone()),
+            Field::Token { token, .. } => (true, token.clone()),
             Field::Node { name, .. } => (false, name.clone()),
         });
     });
@@ -908,12 +928,11 @@ fn lower_rule(acc: &mut Vec<Field>, grammar: &Grammar, label: Option<&String>, r
             acc.push(field);
         }
         Rule::Token(token) => {
-            assert!(label.is_none());
-            let mut name = clean_token_name(&grammar[*token].name);
-            if "[]{}()".contains(&name) {
-                name = format!("'{name}'");
+            let mut token = clean_token_name(&grammar[*token].name);
+            if "[]{}()".contains(&token) {
+                token = format!("'{token}'");
             }
-            let field = Field::Token(name);
+            let field = Field::Token { name: label.cloned(), token };
             acc.push(field);
         }
         Rule::Rep(inner) => {
@@ -1001,8 +1020,8 @@ fn lower_separated_list(
     }
     match nt {
         Either::Right(token) => {
-            let name = clean_token_name(&grammar[*token].name);
-            let field = Field::Token(name);
+            let token = clean_token_name(&grammar[*token].name);
+            let field = Field::Token { token, name: None };
             acc.push(field);
         }
         Either::Left(node) => {
@@ -1081,7 +1100,6 @@ fn extract_struct_traits(ast: &mut AstSrc) {
         "Enum",
         "Variant",
         "Trait",
-        "TraitAlias",
         "Module",
         "Static",
         "Const",

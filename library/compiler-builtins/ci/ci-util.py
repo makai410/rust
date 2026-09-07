@@ -7,18 +7,19 @@ git history.
 
 import json
 import os
+import pprint
 import re
 import subprocess as sp
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cache
 from glob import glob
 from inspect import cleandoc
 from os import getenv
 from pathlib import Path
 from typing import TypedDict, Self
 
-USAGE = cleandoc(
-    """
+USAGE = cleandoc("""
     usage:
 
     ./ci/ci-util.py <COMMAND> [flags]
@@ -36,29 +37,19 @@ USAGE = cleandoc(
             `--tag` can be specified to look for artifacts with a specific tag, such as
             for a specific architecture.
 
-            Note that `--extract` will overwrite files in `iai-home`.
+            Note that `--extract` will overwrite files in `gungraun-home`.
 
         handle-bench-regressions PR_NUMBER
             Exit with success if the pull request contains a line starting with
             `ci: allow-regressions`, indicating that regressions in benchmarks should
             be accepted. Otherwise, exit 1.
-    """
-)
+    """)
 
 REPO_ROOT = Path(__file__).parent.parent
 GIT = ["git", "-C", REPO_ROOT]
-DEFAULT_BRANCH = "master"
+DEFAULT_BRANCH = "main"
 WORKFLOW_NAME = "CI"  # Workflow that generates the benchmark artifacts
 ARTIFACT_PREFIX = "baseline-icount*"
-# Place this in a PR body to skip regression checks (must be at the start of a line).
-REGRESSION_DIRECTIVE = "ci: allow-regressions"
-# Place this in a PR body to skip extensive tests
-SKIP_EXTENSIVE_DIRECTIVE = "ci: skip-extensive"
-# Place this in a PR body to allow running a large number of extensive tests. If not
-# set, this script will error out if a threshold is exceeded in order to avoid
-# accidentally spending huge amounts of CI time.
-ALLOW_MANY_EXTENSIVE_DIRECTIVE = "ci: allow-many-extensive"
-MANY_EXTENSIVE_THRESHOLD = 20
 
 # Don't run exhaustive tests if these files change, even if they contaiin a function
 # definition.
@@ -70,7 +61,7 @@ IGNORE_FILES = [
 
 # libm PR CI takes a long time and doesn't need to run unless relevant files have been
 # changed. Anything matching this regex pattern will trigger a run.
-TRIGGER_LIBM_PR_CI = ".*(libm|musl).*"
+TRIGGER_LIBM_CI_FILE_PAT = ".*(libm|musl).*"
 
 TYPES = ["f16", "f32", "f64", "f128"]
 
@@ -78,6 +69,71 @@ TYPES = ["f16", "f32", "f64", "f128"]
 def eprint(*args, **kwargs):
     """Print to stderr."""
     print(*args, file=sys.stderr, **kwargs)
+
+
+@dataclass(kw_only=True)
+class PrCfg:
+    """Directives that we allow in the commit body to control test behavior.
+
+    These are of the form `ci: foo`, at the start of a line.
+    """
+
+    # The PR body
+    body: str
+    # Skip regression checks (must be at the start of a line).
+    allow_regressions: bool = False
+    # Don't run extensive tests
+    skip_extensive: bool = False
+    # Add these extensive tests to the list
+    extra_extensive: list[str] = field(default_factory=list, init=False)
+
+    # Allow running a large number of extensive tests. If not set, this script
+    # will error out if a threshold is exceeded in order to avoid accidentally
+    # spending huge amounts of CI time.
+    allow_many_extensive: bool = False
+
+    # Max number of extensive tests to run by default
+    MANY_EXTENSIVE_THRESHOLD: int = 20
+
+    # Run tests for `libm` that may otherwise be skipped due to no changed files.
+    always_test_libm: bool = False
+
+    # String values of directive names
+    DIR_ALLOW_REGRESSIONS: str = "allow-regressions"
+    DIR_SKIP_EXTENSIVE: str = "skip-extensive"
+    DIR_ALLOW_MANY_EXTENSIVE: str = "allow-many-extensive"
+    DIR_TEST_LIBM: str = "test-libm"
+    DIR_EXTRA_EXTENSIVE: str = "extra-extensive"
+
+    def __post_init__(self):
+        directives = re.finditer(
+            r"^\s*ci:\s*(?P<dir_name>[^\s=]*)(?:\s*=\s*(?P<args>.*))?",
+            self.body,
+            re.MULTILINE,
+        )
+        for dir in directives:
+            name = dir.group("dir_name")
+            args = dir.group("args")
+            if name == self.DIR_ALLOW_REGRESSIONS:
+                self.allow_regressions = True
+            elif name == self.DIR_SKIP_EXTENSIVE:
+                self.skip_extensive = True
+            elif name == self.DIR_ALLOW_MANY_EXTENSIVE:
+                self.allow_many_extensive = True
+            elif name == self.DIR_TEST_LIBM:
+                self.always_test_libm = True
+            elif name == self.DIR_EXTRA_EXTENSIVE:
+                self.extra_extensive = [x.strip() for x in args.split(",")]
+                args = None
+            else:
+                eprint(f"Found unexpected directive `{name}`")
+                exit(1)
+
+            if args is not None:
+                eprint("Found arguments where not expected")
+                exit(1)
+
+        eprint(pprint.pformat(self))
 
 
 @dataclass
@@ -88,10 +144,21 @@ class PrInfo:
     commits: list[str]
     created_at: str
     number: int
+    cfg: PrCfg
 
     @classmethod
-    def load(cls, pr_number: int | str) -> Self:
-        """For a given PR number, query the body and commit list"""
+    def from_env(cls) -> Self | None:
+        """Create a PR object from the PR_NUMBER environment if set, `None` otherwise."""
+        pr_env = os.environ.get("PR_NUMBER")
+        if pr_env is not None and len(pr_env) > 0:
+            return cls.from_pr(pr_env)
+
+        return None
+
+    @classmethod
+    @cache  # Cache so we don't print info messages multiple times
+    def from_pr(cls, pr_number: int | str) -> Self:
+        """For a given PR number, query the body and commit list."""
         pr_info = sp.check_output(
             [
                 "gh",
@@ -104,13 +171,9 @@ class PrInfo:
             ],
             text=True,
         )
-        eprint("PR info:", json.dumps(pr_info, indent=4))
-        return cls(**json.loads(pr_info))
-
-    def contains_directive(self, directive: str) -> bool:
-        """Return true if the provided directive is on a line in the PR body"""
-        lines = self.body.splitlines()
-        return any(line.startswith(directive) for line in lines)
+        pr_json = json.loads(pr_info)
+        eprint("PR info:", json.dumps(pr_json, indent=4))
+        return cls(**pr_json, cfg=PrCfg(body=pr_json["body"]))
 
 
 class FunctionDef(TypedDict):
@@ -138,7 +201,7 @@ class Context:
 
     def _init_change_list(self):
         """Create a list of files that have been changed. This uses GITHUB_REF if
-        available, otherwise a diff between `HEAD` and `master`.
+        available, otherwise a diff between `HEAD` and `main`.
         """
 
         # For pull requests, GitHub creates a ref `refs/pull/1234/merge` (1234 being
@@ -166,12 +229,21 @@ class Context:
         assert len(parents) == 2, f"expected two-parent merge but got:\n{parents}"
         base = parents[0].strip()
         incoming = parents[1].strip()
-
         eprint(f"base: {base}, incoming: {incoming}")
+
+        merge_base = sp.check_output(
+            GIT + ["merge-base", base, incoming], text=True
+        ).strip()
+        eprint(f"merge base: {merge_base}")
+
         textlist = sp.check_output(
-            GIT + ["diff", base, incoming, "--name-only"], text=True
+            GIT + ["diff", merge_base, incoming, "--name-only"], text=True
         )
         self.changed = [Path(p) for p in textlist.splitlines()]
+        eprint("all changed: [")
+        for f in self.changed:
+            eprint(f"    {f},")
+        eprint("]")
 
     def is_pr(self) -> bool:
         """Check if we are looking at a PR rather than a push."""
@@ -207,44 +279,56 @@ class Context:
         """If this is a PR and no libm files were changed, allow skipping libm
         jobs."""
 
-        if self.is_pr():
-            return all(not re.match(TRIGGER_LIBM_PR_CI, str(f)) for f in self.changed)
+        # Always run on merge CI
+        if not self.is_pr():
+            return False
 
-        return False
+        pr = PrInfo.from_env()
+        assert pr is not None, "Is a PR but couldn't load PrInfo"
+
+        # Allow opting in to libm tests
+        if pr.cfg.always_test_libm:
+            return False
+
+        # By default, run if there are any changed files matching the pattern
+        return all(not re.match(TRIGGER_LIBM_CI_FILE_PAT, str(f)) for f in self.changed)
 
     def emit_workflow_output(self):
         """Create a JSON object a list items for each type's changed files, if any
         did change, and the routines that were affected by the change.
         """
 
-        pr_number = os.environ.get("PR_NUMBER")
         skip_tests = False
         error_on_many_tests = False
+        extra_tests = {}
 
-        if pr_number is not None and len(pr_number) > 0:
-            pr = PrInfo.load(pr_number)
-            skip_tests = pr.contains_directive(SKIP_EXTENSIVE_DIRECTIVE)
-            error_on_many_tests = not pr.contains_directive(
-                ALLOW_MANY_EXTENSIVE_DIRECTIVE
-            )
+        pr = PrInfo.from_env()
+        if pr is not None:
+            skip_tests = pr.cfg.skip_extensive
+            error_on_many_tests = not pr.cfg.allow_many_extensive
+            for fn_name in pr.cfg.extra_extensive:
+                extra_tests.setdefault(base_name(fn_name)[1], []).append(fn_name)
 
             if skip_tests:
                 eprint("Skipping all extensive tests")
 
         changed = self.changed_routines()
+        eprint(f"changed routines: {changed}")
+
         matrix = []
         total_to_test = 0
 
         # Figure out which extensive tests need to run
         for ty in TYPES:
             ty_changed = changed.get(ty, [])
-            ty_to_test = [] if skip_tests else ty_changed
+            ty_to_test = [] if skip_tests else ty_changed.copy()
+            ty_to_test.extend(extra_tests.get(ty, []))
             total_to_test += len(ty_to_test)
 
             item = {
                 "ty": ty,
-                "changed": ",".join(ty_changed),
-                "to_test": ",".join(ty_to_test),
+                "changed": ",".join(sorted(set(ty_changed))),
+                "to_test": ",".join(sorted(set(ty_to_test))),
             }
 
             matrix.append(item)
@@ -253,18 +337,47 @@ class Context:
         may_skip = str(self.may_skip_libm_ci()).lower()
         print(f"extensive_matrix={ext_matrix}")
         print(f"may_skip_libm_ci={may_skip}")
-        eprint(f"extensive_matrix={ext_matrix}")
-        eprint(f"may_skip_libm_ci={may_skip}")
         eprint(f"total extensive tests: {total_to_test}")
 
-        if error_on_many_tests and total_to_test > MANY_EXTENSIVE_THRESHOLD:
+        if error_on_many_tests and total_to_test > PrCfg.MANY_EXTENSIVE_THRESHOLD:
             eprint(
-                f"More than {MANY_EXTENSIVE_THRESHOLD} tests would be run; add"
-                f" `{ALLOW_MANY_EXTENSIVE_DIRECTIVE}` to the PR body if this is"
+                f"More than {PrCfg.MANY_EXTENSIVE_THRESHOLD} tests would be run; add"
+                f" `{PrCfg.DIR_ALLOW_MANY_EXTENSIVE}` to the PR body if this is"
                 " intentional. If this is refactoring that happens to touch a lot of"
-                f" files, `{SKIP_EXTENSIVE_DIRECTIVE}` can be used instead."
+                f" files, `{PrCfg.DIR_SKIP_EXTENSIVE}` can be used instead."
             )
             exit(1)
+
+
+def base_name(name: str) -> tuple[str, str]:
+    """Return the basename and type from a full function name. Keep in sync with Rust's
+    `fn base_name`.
+    """
+    known_mappings = [
+        ("erff", ("erf", "f32")),
+        ("erf", ("erf", "f64")),
+        ("modff", ("modf", "f32")),
+        ("modf", ("modf", "f64")),
+        ("lgammaf_r", ("lgamma_r", "f32")),
+        ("lgamma_r", ("lgamma_r", "f64")),
+    ]
+
+    found = next((base for (full, base) in known_mappings if full == name), None)
+    if found is not None:
+        return found
+
+    if name.endswith("f"):
+        return (name.rstrip("f"), "f32")
+    elif name.endswith("f16"):
+        return (name.rstrip("f16"), "f16")
+    elif name.endswith("f32"):
+        return (name.rstrip("f32"), "f32")
+    elif name.endswith("f64"):
+        return (name.rstrip("f64"), "f64")
+    elif name.endswith("f128"):
+        return (name.rstrip("f128"), "f128")
+
+    return (name, "f64")
 
 
 def locate_baseline(flags: list[str]) -> None:
@@ -338,6 +451,7 @@ def locate_baseline(flags: list[str]) -> None:
 
     artifact_glob = f"{ARTIFACT_PREFIX}{f"-{tag}" if tag else ""}*"
 
+    # Skip checking because this will fail if the file already exists, which is fine.
     sp.run(
         ["gh", "run", "download", str(job_id), f"--pattern={artifact_glob}"],
         check=False,
@@ -357,7 +471,17 @@ def locate_baseline(flags: list[str]) -> None:
     candidate_baselines.sort(reverse=True)
     baseline_archive = candidate_baselines[0]
     eprint(f"extracting {baseline_archive}")
-    sp.run(["tar", "xJvf", baseline_archive], check=True)
+
+    all_paths = sp.check_output(["tar", "tJf", baseline_archive], encoding="utf8")
+    sp.run(["tar", "xJf", baseline_archive], check=True)
+
+    # Print a short summary of paths, we don't use `tar v` since the list is huge
+    short_paths = re.findall(r"^(?:[^/\n]+/?){1,3}", all_paths, re.MULTILINE)
+
+    print("Extracted:")
+    for path in sorted(set(short_paths)):
+        print(f"* {path}")
+
     eprint("baseline extracted successfully")
 
 
@@ -371,8 +495,8 @@ def handle_bench_regressions(args: list[str]):
             eprint(USAGE)
             exit(1)
 
-    pr = PrInfo.load(pr_number)
-    if pr.contains_directive(REGRESSION_DIRECTIVE):
+    pr = PrInfo.from_pr(pr_number)
+    if pr.cfg.allow_regressions:
         eprint("PR allows regressions")
         return
 

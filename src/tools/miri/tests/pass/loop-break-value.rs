@@ -1,4 +1,3 @@
-#![feature(never_type)]
 #![allow(unreachable_code)]
 
 #[allow(unused)]
@@ -8,7 +7,7 @@ fn never_returns() {
     }
 }
 
-pub fn main() {
+fn main() {
     let value = 'outer: loop {
         if 1 == 1 {
             break 13;

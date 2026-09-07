@@ -10,7 +10,7 @@ use hir::{Complete, Crate, ItemInNs, Module, import_map};
 use crate::{
     RootDatabase,
     imports::import_assets::NameToImport,
-    symbol_index::{self, SymbolsDatabase as _},
+    symbol_index::{self, SymbolIndex},
 };
 
 /// A value to use, when uncertain which limit to pick.
@@ -110,7 +110,7 @@ pub fn items_with_name_in_module<T>(
             local_query
         }
     };
-    local_query.search(&[db.module_symbols(module)], |local_candidate| {
+    local_query.search(db, &[SymbolIndex::module_symbols(db, module)], |local_candidate| {
         cb(match local_candidate.def {
             hir::ModuleDef::Macro(macro_def) => ItemInNs::Macros(macro_def),
             def => ItemInNs::from(def),
@@ -140,7 +140,7 @@ fn find_items(
 
     // Query the local crate using the symbol index.
     let mut local_results = Vec::new();
-    local_query.search(&symbol_index::crate_symbols(db, krate), |local_candidate| {
+    local_query.search(db, &symbol_index::crate_symbols(db, krate), |local_candidate| {
         let def = match local_candidate.def {
             hir::ModuleDef::Macro(macro_def) => ItemInNs::Macros(macro_def),
             def => ItemInNs::from(def),

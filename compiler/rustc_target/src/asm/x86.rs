@@ -3,7 +3,7 @@ use std::fmt;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_span::Symbol;
 
-use super::{InlineAsmArch, InlineAsmType, ModifierInfo};
+use super::{InlineAsmArch, InlineAsmSize, InlineAsmType, ModifierInfo};
 use crate::spec::{RelocModel, Target};
 
 def_reg_class! {
@@ -49,33 +49,45 @@ impl X86InlineAsmRegClass {
 
     pub fn suggest_class(self, _arch: InlineAsmArch, ty: InlineAsmType) -> Option<Self> {
         match self {
-            Self::reg | Self::reg_abcd if ty.size().bits() == 8 => Some(Self::reg_byte),
+            Self::reg | Self::reg_abcd if ty.size() == InlineAsmSize::FixedBytes(1) => {
+                Some(Self::reg_byte)
+            }
             _ => None,
         }
     }
 
     pub fn suggest_modifier(self, arch: InlineAsmArch, ty: InlineAsmType) -> Option<ModifierInfo> {
         match self {
-            Self::reg => match ty.size().bits() {
-                16 => Some(('x', "ax", 16).into()),
-                32 if arch == InlineAsmArch::X86_64 => Some(('e', "eax", 32).into()),
+            Self::reg => match ty.size() {
+                InlineAsmSize::FixedBytes(2) => {
+                    Some(('x', "ax", InlineAsmSize::FixedBytes(2)).into())
+                }
+                InlineAsmSize::FixedBytes(4) if arch == InlineAsmArch::X86_64 => {
+                    Some(('e', "eax", InlineAsmSize::FixedBytes(4)).into())
+                }
                 _ => None,
             },
-            Self::reg_abcd => match ty.size().bits() {
-                16 => Some(('x', "ax", 16).into()),
-                32 if arch == InlineAsmArch::X86_64 => Some(('e', "eax", 32).into()),
+            Self::reg_abcd => match ty.size() {
+                InlineAsmSize::FixedBytes(2) => {
+                    Some(('x', "ax", InlineAsmSize::FixedBytes(2)).into())
+                }
+                InlineAsmSize::FixedBytes(4) if arch == InlineAsmArch::X86_64 => {
+                    Some(('e', "eax", InlineAsmSize::FixedBytes(4)).into())
+                }
                 _ => None,
             },
             Self::reg_byte => None,
             Self::xmm_reg => None,
-            Self::ymm_reg => match ty.size().bits() {
-                256 => None,
-                _ => Some(('x', "xmm0", 128).into()),
+            Self::ymm_reg => match ty.size() {
+                InlineAsmSize::FixedBytes(32) => None,
+                _ => Some(('x', "xmm0", InlineAsmSize::FixedBytes(16)).into()),
             },
-            Self::zmm_reg => match ty.size().bits() {
-                512 => None,
-                256 => Some(('y', "ymm0", 256).into()),
-                _ => Some(('x', "xmm0", 128).into()),
+            Self::zmm_reg => match ty.size() {
+                InlineAsmSize::FixedBytes(64) => None,
+                InlineAsmSize::FixedBytes(32) => {
+                    Some(('y', "ymm0", InlineAsmSize::FixedBytes(32)).into())
+                }
+                _ => Some(('x', "xmm0", InlineAsmSize::FixedBytes(16)).into()),
             },
             Self::kreg | Self::kreg0 => None,
             Self::mmx_reg | Self::x87_reg => None,
@@ -87,15 +99,15 @@ impl X86InlineAsmRegClass {
         match self {
             Self::reg | Self::reg_abcd => {
                 if arch == InlineAsmArch::X86_64 {
-                    Some(('r', "rax", 64).into())
+                    Some(('r', "rax", InlineAsmSize::FixedBytes(8)).into())
                 } else {
-                    Some(('e', "eax", 32).into())
+                    Some(('e', "eax", InlineAsmSize::FixedBytes(4)).into())
                 }
             }
             Self::reg_byte => None,
-            Self::xmm_reg => Some(('x', "xmm0", 128).into()),
-            Self::ymm_reg => Some(('y', "ymm0", 256).into()),
-            Self::zmm_reg => Some(('z', "zmm0", 512).into()),
+            Self::xmm_reg => Some(('x', "xmm0", InlineAsmSize::FixedBytes(16)).into()),
+            Self::ymm_reg => Some(('y', "ymm0", InlineAsmSize::FixedBytes(32)).into()),
+            Self::zmm_reg => Some(('z', "zmm0", InlineAsmSize::FixedBytes(64)).into()),
             Self::kreg | Self::kreg0 => None,
             Self::mmx_reg | Self::x87_reg => None,
             Self::tmm_reg => None,
@@ -105,6 +117,7 @@ impl X86InlineAsmRegClass {
     pub fn supported_types(
         self,
         arch: InlineAsmArch,
+        _allow_experimental_reg: bool,
     ) -> &'static [(InlineAsmType, Option<Symbol>)] {
         match self {
             Self::reg | Self::reg_abcd => {
@@ -115,21 +128,28 @@ impl X86InlineAsmRegClass {
                 }
             }
             Self::reg_byte => types! { _: I8; },
-            Self::xmm_reg => types! {
-                sse: I32, I64, F16, F32, F64, F128,
-                  VecI8(16), VecI16(8), VecI32(4), VecI64(2), VecF16(8), VecF32(4), VecF64(2);
-            },
-            Self::ymm_reg => types! {
-                avx: I32, I64, F16, F32, F64, F128,
-                    VecI8(16), VecI16(8), VecI32(4), VecI64(2), VecF16(8), VecF32(4), VecF64(2),
-                    VecI8(32), VecI16(16), VecI32(8), VecI64(4), VecF16(16), VecF32(8), VecF64(4);
-            },
-            Self::zmm_reg => types! {
-                avx512f: I32, I64, F16, F32, F64, F128,
-                    VecI8(16), VecI16(8), VecI32(4), VecI64(2), VecF16(8), VecF32(4), VecF64(2),
-                    VecI8(32), VecI16(16), VecI32(8), VecI64(4), VecF16(16), VecF32(8), VecF64(4),
-                    VecI8(64), VecI16(32), VecI32(16), VecI64(8), VecF16(32), VecF32(16), VecF64(8);
-            },
+            Self::xmm_reg => {
+                types! {
+                    sse: I32, I64, I128, F16, F32, F64, F128,
+                      VecI8(16), VecI16(8), VecI32(4), VecI64(2), VecF16(8), VecF32(4), VecF64(2);
+                }
+            }
+            Self::ymm_reg => {
+                types! {
+                    avx: I32, I64, I128, F16, F32, F64, F128,
+                        VecI8(16), VecI16(8), VecI32(4), VecI64(2), VecF16(8), VecF32(4), VecF64(2),
+                        VecI8(32), VecI16(16), VecI32(8), VecI64(4), VecF16(16), VecF32(8), VecF64(4);
+                }
+            }
+            Self::zmm_reg => {
+                types! {
+                    avx512f: I32, I64, I128, F16, F32, F64, F128,
+                        VecI8(16), VecI16(8), VecI32(4), VecI64(2), VecF16(8), VecF32(4), VecF64(2),
+                        VecI8(32), VecI16(16), VecI32(8), VecI64(4), VecF16(16), VecF32(8), VecF64(4),
+                        VecI8(64), VecI16(32), VecI32(16), VecI64(8), VecF16(32), VecF32(16), VecF64(8);
+                }
+            }
+
             Self::kreg => types! {
                 avx512f: I8, I16;
                 avx512bw: I32, I64;
@@ -218,8 +238,8 @@ def_regs! {
         r15: reg = ["r15", "r15w", "r15d"] % x86_64_only,
         al: reg_byte = ["al"],
         ah: reg_byte = ["ah"] % high_byte,
-        bl: reg_byte = ["bl"],
-        bh: reg_byte = ["bh"] % high_byte,
+        bl: reg_byte = ["bl"] % rbx_reserved,
+        bh: reg_byte = ["bh"] % rbx_reserved % high_byte,
         cl: reg_byte = ["cl"],
         ch: reg_byte = ["ch"] % high_byte,
         dl: reg_byte = ["dl"],

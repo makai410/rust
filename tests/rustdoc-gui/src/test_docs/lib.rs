@@ -1,3 +1,6 @@
+// ignore-tidy-file-linelength
+//
+//@ compile-flags: --enable-index-page -Z unstable-options
 //! The point of this crate is to be able to have enough different "kinds" of
 //! documentation generated so we can test each different features.
 #![doc(html_playground_url="https://play.rust-lang.org/")]
@@ -7,6 +10,11 @@
 #![feature(rustdoc_internals)]
 #![feature(doc_cfg)]
 #![feature(associated_type_defaults)]
+#![feature(macro_attr)]
+#![feature(macro_derive)]
+#![feature(negative_impls)]
+#![feature(doc_notable_trait)]
+#![feature(decl_macro)]
 
 /*!
 Enable the feature <span class="stab portability"><code>some-feature</code></span> to enjoy
@@ -86,6 +94,19 @@ impl AsRef<str> for Foo {
     }
 }
 
+unsafe impl Send for Foo {}
+impl !Sync for Foo {}
+
+impl From<u8> for Foo {
+    fn from(value: u8) -> Self { todo!(); }
+}
+impl From<u16> for Foo {
+    fn from(value: u16) -> Self { todo!(); }
+}
+impl From<u32> for Foo {
+    fn from(value: u32) -> Self { todo!(); }
+}
+
 /// <div id="doc-warning-0" class="warning">I have warnings!</div>
 pub struct WarningStruct;
 
@@ -159,7 +180,11 @@ pub enum AnEnum {
 
 #[doc(keyword = "for")]
 /// Some keyword.
-pub mod keyword {}
+const _: () = ();
+
+#[doc(attribute = "forbid")]
+/// Some attribute.
+const _: () = ();
 
 /// Just some type alias.
 pub type SomeType = u32;
@@ -455,10 +480,10 @@ pub fn safe_fn() {}
 
 #[repr(C)]
 pub struct WithGenerics<T: TraitWithNoDocblocks, S = String, E = WhoLetTheDogOut, P = i8> {
-    s: S,
-    t: T,
-    e: E,
-    p: P,
+    pub s: S,
+    pub t: T,
+    pub e: E,
+    pub p: P,
 }
 
 pub struct StructWithPublicUndocumentedFields {
@@ -655,12 +680,12 @@ pub mod long_list {
     //!
     //! Another list:
     //!
-    //! * [`TryFromBytes`](#a) indicates that a type may safely be converted from certain byte
-    //!   sequence (conditional on runtime checks)
-    //! * [`FromZeros`](#a) indicates that a sequence of zero bytes represents a valid instance of
-    //!   a type
-    //! * [`FromBytes`](#a) indicates that a type may safely be converted from an arbitrary byte
-    //!   sequence
+    //! 100. [`TryFromBytes`](#a) indicates that a type may safely be converted from certain byte
+    //!      sequence (conditional on runtime checks)
+    //! 101. [`FromZeros`](#a) indicates that a sequence of zero bytes represents a valid instance of
+    //!      a type
+    //! 102. [`FromBytes`](#a) indicates that a type may safely be converted from an arbitrary byte
+    //!      sequence
 }
 
 pub struct ImplDoc;
@@ -680,7 +705,6 @@ impl ImplDoc {
     pub fn bar2() {}
 }
 
-// ignore-tidy-linelength
 /// | this::is::a::kinda::very::long::header::number::one | this::is::a::kinda::very::long::header::number::two | this::is::a::kinda::very::long::header::number::three |
 /// |-|-|-|
 /// | bla | bli | blob |
@@ -766,4 +790,40 @@ pub mod impls_indent {
         /// bla
         pub fn bar() {}
     }
+}
+
+pub mod tooltips {
+    pub struct X;
+
+    impl X {
+        pub fn bar() -> Vec<u8> {
+            Vec::new()
+        }
+    }
+
+    pub fn bar() -> Vec<u8> {
+        Vec::new()
+    }
+}
+
+pub mod tyalias {
+    pub struct X<T>(pub T);
+
+    impl<T: std::fmt::Debug> X<T> {
+        pub fn blob(&self) {}
+    }
+
+    pub type Y = X<u8>;
+}
+
+pub mod notable {
+    #[doc(notable_trait)]
+    pub trait Labeled {}
+
+    pub struct Wrapper;
+    impl Labeled for Wrapper {}
+}
+
+pub macro decl_macro {
+    () => { "bar" }
 }

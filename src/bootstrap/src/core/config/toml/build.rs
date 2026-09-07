@@ -6,13 +6,11 @@
 //! various feature flags. These options apply across different stages and components
 //! unless specifically overridden by other configuration sections or command-line flags.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
-use serde::{Deserialize, Deserializer};
-
-use crate::core::config::toml::ReplaceOpt;
-use crate::core::config::{Merge, StringOrBool};
-use crate::{HashSet, PathBuf, define_config, exit};
+use crate::core::config::macros::define_config;
+use crate::core::config::{Allocator, CompilerBuiltins, DebuggerPath, StringOrBool};
 
 define_config! {
     /// TOML representation of various global build decisions.
@@ -25,6 +23,7 @@ define_config! {
         build_dir: Option<String> = "build-dir",
         cargo: Option<PathBuf> = "cargo",
         rustc: Option<PathBuf> = "rustc",
+        rustdoc: Option<PathBuf> = "rustdoc",
         rustfmt: Option<PathBuf> = "rustfmt",
         cargo_clippy: Option<PathBuf> = "cargo-clippy",
         docs: Option<bool> = "docs",
@@ -32,11 +31,13 @@ define_config! {
         library_docs_private_items: Option<bool> = "library-docs-private-items",
         docs_minification: Option<bool> = "docs-minification",
         submodules: Option<bool> = "submodules",
-        gdb: Option<String> = "gdb",
-        lldb: Option<String> = "lldb",
+        gdb: Option<DebuggerPath> = "gdb",
+        lldb: Option<DebuggerPath> = "lldb",
         nodejs: Option<String> = "nodejs",
-        npm: Option<String> = "npm",
+        npm: Option<String> = "npm", // unused, present for compatibility
+        yarn: Option<String> = "yarn",
         python: Option<String> = "python",
+        windows_rc: Option<String> = "windows-rc",
         reuse: Option<String> = "reuse",
         locked_deps: Option<bool> = "locked-deps",
         vendor: Option<bool> = "vendor",
@@ -65,13 +66,16 @@ define_config! {
         // NOTE: only parsed by bootstrap.py, `--feature build-metrics` enables metrics unconditionally
         metrics: Option<bool> = "metrics",
         android_ndk: Option<PathBuf> = "android-ndk",
-        optimized_compiler_builtins: Option<bool> = "optimized-compiler-builtins",
+        optimized_compiler_builtins: Option<CompilerBuiltins> = "optimized-compiler-builtins",
         jobs: Option<u32> = "jobs",
         compiletest_diff_tool: Option<String> = "compiletest-diff-tool",
-        compiletest_use_stage0_libtest: Option<bool> = "compiletest-use-stage0-libtest",
+        compiletest_allow_stage0: Option<bool> = "compiletest-allow-stage0",
         tidy_extra_checks: Option<String> = "tidy-extra-checks",
         ccache: Option<StringOrBool> = "ccache",
         exclude: Option<Vec<PathBuf>> = "exclude",
+        record_failed_tests_path: Option<String> = "record_failed_tests_path",
+        sde: Option<String> = "sde",
+        allocator: Option<Allocator> = "allocator",
     }
 }
 

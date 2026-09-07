@@ -1,6 +1,6 @@
 use rustc_data_structures::fx::FxHashSet;
 pub use rustc_middle::ty::elaborate::*;
-use rustc_middle::ty::{self, TyCtxt};
+use rustc_middle::ty::{self, TyCtxt, Unnormalized};
 use rustc_span::{Ident, Span};
 
 use crate::traits::{self, Obligation, ObligationCauseCode, PredicateObligation};
@@ -81,14 +81,14 @@ impl<'tcx> Elaboratable<TyCtxt<'tcx>> for PredicateObligation<'tcx> {
         &self,
         clause: ty::Clause<'tcx>,
         span: Span,
-        parent_trait_pred: ty::PolyTraitPredicate<'tcx>,
+        parent_trait_pred: ty::PolyTraitClause<'tcx>,
         index: usize,
     ) -> Self {
         let cause = self.cause.clone().derived_cause(parent_trait_pred, |derived| {
             ObligationCauseCode::ImplDerived(Box::new(traits::ImplDerivedCause {
                 derived,
                 impl_or_alias_def_id: parent_trait_pred.def_id(),
-                impl_def_predicate_index: Some(index),
+                impl_def_clause_index: Some(index),
                 span,
             }))
         });
@@ -123,9 +123,10 @@ pub fn transitive_bounds_that_define_assoc_item<'tcx>(
             stack.extend(
                 tcx.explicit_supertraits_containing_assoc_item((trait_ref.def_id(), assoc_name))
                     .iter_identity_copied()
+                    .map(Unnormalized::skip_norm_wip)
                     .map(|(clause, _)| clause.instantiate_supertrait(tcx, trait_ref))
                     .filter_map(|clause| clause.as_trait_clause())
-                    .filter(|clause| clause.polarity() == ty::PredicatePolarity::Positive)
+                    .filter(|clause| clause.polarity() == ty::ClausePolarity::Positive)
                     .map(|clause| clause.map_bound(|clause| clause.trait_ref)),
             );
 

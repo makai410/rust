@@ -1,24 +1,38 @@
-use std::sync::Arc;
+use std::assert_matches;
 
 use itertools::Itertools;
 use rustc_abi::Align;
 use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, ConstCodegenMethods};
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_index::IndexVec;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::RemapFileNameExt;
-use rustc_session::config::RemapPathScopeComponents;
-use rustc_span::{SourceFile, StableSourceFileId};
+use rustc_span::{FileName, RemapPathScopeComponents, SourceFile, StableSourceFileId};
 use tracing::debug;
 
 use crate::common::CodegenCx;
 use crate::coverageinfo::llvm_cov;
 use crate::coverageinfo::mapgen::covfun::prepare_covfun_record;
-use crate::llvm;
+use crate::{TryFromU32, llvm};
 
 mod covfun;
 mod spans;
 mod unused;
+
+/// Version number that will be included the `__llvm_covmap` section header.
+/// Corresponds to LLVM's `llvm::coverage::CovMapVersion` (in `CoverageMapping.h`),
+/// or at least the subset that we know and care about.
+///
+/// Note that version `n` is encoded as `(n-1)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, TryFromU32)]
+enum CovmapVersion {
+    /// Used by LLVM 18 onwards.
+    Version7 = 6,
+}
+
+impl CovmapVersion {
+    fn to_u32(self) -> u32 {
+        self as u32
+    }
+}
 
 /// Generates and exports the coverage map, which is embedded in special
 /// linker sections in the final binary.
@@ -29,38 +43,28 @@ pub(crate) fn finalize(cx: &mut CodegenCx<'_, '_>) {
     let tcx = cx.tcx;
 
     // Ensure that LLVM is using a version of the coverage mapping format that
-    // agrees with our Rust-side code. Expected versions (encoded as n-1) are:
-    // - `CovMapVersion::Version7` (6) used by LLVM 18-19
-    let covmap_version = {
-        let llvm_covmap_version = llvm_cov::mapping_version();
-        let expected_versions = 6..=6;
-        assert!(
-            expected_versions.contains(&llvm_covmap_version),
-            "Coverage mapping version exposed by `llvm-wrapper` is out of sync; \
-            expected {expected_versions:?} but was {llvm_covmap_version}"
-        );
-        // This is the version number that we will embed in the covmap section:
-        llvm_covmap_version
-    };
+    // agrees with our Rust-side code. Expected versions are:
+    // - `Version7` (6) used by LLVM 18 onwards.
+    let covmap_version =
+        CovmapVersion::try_from(llvm_cov::mapping_version()).unwrap_or_else(|raw_version: u32| {
+            panic!("unknown coverage mapping version reported by `llvm-wrapper`: {raw_version}")
+        });
+    assert_matches!(covmap_version, CovmapVersion::Version7);
 
     debug!("Generating coverage map for CodegenUnit: `{}`", cx.codegen_unit.name());
 
     // FIXME(#132395): Can this be none even when coverage is enabled?
-    let instances_used = match cx.coverage_cx {
-        Some(ref cx) => cx.instances_used.borrow(),
-        None => return,
-    };
+    let Some(ref coverage_cx) = cx.coverage_cx else { return };
 
-    let mut covfun_records = instances_used
-        .iter()
-        .copied()
+    let mut covfun_records = coverage_cx
+        .instances_used()
+        .into_iter()
         // Sort by symbol name, so that the global file table is built in an
         // order that doesn't depend on the stable-hash-based order in which
         // instances were visited during codegen.
         .sorted_by_cached_key(|&instance| tcx.symbol_name(instance).name)
         .filter_map(|instance| prepare_covfun_record(tcx, instance, true))
         .collect::<Vec<_>>();
-    drop(instances_used);
 
     // In a single designated CGU, also prepare covfun records for functions
     // in this crate that were instrumented for coverage, but are unused.
@@ -68,7 +72,7 @@ pub(crate) fn finalize(cx: &mut CodegenCx<'_, '_>) {
         unused::prepare_covfun_records_for_unused_functions(cx, &mut covfun_records);
     }
 
-    // If there are no covfun records for this CGU, don't generate a covmap record.
+    // If there are no covfun records for this CGU, don't emit a covmap record.
     // Emitting a covmap record without any covfun records causes `llvm-cov` to
     // fail when generating coverage reports, and if there are no covfun records
     // then the covmap record isn't useful anyway.
@@ -83,13 +87,13 @@ pub(crate) fn finalize(cx: &mut CodegenCx<'_, '_>) {
         GlobalFileTable::build(tcx, covfun_records.iter().flat_map(|c| c.all_source_files()));
 
     for covfun in &covfun_records {
-        covfun::generate_covfun_record(cx, &global_file_table, covfun)
+        covfun::emit_covfun_record(cx, &global_file_table, covfun);
     }
 
-    // Generate the coverage map header, which contains the filenames used by
+    // Emit the coverage map header, which contains the filenames used by
     // this CGU's coverage mappings, and store it in a well-known global.
     // (This is skipped if we returned early due to having no covfun records.)
-    generate_covmap_record(cx, covmap_version, &global_file_table.filenames_buffer);
+    emit_covmap_record(cx, covmap_version, &global_file_table.filenames_buffer);
 }
 
 /// Maps "global" (per-CGU) file ID numbers to their underlying source file paths.
@@ -119,10 +123,19 @@ impl GlobalFileTable {
 
         for file in all_files {
             raw_file_table.entry(file.stable_id).or_insert_with(|| {
-                file.name
-                    .for_scope(tcx.sess, RemapPathScopeComponents::MACRO)
-                    .to_string_lossy()
-                    .into_owned()
+                // Prefer using the embeddable filename as this filename is going to
+                // end-up in the coverage artifacts (see rust-lang/rust#150020).
+                if let FileName::Real(real) = &file.name {
+                    let (_work_dir, abs_name) =
+                        real.embeddable_name(RemapPathScopeComponents::COVERAGE);
+
+                    abs_name.to_string_lossy().into_owned()
+                } else {
+                    file.name
+                        .display(RemapPathScopeComponents::COVERAGE)
+                        .to_string_lossy()
+                        .into_owned()
+                }
             });
         }
 
@@ -137,9 +150,10 @@ impl GlobalFileTable {
         // resolve any other entries that are stored as relative paths.
         let base_dir = tcx
             .sess
-            .opts
-            .working_dir
-            .for_scope(tcx.sess, RemapPathScopeComponents::MACRO)
+            .psess
+            .source_map()
+            .working_dir()
+            .path(RemapPathScopeComponents::COVERAGE)
             .to_string_lossy();
         table.push(base_dir.as_ref());
 
@@ -174,38 +188,14 @@ rustc_index::newtype_index! {
     struct LocalFileId {}
 }
 
-/// Holds a mapping from "local" (per-function) file IDs to their corresponding
-/// source files.
-#[derive(Debug, Default)]
-struct VirtualFileMapping {
-    local_file_table: IndexVec<LocalFileId, Arc<SourceFile>>,
-}
-
-impl VirtualFileMapping {
-    fn push_file(&mut self, source_file: &Arc<SourceFile>) -> LocalFileId {
-        self.local_file_table.push(Arc::clone(source_file))
-    }
-
-    /// Resolves all of the filenames in this local file mapping to a list of
-    /// global file IDs in its CGU, for inclusion in this function's
-    /// `__llvm_covfun` record.
-    ///
-    /// The global file IDs are returned as `u32` to make FFI easier.
-    fn resolve_all(&self, global_file_table: &GlobalFileTable) -> Option<Vec<u32>> {
-        self.local_file_table
-            .iter()
-            .map(|file| try {
-                let id = global_file_table.get_existing_id(file)?;
-                GlobalFileId::as_u32(id)
-            })
-            .collect::<Option<Vec<_>>>()
-    }
-}
-
-/// Generates the contents of the covmap record for this CGU, which mostly
-/// consists of a header and a list of filenames. The record is then stored
+/// Generates and emits the covmap record for this CGU, which mostly
+/// consists of a header and a list of filenames. The record is emitted
 /// as a global variable in the `__llvm_covmap` section.
-fn generate_covmap_record<'ll>(cx: &mut CodegenCx<'ll, '_>, version: u32, filenames_buffer: &[u8]) {
+fn emit_covmap_record<'ll>(
+    cx: &mut CodegenCx<'ll, '_>,
+    version: CovmapVersion,
+    filenames_buffer: &[u8],
+) {
     // A covmap record consists of four target-endian u32 values, followed by
     // the encoded filenames table. Two of the header fields are unused in
     // modern versions of the LLVM coverage mapping format, and are always 0.
@@ -216,7 +206,7 @@ fn generate_covmap_record<'ll>(cx: &mut CodegenCx<'ll, '_>, version: u32, filena
             cx.const_u32(0), // (unused)
             cx.const_u32(filenames_buffer.len() as u32),
             cx.const_u32(0), // (unused)
-            cx.const_u32(version),
+            cx.const_u32(version.to_u32()),
         ],
         /* packed */ false,
     );

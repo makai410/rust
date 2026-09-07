@@ -19,6 +19,7 @@ fn sleep_very_long() {
 }
 
 #[test]
+#[cfg_attr(target_env = "sgx", ignore = "Time within SGX enclave cannot be trusted")]
 fn sleep_until() {
     let now = Instant::now();
     let period = Duration::from_millis(100);
@@ -65,6 +66,8 @@ fn thread_local_hygeiene() {
     type Storage = ();
     type LazyStorage = ();
     type EagerStorage = ();
+    #[allow(non_camel_case_types)]
+    type usize = ();
     thread_local! {
         static A: LocalKey = const { () };
         static B: Storage = const { () };
@@ -82,7 +85,6 @@ fn thread_local_hygeiene() {
         target_env = "sgx",
         target_os = "solid_asp3",
         target_os = "teeos",
-        target_os = "wasi"
     ),
     should_panic
 )]

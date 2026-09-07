@@ -624,8 +624,25 @@ impl GetOptsOptions {
             options.emit_mode = Some(emit_mode_from_emit_str(emit_str)?);
         }
 
+        if options.inline_config.contains_key("emit_mode") {
+            if options.check {
+                return Err(format_err!(
+                    "Invalid to use `--config=emit_mode=<mode>` and `--check`"
+                ));
+            }
+            if options.emit_mode.is_some() {
+                return Err(format_err!(
+                    "Invalid to use `--config=emit_mode=<mode>` and `--emit`"
+                ));
+            }
+        }
+
         if let Some(ref edition_str) = matches.opt_str("edition") {
             options.edition = Some(edition_from_edition_str(edition_str)?);
+        }
+
+        if let Some(ref edition_str) = matches.opt_str("style-edition") {
+            options.style_edition = Some(style_edition_from_style_edition_str(edition_str)?);
         }
 
         if matches.opt_present("backup") {
@@ -767,6 +784,7 @@ fn style_edition_from_style_edition_str(edition_str: &str) -> Result<StyleEditio
         "2018" => Ok(StyleEdition::Edition2018),
         "2021" => Ok(StyleEdition::Edition2021),
         "2024" => Ok(StyleEdition::Edition2024),
+        "2027" => Ok(StyleEdition::Edition2027),
         _ => Err(format_err!("Invalid value for `--style-edition`")),
     }
 }
@@ -817,6 +835,37 @@ mod test {
         options.inline_config = HashMap::from([("version".to_owned(), "Two".to_owned())]);
         let config = get_config(None, Some(options));
         assert_eq!(config.style_edition(), StyleEdition::Edition2024);
+    }
+
+    #[test]
+    fn emit_mode_from_inline_config_is_rejected() {
+        // Regression for #6999.
+        let emit_modes = [
+            "Files",
+            "Stdout",
+            "Coverage",
+            "Checkstyle",
+            "Json",
+            "ModifiedLines",
+            "Diff",
+        ];
+        for mode in emit_modes {
+            let config = format!("emit_mode={mode}");
+
+            let matches = make_opts().parse(["--check", "--config", &config]).unwrap();
+            assert!(
+                GetOptsOptions::from_matches(&matches).is_err(),
+                "`--check` with `--config={config}` should be rejected"
+            );
+
+            let matches = make_opts()
+                .parse(["--emit", "stdout", "--config", &config])
+                .unwrap();
+            assert!(
+                GetOptsOptions::from_matches(&matches).is_err(),
+                "`--emit` with `--config={config}` should be rejected"
+            );
+        }
     }
 
     #[nightly_only_test]
@@ -955,10 +1004,10 @@ mod test {
         let mut options = GetOptsOptions::default();
         let config_file = Some(Path::new("tests/config/style-edition/just-style-edition"));
         options.inline_config =
-            HashMap::from([("overflow_delimited_expr".to_owned(), "false".to_owned())]);
+            HashMap::from([("overflow_delimited_expr".to_owned(), "true".to_owned())]);
         let config = get_config(config_file, Some(options));
         // FIXME: this test doesn't really exercise anything, since
         // `overflow_delimited_expr` is disabled by default in edition 2024.
-        assert_eq!(config.overflow_delimited_expr(), false);
+        assert_eq!(config.overflow_delimited_expr(), true);
     }
 }

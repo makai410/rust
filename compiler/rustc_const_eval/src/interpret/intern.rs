@@ -17,18 +17,21 @@ use hir::def::DefKind;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_hir as hir;
-use rustc_hir::definitions::{DefPathData, DisambiguatorState};
+use rustc_hir::definitions::{DefPathData, PerParentDisambiguatorState};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
-use rustc_middle::mir::interpret::{ConstAllocation, CtfeProvenance, InterpResult};
+use rustc_middle::mir::interpret::{
+    AllocBytes, ConstAllocation, CtfeProvenance, InterpResult, Provenance,
+};
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::span_bug;
+use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_span::def_id::LocalDefId;
 use tracing::{instrument, trace};
 
 use super::{AllocId, Allocation, InterpCx, MPlaceTy, Machine, MemoryKind, PlaceTy, interp_ok};
 use crate::const_eval::DummyMachine;
-use crate::{const_eval, errors};
+use crate::{const_eval, diagnostics};
 
 pub trait CompileTimeMachine<'tcx> = Machine<
         'tcx,
@@ -52,37 +55,28 @@ impl HasStaticRootDefId for const_eval::CompileTimeMachine<'_> {
     }
 }
 
-/// Intern an allocation. Returns `Err` if the allocation does not exist in the local memory.
-///
-/// `mutability` can be used to force immutable interning: if it is `Mutability::Not`, the
-/// allocation is interned immutably; if it is `Mutability::Mut`, then the allocation *must be*
-/// already mutable (as a sanity check).
-///
-/// Returns an iterator over all relocations referred to by this allocation.
-fn intern_shallow<'tcx, M: CompileTimeMachine<'tcx>>(
-    ecx: &mut InterpCx<'tcx, M>,
-    alloc_id: AllocId,
+fn prepare_alloc<'tcx, Prov: Provenance, Extra, Bytes: AllocBytes>(
+    tcx: TyCtxt<'tcx>,
+    kind: MemoryKind<const_eval::MemoryKind>,
+    alloc: &mut Allocation<Prov, Extra, Bytes>,
     mutability: Mutability,
-    disambiguator: Option<&mut DisambiguatorState>,
-) -> Result<impl Iterator<Item = CtfeProvenance> + 'tcx, InternError> {
-    trace!("intern_shallow {:?}", alloc_id);
-    // remove allocation
-    // FIXME(#120456) - is `swap_remove` correct?
-    let Some((kind, mut alloc)) = ecx.memory.alloc_map.swap_remove(&alloc_id) else {
-        return Err(InternError::DanglingPointer);
-    };
-
+) -> Result<(), InternError> {
     match kind {
         MemoryKind::Machine(const_eval::MemoryKind::Heap { was_made_global }) => {
             if !was_made_global {
                 // Attempting to intern a `const_allocate`d pointer that was not made global via
-                // `const_make_global`. We want to error here, but we have to first put the
-                // allocation back into the `alloc_map` to keep things in a consistent state.
-                ecx.memory.alloc_map.insert(alloc_id, (kind, alloc));
+                // `const_make_global`.
+                tcx.dcx().delayed_bug("non-global heap allocation in const value");
                 return Err(InternError::ConstAllocNotGlobal);
             }
         }
         MemoryKind::Stack | MemoryKind::CallerLocation => {}
+    }
+
+    if !alloc.provenance_merge_bytes(&tcx) {
+        // Per-byte provenance is not supported by backends, so we cannot accept it here.
+        tcx.dcx().delayed_bug("partial pointer in const value");
+        return Err(InternError::PartialPointer);
     }
 
     // Set allocation mutability as appropriate. This is used by LLVM to put things into
@@ -97,6 +91,36 @@ fn intern_shallow<'tcx, M: CompileTimeMachine<'tcx>>(
             assert_eq!(alloc.mutability, Mutability::Mut);
         }
     }
+    Ok(())
+}
+
+/// Intern an allocation. Returns `Err` if the allocation does not exist in the local memory.
+///
+/// `mutability` can be used to force immutable interning: if it is `Mutability::Not`, the
+/// allocation is interned immutably; if it is `Mutability::Mut`, then the allocation *must be*
+/// already mutable (as a sanity check).
+///
+/// Returns an iterator over all relocations referred to by this allocation.
+fn intern_shallow<'tcx, M: CompileTimeMachine<'tcx>>(
+    ecx: &mut InterpCx<'tcx, M>,
+    alloc_id: AllocId,
+    mutability: Mutability,
+    disambiguator: Option<&mut PerParentDisambiguatorState>,
+) -> Result<impl Iterator<Item = CtfeProvenance> + 'tcx, InternError> {
+    trace!("intern_shallow {:?}", alloc_id);
+    // remove allocation
+    // FIXME(#120456) - is `swap_remove` correct?
+    let Some((kind, mut alloc)) = ecx.memory.alloc_map.swap_remove(&alloc_id) else {
+        return Err(InternError::DanglingPointer);
+    };
+
+    if let Err(err) = prepare_alloc(*ecx.tcx, kind, &mut alloc, mutability) {
+        // We want to error here, but we have to first put the
+        // allocation back into the `alloc_map` to keep things in a consistent state.
+        ecx.memory.alloc_map.insert(alloc_id, (kind, alloc));
+        return Err(err);
+    }
+
     // link the alloc id to the actual allocation
     let alloc = ecx.tcx.mk_const_alloc(alloc);
     if let Some(static_id) = ecx.machine.static_def_id() {
@@ -120,11 +144,11 @@ fn intern_as_new_static<'tcx>(
     static_id: LocalDefId,
     alloc_id: AllocId,
     alloc: ConstAllocation<'tcx>,
-    disambiguator: &mut DisambiguatorState,
+    disambiguator: &mut PerParentDisambiguatorState,
 ) {
-    // `intern_const_alloc_recursive` is called once per static and it contains the `DisambiguatorState`.
+    // `intern_const_alloc_recursive` is called once per static and it contains the `PerParentDisambiguatorState`.
     //  The `<static_id>::{{nested}}` path is thus unique to `intern_const_alloc_recursive` and the
-    // `DisambiguatorState` ensures the generated path is unique for this call as we generate
+    // `PerParentDisambiguatorState` ensures the generated path is unique for this call as we generate
     // `<static_id>::{{nested#n}}` where `n` is the `n`th `intern_as_new_static` call.
     let feed = tcx.create_def(
         static_id,
@@ -136,7 +160,8 @@ fn intern_as_new_static<'tcx>(
     tcx.set_nested_alloc_id_static(alloc_id, feed.def_id());
 
     if tcx.is_thread_local_static(static_id.into()) {
-        tcx.dcx().emit_err(errors::NestedStaticInThreadLocal { span: tcx.def_span(static_id) });
+        tcx.dcx()
+            .emit_err(diagnostics::NestedStaticInThreadLocal { span: tcx.def_span(static_id) });
     }
 
     // These do not inherit the codegen attrs of the parent static allocation, since
@@ -147,7 +172,7 @@ fn intern_as_new_static<'tcx>(
     feed.eval_static_initializer(Ok(alloc));
     feed.generics_of(tcx.generics_of(static_id).clone());
     feed.def_ident_span(tcx.def_ident_span(static_id));
-    feed.explicit_predicates_of(tcx.explicit_predicates_of(static_id));
+    feed.explicit_clauses_of(tcx.explicit_clauses_of(static_id));
     feed.feed_hir();
 }
 
@@ -166,6 +191,7 @@ pub enum InternError {
     BadMutablePointer,
     DanglingPointer,
     ConstAllocNotGlobal,
+    PartialPointer,
 }
 
 /// Intern `ret` and everything it references.
@@ -180,7 +206,9 @@ pub fn intern_const_alloc_recursive<'tcx, M: CompileTimeMachine<'tcx>>(
     intern_kind: InternKind,
     ret: &MPlaceTy<'tcx>,
 ) -> Result<(), InternError> {
-    let mut disambiguator = DisambiguatorState::new();
+    let mut disambiguator =
+        ecx.machine.static_def_id().map(|id| PerParentDisambiguatorState::new(id));
+    let mut disambiguator = disambiguator.as_mut();
 
     // We are interning recursively, and for mutability we are distinguishing the "root" allocation
     // that we are starting in, and all other allocations that we are encountering recursively.
@@ -219,15 +247,15 @@ pub fn intern_const_alloc_recursive<'tcx, M: CompileTimeMachine<'tcx>>(
     // This gives us the initial set of nested allocations, which will then all be processed
     // recursively in the loop below.
     let mut todo: Vec<_> = if is_static {
+        assert!(disambiguator.is_some());
         // Do not steal the root allocation, we need it later to create the return value of `eval_static_initializer`.
         // But still change its mutability to match the requested one.
-        let alloc = ecx.memory.alloc_map.get_mut(&base_alloc_id).unwrap();
-        alloc.1.mutability = base_mutability;
-        alloc.1.provenance().ptrs().iter().map(|&(_, prov)| prov).collect()
+        let (kind, alloc) = ecx.memory.alloc_map.get_mut(&base_alloc_id).unwrap();
+        prepare_alloc(*ecx.tcx, *kind, alloc, base_mutability)?;
+        alloc.provenance().ptrs().iter().map(|&(_, prov)| prov).collect()
     } else {
-        intern_shallow(ecx, base_alloc_id, base_mutability, Some(&mut disambiguator))
-            .unwrap()
-            .collect()
+        assert!(disambiguator.is_none());
+        intern_shallow(ecx, base_alloc_id, base_mutability, None)?.collect()
     };
     // We need to distinguish "has just been interned" from "was already in `tcx`",
     // so we track this in a separate set.
@@ -235,7 +263,6 @@ pub fn intern_const_alloc_recursive<'tcx, M: CompileTimeMachine<'tcx>>(
     // Whether we encountered a bad mutable pointer.
     // We want to first report "dangling" and then "mutable", so we need to delay reporting these
     // errors.
-    let mut result = Ok(());
     let mut found_bad_mutable_ptr = false;
 
     // Keep interning as long as there are things to intern.
@@ -310,20 +337,15 @@ pub fn intern_const_alloc_recursive<'tcx, M: CompileTimeMachine<'tcx>>(
         // okay with losing some potential for immutability here. This can anyway only affect
         // `static mut`.
         just_interned.insert(alloc_id);
-        match intern_shallow(ecx, alloc_id, inner_mutability, Some(&mut disambiguator)) {
-            Ok(nested) => todo.extend(nested),
-            Err(err) => {
-                ecx.tcx.dcx().delayed_bug("error during const interning");
-                result = Err(err);
-            }
-        }
+        let next = intern_shallow(ecx, alloc_id, inner_mutability, disambiguator.as_deref_mut())?;
+        todo.extend(next);
     }
-    if found_bad_mutable_ptr && result.is_ok() {
+    if found_bad_mutable_ptr {
         // We found a mutable pointer inside a const where inner allocations should be immutable,
         // and there was no other error. This should usually never happen! However, this can happen
         // in unleash-miri mode, so report it as a normal error then.
         if ecx.tcx.sess.opts.unstable_opts.unleash_the_miri_inside_of_you {
-            result = Err(InternError::BadMutablePointer);
+            return Err(InternError::BadMutablePointer);
         } else {
             span_bug!(
                 ecx.tcx.span,
@@ -331,7 +353,7 @@ pub fn intern_const_alloc_recursive<'tcx, M: CompileTimeMachine<'tcx>>(
             );
         }
     }
-    result
+    Ok(())
 }
 
 /// Intern `ret`. This function assumes that `ret` references no other allocation.

@@ -1,6 +1,7 @@
 //@ compile-flags: -Zunleash-the-miri-inside-of-you
 //@ normalize-stderr: "(the raw bytes of the constant) \(size: [0-9]*, align: [0-9]*\)" -> "$1 (size: $$SIZE, align: $$ALIGN)"
 //@ normalize-stderr: "([0-9a-f][0-9a-f] |╾─*ALLOC[0-9]+(\+[a-z0-9]+)?(<imm>)?─*╼ )+ *│.*" -> "HEX_DUMP"
+//@ normalize-stderr: "╾ALLOC\$ID╼\s+│.*╾.*╼" -> "╾ALLOC$$ID╼ │ ╾─╼"
 //@ dont-require-annotations: NOTE
 
 #![allow(static_mut_refs)]
@@ -25,8 +26,8 @@ static BOO: &mut Foo<()> = &mut Foo(());
 const BLUNT: &mut i32 = &mut 42;
 //~^ ERROR: pointing to read-only memory
 
+// This is fine, it points to a static so there are no questions of pointer identity.
 const SUBTLE: &mut i32 = unsafe {
-    //~^ ERROR: encountered mutable reference
     static mut STATIC: i32 = 0;
     &mut STATIC
 };

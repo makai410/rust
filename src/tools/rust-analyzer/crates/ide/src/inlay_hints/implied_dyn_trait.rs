@@ -11,14 +11,22 @@ use crate::{InlayHint, InlayHintLabel, InlayHintPosition, InlayHintsConfig, Inla
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
     FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     path: Either<ast::PathType, ast::DynTraitType>,
 ) -> Option<()> {
+    if !config.implied_dyn_trait_hints {
+        return None;
+    }
+
     let parent = path.syntax().parent()?;
     let range = match path {
         Either::Left(path) => {
-            let paren =
-                parent.ancestors().take_while(|it| ast::ParenType::can_cast(it.kind())).last();
+            let paren = parent
+                .ancestors()
+                .take_while(|it| {
+                    ast::ParenType::can_cast(it.kind()) || ast::ForType::can_cast(it.kind())
+                })
+                .last();
             let parent = paren.as_ref().and_then(|it| it.parent()).unwrap_or(parent);
             if ast::TypeBound::can_cast(parent.kind())
                 || ast::TypeAnchor::can_cast(parent.kind())
@@ -34,7 +42,7 @@ pub(super) fn hints(
                 return None;
             }
             sema.resolve_trait(&path.path()?)?;
-            paren.map_or_else(|| path.syntax().text_range(), |it| it.text_range())
+            path.syntax().text_range()
         }
         Either::Right(dyn_) => {
             if dyn_.dyn_token().is_some() {
@@ -72,7 +80,14 @@ mod tests {
 
     #[track_caller]
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
-        check_with_config(InlayHintsConfig { sized_bound: true, ..DISABLED_CONFIG }, ra_fixture);
+        check_with_config(
+            InlayHintsConfig {
+                sized_bound: true,
+                implied_dyn_trait_hints: true,
+                ..DISABLED_CONFIG
+            },
+            ra_fixture,
+        );
     }
 
     #[test]
@@ -89,7 +104,8 @@ fn foo(_: &T,  _: for<'a> T) {}
 impl T {}
   // ^ dyn
 impl T for (T) {}
-        // ^^^ dyn
+         // ^ dyn
+impl T for {}
 impl T
 "#,
         );
@@ -112,7 +128,7 @@ fn foo(
     _: &mut (T + T)
     //       ^^^^^ dyn
     _: *mut (T),
-    //      ^^^ dyn
+    //       ^ dyn
 ) {}
 "#,
         );
@@ -121,7 +137,7 @@ fn foo(
     #[test]
     fn edit() {
         check_edit(
-            DISABLED_CONFIG,
+            InlayHintsConfig { implied_dyn_trait_hints: true, ..DISABLED_CONFIG },
             r#"
 trait T {}
 fn foo(
@@ -134,6 +150,28 @@ fn foo(
                     _: &mut dyn T
                 ) {}
             "#]],
+        );
+    }
+
+    #[test]
+    fn hrtb_bound_does_not_add_dyn() {
+        check(
+            r#"
+//- minicore: fn
+fn test<F>(f: F) where F: for<'a> FnOnce(&'a i32) {}
+     // ^: Sized
+        "#,
+        );
+    }
+
+    #[test]
+    fn with_parentheses() {
+        check(
+            r#"
+trait T {}
+fn foo(v: &(T)) {}
+         // ^ dyn
+        "#,
         );
     }
 }

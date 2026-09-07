@@ -1,10 +1,10 @@
-#![feature(async_fn_traits, async_trait_bounds)]
+#![feature(async_trait_bounds)]
 
 use std::future::Future;
 use std::pin::pin;
 use std::task::*;
 
-pub fn block_on<T>(fut: impl Future<Output = T>) -> T {
+fn block_on<T>(fut: impl Future<Output = T>) -> T {
     let mut fut = pin!(fut);
     let ctx = &mut Context::from_waker(Waker::noop());
 
@@ -29,7 +29,7 @@ impl Drop for DropMe {
     }
 }
 
-pub fn main() {
+fn main() {
     block_on(async {
         let b = DropMe("hello");
         let async_closure = async move |a: DropMe| {

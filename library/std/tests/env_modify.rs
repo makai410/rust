@@ -98,7 +98,6 @@ fn test_env_set_var() {
 
 #[test]
 #[cfg_attr(not(any(unix, windows)), ignore, allow(unused))]
-#[allow(deprecated)]
 fn env_home_dir() {
     use std::path::PathBuf;
 
@@ -110,8 +109,8 @@ fn env_home_dir() {
         }
     }
 
-    cfg_if::cfg_if! {
-        if #[cfg(unix)] {
+    cfg_select! {
+        unix => {
             let oldhome = var_to_os_string(var("HOME"));
 
             unsafe {
@@ -129,8 +128,13 @@ fn env_home_dir() {
                 assert_ne!(home_dir(), Some(PathBuf::from("/home/MountainView")));
             }
 
-            if let Some(oldhome) = oldhome { unsafe { set_var("HOME", oldhome); } }
-        } else if #[cfg(windows)] {
+            if let Some(oldhome) = oldhome {
+                unsafe {
+                    set_var("HOME", oldhome);
+                }
+            }
+        }
+        windows => {
             let oldhome = var_to_os_string(var("HOME"));
             let olduserprofile = var_to_os_string(var("USERPROFILE"));
 
@@ -141,7 +145,11 @@ fn env_home_dir() {
                 assert!(home_dir().is_some());
 
                 set_var("HOME", "/home/PaloAlto");
-                assert_ne!(home_dir(), Some(PathBuf::from("/home/PaloAlto")), "HOME must not be used");
+                assert_ne!(
+                    home_dir(),
+                    Some(PathBuf::from("/home/PaloAlto")),
+                    "HOME must not be used"
+                );
 
                 set_var("USERPROFILE", "/home/MountainView");
                 assert_eq!(home_dir(), Some(PathBuf::from("/home/MountainView")));
@@ -151,14 +159,23 @@ fn env_home_dir() {
                 assert_eq!(home_dir(), Some(PathBuf::from("/home/MountainView")));
 
                 set_var("USERPROFILE", "");
-                assert_ne!(home_dir(), Some(PathBuf::from("")), "Empty USERPROFILE must be ignored");
+                assert_ne!(
+                    home_dir(),
+                    Some(PathBuf::from("")),
+                    "Empty USERPROFILE must be ignored"
+                );
 
                 remove_var("USERPROFILE");
 
-                if let Some(oldhome) = oldhome { set_var("HOME", oldhome); }
-                if let Some(olduserprofile) = olduserprofile { set_var("USERPROFILE", olduserprofile); }
+                if let Some(oldhome) = oldhome {
+                    set_var("HOME", oldhome);
+                }
+                if let Some(olduserprofile) = olduserprofile {
+                    set_var("USERPROFILE", olduserprofile);
+                }
             }
         }
+        _ => {}
     }
 }
 

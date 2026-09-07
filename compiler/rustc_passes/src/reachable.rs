@@ -23,7 +23,6 @@
 //! considering here as at that point, everything is monomorphic.
 
 use hir::def_id::LocalDefIdSet;
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir as hir;
 use rustc_hir::Node;
 use rustc_hir::def::{DefKind, Res};
@@ -36,7 +35,7 @@ use rustc_middle::mir::interpret::{ConstAllocation, ErrorHandled, GlobalAlloc};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, ExistentialTraitRef, TyCtxt};
 use rustc_privacy::DefIdVisitor;
-use rustc_session::config::CrateType;
+use rustc_structures::CrateType;
 use tracing::debug;
 
 /// Determines whether this item is recursive for reachability. See `is_recursively_reachable_local`
@@ -104,10 +103,10 @@ impl<'tcx> Visitor<'tcx> for ReachableContext<'tcx> {
 
     fn visit_inline_asm(&mut self, asm: &'tcx hir::InlineAsm<'tcx>, id: hir::HirId) {
         for (op, _) in asm.operands {
-            if let hir::InlineAsmOperand::SymStatic { def_id, .. } = op {
-                if let Some(def_id) = def_id.as_local() {
-                    self.reachable_symbols.insert(def_id);
-                }
+            if let hir::InlineAsmOperand::SymStatic { def_id, .. } = op
+                && let Some(def_id) = def_id.as_local()
+            {
+                self.reachable_symbols.insert(def_id);
             }
         }
         intravisit::walk_inline_asm(self, asm, id);
@@ -184,7 +183,13 @@ impl<'tcx> ReachableContext<'tcx> {
                 CodegenFnAttrs::EMPTY
             };
             let is_extern = codegen_attrs.contains_extern_indicator();
-            if is_extern {
+            // Right now, the only way to get "foreign item symbol aliases" is by being an EII-implementation.
+            // EII implementations will generate under their own name but also under the name of some foreign item
+            // (hence alias) that may be in another crate. These functions are marked as always-reachable since
+            // it's very hard to track whether the original foreign item was reachable. It may live in another crate
+            // and may be reachable from sibling crates.
+            let has_foreign_aliases_eii = !codegen_attrs.foreign_item_symbol_aliases.is_empty();
+            if is_extern || has_foreign_aliases_eii {
                 self.reachable_symbols.insert(search_item);
             }
         } else {
@@ -203,21 +208,32 @@ impl<'tcx> ReachableContext<'tcx> {
                             self.visit_nested_body(body);
                         }
                     }
-
+                    // For `type const` we want to evaluate the RHS.
+                    hir::ItemKind::Const(_, _, _, init @ hir::ConstItemRhs::Direct(_)) => {
+                        self.visit_const_item_rhs(init);
+                    }
                     hir::ItemKind::Const(_, _, _, init) => {
-                        // Only things actually ending up in the final constant value are reachable
-                        // for codegen. Everything else is only needed during const-eval, so even if
-                        // const-eval happens in a downstream crate, all they need is
-                        // `mir_for_ctfe`.
+                        if self.tcx.generics_of(item.owner_id).own_requires_monomorphization() {
+                            // In this case, we don't want to evaluate the const initializer.
+                            // In lieu of that, we have to consider everything mentioned in it
+                            // as reachable, since it *may* end up in the final value.
+                            self.visit_const_item_rhs(init);
+                            return;
+                        }
+
                         match self.tcx.const_eval_poly_to_alloc(item.owner_id.def_id.into()) {
                             Ok(alloc) => {
+                                // Only things actually ending up in the final constant value are
+                                // reachable for codegen. Everything else is only needed during
+                                // const-eval, so even if const-eval happens in a downstream crate,
+                                // all they need is `mir_for_ctfe`.
                                 let alloc = self.tcx.global_alloc(alloc.alloc_id).unwrap_memory();
                                 self.propagate_from_alloc(alloc);
                             }
-                            // We can't figure out which value the constant will evaluate to. In
-                            // lieu of that, we have to consider everything mentioned in the const
-                            // initializer reachable, since it *may* end up in the final value.
-                            Err(ErrorHandled::TooGeneric(_)) => self.visit_nested_body(init),
+                            // Trivially unsatisfiable bounds on the item prevented us from
+                            // normalizing the initializer. Similar to the other case, we have to
+                            // everything mentioned in it as reachable.
+                            Err(ErrorHandled::TooGeneric(_)) => self.visit_const_item_rhs(init),
                             // If there was an error evaluating the const, nothing can be reachable
                             // via it, and anyway compilation will fail.
                             Err(ErrorHandled::Reported(..)) => {}
@@ -239,12 +255,13 @@ impl<'tcx> ReachableContext<'tcx> {
                     | hir::ItemKind::Mod(..)
                     | hir::ItemKind::ForeignMod { .. }
                     | hir::ItemKind::Impl { .. }
-                    | hir::ItemKind::Trait(..)
+                    | hir::ItemKind::Trait { .. }
                     | hir::ItemKind::TraitAlias(..)
                     | hir::ItemKind::Struct(..)
                     | hir::ItemKind::Enum(..)
                     | hir::ItemKind::Union(..)
-                    | hir::ItemKind::GlobalAsm { .. } => {}
+                    | hir::ItemKind::GlobalAsm { .. }
+                    | rustc_hir::ItemKind::TestBinderConstraints { .. } => {}
                 }
             }
             Node::TraitItem(trait_method) => {
@@ -253,16 +270,16 @@ impl<'tcx> ReachableContext<'tcx> {
                     | hir::TraitItemKind::Fn(_, hir::TraitFn::Required(_)) => {
                         // Keep going, nothing to get exported
                     }
-                    hir::TraitItemKind::Const(_, Some(body_id))
-                    | hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(body_id)) => {
+                    hir::TraitItemKind::Const(_, Some(rhs)) => self.visit_const_item_rhs(rhs),
+                    hir::TraitItemKind::Fn(_, hir::TraitFn::Provided(body_id)) => {
                         self.visit_nested_body(body_id);
                     }
                     hir::TraitItemKind::Type(..) => {}
                 }
             }
             Node::ImplItem(impl_item) => match impl_item.kind {
-                hir::ImplItemKind::Const(_, body) => {
-                    self.visit_nested_body(body);
+                hir::ImplItemKind::Const(_, rhs) => {
+                    self.visit_const_item_rhs(rhs);
                 }
                 hir::ImplItemKind::Fn(_, body) => {
                     if recursively_reachable(self.tcx, impl_item.hir_id().owner.to_def_id()) {
@@ -345,13 +362,13 @@ impl<'tcx> ReachableContext<'tcx> {
                         // become recursive, are also not infinitely recursing, because of the
                         // `reachable_symbols` check above.
                         // We still need to protect against stack overflow due to deeply nested statics.
-                        ensure_sufficient_stack(|| self.propagate_from_alloc(alloc));
+                        self.propagate_from_alloc(alloc);
                     }
                 }
             }
             // Reachable constants and reachable statics can have their contents inlined
             // into other crates. Mark them as reachable and recurse into their body.
-            DefKind::Const | DefKind::AssocConst | DefKind::Static { .. } => {
+            DefKind::Const { .. } | DefKind::AssocConst { .. } | DefKind::Static { .. } => {
                 self.worklist.push(def_id);
             }
             _ => {
@@ -404,9 +421,7 @@ fn check_item<'tcx>(
     let items = tcx.associated_item_def_ids(id.owner_id);
     worklist.extend(items.iter().map(|ii_ref| ii_ref.expect_local()));
 
-    let Some(trait_def_id) = tcx.trait_id_of_impl(id.owner_id.to_def_id()) else {
-        unreachable!();
-    };
+    let trait_def_id = tcx.impl_trait_id(id.owner_id.to_def_id());
 
     if !trait_def_id.is_local() {
         return;
@@ -423,13 +438,22 @@ fn has_custom_linkage(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     if !tcx.def_kind(def_id).has_codegen_attrs() {
         return false;
     }
+
     let codegen_attrs = tcx.codegen_fn_attrs(def_id);
     codegen_attrs.contains_extern_indicator()
         // FIXME(nbdd0121): `#[used]` are marked as reachable here so it's picked up by
         // `linked_symbols` in cg_ssa. They won't be exported in binary or cdylib due to their
         // `SymbolExportLevel::Rust` export level but may end up being exported in dylibs.
+        // Also note that Miri is relying on this to be able to find private `link_section` statics
+        // across all crates.
         || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER)
         || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
+        // Right now, the only way to get "foreign item symbol aliases" is by being an EII-implementation.
+        // EII implementations will generate under their own name but also under the name of some foreign item
+        // (hence alias) that may be in another crate. These functions are marked as always-reachable since
+        // it's very hard to track whether the original foreign item was reachable. It may live in another crate
+        // and may be reachable from sibling crates.
+        || !codegen_attrs.foreign_item_symbol_aliases.is_empty()
 }
 
 /// See module-level doc comment above.

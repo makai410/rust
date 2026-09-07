@@ -6,9 +6,10 @@
 //! }
 //! ```
 use hir::{
-    ChalkTyInterner, DefWithBody,
-    db::{DefDatabase as _, HirDatabase as _},
+    DefWithBody,
+    db::HirDatabase as _,
     mir::{MirSpan, TerminatorKind},
+    name,
 };
 use ide_db::{FileRange, famous_defs::FamousDefs};
 
@@ -23,7 +24,7 @@ use crate::{InlayHint, InlayHintLabel, InlayHintPosition, InlayHintsConfig, Inla
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
     FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     display_target: hir::DisplayTarget,
     node: &ast::Fn,
 ) -> Option<()> {
@@ -34,7 +35,8 @@ pub(super) fn hints(
     let def = sema.to_def(node)?;
     let def: DefWithBody = def.into();
 
-    let (hir, source_map) = sema.db.body_with_source_map(def.into());
+    let def = def.try_into().ok()?;
+    let (hir, source_map) = hir::Body::with_source_map(sema.db, def);
 
     let mir = sema.db.mir_body(def.into()).ok()?;
 
@@ -42,11 +44,11 @@ pub(super) fn hints(
 
     for (_, bb) in mir.basic_blocks.iter() {
         let terminator = bb.terminator.as_ref()?;
-        if let TerminatorKind::Drop { place, .. } = terminator.kind {
+        if let TerminatorKind::Drop { place, .. } = &terminator.kind {
             if !place.projection.is_empty() {
                 continue; // Ignore complex cases for now
             }
-            if mir.locals[place.local].ty.adt_id(ChalkTyInterner).is_none() {
+            if mir.locals[place.local].ty.as_ref().as_adt().is_none() {
                 continue; // Arguably only ADTs have significant drop impls
             }
             let Some(&binding_idx) = local_to_binding.get(place.local) else {
@@ -92,9 +94,9 @@ pub(super) fn hints(
                 },
                 MirSpan::Unknown => continue,
             };
-            let binding = &hir.bindings[binding_idx];
+            let binding = &hir[binding_idx];
             let name = binding.name.display_no_db(display_target.edition).to_smolstr();
-            if name.starts_with("<ra@") {
+            if name::is_generated(&name) {
                 continue; // Ignore desugared variables
             }
             let mut label = InlayHintLabel::simple(
@@ -147,7 +149,7 @@ mod tests {
         inlay_hints::tests::{DISABLED_CONFIG, check_with_config},
     };
 
-    const ONLY_DROP_CONFIG: InlayHintsConfig =
+    const ONLY_DROP_CONFIG: InlayHintsConfig<'_> =
         InlayHintsConfig { implicit_drop_hints: true, ..DISABLED_CONFIG };
 
     #[test]

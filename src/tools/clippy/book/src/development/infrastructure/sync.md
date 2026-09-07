@@ -79,7 +79,7 @@ to be run inside the `rust` directory):
     ```bash
     git fetch upstream  # assuming upstream is the rust-lang/rust remote
     git switch rustup
-    git merge upstream/master --no-ff
+    git merge upstream/main --no-ff
     ```
     > Note: This is one of the few instances where a merge commit is allowed in
     > a PR.
@@ -92,14 +92,14 @@ to be run inside the `rust` directory):
    accelerate the process ping the `@rust-lang/clippy` team in your PR and/or
    ask them in the [Zulip] stream.)
 
-[Zulip]: https://rust-lang.zulipchat.com/#narrow/stream/clippy
+[Zulip]: https://rust-lang.zulipchat.com/#narrow/stream/t-clippy
 [`rust-lang/rust`]: https://github.com/rust-lang/rust
 
 ## Performing the sync from Clippy to [`rust-lang/rust`]
 
 All the following commands have to be run inside the `rust` directory.
 
-1. Make sure you have checked out the latest `master` of `rust-lang/rust`.
+1. Make sure you have checked out the latest `main` of `rust-lang/rust`.
 2. Sync the `rust-lang/rust-clippy` master to the rust-copy of Clippy:
     ```bash
     git switch -c clippy-subtree-update

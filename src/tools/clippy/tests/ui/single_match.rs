@@ -1,13 +1,6 @@
 //@require-annotations-for-level: WARN
 #![warn(clippy::single_match)]
-#![allow(
-    unused,
-    clippy::uninlined_format_args,
-    clippy::needless_if,
-    clippy::redundant_guards,
-    clippy::redundant_pattern_matching,
-    clippy::manual_unwrap_or_default
-)]
+#![allow(clippy::redundant_pattern_matching)]
 fn dummy() {}
 
 fn single_match() {
@@ -269,7 +262,7 @@ fn main() {
     };
 }
 
-fn issue_10808(bar: Option<i32>) {
+fn issue10808(bar: Option<i32>) {
     match bar {
         Some(v) => unsafe {
             let r = &v as *const i32;
@@ -397,6 +390,7 @@ pub struct Data([u8; 4]);
 const DATA: Data = Data([1, 2, 3, 4]);
 const CONST_I32: i32 = 1;
 
+// https://github.com/rust-lang/rust-clippy/issues/13012
 fn irrefutable_match() {
     match DATA {
         DATA => println!(),
@@ -462,7 +456,7 @@ fn irrefutable_match() {
     //~| NOTE: you might want to preserve the comments from inside the `match`
 }
 
-fn issue_14493() {
+fn issue14493() {
     macro_rules! mac {
         (some) => {
             Some(42)

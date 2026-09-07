@@ -42,8 +42,6 @@ fn main() -> anyhow::Result<()> {
         flags::XtaskCmd::Install(cmd) => cmd.run(sh),
         flags::XtaskCmd::FuzzTests(_) => run_fuzzer(sh),
         flags::XtaskCmd::Release(cmd) => cmd.run(sh),
-        flags::XtaskCmd::RustcPull(cmd) => cmd.run(sh),
-        flags::XtaskCmd::RustcPush(cmd) => cmd.run(sh),
         flags::XtaskCmd::Dist(cmd) => cmd.run(sh),
         flags::XtaskCmd::PublishReleaseNotes(cmd) => cmd.run(sh),
         flags::XtaskCmd::Metrics(cmd) => cmd.run(sh),
@@ -93,5 +91,8 @@ fn date_iso(sh: &Shell) -> anyhow::Result<String> {
 }
 
 fn is_release_tag(tag: &str) -> bool {
-    tag.len() == "2020-02-24".len() && tag.starts_with(|c: char| c.is_ascii_digit())
+    tag.len() >= 10
+        && tag.starts_with(|c: char| c.is_ascii_digit())
+        && tag.as_bytes()[4] == b'-'
+        && tag.as_bytes()[7] == b'-'
 }

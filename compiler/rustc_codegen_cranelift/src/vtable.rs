@@ -5,8 +5,8 @@
 use crate::constant::data_id_for_vtable;
 use crate::prelude::*;
 
-pub(crate) fn vtable_memflags() -> MemFlags {
-    let mut flags = MemFlags::trusted(); // A vtable access is always aligned and will never trap.
+pub(crate) fn vtable_memflags() -> MemFlagsData {
+    let mut flags = MemFlagsData::trusted(); // A vtable access is always aligned and will never trap.
     flags.set_readonly(); // A vtable is always read-only.
     flags
 }
@@ -56,7 +56,7 @@ pub(crate) fn get_ptr_and_method_ref<'tcx>(
         }
     }
 
-    let (ptr, vtable) = if let BackendRepr::ScalarPair(_, _) = arg.layout().backend_repr {
+    let (ptr, vtable) = if let BackendRepr::ScalarPair { .. } = arg.layout().backend_repr {
         let (ptr, vtable) = arg.load_scalar_pair(fx);
         (Pointer::new(ptr), vtable)
     } else {
@@ -84,5 +84,5 @@ pub(crate) fn get_vtable<'tcx>(
     if fx.clif_comments.enabled() {
         fx.add_comment(local_data_id, "vtable");
     }
-    fx.bcx.ins().global_value(fx.pointer_type, local_data_id)
+    fx.bcx.ins().symbol_value(fx.pointer_type, local_data_id)
 }

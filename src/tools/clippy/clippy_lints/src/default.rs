@@ -5,10 +5,9 @@ use clippy_utils::{contains_name, get_parent_expr, in_automatically_derived, is_
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
 use rustc_hir::{Block, Expr, ExprKind, PatKind, QPath, Stmt, StmtKind, StructTailExpr};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty;
 use rustc_middle::ty::print::with_forced_trimmed_paths;
-use rustc_session::impl_lint_pass;
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::{Span, sym};
 
@@ -69,13 +68,13 @@ declare_clippy_lint! {
     "binding initialized with Default should have its fields set in the initializer"
 }
 
+impl_lint_pass!(Default => [DEFAULT_TRAIT_ACCESS, FIELD_REASSIGN_WITH_DEFAULT]);
+
 #[derive(Default)]
 pub struct Default {
     // Spans linted by `field_reassign_with_default`.
     reassigned_linted: FxHashSet<Span>,
 }
-
-impl_lint_pass!(Default => [DEFAULT_TRAIT_ACCESS, FIELD_REASSIGN_WITH_DEFAULT]);
 
 impl<'tcx> LateLintPass<'tcx> for Default {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
@@ -102,7 +101,8 @@ impl<'tcx> LateLintPass<'tcx> for Default {
                 format!("calling `{replacement}` is more clear than this expression"),
                 "try",
                 replacement,
-                Applicability::Unspecified, // First resolve the TODO above
+                // The trimmed path may not be in scope, so the suggestion cannot be machine-applicable.
+                Applicability::Unspecified,
             );
         }
     }
@@ -143,7 +143,7 @@ impl<'tcx> LateLintPass<'tcx> for Default {
                     .fields
                     .iter()
                     .all(|field| {
-                        is_copy(cx, cx.tcx.type_of(field.did).instantiate(cx.tcx, args))
+                        is_copy(cx, cx.tcx.type_of(field.did).instantiate(cx.tcx, args).skip_norm_wip())
                     })
                 && (!has_drop(cx, binding_type) || all_fields_are_copy)
             {

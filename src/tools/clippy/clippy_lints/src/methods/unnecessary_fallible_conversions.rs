@@ -95,7 +95,7 @@ fn check<'tcx>(
         // If `T: TryFrom<U>` and `T: From<U>` both exist, then that means that the `TryFrom`
         // _must_ be from the blanket impl and cannot have been manually implemented
         // (else there would be conflicting impls, even with #![feature(spec)]), so we don't even need to check
-        // what `<T as TryFrom<U>>::Error` is: it's always `Infallible`
+        // what `<T as TryFrom<U>>::Error` is: it's always `!`
         && implements_trait(cx, self_ty, from_into_trait, &[other_ty])
         && let Some(other_ty) = other_ty.as_type()
     {
@@ -165,7 +165,7 @@ pub(super) fn check_method(cx: &LateContext<'_>, expr: &Expr<'_>) {
 pub(super) fn check_function(cx: &LateContext<'_>, expr: &Expr<'_>, callee: &Expr<'_>) {
     if let ExprKind::Path(ref qpath) = callee.kind
         && let Some(item_def_id) = cx.qpath_res(qpath, callee.hir_id).opt_def_id()
-        && let Some(trait_def_id) = cx.tcx.trait_of_item(item_def_id)
+        && let Some(trait_def_id) = cx.tcx.trait_of_assoc(item_def_id)
     {
         let qpath_spans = match qpath {
             QPath::Resolved(_, path) => {
@@ -181,7 +181,6 @@ pub(super) fn check_function(cx: &LateContext<'_>, expr: &Expr<'_>, callee: &Exp
             QPath::TypeRelative(_, seg) => Some(SpansKind::Fn {
                 fn_span: seg.ident.span,
             }),
-            QPath::LangItem(_, _) => unreachable!("`TryFrom` and `TryInto` are not lang items"),
         };
 
         check(

@@ -17,18 +17,24 @@ use clap::Parser;
 use jobs::JobDatabase;
 use serde_yaml::Value;
 
-use crate::analysis::{output_largest_duration_changes, output_test_diffs};
+use crate::analysis::{output_largest_job_duration_changes, output_test_diffs};
 use crate::cpu_usage::load_cpu_usage;
 use crate::datadog::upload_datadog_metric;
 use crate::github::JobInfoResolver;
 use crate::jobs::RunType;
 use crate::metrics::{JobMetrics, download_auto_job_metrics, download_job_metrics, load_metrics};
 use crate::test_dashboard::generate_test_dashboard;
-use crate::utils::{load_env_var, output_details};
+use crate::utils::{init_submodule_if_needed, load_env_var, output_details};
 
 const CI_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 pub const DOCKER_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker");
 const JOBS_YML_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../github-actions/jobs.yml");
+
+#[derive(Default)]
+struct TryJobMetadata {
+    job_patterns: Vec<String>,
+    nolimit: bool,
+}
 
 struct GitHubContext {
     event_name: String,
@@ -40,37 +46,64 @@ impl GitHubContext {
     fn get_run_type(&self) -> Option<RunType> {
         match (self.event_name.as_str(), self.branch_ref.as_str()) {
             ("pull_request", _) => Some(RunType::PullRequest),
-            ("push", "refs/heads/try-perf") => Some(RunType::TryJob { job_patterns: None }),
-            ("push", "refs/heads/try" | "refs/heads/automation/bors/try") => {
-                let patterns = self.get_try_job_patterns();
-                let patterns = if !patterns.is_empty() { Some(patterns) } else { None };
-                Some(RunType::TryJob { job_patterns: patterns })
+            ("push", "refs/heads/automation/bors/try-perf") => {
+                Some(RunType::TryJob { job_patterns: None, nolimit: false })
             }
-            ("push", "refs/heads/auto") => Some(RunType::AutoJob),
-            ("push", "refs/heads/master") => Some(RunType::MasterJob),
+            ("push", "refs/heads/automation/bors/try") => {
+                let metadata = self.get_try_job_metadata();
+                let patterns = if !metadata.job_patterns.is_empty() {
+                    Some(metadata.job_patterns)
+                } else {
+                    None
+                };
+                Some(RunType::TryJob { job_patterns: patterns, nolimit: metadata.nolimit })
+            }
+            ("push", "refs/heads/automation/bors/auto") => Some(RunType::AutoJob),
+            ("push", "refs/heads/main") => Some(RunType::MainJob),
             _ => None,
         }
     }
 
-    /// Tries to parse patterns of CI jobs that should be executed
-    /// from the commit message of the passed GitHub context
+    /// Tries to parse metadata about try jobs from the commit message.
+    ///
+    /// Currently, two things can be specified.
+    ///
+    /// # Try job patterns
+    /// The first is a set of patterns of CI jobs that should be executed.
     ///
     /// They can be specified in the form of
     /// try-job: <job-pattern>
     /// or
     /// try-job: `<job-pattern>`
     /// (to avoid GitHub rendering the glob patterns as Markdown)
-    fn get_try_job_patterns(&self) -> Vec<String> {
-        if let Some(ref msg) = self.commit_message {
-            msg.lines()
-                .filter_map(|line| line.trim().strip_prefix("try-job: "))
-                // Strip backticks if present
-                .map(|l| l.trim_matches('`'))
-                .map(|l| l.trim().to_string())
-                .collect()
-        } else {
-            vec![]
+    ///
+    /// # No limit
+    /// The second is a marker that specifies that the limit on the maximum number of allowed try
+    /// jobs to execute should NOT be applied.
+    ///
+    /// try-nolimit
+    fn get_try_job_metadata(&self) -> TryJobMetadata {
+        let Some(commit_msg) = &self.commit_message else {
+            return TryJobMetadata::default();
+        };
+
+        let mut nolimit = false;
+        let mut job_patterns = vec![];
+
+        for line in commit_msg.lines() {
+            let line = line.trim();
+            if line.starts_with("try-nolimit") {
+                nolimit = true;
+                continue;
+            }
+            let Some(pattern) = line.strip_prefix("try-job: ") else {
+                continue;
+            };
+            // Strip backticks if present
+            let pattern = pattern.trim_matches('`');
+            job_patterns.push(pattern.trim().to_string());
         }
+        TryJobMetadata { job_patterns, nolimit }
     }
 }
 
@@ -120,6 +153,8 @@ fn run_workflow_locally(db: JobDatabase, job_type: JobType, name: String) -> any
         };
         (key.clone(), value)
     }));
+
+    init_submodule_if_needed("src/llvm-project/")?;
 
     let mut cmd = Command::new(Path::new(DOCKER_DIRECTORY).join("run.sh"));
     cmd.arg(job.image());
@@ -203,7 +238,7 @@ And then open `test-dashboard/index.html` in your browser to see an overview of 
         );
     });
 
-    output_largest_duration_changes(&metrics, &mut job_info_resolver);
+    output_largest_job_duration_changes(&metrics, &mut job_info_resolver);
 
     Ok(())
 }

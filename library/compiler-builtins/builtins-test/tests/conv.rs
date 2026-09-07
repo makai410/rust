@@ -1,11 +1,12 @@
 #![cfg_attr(f128_enabled, feature(f128))]
 #![cfg_attr(f16_enabled, feature(f16))]
 // makes configuration easier
-#![allow(unused_macros)]
+#![allow(unused_features)]
 #![allow(unused_imports)]
+#![allow(unused_macros)]
 
 use builtins_test::*;
-use compiler_builtins::float::Float;
+use compiler_builtins::support::Float;
 use rustc_apfloat::{Float as _, FloatConvert as _};
 
 mod i_to_f {
@@ -17,7 +18,7 @@ mod i_to_f {
                 #[test]
                 fn $fn() {
                     use compiler_builtins::float::conv::$fn;
-                    use compiler_builtins::int::Int;
+                    use compiler_builtins::support::Int;
 
                     fuzz(N, |x: $i_ty| {
                         let f0 = apfloat_fallback!(
@@ -26,7 +27,7 @@ mod i_to_f {
                             // When the builtin is not available, we need to use a different conversion
                             // method (since apfloat doesn't support `as` casting).
                             |x: $i_ty| {
-                                use compiler_builtins::int::MinInt;
+                                use compiler_builtins::support::MinInt;
 
                                 let apf = if <$i_ty>::SIGNED {
                                     FloatTy::from_i128(x.try_into().unwrap()).value
@@ -59,32 +60,28 @@ mod i_to_f {
                                 || ((error_minus == error || error_plus == error)
                                     && ((f0.to_bits() & 1) != 0))
                             {
-                                if !cfg!(any(
-                                    target_arch = "powerpc",
-                                    target_arch = "powerpc64"
-                                )) {
-                                    panic!(
-                                        "incorrect rounding by {}({}): {}, ({}, {}, {}), errors ({}, {}, {})",
-                                        stringify!($fn),
-                                        x,
-                                        f1.to_bits(),
-                                        y_minus_ulp,
-                                        y,
-                                        y_plus_ulp,
-                                        error_minus,
-                                        error,
-                                        error_plus,
-                                    );
-                                }
+                                panic!(
+                                    "incorrect rounding by {}({}): {}, ({}, {}, {}), errors ({}, {}, {})",
+                                    stringify!($fn),
+                                    x,
+                                    f1.to_bits(),
+                                    y_minus_ulp,
+                                    y,
+                                    y_plus_ulp,
+                                    error_minus,
+                                    error,
+                                    error_plus,
+                                );
                             }
                         }
 
-                        // Test against native conversion. We disable testing on all `x86` because of
-                        // rounding bugs with `i686`. `powerpc` also has the same rounding bug.
+                        // Test against native conversion.
+                        // FIXME(x86,ppc): the platform version has rounding bugs on i686 and
+                        // PowerPC64le (for PPC this only shows up in Docker, not the native runner).
+                        // https://github.com/rust-lang/compiler-builtins/pull/384#issuecomment-740413334
                         if !Float::eq_repr(f0, f1) && !cfg!(any(
                             target_arch = "x86",
-                            target_arch = "powerpc",
-                            target_arch = "powerpc64"
+                            all(target_arch = "powerpc64", target_endian = "little")
                         )) {
                             panic!(
                                 "{}({}): std: {:?}, builtins: {:?}",
@@ -120,7 +117,7 @@ mod i_to_f {
 
     #[cfg(f128_enabled)]
     #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
-    i_to_f! { f128, Quad, not(feature = "no-sys-f128-int-convert"),
+    i_to_f! { f128, Quad, not(no_sys_f128_int_convert),
         u32, __floatunsitf;
         i32, __floatsitf;
         u64, __floatunditf;
@@ -131,7 +128,7 @@ mod i_to_f {
 
     #[cfg(f128_enabled)]
     #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
-    i_to_f! { f128, Quad, not(feature = "no-sys-f128-int-convert"),
+    i_to_f! { f128, Quad, not(no_sys_f128_int_convert),
         u32, __floatunsikf;
         i32, __floatsikf;
         u64, __floatundikf;
@@ -158,7 +155,7 @@ mod f_to_i {
                         // When the builtin is not available, we need to use a different conversion
                         // method (since apfloat doesn't support `as` casting).
                         |x: $f_ty| {
-                            use compiler_builtins::int::MinInt;
+                            use compiler_builtins::support::MinInt;
 
                             let apf = FloatTy::from_bits(x.to_bits().into());
                             let bits: usize = <$i_ty>::BITS.try_into().unwrap();
@@ -239,7 +236,7 @@ mod f_to_i {
                 x,
                 f128,
                 Quad,
-                not(feature = "no-sys-f128-int-convert"),
+                not(no_sys_f128_int_convert),
                 u32, __fixunstfsi;
                 u64, __fixunstfdi;
                 u128, __fixunstfti;
@@ -262,7 +259,8 @@ macro_rules! f_to_f {
     ) => {$(
         #[test]
         fn $fn() {
-            use compiler_builtins::float::{$mod::$fn, Float};
+            use imp::$fn;
+            use compiler_builtins::support::Float;
             use rustc_apfloat::ieee::{$from_ap_ty, $to_ap_ty};
 
             fuzz_float(N, |x: $from_ty| {
@@ -296,41 +294,101 @@ macro_rules! f_to_f {
 }
 
 mod extend {
+    mod imp {
+        #[cfg(f128_enabled)]
+        cfg_select! {
+            any(target_arch = "powerpc", target_arch = "powerpc64") => {
+                #[cfg(f16_enabled)]
+                pub use compiler_builtins::float::extend::__extendhfkf2 as __extendhftf2;
+                pub use compiler_builtins::float::extend::{
+                    __extenddfkf2 as __extenddftf2, __extendsfkf2 as __extendsftf2,
+                };
+            }
+            _ => {
+                #[cfg(f16_enabled)]
+                pub use compiler_builtins::float::extend::__extendhftf2;
+                pub use compiler_builtins::float::extend::{__extenddftf2, __extendsftf2};
+            }
+        }
+
+        pub use compiler_builtins::float::extend::__extendsfdf2;
+        #[cfg(f16_enabled)]
+        pub use compiler_builtins::float::extend::{__extendhfdf2, __extendhfsf2, __gnu_h2f_ieee};
+
+        #[cfg(f16_enabled)]
+        pub fn check_gnu_h2f_ieee(x: f16) -> f32 {
+            f32::from_bits(compiler_builtins::float::extend::__gnu_h2f_ieee(
+                x.to_bits(),
+            ))
+        }
+    }
+
     use super::*;
+
+    #[cfg(f16_enabled)]
+    f_to_f! {
+        extend,
+        f16 => f32, Half => Single, __extendhfsf2, not(no_sys_f16);
+        f16 => f32, Half => Single, check_gnu_h2f_ieee, not(no_sys_f16);
+        f16 => f64, Half => Double, __extendhfdf2, not(no_sys_f16_f64_convert);
+    }
+
+    #[cfg(all(f16_enabled, f128_enabled))]
+    f_to_f! {
+        extend,
+        f16 => f128, Half => Quad, __extendhftf2, not(no_sys_f16_f128_convert);
+    }
 
     f_to_f! {
         extend,
         f32 => f64, Single => Double, __extendsfdf2, all();
     }
 
-    #[cfg(all(f16_enabled, f128_enabled))]
-    #[cfg(not(any(
-        target_arch = "powerpc",
-        target_arch = "powerpc64",
-        target_arch = "loongarch64"
-    )))]
-    f_to_f! {
-        extend,
-        f16 => f32, Half => Single, __extendhfsf2, not(feature = "no-sys-f16");
-        f16 => f32, Half => Single, __gnu_h2f_ieee, not(feature = "no-sys-f16");
-        f16 => f64, Half => Double, __extendhfdf2, not(feature = "no-sys-f16-f64-convert");
-        f16 => f128, Half => Quad, __extendhftf2, not(feature = "no-sys-f16-f128-convert");
-        f32 => f128, Single => Quad, __extendsftf2, not(feature = "no-sys-f128");
-        f64 => f128, Double => Quad, __extenddftf2, not(feature = "no-sys-f128");
-    }
-
     #[cfg(f128_enabled)]
-    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
     f_to_f! {
         extend,
-        // FIXME(#655): `f16` tests disabled until we can bootstrap symbols
-        f32 => f128, Single => Quad, __extendsfkf2, not(feature = "no-sys-f128");
-        f64 => f128, Double => Quad, __extenddfkf2, not(feature = "no-sys-f128");
+        f32 => f128, Single => Quad, __extendsftf2, not(no_sys_f128);
+        f64 => f128, Double => Quad, __extenddftf2, not(no_sys_f128);
     }
 }
 
 mod trunc {
+    mod imp {
+        #[cfg(f128_enabled)]
+        cfg_select! {
+            any(target_arch = "powerpc", target_arch = "powerpc64") => {
+                #[cfg(f16_enabled)]
+                pub use compiler_builtins::float::trunc::__trunckfhf2 as __trunctfhf2;
+                pub use compiler_builtins::float::trunc::{
+                    __trunckfdf2 as __trunctfdf2, __trunckfsf2 as __trunctfsf2,
+                };
+            }
+            _ => {
+                #[cfg(f16_enabled)]
+                pub use compiler_builtins::float::trunc::__trunctfhf2;
+                pub use compiler_builtins::float::trunc::{__trunctfdf2, __trunctfsf2};
+            }
+        }
+
+        pub use compiler_builtins::float::trunc::__truncdfsf2;
+        #[cfg(f16_enabled)]
+        pub use compiler_builtins::float::trunc::{__gnu_f2h_ieee, __truncdfhf2, __truncsfhf2};
+
+        #[cfg(f16_enabled)]
+        pub fn check_gnu_f2h_ieee(x: f32) -> f16 {
+            f16::from_bits(compiler_builtins::float::trunc::__gnu_f2h_ieee(x.to_bits()))
+        }
+    }
+
     use super::*;
+
+    #[cfg(f16_enabled)]
+    f_to_f! {
+        trunc,
+        f32 => f16, Single => Half, __truncsfhf2, not(no_sys_f16);
+        f32 => f16, Single => Half, check_gnu_f2h_ieee, not(no_sys_f16);
+        f64 => f16, Double => Half, __truncdfhf2, not(no_sys_f16_f64_convert);
+    }
 
     f_to_f! {
         trunc,
@@ -338,27 +396,15 @@ mod trunc {
     }
 
     #[cfg(all(f16_enabled, f128_enabled))]
-    #[cfg(not(any(
-        target_arch = "powerpc",
-        target_arch = "powerpc64",
-        target_arch = "loongarch64"
-    )))]
     f_to_f! {
         trunc,
-        f32 => f16, Single => Half, __truncsfhf2, not(feature = "no-sys-f16");
-        f32 => f16, Single => Half, __gnu_f2h_ieee, not(feature = "no-sys-f16");
-        f64 => f16, Double => Half, __truncdfhf2, not(feature = "no-sys-f16-f64-convert");
-        f128 => f16, Quad => Half, __trunctfhf2, not(feature = "no-sys-f16-f128-convert");
-        f128 => f32, Quad => Single, __trunctfsf2, not(feature = "no-sys-f128");
-        f128 => f64, Quad => Double, __trunctfdf2, not(feature = "no-sys-f128");
+        f128 => f16, Quad => Half, __trunctfhf2, not(no_sys_f16_f128_convert);
     }
 
     #[cfg(f128_enabled)]
-    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
     f_to_f! {
         trunc,
-        // FIXME(#655): `f16` tests disabled until we can bootstrap symbols
-        f128 => f32, Quad => Single, __trunckfsf2, not(feature = "no-sys-f128");
-        f128 => f64, Quad => Double, __trunckfdf2, not(feature = "no-sys-f128");
+        f128 => f32, Quad => Single, __trunctfsf2, not(no_sys_f128);
+        f128 => f64, Quad => Double, __trunctfdf2, not(no_sys_f128);
     }
 }
