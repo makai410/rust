@@ -41,10 +41,27 @@
 //!
 //! This API is not yet published and is still subject to breaking changes.
 //! For more information, see <https://github.com/rust-lang/rustc_public>.
-
 #![allow(rustc::usage_of_ty_tykind)]
 #![doc(test(attr(allow(unused_variables), deny(warnings))))]
+#![feature(rustc_private)]
 #![feature(sized_hierarchy)]
+
+#[cfg(not(feature = "rustc-build"))]
+macro_rules! rustc_crates {
+    () => {
+        extern crate rustc_abi;
+        extern crate rustc_driver;
+        extern crate rustc_hir;
+        extern crate rustc_middle;
+        extern crate rustc_public_bridge;
+        extern crate rustc_crate_store;
+        extern crate rustc_span;
+        extern crate rustc_target;
+    };
+}
+
+#[cfg(not(feature = "rustc-build"))]
+rustc_crates!();
 
 use std::fmt::Debug;
 use std::marker::PhantomData;
