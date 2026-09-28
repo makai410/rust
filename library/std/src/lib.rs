@@ -341,7 +341,6 @@
 #![feature(error_generic_member_access)]
 #![feature(error_iter)]
 #![feature(exact_size_is_empty)]
-#![feature(exclusive_wrapper)]
 #![feature(extend_one)]
 #![feature(float_gamma)]
 #![feature(float_minimum_maximum)]
@@ -759,6 +758,8 @@ pub use core::concat_bytes;
 )]
 #[unstable(feature = "derive_macro_global_path", issue = "154645")]
 pub use core::derive;
+#[unstable(feature = "gca_min_const_items", issue = "132980")]
+pub use core::gca;
 #[stable(feature = "matches_macro", since = "1.42.0")]
 pub use core::matches;
 #[stable(feature = "core_primitive", since = "1.43.0")]

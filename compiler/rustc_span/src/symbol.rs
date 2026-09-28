@@ -413,7 +413,6 @@ symbols! {
         alloc_layout,
         alloc_zeroed,
         allocator,
-        allocator_api,
         allocator_internals,
         allow,
         allow_fail,
@@ -848,7 +847,6 @@ symbols! {
         diagnostic_opaque,
         dialect,
         direct,
-        direct_const_arg,
         discriminant_kind,
         discriminant_type,
         discriminant_value,
@@ -1030,6 +1028,7 @@ symbols! {
         forall,
         forbid,
         force_target_feature,
+        forced_keywords,
         forget,
         format_args,
         format_args_capture,
@@ -1068,6 +1067,11 @@ symbols! {
         future_output,
         future_trait,
         fxsr,
+        gca,
+        gca_const_items,
+        gca_macroless_args,
+        gca_macroless_items,
+        gca_min_const_items,
         gdb_script_file,
         ge,
         gen_blocks,
@@ -2580,6 +2584,7 @@ impl fmt::Display for Ident {
 pub enum IdentPrintMode {
     Normal,
     RawIdent,
+    ForcedKeywordIdent,
     RawLifetime,
 }
 
@@ -2638,6 +2643,10 @@ impl fmt::Display for IdentPrinter {
             IdentPrintMode::Normal => self.symbol,
             IdentPrintMode::RawIdent => {
                 f.write_str("r#")?;
+                self.symbol
+            }
+            IdentPrintMode::ForcedKeywordIdent => {
+                f.write_str("k#")?;
                 self.symbol
             }
             IdentPrintMode::RawLifetime => {
