@@ -1,0 +1,20 @@
+# Run a job to ensure that we can run the demo successfully.
+name: Run demo
+on:
+  pull_request:
+    paths:
+      - demo/**
+
+  push:
+    paths:
+      - demo/**
+
+jobs:
+  check_demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Demo
+        run: ./demo/run_demo.sh

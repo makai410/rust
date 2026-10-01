@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "devtool",
+    "rustc_public",
+    "test-drive",
+]
+
+exclude = [
+    "build",
+    "demo",
+    "target",
+]

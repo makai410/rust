@@ -1,0 +1,17 @@
+[book]
+title = "Rustc Public Project (formerly Stable MIR)"
+language = "en"
+
+[output.html]
+curly-quotes = true
+git-repository-url = "https://github.com/rust-lang/rustc_public"
+site-url = "/rustc_public/"
+
+[output.html.playground]
+runnable = false
+
+[rust]
+edition = "2021"
+
+[build]
+build-dir = "build"

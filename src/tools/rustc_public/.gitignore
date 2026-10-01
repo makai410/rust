@@ -1,0 +1,12 @@
+/book/build
+**/target
+
+# direnv
+.envrc
+/.direnv
+/.nix-cargo
+
+.idea
+*.swp
+*.swo
+.vscode
