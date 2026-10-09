@@ -362,7 +362,7 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
                         sym::cttz_nonzero => {
                             self.count_trailing_zeroes_nonzero(width, args[0].immediate())
                         }
-                        sym::ctpop => self.pop_count(args[0].immediate()),
+                        sym::ctpop => self.ctpop(args[0].immediate()),
                         sym::bswap => {
                             if width == 8 {
                                 args[0].immediate() // byte swap a u8/i8 is just a no-op
@@ -661,7 +661,7 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
         llret
     }
 
-    fn abort(&mut self) {
+    fn abort_immediate(&mut self) {
         let func = self.context.get_builtin_function("__builtin_trap");
         self.block.add_eval(self.location, self.context.new_call(self.location, func, &[]));
     }
@@ -687,6 +687,10 @@ impl<'a, 'gcc, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tc
     fn expect(&mut self, cond: Self::Value, _expected: bool) -> Self::Value {
         // FIXME(antoyo)
         cond
+    }
+
+    fn ctpop(&mut self, val: Self::Value) -> Self::Value {
+        self.pop_count(val)
     }
 
     fn type_checked_load(
@@ -841,12 +845,10 @@ impl<'gcc, 'tcx> ArgAbiExt<'gcc, 'tcx> for ArgAbi<'tcx, Ty<'tcx>> {
             PassMode::Pair(..) => {
                 OperandValue::Pair(next(), next()).store(bx, dst);
             }
-            PassMode::Indirect { meta_attrs: Some(_), .. } => {
+            PassMode::IndirectUnsized { .. } => {
                 bug!("unsized `ArgAbi` cannot be stored");
             }
-            PassMode::Direct(_)
-            | PassMode::Indirect { meta_attrs: None, .. }
-            | PassMode::Cast { .. } => {
+            PassMode::Direct(_) | PassMode::Indirect { .. } | PassMode::Cast { .. } => {
                 let next_arg = next();
                 self.store(bx, next_arg, dst);
             }

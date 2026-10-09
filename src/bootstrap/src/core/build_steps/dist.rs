@@ -355,12 +355,13 @@ fn make_win_llvm_dist(plat_root: &Path, target: TargetSelection, builder: &Build
         "libmingwex.a",
         "libmsvcrt.a",
         // Windows import libs, remove them once std transitions to raw-dylib
+        "libdbghelp.a",
         "libkernel32.a",
-        "libuser32.a",
         "libntdll.a",
+        "libsynchronization.a",
+        "libuser32.a",
         "libuserenv.a",
         "libws2_32.a",
-        "libdbghelp.a",
     ];
 
     //Find mingw artifacts we want to bundle
@@ -1401,8 +1402,10 @@ fn prepare_source_tarball<'a>(
         builder.require_and_update_all_submodules();
 
         // Vendor packages that are required by opt-dist to collect PGO profiles.
-        let pkgs_for_pgo_training =
-            build_helper::LLVM_PGO_CRATES.iter().chain(build_helper::RUSTC_PGO_CRATES).map(|pkg| {
+        let pkgs_for_pgo_training = build_helper::BACKEND_PGO_CRATES
+            .iter()
+            .chain(build_helper::RUSTC_PGO_CRATES)
+            .map(|pkg| {
                 let mut manifest_path =
                     builder.src.join("./src/tools/rustc-perf/collector/compile-benchmarks");
                 manifest_path.push(pkg);
@@ -1737,7 +1740,7 @@ impl CommandLineStep for GccCodegenBackend {
     fn is_default_step(builder: &Builder<'_>) -> bool {
         // We only want to build the gcc backend in `x dist` if the backend was enabled
         // in rust.codegen-backends.
-        // Sadly, we don't have access to the actual target for which we're disting clif here..
+        // Sadly, we don't have access to the actual target for which we're disting gcc here..
         // So we just use the host target.
         builder
             .config
@@ -3142,6 +3145,7 @@ impl CommandLineStep for ReproducibleArtifacts {
             &builder.config.rustdoc_pgo.use_profile,
             &builder.config.cargo_pgo.use_profile,
             &builder.config.clippy_pgo.use_profile,
+            &builder.config.cranelift_pgo.use_profile,
         ];
         for profile in pgo_profiles {
             if let Some(path) = profile.as_ref() {
