@@ -3,6 +3,9 @@ name = "rustc_public"
 version = "0.1.0-preview"
 edition = "2024"
 
+# completely unrelated!!!!!!!!!!!!
+# ahsdfj
+# ashdfisa
 [dependencies]
 # tidy-alphabetical-start
 rustc_abi = { path = "../rustc_abi" }
