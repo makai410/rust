@@ -7,12 +7,10 @@ This guide describes the current state of rust-analyzer as of the 2024-01-01 rel
 architectural solutions related to the problem of building IDE-first compiler
 for Rust. There is a video version of this guide as well -
 however, it's based on an older 2019-01-20 release (git tag [guide-2019-01]):
-https://youtu.be/ANKBNiSWyfc.
+<https://youtu.be/ANKBNiSWyfc>.
 
 [guide-2019-01]: https://github.com/rust-lang/rust-analyzer/tree/guide-2019-01
 [2024-01-01]: https://github.com/rust-lang/rust-analyzer/tree/2024-01-01
-
-<!-- toc -->
 
 ## The big picture
 
@@ -69,12 +67,12 @@ Next, let's talk about what the inputs to the `Analysis` are, precisely.
 
 rust-analyzer never does any I/O itself, all inputs get passed explicitly via
 the `AnalysisHost::apply_change` method, which accepts a single argument, a
-`Change`. [`Change`] is a wrapper for `FileChange` that adds proc-macro knowledge.
-[`FileChange`] is a builder for a single change "transaction", so it suffices
-to study its methods to understand all the input data.
+[`ChangeWithProcMacros`]. [`ChangeWithProcMacros`] is a wrapper for `FileChange`
+that adds proc-macro knowledge. [`FileChange`] is a builder for a single change
+"transaction", so it suffices to study its methods to understand all the input data.
 
-[`Change`]: https://github.com/rust-lang/rust-analyzer/blob/2024-01-01/crates/hir-expand/src/change.rs#L10-L42
-[`FileChange`]: https://github.com/rust-lang/rust-analyzer/blob/2024-01-01/crates/base-db/src/change.rs#L14-L78
+[`ChangeWithProcMacros`]: https://github.com/rust-lang/rust-analyzer/blob/2026-08-03/crates/hir-expand/src/change.rs#L9-L42
+[`FileChange`]: https://github.com/rust-lang/rust-analyzer/blob/2026-08-03/crates/base-db/src/change.rs#L18-L99
 
 The `change_file` method controls the set of the input files, where each file
 has an integer id (`FileId`, picked by the client) and text (`Option<Arc<str>>`).
@@ -235,7 +233,7 @@ of type `V`. Queries come in two basic varieties:
   intelligently) when we can re-use these memoized values and when we have to
   recompute them.
 
-For further discussion, its important to understand one bit of "fairly
+For further discussion, it's important to understand one bit of "fairly
 intelligently". Suppose we have two functions, `f1` and `f2`, and one input,
 `z`. We call `f1(X)` which in turn calls `f2(Y)` which inspects `i(Z)`. `i(Z)`
 returns some value `V1`, `f2` uses that and returns `R1`, `f1` uses that and

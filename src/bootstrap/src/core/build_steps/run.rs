@@ -5,22 +5,24 @@
 
 use std::path::PathBuf;
 
+use build_helper::git::get_git_untracked_files;
 use clap_complete::{Generator, shells};
 
 use crate::core::build_steps::dist::distdir;
 use crate::core::build_steps::test;
 use crate::core::build_steps::tool::{self, RustcPrivateCompilers, SourceType, Tool};
-use crate::core::build_steps::vendor::{Vendor, default_paths_to_vendor};
-use crate::core::builder::{Builder, Kind, RunConfig, ShouldRun, Step};
+use crate::core::build_steps::vendor::{VENDOR_DIR, Vendor, default_paths_to_vendor};
+use crate::core::builder::{Builder, CommandLineStep, Kind, RunConfig, ShouldRun, StepMetadata};
 use crate::core::config::TargetSelection;
-use crate::core::config::flags::get_completion;
+use crate::core::config::flags::{get_completion, top_level_help};
+use crate::core::session::Mode;
 use crate::utils::exec::command;
-use crate::{Mode, t};
+use crate::utils::helpers::{self, t};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct BuildManifest;
 
-impl Step for BuildManifest {
+impl CommandLineStep for BuildManifest {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -35,7 +37,9 @@ impl Step for BuildManifest {
     fn run(self, builder: &Builder<'_>) {
         // This gets called by `promote-release`
         // (https://github.com/rust-lang/promote-release).
-        let mut cmd = builder.tool_cmd(Tool::BuildManifest);
+        let mut cmd = command(
+            builder.ensure(tool::BuildManifest::new(builder, builder.config.host_target)).tool_path,
+        );
         let sign = builder.config.dist_sign_folder.as_ref().unwrap_or_else(|| {
             panic!("\n\nfailed to specify `dist.sign-folder` in `bootstrap.toml`\n\n")
         });
@@ -59,7 +63,7 @@ impl Step for BuildManifest {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct BumpStage0;
 
-impl Step for BumpStage0 {
+impl CommandLineStep for BumpStage0 {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -81,7 +85,7 @@ impl Step for BumpStage0 {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ReplaceVersionPlaceholder;
 
-impl Step for ReplaceVersionPlaceholder {
+impl CommandLineStep for ReplaceVersionPlaceholder {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -100,12 +104,21 @@ impl Step for ReplaceVersionPlaceholder {
     }
 }
 
+/// Invoke the Miri tool on a specified file.
+///
+/// Note that Miri always executed on the host, as it is an interpreter.
+/// That means that `x run miri --target FOO` will build miri for the host,
+/// prepare a miri sysroot for the target `FOO` and then execute miri with
+/// the target `FOO`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Miri {
+    /// The build compiler that will build miri and the target compiler to which miri links.
+    compilers: RustcPrivateCompilers,
+    /// The target which will miri interpret.
     target: TargetSelection,
 }
 
-impl Step for Miri {
+impl CommandLineStep for Miri {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -113,14 +126,9 @@ impl Step for Miri {
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(Miri { target: run.target });
-    }
+        let builder = run.builder;
 
-    fn run(self, builder: &Builder<'_>) {
-        let host = builder.build.host_target;
-        let target = self.target;
-
-        // `x run` uses stage 0 by default but miri does not work well with stage 0.
+        // `x run` uses stage 0 by default, but miri does not work well with stage 0.
         // Change the stage to 1 if it's not set explicitly.
         let stage = if builder.config.is_explicit_stage() || builder.top_stage >= 1 {
             builder.top_stage
@@ -129,14 +137,22 @@ impl Step for Miri {
         };
 
         if stage == 0 {
-            eprintln!("miri cannot be run at stage 0");
-            std::process::exit(1);
+            eprintln!("ERROR: miri cannot be run at stage 0");
+            helpers::exit_process(1);
         }
 
-        // This compiler runs on the host, we'll just use it for the target.
-        let compilers = RustcPrivateCompilers::new(builder, stage, target);
-        let miri_build = builder.ensure(tool::Miri::from_compilers(compilers));
-        let host_compiler = miri_build.build_compiler;
+        // Miri always runs on the host, because it can interpret code for any target
+        let compilers = RustcPrivateCompilers::new(builder, stage, builder.host_target);
+
+        run.builder.ensure(Miri { compilers, target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        let host = builder.sess.host_target;
+        let compilers = self.compilers;
+        let target = self.target;
+
+        builder.ensure(tool::Miri::from_compilers(compilers));
 
         // Get a target sysroot for Miri.
         let miri_sysroot =
@@ -147,8 +163,8 @@ impl Step for Miri {
         // add_rustc_lib_path does not add the path that contains librustc_driver-<...>.so.
         let mut miri = tool::prepare_tool_cargo(
             builder,
-            host_compiler,
-            Mode::ToolRustc,
+            compilers.build_compiler(),
+            Mode::ToolRustcPrivate,
             host,
             Kind::Run,
             "src/tools/miri",
@@ -164,15 +180,23 @@ impl Step for Miri {
         // Forward arguments. This may contain further arguments to the program
         // after another --, so this must be at the end.
         miri.args(builder.config.args());
+        // Add default edition for Miri tests (2021); defaulting to 2015 is often confusing.
+        if !builder.config.args().iter().any(|arg| arg.starts_with("--edition")) {
+            miri.arg("--edition=2021");
+        }
 
         miri.into_cmd().run(builder);
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::run("miri", self.target).built_by(self.compilers.build_compiler()))
     }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CollectLicenseMetadata;
 
-impl Step for CollectLicenseMetadata {
+impl CommandLineStep for CollectLicenseMetadata {
     type Output = PathBuf;
     const IS_HOST: bool = true;
 
@@ -191,6 +215,16 @@ impl Step for CollectLicenseMetadata {
 
         let dest = builder.src.join("license-metadata.json");
 
+        if !builder.config.dry_run() {
+            builder.require_and_update_all_submodules();
+            if let Ok(Some(untracked)) = get_git_untracked_files(None) {
+                eprintln!(
+                    "Warning: {} untracked files may cause the license report to be incorrect.",
+                    untracked.len()
+                );
+            }
+        }
+
         let mut cmd = builder.tool_cmd(Tool::CollectLicenseMetadata);
         cmd.env("REUSE_EXE", reuse);
         cmd.env("DEST", &dest);
@@ -203,7 +237,7 @@ impl Step for CollectLicenseMetadata {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct GenerateCopyright;
 
-impl Step for GenerateCopyright {
+impl CommandLineStep for GenerateCopyright {
     type Output = Vec<PathBuf>;
     const IS_HOST: bool = true;
 
@@ -223,7 +257,7 @@ impl Step for GenerateCopyright {
         let paths_to_vendor = default_paths_to_vendor(builder);
         for (_, submodules) in &paths_to_vendor {
             for submodule in submodules {
-                builder.build.require_submodule(submodule, None);
+                builder.sess.require_submodule(submodule, None);
             }
         }
         let cargo_manifests = paths_to_vendor
@@ -241,10 +275,13 @@ impl Step for GenerateCopyright {
                 sync_args: Vec::new(),
                 versioned_dirs: true,
                 root_dir: builder.src.clone(),
-                output_dir: cache_dir.clone(),
+                output_dir: Some(cache_dir.clone()),
+                only_library_workspace: false,
             });
-            cache_dir
+            cache_dir.join(VENDOR_DIR)
         };
+
+        let _guard = builder.group("generate-copyright");
 
         let mut cmd = builder.tool_cmd(Tool::GenerateCopyright);
         cmd.env("CARGO_MANIFESTS", &cargo_manifests);
@@ -267,7 +304,7 @@ impl Step for GenerateCopyright {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct GenerateWindowsSys;
 
-impl Step for GenerateWindowsSys {
+impl CommandLineStep for GenerateWindowsSys {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -303,7 +340,7 @@ pub fn get_completion_paths(builder: &Builder<'_>) -> Vec<(&'static dyn Generato
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GenerateCompletions;
 
-impl Step for GenerateCompletions {
+impl CommandLineStep for GenerateCompletions {
     type Output = ();
 
     /// Uses `clap_complete` to generate shell completions.
@@ -326,10 +363,12 @@ impl Step for GenerateCompletions {
     }
 }
 
+/// The build step for generating the tables in `core/src/char/unicode/unicode_data.rs`
+/// and the tests in `library/coretests/tests/unicode/test_data.rs`.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct UnicodeTableGenerator;
 
-impl Step for UnicodeTableGenerator {
+impl CommandLineStep for UnicodeTableGenerator {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -343,7 +382,9 @@ impl Step for UnicodeTableGenerator {
 
     fn run(self, builder: &Builder<'_>) {
         let mut cmd = builder.tool_cmd(Tool::UnicodeTableGenerator);
+        // Generated files that are checked into git:
         cmd.arg(builder.src.join("library/core/src/unicode/unicode_data.rs"));
+        cmd.arg(builder.src.join("library/coretests/tests/unicode/test_data.rs"));
         cmd.run(builder);
     }
 }
@@ -351,7 +392,7 @@ impl Step for UnicodeTableGenerator {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct FeaturesStatusDump;
 
-impl Step for FeaturesStatusDump {
+impl CommandLineStep for FeaturesStatusDump {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -386,7 +427,7 @@ pub struct CyclicStep {
     n: u32,
 }
 
-impl Step for CyclicStep {
+impl CommandLineStep for CyclicStep {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -411,14 +452,16 @@ impl Step for CyclicStep {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CoverageDump;
 
-impl Step for CoverageDump {
+impl CommandLineStep for CoverageDump {
     type Output = ();
-
-    const DEFAULT: bool = false;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.path("src/tools/coverage-dump")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -435,7 +478,7 @@ impl Step for CoverageDump {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rustfmt;
 
-impl Step for Rustfmt {
+impl CommandLineStep for Rustfmt {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -448,7 +491,7 @@ impl Step for Rustfmt {
     }
 
     fn run(self, builder: &Builder<'_>) {
-        let host = builder.build.host_target;
+        let host = builder.sess.host_target;
 
         // `x run` uses stage 0 by default but rustfmt does not work well with stage 0.
         // Change the stage to 1 if it's not set explicitly.
@@ -467,10 +510,10 @@ impl Step for Rustfmt {
         let compilers = RustcPrivateCompilers::new(builder, stage, host);
         let rustfmt_build = builder.ensure(tool::Rustfmt::from_compilers(compilers));
 
-        let mut rustfmt = tool::prepare_tool_cargo(
+        let mut cargo = tool::prepare_tool_cargo(
             builder,
             rustfmt_build.build_compiler,
-            Mode::ToolRustc,
+            Mode::ToolRustcPrivate,
             host,
             Kind::Run,
             "src/tools/rustfmt",
@@ -478,9 +521,36 @@ impl Step for Rustfmt {
             &[],
         );
 
-        rustfmt.args(["--bin", "rustfmt", "--"]);
-        rustfmt.args(builder.config.args());
+        cargo.args(["--bin", "rustfmt", "--"]);
+        cargo.args(builder.config.args());
 
-        rustfmt.into_cmd().run(builder);
+        cargo.into_cmd().run(builder);
+    }
+}
+
+/// Return the path of x.py's help.
+pub fn get_help_path(builder: &Builder<'_>) -> PathBuf {
+    builder.src.join("src/etc/xhelp")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenerateHelp;
+
+impl CommandLineStep for GenerateHelp {
+    type Output = ();
+
+    fn run(self, builder: &Builder<'_>) {
+        let help = top_level_help();
+        let path = get_help_path(builder);
+        std::fs::write(&path, help)
+            .unwrap_or_else(|e| panic!("writing help into {} failed: {e:?}", path.display()));
+    }
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("generate-help")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(GenerateHelp)
     }
 }

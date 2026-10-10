@@ -132,13 +132,23 @@ fn test_env_expand() {
 #[rustc_builtin_macro]
 macro_rules! env {() => {}}
 
-fn main() { env!("TEST_ENV_VAR"); }
+fn main() {
+    env!("TEST_ENV_VAR");
+    env!("TEST_ENV_VAR",);
+    env!("TEST_ENV_VAR", "error");
+    env!("TEST_ENV_VAR", "error",);
+}
 "#,
         expect![[r##"
 #[rustc_builtin_macro]
 macro_rules! env {() => {}}
 
-fn main() { "UNRESOLVED_ENV_VAR"; }
+fn main() {
+    "UNRESOLVED_ENV_VAR";
+    "UNRESOLVED_ENV_VAR";
+    "UNRESOLVED_ENV_VAR";
+    "UNRESOLVED_ENV_VAR";
+}
 "##]],
     );
 }
@@ -150,13 +160,21 @@ fn test_option_env_expand() {
 #[rustc_builtin_macro]
 macro_rules! option_env {() => {}}
 
-fn main() { option_env!("TEST_ENV_VAR"); }
+fn main() {
+    option_env!("TEST_ENV_VAR");
+    option_env!("TEST_ENV_VAR",);
+    option_env!("TEST_ENV_VAR", "invalid");
+}
 "#,
         expect![[r#"
 #[rustc_builtin_macro]
 macro_rules! option_env {() => {}}
 
-fn main() { $crate::option::Option::None:: < &str>; }
+fn main() {
+    $crate::option::Option::None:: < &str>;
+    $crate::option::Option::None:: < &str>;
+    /* error: unexpected input */;
+}
 "#]],
     );
 }
@@ -568,6 +586,12 @@ cfg_select! {
     _ => { fn true_2() {} }
 }
 
+const _: ((),) = cfg_select! { _ => ((), ) };
+const _: i32 = cfg_select! { true => 2 + 3, _ => 3 + 4 };
+const _: i32 = cfg_select! { false => 2 + 3, _ => 3 + 4 };
+const _: bool = cfg_select! { _ => 2 < 3 };
+const _: bool = cfg_select! { true => foo::<(), fn() -> Foo<i32, i64>>(1,), _ => false };
+
 cfg_select! {
     false => { fn false_3() {} }
 }
@@ -589,12 +613,49 @@ fn true_1() {}
 
 fn true_2() {}
 
+const _: ((),) = ((), );
+const _: i32 = 2+3;
+const _: i32 = 3+4;
+const _: bool = 2<3;
+const _: bool = foo::<(), fn() -> Foo<i32, i64>>(1, );
+
 /* error: none of the predicates in this `cfg_select` evaluated to true */
 
 /* error: expected `=>` after cfg expression */
 
 /* error: expected a token tree after `=>` */
 
+    "#]],
+    );
+}
+
+#[test]
+fn eager_recursion_limit() {
+    check(
+        r#"
+//- minicore: concat
+
+macro_rules! concat_separator {
+    () => {
+        concat!("", concat_separator!())
+    };
+}
+
+fn main() {
+    concat_separator!()
+}
+    "#,
+        expect![[r#"
+
+macro_rules! concat_separator {
+    () => {
+        concat!("", concat_separator!())
+    };
+}
+
+fn main() {
+    concat!("", concat_separator!())
+}
     "#]],
     );
 }

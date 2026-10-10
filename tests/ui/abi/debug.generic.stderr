@@ -1,3 +1,36 @@
+error: the `rustc_abi` attribute cannot be used on constants
+  --> $DIR/debug.rs:48:3
+   |
+LL | #[rustc_abi(debug)]
+   |   ^^^^^^^^^
+   |
+   = help: the `rustc_abi` attribute can be applied to functions and type aliases
+
+error: the `rustc_abi` attribute cannot be used on associated consts
+  --> $DIR/debug.rs:52:7
+   |
+LL |     #[rustc_abi(debug)]
+   |       ^^^^^^^^^
+   |
+   = help: the `rustc_abi` attribute can be applied to functions and type aliases
+
+error[E0539]: malformed `rustc_abi` attribute input
+  --> $DIR/debug.rs:80:3
+   |
+LL | #[rustc_abi("assert_eq")]
+   |   ^^^^^^^^^-------------
+   |            |
+   |            valid arguments are `assert_eq` or `debug`
+   |
+help: try changing it to one of the following valid forms of the attribute
+   |
+LL - #[rustc_abi("assert_eq")]
+LL + #[rustc_abi(assert_eq)]
+   |
+LL - #[rustc_abi("assert_eq")]
+LL + #[rustc_abi(debug)]
+   |
+
 error: fn_abi_of(test) = FnAbi {
            args: [
                ArgAbi {
@@ -9,13 +42,7 @@ error: fn_abi_of(test) = FnAbi {
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I8,
-                                       false,
-                                   ),
-                                   valid_range: 0..=255,
-                               },
+                               u8 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -25,6 +52,7 @@ error: fn_abi_of(test) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -47,22 +75,13 @@ error: fn_abi_of(test) = FnAbi {
                            abi: $SOME_ALIGN,
                        },
                        backend_repr: Scalar(
-                           Initialized {
-                               value: Int(
-                                   I8,
-                                   false,
-                               ),
-                               valid_range: 0..=1,
-                           },
+                           u8 is 0..=1,
                        ),
                        fields: Primitive,
                        largest_niche: Some(
                            Niche {
                                offset: Size(0 bytes),
-                               value: Int(
-                                   I8,
-                                   false,
-                               ),
+                               value: u8,
                                valid_range: 0..=1,
                            },
                        ),
@@ -72,6 +91,7 @@ error: fn_abi_of(test) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -89,10 +109,104 @@ error: fn_abi_of(test) = FnAbi {
            conv: Rust,
            can_unwind: $SOME_BOOL,
        }
-  --> $DIR/debug.rs:27:1
+  --> $DIR/debug.rs:31:1
    |
 LL | fn test(_x: u8) -> bool {
    | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: fn_abi_of(test_unsized) = FnAbi {
+           args: [
+               ArgAbi {
+                   layout: TyAndLayout {
+                       ty: [u8],
+                       layout: Layout {
+                           size: Size(0 bytes),
+                           align: AbiAlign {
+                               abi: $SOME_ALIGN,
+                           },
+                           backend_repr: Memory {
+                               sized: false,
+                           },
+                           fields: Array {
+                               stride: Size(1 bytes),
+                               count: 0,
+                           },
+                           largest_niche: None,
+                           uninhabited: false,
+                           variants: Single {
+                               index: 0,
+                           },
+                           max_repr_align: None,
+                           unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
+                           randomization_seed: $SEED,
+                       },
+                   },
+                   mode: IndirectUnsized {
+                       attrs: ArgAttributes {
+                           regular: CapturesAddress | NoAlias | NonNull | NoUndef | NoFree,
+                           arg_ext: None,
+                           pointee_size: Size(0 bytes),
+                           pointee_align: Some(
+                               Align(1 bytes),
+                           ),
+                       },
+                       meta_attrs: ArgAttributes {
+                           regular: ,
+                           arg_ext: None,
+                           pointee_size: Size(0 bytes),
+                           pointee_align: None,
+                       },
+                   },
+               },
+           ],
+           ret: ArgAbi {
+               layout: TyAndLayout {
+                   ty: bool,
+                   layout: Layout {
+                       size: Size(1 bytes),
+                       align: AbiAlign {
+                           abi: $SOME_ALIGN,
+                       },
+                       backend_repr: Scalar(
+                           u8 is 0..=1,
+                       ),
+                       fields: Primitive,
+                       largest_niche: Some(
+                           Niche {
+                               offset: Size(0 bytes),
+                               value: u8,
+                               valid_range: 0..=1,
+                           },
+                       ),
+                       uninhabited: false,
+                       variants: Single {
+                           index: 0,
+                       },
+                       max_repr_align: None,
+                       unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
+                       randomization_seed: $SEED,
+                   },
+               },
+               mode: Direct(
+                   ArgAttributes {
+                       regular: NoUndef,
+                       arg_ext: Zext,
+                       pointee_size: Size(0 bytes),
+                       pointee_align: None,
+                   },
+               ),
+           },
+           c_variadic: false,
+           fixed_count: 1,
+           conv: Rust,
+           can_unwind: $SOME_BOOL,
+       }
+  --> $DIR/debug.rs:37:1
+   |
+LL | fn test_unsized(_x: [u8]) -> bool {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error: fn_abi_of(TestFnPtr) = FnAbi {
            args: [
@@ -105,22 +219,13 @@ error: fn_abi_of(TestFnPtr) = FnAbi {
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I8,
-                                       false,
-                                   ),
-                                   valid_range: 0..=1,
-                               },
+                               u8 is 0..=1,
                            ),
                            fields: Primitive,
                            largest_niche: Some(
                                Niche {
                                    offset: Size(0 bytes),
-                                   value: Int(
-                                       I8,
-                                       false,
-                                   ),
+                                   value: u8,
                                    valid_range: 0..=1,
                                },
                            ),
@@ -130,6 +235,7 @@ error: fn_abi_of(TestFnPtr) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -152,13 +258,7 @@ error: fn_abi_of(TestFnPtr) = FnAbi {
                            abi: $SOME_ALIGN,
                        },
                        backend_repr: Scalar(
-                           Initialized {
-                               value: Int(
-                                   I8,
-                                   false,
-                               ),
-                               valid_range: 0..=255,
-                           },
+                           u8 is ..,
                        ),
                        fields: Primitive,
                        largest_niche: None,
@@ -168,6 +268,7 @@ error: fn_abi_of(TestFnPtr) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -185,7 +286,7 @@ error: fn_abi_of(TestFnPtr) = FnAbi {
            conv: Rust,
            can_unwind: $SOME_BOOL,
        }
-  --> $DIR/debug.rs:33:1
+  --> $DIR/debug.rs:43:1
    |
 LL | type TestFnPtr = fn(bool) -> u8;
    | ^^^^^^^^^^^^^^
@@ -201,14 +302,7 @@ error: fn_abi_of(test_generic) = FnAbi {
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Pointer(
-                                       AddressSpace(
-                                           0,
-                                       ),
-                                   ),
-                                   valid_range: $FULL,
-                               },
+                               pointer is $FULL,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -218,6 +312,7 @@ error: fn_abi_of(test_generic) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -244,7 +339,7 @@ error: fn_abi_of(test_generic) = FnAbi {
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -253,6 +348,7 @@ error: fn_abi_of(test_generic) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -263,13 +359,13 @@ error: fn_abi_of(test_generic) = FnAbi {
            conv: Rust,
            can_unwind: $SOME_BOOL,
        }
-  --> $DIR/debug.rs:36:1
+  --> $DIR/debug.rs:46:1
    |
 LL | fn test_generic<T>(_x: *const T) {}
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: `#[rustc_abi]` can only be applied to function items, type aliases, and associated functions
-  --> $DIR/debug.rs:39:1
+error: the `rustc_abi` attribute can only be applied to function items, type aliases, and associated functions
+  --> $DIR/debug.rs:49:1
    |
 LL | const C: () = ();
    | ^^^^^^^^^^^
@@ -286,13 +382,7 @@ error: ABIs are not compatible
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I8,
-                                       false,
-                                   ),
-                                   valid_range: 0..=255,
-                               },
+                               u8 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -302,6 +392,7 @@ error: ABIs are not compatible
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -328,7 +419,7 @@ error: ABIs are not compatible
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -337,6 +428,7 @@ error: ABIs are not compatible
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -358,13 +450,7 @@ error: ABIs are not compatible
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I32,
-                                       false,
-                                   ),
-                                   valid_range: $FULL,
-                               },
+                               u32 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -374,6 +460,7 @@ error: ABIs are not compatible
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -400,7 +487,7 @@ error: ABIs are not compatible
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -409,6 +496,7 @@ error: ABIs are not compatible
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -419,7 +507,7 @@ error: ABIs are not compatible
            conv: Rust,
            can_unwind: $SOME_BOOL,
        }
-  --> $DIR/debug.rs:55:1
+  --> $DIR/debug.rs:65:1
    |
 LL | type TestAbiNe = (fn(u8), fn(u32));
    | ^^^^^^^^^^^^^^
@@ -449,20 +537,21 @@ error: ABIs are not compatible
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
                    mode: Indirect {
                        attrs: ArgAttributes {
-                           regular: NoAlias | NoCapture | NonNull | NoUndef,
+                           regular: CapturesAddress | NoAlias | NonNull | NoUndef | NoFree,
                            arg_ext: None,
                            pointee_size: Size(32 bytes),
                            pointee_align: Some(
                                Align(1 bytes),
                            ),
                        },
-                       meta_attrs: None,
-                       on_stack: false,
+                       address_space: None,
+                       mode: Pointer,
                    },
                },
            ],
@@ -479,7 +568,7 @@ error: ABIs are not compatible
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -488,6 +577,7 @@ error: ABIs are not compatible
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -522,20 +612,21 @@ error: ABIs are not compatible
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
                    mode: Indirect {
                        attrs: ArgAttributes {
-                           regular: NoAlias | NoCapture | NonNull | NoUndef,
+                           regular: CapturesAddress | NoAlias | NonNull | NoUndef | NoFree,
                            arg_ext: None,
                            pointee_size: Size(128 bytes),
                            pointee_align: Some(
                                Align(4 bytes),
                            ),
                        },
-                       meta_attrs: None,
-                       on_stack: false,
+                       address_space: None,
+                       mode: Pointer,
                    },
                },
            ],
@@ -552,7 +643,7 @@ error: ABIs are not compatible
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -561,6 +652,7 @@ error: ABIs are not compatible
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -571,7 +663,7 @@ error: ABIs are not compatible
            conv: Rust,
            can_unwind: $SOME_BOOL,
        }
-  --> $DIR/debug.rs:58:1
+  --> $DIR/debug.rs:68:1
    |
 LL | type TestAbiNeLarger = (fn([u8; 32]), fn([u32; 32]));
    | ^^^^^^^^^^^^^^^^^^^^
@@ -588,12 +680,7 @@ error: ABIs are not compatible
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Float(
-                                       F32,
-                                   ),
-                                   valid_range: $FULL,
-                               },
+                               f32 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -603,6 +690,7 @@ error: ABIs are not compatible
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -629,7 +717,7 @@ error: ABIs are not compatible
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -638,6 +726,7 @@ error: ABIs are not compatible
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -659,13 +748,7 @@ error: ABIs are not compatible
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I32,
-                                       false,
-                                   ),
-                                   valid_range: $FULL,
-                               },
+                               u32 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -675,6 +758,7 @@ error: ABIs are not compatible
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -701,7 +785,7 @@ error: ABIs are not compatible
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -710,6 +794,7 @@ error: ABIs are not compatible
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -720,7 +805,7 @@ error: ABIs are not compatible
            conv: Rust,
            can_unwind: $SOME_BOOL,
        }
-  --> $DIR/debug.rs:61:1
+  --> $DIR/debug.rs:71:1
    |
 LL | type TestAbiNeFloat = (fn(f32), fn(u32));
    | ^^^^^^^^^^^^^^^^^^^
@@ -737,13 +822,7 @@ error: ABIs are not compatible
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I32,
-                                       true,
-                                   ),
-                                   valid_range: $FULL,
-                               },
+                               i32 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -753,6 +832,7 @@ error: ABIs are not compatible
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -779,7 +859,7 @@ error: ABIs are not compatible
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -788,6 +868,7 @@ error: ABIs are not compatible
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -809,13 +890,7 @@ error: ABIs are not compatible
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Int(
-                                       I32,
-                                       false,
-                                   ),
-                                   valid_range: $FULL,
-                               },
+                               u32 is ..,
                            ),
                            fields: Primitive,
                            largest_niche: None,
@@ -825,6 +900,7 @@ error: ABIs are not compatible
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -851,7 +927,7 @@ error: ABIs are not compatible
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -860,6 +936,7 @@ error: ABIs are not compatible
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -870,13 +947,13 @@ error: ABIs are not compatible
            conv: Rust,
            can_unwind: $SOME_BOOL,
        }
-  --> $DIR/debug.rs:65:1
+  --> $DIR/debug.rs:75:1
    |
 LL | type TestAbiNeSign = (fn(i32), fn(u32));
    | ^^^^^^^^^^^^^^^^^^
 
 error[E0277]: the size for values of type `str` cannot be known at compilation time
-  --> $DIR/debug.rs:68:46
+  --> $DIR/debug.rs:78:46
    |
 LL | type TestAbiEqNonsense = (fn((str, str)), fn((str, str)));
    |                                              ^^^^^^^^^^ doesn't have a size known at compile-time
@@ -884,14 +961,8 @@ LL | type TestAbiEqNonsense = (fn((str, str)), fn((str, str)));
    = help: the trait `Sized` is not implemented for `str`
    = note: only the last element of a tuple may have a dynamically sized type
 
-error: unrecognized argument
-  --> $DIR/debug.rs:70:13
-   |
-LL | #[rustc_abi("assert_eq")]
-   |             ^^^^^^^^^^^
-
-error: `#[rustc_abi]` can only be applied to function items, type aliases, and associated functions
-  --> $DIR/debug.rs:43:5
+error: the `rustc_abi` attribute can only be applied to function items, type aliases, and associated functions
+  --> $DIR/debug.rs:53:5
    |
 LL |     const C: () = ();
    |     ^^^^^^^^^^^
@@ -907,24 +978,13 @@ error: fn_abi_of(assoc_test) = FnAbi {
                                abi: $SOME_ALIGN,
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Pointer(
-                                       AddressSpace(
-                                           0,
-                                       ),
-                                   ),
-                                   valid_range: $NON_NULL,
-                               },
+                               pointer is $NON_NULL,
                            ),
                            fields: Primitive,
                            largest_niche: Some(
                                Niche {
                                    offset: Size(0 bytes),
-                                   value: Pointer(
-                                       AddressSpace(
-                                           0,
-                                       ),
-                                   ),
+                                   value: pointer,
                                    valid_range: $NON_NULL,
                                },
                            ),
@@ -934,12 +994,13 @@ error: fn_abi_of(assoc_test) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: $SOME_ALIGN,
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
                    mode: Direct(
                        ArgAttributes {
-                           regular: NoAlias | NonNull | ReadOnly | NoUndef,
+                           regular: CapturesReadOnly | NoAlias | NonNull | ReadOnly | NoUndef | NoFree,
                            arg_ext: None,
                            pointee_size: Size(2 bytes),
                            pointee_align: Some(
@@ -962,7 +1023,7 @@ error: fn_abi_of(assoc_test) = FnAbi {
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -971,6 +1032,7 @@ error: fn_abi_of(assoc_test) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: $SOME_ALIGN,
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },
@@ -981,11 +1043,12 @@ error: fn_abi_of(assoc_test) = FnAbi {
            conv: Rust,
            can_unwind: $SOME_BOOL,
        }
-  --> $DIR/debug.rs:48:5
+  --> $DIR/debug.rs:58:5
    |
 LL |     fn assoc_test(&self) {}
    |     ^^^^^^^^^^^^^^^^^^^^
 
-error: aborting due to 12 previous errors
+error: aborting due to 15 previous errors
 
-For more information about this error, try `rustc --explain E0277`.
+Some errors have detailed explanations: E0277, E0539.
+For more information about an error, try `rustc --explain E0277`.

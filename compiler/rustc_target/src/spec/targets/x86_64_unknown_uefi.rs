@@ -7,7 +7,7 @@
 
 use rustc_abi::{CanonAbi, X86Call};
 
-use crate::spec::{RustcAbi, Target, TargetMetadata, base};
+use crate::spec::{Arch, RustcAbi, Target, TargetMetadata, base};
 
 pub(crate) fn target() -> Target {
     let mut base = base::uefi_msvc::opts();
@@ -27,7 +27,7 @@ pub(crate) fn target() -> Target {
     // If you initialize FP units yourself, you can override these flags with custom linker
     // arguments, thus giving you access to full MMX/SSE acceleration.
     base.features = "-mmx,-sse,+soft-float".into();
-    base.rustc_abi = Some(RustcAbi::X86Softfloat);
+    base.rustc_abi = Some(RustcAbi::Softfloat);
 
     Target {
         llvm_target: "x86_64-unknown-windows".into(),
@@ -40,7 +40,7 @@ pub(crate) fn target() -> Target {
         pointer_width: 64,
         data_layout:
             "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into(),
-        arch: "x86_64".into(),
+        arch: Arch::X86_64,
 
         options: base,
     }

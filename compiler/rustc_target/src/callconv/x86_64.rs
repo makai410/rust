@@ -59,7 +59,9 @@ where
 
             BackendRepr::SimdVector { .. } => Class::Sse,
 
-            BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => {
+            BackendRepr::SimdScalableVector { .. } => panic!("scalable vectors are unsupported"),
+
+            BackendRepr::ScalarPair { .. } | BackendRepr::Memory { .. } => {
                 for i in 0..layout.fields.count() {
                     let field_off = off + layout.fields.offset(i);
                     classify(cx, layout.field(cx, i), cls, field_off)?;
@@ -129,17 +131,16 @@ where
 }
 
 fn reg_component(cls: &[Option<Class>], i: &mut usize, size: Size) -> Option<Reg> {
-    if *i >= cls.len() {
+    let Some(Some(class)) = cls.get(*i) else {
         return None;
-    }
+    };
 
-    match cls[*i] {
-        None => None,
-        Some(Class::Int) => {
+    match class {
+        Class::Int => {
             *i += 1;
             Some(if size.bytes() < 8 { Reg { kind: RegKind::Integer, size } } else { Reg::i64() })
         }
-        Some(Class::Sse) => {
+        Class::Sse => {
             let vec_len =
                 1 + cls[*i + 1..].iter().take_while(|&&c| c == Some(Class::SseUp)).count();
             *i += vec_len;
@@ -149,10 +150,10 @@ fn reg_component(cls: &[Option<Class>], i: &mut usize, size: Size) -> Option<Reg
                     _ => Reg::f64(),
                 }
             } else {
-                Reg { kind: RegKind::Vector, size: Size::from_bytes(8) * (vec_len as u64) }
+                Reg::opaque_vector(Size::from_bytes(8) * (vec_len as u64))
             })
         }
-        Some(c) => unreachable!("reg_component: unhandled class {:?}", c),
+        c => unreachable!("reg_component: unhandled class {:?}", c),
     }
 }
 
@@ -183,7 +184,13 @@ where
 
     let mut x86_64_arg_or_ret = |arg: &mut ArgAbi<'a, Ty>, is_arg: bool| {
         if !arg.layout.is_sized() {
+            // FIXME: Update int_regs?
             // Not touching this...
+            return;
+        }
+        if is_arg && arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
+            int_regs = int_regs.saturating_sub(1);
+            arg.make_indirect();
             return;
         }
         let mut cls_or_mem = classify_arg(cx, arg);

@@ -1,4 +1,4 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ revisions: s390x s390x_vector
 //@ assembly-output: emit-asm
 //@[s390x] compile-flags: --target s390x-unknown-linux-gnu
@@ -7,36 +7,16 @@
 //@[s390x_vector] needs-llvm-components: systemz
 //@ compile-flags: -Zmerge-functions=disabled
 
-#![feature(no_core, repr_simd, f128)]
-#![cfg_attr(s390x_vector, feature(asm_experimental_reg))]
+#![feature(no_core, f16, f128)]
 #![crate_type = "rlib"]
 #![no_core]
 #![allow(asm_sub_register, non_camel_case_types)]
 
 extern crate minicore;
+use minicore::simd::*;
 use minicore::*;
 
 type ptr = *const i32;
-
-#[repr(simd)]
-pub struct i8x16([i8; 16]);
-#[repr(simd)]
-pub struct i16x8([i16; 8]);
-#[repr(simd)]
-pub struct i32x4([i32; 4]);
-#[repr(simd)]
-pub struct i64x2([i64; 2]);
-#[repr(simd)]
-pub struct f32x4([f32; 4]);
-#[repr(simd)]
-pub struct f64x2([f64; 2]);
-
-impl Copy for i8x16 {}
-impl Copy for i16x8 {}
-impl Copy for i32x4 {}
-impl Copy for i64x2 {}
-impl Copy for f32x4 {}
-impl Copy for f64x2 {}
 
 extern "C" {
     fn extern_func();
@@ -127,6 +107,12 @@ check!(reg_i32_addr, i32, reg_addr, "lgr");
 // CHECK: #NO_APP
 check!(reg_i64_addr, i64, reg_addr, "lgr");
 
+// CHECK-LABEL: reg_f16:
+// CHECK: #APP
+// CHECK: ler %f{{[0-9]+}}, %f{{[0-9]+}}
+// CHECK: #NO_APP
+check!(reg_f16, f16, freg, "ler");
+
 // CHECK-LABEL: reg_f32:
 // CHECK: #APP
 // CHECK: ler %f{{[0-9]+}}, %f{{[0-9]+}}
@@ -173,6 +159,13 @@ check!(vreg_i32x4, i32x4, vreg, "vlr");
 #[cfg(s390x_vector)]
 check!(vreg_i64x2, i64x2, vreg, "vlr");
 
+// s390x_vector-LABEL: vreg_f16x8:
+// s390x_vector: #APP
+// s390x_vector: vlr %v{{[0-9]+}}, %v{{[0-9]+}}
+// s390x_vector: #NO_APP
+#[cfg(s390x_vector)]
+check!(vreg_f16x8, f16x8, vreg, "vlr");
+
 // s390x_vector-LABEL: vreg_f32x4:
 // s390x_vector: #APP
 // s390x_vector: vlr %v{{[0-9]+}}, %v{{[0-9]+}}
@@ -207,6 +200,13 @@ check!(vreg_i64, i64, vreg, "vlr");
 // s390x_vector: #NO_APP
 #[cfg(s390x_vector)]
 check!(vreg_i128, i128, vreg, "vlr");
+
+// s390x_vector-LABEL: vreg_f16:
+// s390x_vector: #APP
+// s390x_vector: vlr %v{{[0-9]+}}, %v{{[0-9]+}}
+// s390x_vector: #NO_APP
+#[cfg(s390x_vector)]
+check!(vreg_f16, f16, vreg, "vlr");
 
 // s390x_vector-LABEL: vreg_f32:
 // s390x_vector: #APP
@@ -253,6 +253,12 @@ check_reg!(r0_i32, i32, "r0", "lr");
 // CHECK: #NO_APP
 check_reg!(r0_i64, i64, "r0", "lr");
 
+// CHECK-LABEL: f0_f16:
+// CHECK: #APP
+// CHECK: ler %f0, %f0
+// CHECK: #NO_APP
+check_reg!(f0_f16, f16, "f0", "ler");
+
 // CHECK-LABEL: f0_f32:
 // CHECK: #APP
 // CHECK: ler %f0, %f0
@@ -293,6 +299,13 @@ check_reg!(v0_i32x4, i32x4, "v0", "vlr");
 #[cfg(s390x_vector)]
 check_reg!(v0_i64x2, i64x2, "v0", "vlr");
 
+// s390x_vector-LABEL: v0_f16x8:
+// s390x_vector: #APP
+// s390x_vector: vlr %v0, %v0
+// s390x_vector: #NO_APP
+#[cfg(s390x_vector)]
+check_reg!(v0_f16x8, f16x8, "v0", "vlr");
+
 // s390x_vector-LABEL: v0_f32x4:
 // s390x_vector: #APP
 // s390x_vector: vlr %v0, %v0
@@ -327,6 +340,13 @@ check_reg!(v0_i64, i64, "v0", "vlr");
 // s390x_vector: #NO_APP
 #[cfg(s390x_vector)]
 check_reg!(v0_i128, i128, "v0", "vlr");
+
+// s390x_vector-LABEL: v0_f16:
+// s390x_vector: #APP
+// s390x_vector: vlr %v0, %v0
+// s390x_vector: #NO_APP
+#[cfg(s390x_vector)]
+check_reg!(v0_f16, f16, "v0", "vlr");
 
 // s390x_vector-LABEL: v0_f32:
 // s390x_vector: #APP

@@ -2,7 +2,7 @@
 #![crate_type = "dylib"]
 // When denying at the crate level, be sure to not get random warnings from the
 // injected intrinsics by the compiler.
-#![allow(dead_code, non_snake_case)]
+#![expect(non_snake_case)]
 
 type Typedef = String;
 pub type PubTypedef = String;
@@ -95,5 +95,12 @@ pub mod issue15301 {
     #[unsafe(no_mangle)]
     pub fn call_from_rust_no_extern() {
         println!("Just called a Rust function from Rust!");
+    }
+}
+
+pub mod issue15491 {
+    pub trait Foo {
+        #[allow(clippy::missing_inline_in_public_items)]
+        fn foo(&self) {}
     }
 }

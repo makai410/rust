@@ -95,7 +95,7 @@ pub use worker_local::WorkerLocal;
 pub use self::broadcast::{BroadcastContext, broadcast, spawn_broadcast};
 pub use self::join::{join, join_context};
 use self::registry::{CustomSpawn, DefaultSpawn, ThreadSpawn};
-pub use self::registry::{Registry, ThreadBuilder, mark_blocked, mark_unblocked};
+pub use self::registry::{Registry, ThreadBuilder, mark_blocked_and_wait, mark_unblocked};
 pub use self::scope::{Scope, ScopeFifo, in_place_scope, in_place_scope_fifo, scope, scope_fifo};
 pub use self::spawn::{spawn, spawn_fifo};
 pub use self::thread_pool::{
@@ -787,18 +787,7 @@ impl ThreadPoolBuildError {
     }
 }
 
-const GLOBAL_POOL_ALREADY_INITIALIZED: &str =
-    "The global thread pool has already been initialized.";
-
 impl Error for ThreadPoolBuildError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        match self.kind {
-            ErrorKind::GlobalPoolAlreadyInitialized => GLOBAL_POOL_ALREADY_INITIALIZED,
-            ErrorKind::IOError(ref e) => e.description(),
-        }
-    }
-
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
             ErrorKind::GlobalPoolAlreadyInitialized => None,
@@ -810,7 +799,9 @@ impl Error for ThreadPoolBuildError {
 impl fmt::Display for ThreadPoolBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            ErrorKind::GlobalPoolAlreadyInitialized => GLOBAL_POOL_ALREADY_INITIALIZED.fmt(f),
+            ErrorKind::GlobalPoolAlreadyInitialized => {
+                "The global thread pool has already been initialized.".fmt(f)
+            }
             ErrorKind::IOError(e) => e.fmt(f),
         }
     }

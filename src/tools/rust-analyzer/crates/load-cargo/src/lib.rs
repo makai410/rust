@@ -2,6 +2,12 @@
 //! for incorporating changes.
 // Note, don't remove any public api from this. This API is consumed by external tools
 // to run rust-analyzer as a library.
+
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
 use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
 
 use crossbeam_channel::{Receiver, unbounded};
@@ -11,15 +17,21 @@ use hir_expand::proc_macro::{
 };
 use ide_db::{
     ChangeWithProcMacros, FxHashMap, RootDatabase,
-    base_db::{CrateGraphBuilder, Env, ProcMacroLoadingError, SourceRoot, SourceRootId},
+    base_db::{
+        CrateGraphBuilder, Env, ProcMacroLoadingError, SourceDatabase, SourceRoot, SourceRootId,
+    },
     prime_caches,
 };
 use itertools::Itertools;
-use proc_macro_api::{MacroDylib, ProcMacroClient};
+use proc_macro_api::{
+    MacroDylib, ProcMacroClient,
+    bidirectional_protocol::msg::{ParentSpan, SubRequest, SubResponse},
+};
 use project_model::{CargoConfig, PackageRoot, ProjectManifest, ProjectWorkspace};
-use span::Span;
+use span::{Span, SpanAnchor, SyntaxContext};
+use tt::{TextRange, TextSize};
 use vfs::{
-    AbsPath, AbsPathBuf, VfsPath,
+    AbsPath, AbsPathBuf, FileId, VfsPath,
     file_set::FileSetConfig,
     loader::{Handle, LoadingProgress},
 };
@@ -29,6 +41,8 @@ pub struct LoadCargoConfig {
     pub load_out_dirs_from_check: bool,
     pub with_proc_macro_server: ProcMacroServerChoice,
     pub prefill_caches: bool,
+    pub num_worker_threads: usize,
+    pub proc_macro_processes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,15 +110,26 @@ pub fn load_workspace_into_db(
     tracing::debug!(?load_config, "LoadCargoConfig");
     let proc_macro_server = match &load_config.with_proc_macro_server {
         ProcMacroServerChoice::Sysroot => ws.find_sysroot_proc_macro_srv().map(|it| {
-            it.and_then(|it| ProcMacroClient::spawn(&it, extra_env).map_err(Into::into)).map_err(
-                |e| ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str()),
-            )
+            it.and_then(|it| {
+                ProcMacroClient::spawn(
+                    &it,
+                    extra_env,
+                    ws.toolchain.as_ref(),
+                    load_config.proc_macro_processes,
+                )
+                .map_err(Into::into)
+            })
+            .map_err(|e| ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str()))
         }),
-        ProcMacroServerChoice::Explicit(path) => {
-            Some(ProcMacroClient::spawn(path, extra_env).map_err(|e| {
-                ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
-            }))
-        }
+        ProcMacroServerChoice::Explicit(path) => Some(
+            ProcMacroClient::spawn(
+                path,
+                extra_env,
+                ws.toolchain.as_ref(),
+                load_config.proc_macro_processes,
+            )
+            .map_err(|e| ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())),
+        ),
         ProcMacroServerChoice::None => Some(Err(ProcMacroLoadingError::Disabled)),
     };
     match &proc_macro_server {
@@ -145,7 +170,7 @@ pub fn load_workspace_into_db(
             .map(|(crate_id, path)| {
                 (
                     crate_id,
-                    path.map_or_else(Err, |(_, path)| {
+                    path.and_then(|(_, path)| {
                         proc_macro_server.as_ref().map_err(Clone::clone).and_then(
                             |proc_macro_server| load_proc_macro(proc_macro_server, &path, &[]),
                         )
@@ -172,7 +197,8 @@ pub fn load_workspace_into_db(
     );
 
     if load_config.prefill_caches {
-        prime_caches::parallel_prime_caches(db, 1, &|_| ());
+        let all = ide_db::base_db::all_crates(db);
+        prime_caches::parallel_prime_caches(db, &all, load_config.num_worker_threads, &|_| ());
     }
 
     Ok((vfs, proc_macro_server.and_then(Result::ok)))
@@ -257,6 +283,19 @@ impl ProjectFolders {
             }
         }
 
+        // Collect workspace roots not already covered by a local PackageRoot
+        // (e.g. virtual workspaces where no package lives at the workspace root).
+        // We need these to load workspace-root rust-analyzer.toml into a local source root.
+        let uncovered_ws_roots: Vec<AbsPathBuf> = workspaces
+            .iter()
+            .filter_map(|ws| {
+                let ws_root = ws.workspace_root().to_path_buf();
+                let dominated =
+                    roots.iter().any(|root| root.is_local && root.include.contains(&ws_root));
+                (!dominated).then_some(ws_root)
+            })
+            .collect();
+
         for root in roots.into_iter().filter(|it| !it.include.is_empty()) {
             let file_set_roots: Vec<VfsPath> =
                 root.include.iter().cloned().map(VfsPath::from).collect();
@@ -265,6 +304,7 @@ impl ProjectFolders {
                 let mut dirs = vfs::loader::Directories::default();
                 dirs.extensions.push("rs".into());
                 dirs.extensions.push("toml".into());
+                dirs.extensions.push("md".into());
                 dirs.include.extend(root.include);
                 dirs.exclude.extend(root.exclude);
                 for excl in global_excludes {
@@ -307,6 +347,20 @@ impl ProjectFolders {
                 local_filesets.push(fsc.len() as u64);
                 fsc.add_file_set(file_set_roots)
             }
+        }
+
+        // For virtual workspaces, the workspace root has no local PackageRoot, so
+        // rust-analyzer.toml there would fall into a library source root and be
+        // ignored. Load it explicitly via Entry::Files and register the workspace
+        // root as a local file-set root so the file is classified as local.
+        for ws_root in &uncovered_ws_roots {
+            let ratoml_path = ws_root.join("rust-analyzer.toml");
+            let file_set_roots = vec![VfsPath::from(ws_root.clone())];
+            let entry = vfs::loader::Entry::Files(vec![ratoml_path]);
+            res.watch.push(res.load.len());
+            res.load.push(entry);
+            local_filesets.push(fsc.len() as u64);
+            fsc.add_file_set(file_set_roots);
         }
 
         if let Some(user_config_path) = user_config_dir_path {
@@ -353,6 +407,19 @@ impl SourceRootConfig {
                 }
             })
             .collect()
+    }
+
+    /// Returns whether `path` belongs to a library (non-local) source root, such as the
+    /// sysroot sources or a cargo registry dependency.
+    ///
+    /// Paths that belong to no configured file set are *not* considered library files, as
+    /// files outside of any loaded workspace (for example scratch files) fall into the
+    /// catch-all file set despite being client-editable.
+    pub fn path_is_library(&self, path: &VfsPath) -> bool {
+        match self.fsc.classify_path(path) {
+            Some(idx) => !self.local_filesets.contains(&(idx as u64)),
+            None => false,
+        }
     }
 
     /// Maps local source roots to their parent source roots by bytewise comparing of root paths .
@@ -515,14 +582,164 @@ struct Expander(proc_macro_api::ProcMacro);
 impl ProcMacroExpander for Expander {
     fn expand(
         &self,
-        subtree: &tt::TopSubtree<Span>,
-        attrs: Option<&tt::TopSubtree<Span>>,
+        db: &dyn SourceDatabase,
+        subtree: &tt::TopSubtree,
+        attrs: Option<&tt::TopSubtree>,
         env: &Env,
         def_site: Span,
         call_site: Span,
         mixed_site: Span,
         current_dir: String,
-    ) -> Result<tt::TopSubtree<Span>, ProcMacroExpansionError> {
+    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        let cb = |req| match req {
+            SubRequest::LocalFilePath { file_id } => {
+                let file_id = FileId::from_raw(file_id);
+                let source_root_id = db.file_source_root(file_id).source_root_id(db);
+                let source_root = db.source_root(source_root_id).source_root(db);
+                let name = source_root
+                    .path_for_file(&file_id)
+                    .and_then(|path| path.as_path())
+                    .map(|path| path.to_string());
+
+                Ok(SubResponse::LocalFilePathResult { name })
+            }
+            // Not incremental: requires full file text.
+            SubRequest::SourceText { file_id, ast_id, start, end } => {
+                let range = resolve_sub_span(
+                    db,
+                    file_id,
+                    ast_id,
+                    TextRange::new(TextSize::from(start), TextSize::from(end)),
+                );
+                let source = db.file_text(range.file_id.file_id(db)).text(db);
+                let text = source
+                    .get(usize::from(range.range.start())..usize::from(range.range.end()))
+                    .map(ToOwned::to_owned);
+
+                Ok(SubResponse::SourceTextResult { text })
+            }
+            // Not incremental: requires building line index.
+            SubRequest::LineColumn { file_id, ast_id, offset } => {
+                let range =
+                    resolve_sub_span(db, file_id, ast_id, TextRange::empty(TextSize::from(offset)));
+                let (line, column) = db
+                    .line_column(range.file_id.file_id(db), range.range.start())
+                    .map(|(line, col)| (line + 1, col + 1))
+                    .unwrap_or((1, 1));
+                // proc_macro::Span line/column are 1-based
+                Ok(SubResponse::LineColumnResult { line, column })
+            }
+            SubRequest::FilePath { file_id } => {
+                let file_id = FileId::from_raw(file_id);
+                let source_root_id = db.file_source_root(file_id).source_root_id(db);
+                let source_root = db.source_root(source_root_id).source_root(db);
+                let name = source_root
+                    .path_for_file(&file_id)
+                    .and_then(|path| path.as_path())
+                    .map(|path| path.to_string())
+                    .unwrap_or_default();
+
+                Ok(SubResponse::FilePathResult { name })
+            }
+            // Not incremental: requires global span resolution.
+            SubRequest::ByteRange { file_id, ast_id, start, end } => {
+                let range = resolve_sub_span(
+                    db,
+                    file_id,
+                    ast_id,
+                    TextRange::new(TextSize::from(start), TextSize::from(end)),
+                );
+
+                Ok(SubResponse::ByteRangeResult { range: range.range.into() })
+            }
+            SubRequest::SpanSource { file_id, ast_id, start, end, ctx } => {
+                let span = Span {
+                    range: TextRange::new(TextSize::from(start), TextSize::from(end)),
+                    anchor: SpanAnchor {
+                        file_id: span::EditionedFileId::from_raw(file_id),
+                        ast_id: span::ErasedFileAstId::from_raw(ast_id),
+                    },
+                    // SAFETY: We only receive spans from the server. If someone mess up the communication UB can happen,
+                    // but that will be their problem.
+                    ctx: unsafe { SyntaxContext::from_u32(ctx) },
+                };
+
+                let mut current_span = span;
+                let mut current_ctx = span.ctx;
+
+                while let Some(macro_call_id) = current_ctx.outer_expn(db) {
+                    let macro_call_loc = hir_expand::MacroCallId::from(macro_call_id).loc(db);
+
+                    let call_site_file = macro_call_loc.kind.file_id();
+
+                    let resolved = hir_expand::resolve_span(db, current_span);
+
+                    current_ctx = macro_call_loc.ctxt;
+                    current_span = Span {
+                        range: resolved.range,
+                        anchor: SpanAnchor {
+                            file_id: resolved.file_id.span_file_id(db),
+                            ast_id: span::ROOT_ERASED_FILE_AST_ID,
+                        },
+                        ctx: current_ctx,
+                    };
+
+                    if call_site_file.file_id().is_some() {
+                        break;
+                    }
+                }
+
+                let resolved = hir_expand::resolve_span(db, current_span);
+
+                Ok(SubResponse::SpanSourceResult {
+                    file_id: resolved.file_id.span_file_id(db).as_u32(),
+                    ast_id: span::ROOT_ERASED_FILE_AST_ID.into_raw(),
+                    start: u32::from(resolved.range.start()),
+                    end: u32::from(resolved.range.end()),
+                    ctx: current_span.ctx.into_u32(),
+                })
+            }
+            SubRequest::SpanParent { file_id, ast_id, start, end, ctx } => {
+                let span = Span {
+                    range: TextRange::new(TextSize::from(start), TextSize::from(end)),
+                    anchor: SpanAnchor {
+                        file_id: span::EditionedFileId::from_raw(file_id),
+                        ast_id: span::ErasedFileAstId::from_raw(ast_id),
+                    },
+                    // SAFETY: We only receive spans from the server. If someone mess up the communication UB can happen,
+                    // but that will be their problem.
+                    ctx: unsafe { SyntaxContext::from_u32(ctx) },
+                };
+
+                if let Some(macro_call_id) = span.ctx.outer_expn(db) {
+                    let macro_call_loc = hir_expand::MacroCallId::from(macro_call_id).loc(db);
+
+                    let call_site_file = macro_call_loc.kind.file_id();
+                    let call_site_ast_id = macro_call_loc.kind.erased_ast_id();
+
+                    if let Some(editioned_file_id) = call_site_file.file_id() {
+                        let range = hir_expand::HirFileId::from(editioned_file_id)
+                            .ast_id_map(db)
+                            .get_erased(call_site_ast_id)
+                            .text_range();
+
+                        let parent_span = Some(ParentSpan {
+                            file_id: editioned_file_id.span_file_id(db).as_u32(),
+                            ast_id: span::ROOT_ERASED_FILE_AST_ID.into_raw(),
+                            start: u32::from(range.start()),
+                            end: u32::from(range.end()),
+                            ctx: macro_call_loc.ctxt.into_u32(),
+                        });
+
+                        return Ok(SubResponse::SpanParentResult { parent_span });
+                    }
+                }
+
+                Ok(SubResponse::SpanParentResult { parent_span: None })
+            }
+            // FIXME: implement this
+            SubRequest::SpanJoin { .. } => Ok(SubResponse::SpanJoinResult { span: None }),
+        };
         match self.0.expand(
             subtree.view(),
             attrs.map(|attrs| attrs.view()),
@@ -531,6 +748,7 @@ impl ProcMacroExpander for Expander {
             call_site,
             mixed_site,
             current_dir,
+            Some(&cb),
         ) {
             Ok(Ok(subtree)) => Ok(subtree),
             Ok(Err(err)) => Err(ProcMacroExpansionError::Panic(err)),
@@ -543,26 +761,53 @@ impl ProcMacroExpander for Expander {
     }
 }
 
+fn resolve_sub_span(
+    db: &dyn SourceDatabase,
+    file_id: u32,
+    ast_id: u32,
+    range: TextRange,
+) -> hir_expand::FileRange {
+    let ast_id = span::ErasedFileAstId::from_raw(ast_id);
+    let editioned_file_id = span::EditionedFileId::from_raw(file_id);
+    let span = Span {
+        range,
+        anchor: SpanAnchor { file_id: editioned_file_id, ast_id },
+        ctx: SyntaxContext::root(editioned_file_id.edition()),
+    };
+    hir_expand::resolve_span(db, span)
+}
+
 #[cfg(test)]
 mod tests {
-    use ide_db::base_db::RootQueryDb;
+    use ide_db::base_db::all_crates;
     use vfs::file_set::FileSetConfigBuilder;
 
     use super::*;
 
     #[test]
     fn test_loading_rust_analyzer() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let cargo_toml_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("Cargo.toml");
+        let cargo_toml_path = AbsPathBuf::assert_utf8(cargo_toml_path);
+        let manifest = ProjectManifest::from_manifest_file(cargo_toml_path).unwrap();
+
         let cargo_config = CargoConfig { set_test: true, ..CargoConfig::default() };
         let load_cargo_config = LoadCargoConfig {
             load_out_dirs_from_check: false,
             with_proc_macro_server: ProcMacroServerChoice::None,
             prefill_caches: false,
+            num_worker_threads: 1,
+            proc_macro_processes: 1,
         };
+        let workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_| {}).unwrap();
         let (db, _vfs, _proc_macro) =
-            load_workspace_at(path, &cargo_config, &load_cargo_config, &|_| {}).unwrap();
+            load_workspace(workspace, &cargo_config.extra_env, &load_cargo_config).unwrap();
 
-        let n_crates = db.all_crates().len();
+        let n_crates = all_crates(&db).len();
         // RA has quite a few crates, but the exact count doesn't matter
         assert!(n_crates > 20);
     }
@@ -652,7 +897,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 2, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(2), SourceRootId(1)), (SourceRootId(3), SourceRootId(1))])
     }
@@ -667,7 +912,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(3), SourceRootId(1)),])
     }
@@ -682,7 +927,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(3), SourceRootId(1)),])
     }
@@ -698,7 +943,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
     }
@@ -714,7 +959,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
     }

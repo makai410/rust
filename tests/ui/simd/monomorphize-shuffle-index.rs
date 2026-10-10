@@ -1,14 +1,15 @@
 //@ revisions: old generic generic_with_fn
 //@[old]run-pass
 //@[generic_with_fn]run-pass
+//@ ignore-backends: gcc
 #![feature(
     repr_simd,
-    core_intrinsics,
     intrinsics,
     adt_const_params,
     unsized_const_params,
     generic_const_exprs
 )]
+#![cfg_attr(old, feature(core_intrinsics))]
 #![allow(incomplete_features)]
 
 #[path = "../../auxiliary/minisimd.rs"]

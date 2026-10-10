@@ -1,16 +1,15 @@
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::{self as ast, AttrStyle, Attribute, MetaItem, attr, token};
+use rustc_attr_parsing::{AttributeTemplate, validate_attr};
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed};
 use rustc_expand::base::{Annotatable, ExpandResult, ExtCtxt};
 use rustc_expand::expand::AstFragment;
-use rustc_feature::AttributeTemplate;
-use rustc_lint_defs::BuiltinLintDiag;
 use rustc_lint_defs::builtin::DUPLICATE_MACRO_ATTRIBUTES;
-use rustc_parse::{exp, parser, validate_attr};
-use rustc_session::errors::report_lit_error;
+use rustc_parse::{exp, parser};
+use rustc_session::diagnostics::report_lit_error;
 use rustc_span::{BytePos, Span, Symbol};
 
-use crate::errors;
+use crate::diagnostics;
 
 pub(crate) fn check_builtin_macro_attribute(ecx: &ExtCtxt<'_>, meta_item: &MetaItem, name: Symbol) {
     // All the built-in macro attributes are "words" at the moment.
@@ -48,7 +47,7 @@ pub(crate) fn warn_on_duplicate_attribute(ecx: &ExtCtxt<'_>, item: &Annotatable,
                 DUPLICATE_MACRO_ATTRIBUTES,
                 attr.span,
                 ecx.current_expansion.lint_node_id,
-                BuiltinLintDiag::DuplicateMacroAttribute,
+                diagnostics::DuplicateMacroAttribute,
             );
         }
     }
@@ -78,8 +77,6 @@ type UnexpectedExprKind<'a> = Result<(Diag<'a>, bool /* has_suggestions */), Err
 /// The returned bool indicates whether an applicable suggestion has already been
 /// added to the diagnostic to avoid emitting multiple suggestions. `Err(Err(ErrorGuaranteed))`
 /// indicates that an ast error was encountered.
-// FIXME(Nilstrieb) Make this function setup translatable
-#[allow(rustc::untranslatable_diagnostic)]
 pub(crate) fn expr_to_spanned_string<'a>(
     cx: &'a mut ExtCtxt<'_>,
     expr: Box<ast::Expr>,
@@ -109,7 +106,7 @@ pub(crate) fn expr_to_spanned_string<'a>(
             Ok(ast::LitKind::ByteStr(..)) => {
                 let mut err = cx.dcx().struct_span_err(expr.span, err_msg);
                 let span = expr.span.shrink_to_lo();
-                err.span_suggestion(
+                err.span_suggestion_short(
                     span.with_hi(span.lo() + BytePos(1)),
                     "consider removing the leading `b`",
                     "",
@@ -139,7 +136,7 @@ pub(crate) fn expr_to_string(
 ) -> ExpandResult<Result<(Symbol, ast::StrStyle), ErrorGuaranteed>, ()> {
     expr_to_spanned_string(cx, expr, err_msg).map(|res| {
         res.map_err(|err| match err {
-            Ok((err, _)) => err.emit(),
+            Ok((err, _)) => err.emit_err(),
             Err(guar) => guar,
         })
         .map(|ExprToSpannedString { symbol, style, .. }| (symbol, style))
@@ -152,7 +149,7 @@ pub(crate) fn expr_to_string(
 /// (this should be done as rarely as possible).
 pub(crate) fn check_zero_tts(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream, name: &str) {
     if !tts.is_empty() {
-        cx.dcx().emit_err(errors::TakesNoArguments { span, name });
+        cx.dcx().emit_err(diagnostics::TakesNoArguments { span, name });
     }
 }
 
@@ -160,7 +157,7 @@ pub(crate) fn check_zero_tts(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream, nam
 pub(crate) fn parse_expr(p: &mut parser::Parser<'_>) -> Result<Box<ast::Expr>, ErrorGuaranteed> {
     let guar = match p.parse_expr() {
         Ok(expr) => return Ok(expr),
-        Err(err) => err.emit(),
+        Err(err) => err.emit_err(),
     };
     while p.token != token::Eof {
         p.bump();
@@ -194,7 +191,7 @@ pub(crate) fn get_single_str_spanned_from_tts(
     };
     expr_to_spanned_string(cx, ret, "argument must be a string literal").map(|res| {
         res.map_err(|err| match err {
-            Ok((err, _)) => err.emit(),
+            Ok((err, _)) => err.emit_err(),
             Err(guar) => guar,
         })
         .map(|ExprToSpannedString { symbol, span, .. }| (symbol, span))
@@ -211,7 +208,7 @@ pub(crate) fn get_single_expr_from_tts(
 ) -> ExpandResult<Result<Box<ast::Expr>, ErrorGuaranteed>, ()> {
     let mut p = cx.new_parser_from_tts(tts);
     if p.token == token::Eof {
-        let guar = cx.dcx().emit_err(errors::OnlyOneArgument { span, name });
+        let guar = cx.dcx().emit_err(diagnostics::OnlyOneArgument { span, name });
         return ExpandResult::Ready(Err(guar));
     }
     let ret = match parse_expr(&mut p) {
@@ -221,7 +218,7 @@ pub(crate) fn get_single_expr_from_tts(
     let _ = p.eat(exp!(Comma));
 
     if p.token != token::Eof {
-        cx.dcx().emit_err(errors::OnlyOneArgument { span, name });
+        cx.dcx().emit_err(diagnostics::OnlyOneArgument { span, name });
     }
     ExpandResult::Ready(Ok(ret))
 }
@@ -255,7 +252,7 @@ pub(crate) fn get_exprs_from_tts(
             continue;
         }
         if p.token != token::Eof {
-            let guar = cx.dcx().emit_err(errors::ExpectedCommaInList { span: p.token.span });
+            let guar = cx.dcx().emit_err(diagnostics::ExpectedCommaInList { span: p.token.span });
             return ExpandResult::Ready(Err(guar));
         }
     }

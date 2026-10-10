@@ -2,112 +2,128 @@
 // That pass replaces debuginfo for `a => _x` where `_x = &b` to be `a => &b`,
 // and leaves codegen to create a ladder of allocations so as `*a == b`.
 //
+// FIXME: Currently emits warning: MIR pass `ConstDebugInfo` is unknown and will be ignored
 //@ compile-flags:-g -Zmir-enable-passes=+ReferencePropagation,-ConstDebugInfo
 //@ disable-gdb-pretty-printers
+//@ ignore-backends: gcc
+
+// FIXME(f128): Merge `apple` revision once Apple releases Xcode with LLVM 22.
+//@ revisions: not-apple apple
+//@[not-apple] ignore-apple
+//@[apple] only-apple
+// `f128` support was added to `lldb` in version 22.
+//@ min-llvm-lldb-version: 22
 
 // === GDB TESTS ===================================================================================
 
-// gdb-command:run
-// gdb-command:print *bool_ref
-// gdb-check:$1 = true
+//@ gdb-command:run
+//@ gdb-command:print *bool_ref
+//@ gdb-check:$1 = true
 
-// gdb-command:print *int_ref
-// gdb-check:$2 = -1
+//@ gdb-command:print *int_ref
+//@ gdb-check:$2 = -1
 
-// gdb-command:print/d *char_ref
-// gdb-check:$3 = 97
+//@ gdb-command:print/d *char_ref
+//@ gdb-check:$3 = 97
 
-// gdb-command:print *i8_ref
-// gdb-check:$4 = 68
+//@ gdb-command:print *i8_ref
+//@ gdb-check:$4 = 68
 
-// gdb-command:print *i16_ref
-// gdb-check:$5 = -16
+//@ gdb-command:print *i16_ref
+//@ gdb-check:$5 = -16
 
-// gdb-command:print *i32_ref
-// gdb-check:$6 = -32
+//@ gdb-command:print *i32_ref
+//@ gdb-check:$6 = -32
 
-// gdb-command:print *i64_ref
-// gdb-check:$7 = -64
+//@ gdb-command:print *i64_ref
+//@ gdb-check:$7 = -64
 
-// gdb-command:print *uint_ref
-// gdb-check:$8 = 1
+//@ gdb-command:print *uint_ref
+//@ gdb-check:$8 = 1
 
-// gdb-command:print *u8_ref
-// gdb-check:$9 = 100
+//@ gdb-command:print *u8_ref
+//@ gdb-check:$9 = 100
 
-// gdb-command:print *u16_ref
-// gdb-check:$10 = 16
+//@ gdb-command:print *u16_ref
+//@ gdb-check:$10 = 16
 
-// gdb-command:print *u32_ref
-// gdb-check:$11 = 32
+//@ gdb-command:print *u32_ref
+//@ gdb-check:$11 = 32
 
-// gdb-command:print *u64_ref
-// gdb-check:$12 = 64
+//@ gdb-command:print *u64_ref
+//@ gdb-check:$12 = 64
 
-// gdb-command:print *f16_ref
-// gdb-check:$13 = 1.5
+//@ gdb-command:print *f16_ref
+//@ gdb-check:$13 = 1.5
 
-// gdb-command:print *f32_ref
-// gdb-check:$14 = 2.5
+//@ gdb-command:print *f32_ref
+//@ gdb-check:$14 = 2.5
 
-// gdb-command:print *f64_ref
-// gdb-check:$15 = 3.5
+//@ gdb-command:print *f64_ref
+//@ gdb-check:$15 = 3.5
 
-// gdb-command:print *f64_double_ref
-// gdb-check:$16 = 3.5
+// FIXME(f128): gdb doesn't support Rust `f128` yet.
+
+//@ gdb-command:print *f64_double_ref
+//@ gdb-check:$16 = 3.5
 
 
 // === LLDB TESTS ==================================================================================
 
-// lldb-command:run
-// lldb-command:v *bool_ref
-// lldb-check:[...] true
+//@ lldb-command:run
+//@ lldb-command:v *bool_ref
+//@ lldb-check:[...] true
 
-// lldb-command:v *int_ref
-// lldb-check:[...] -1
+//@ lldb-command:v *int_ref
+//@ lldb-check:[...] -1
 
+//@ lldb-command:v *char_ref
+//@ lldb-check: [...] U+[...]61 U'a'
 
-// lldb-command:v *i8_ref
-// lldb-check:[...] 'D'
+//@ lldb-command:v *i8_ref
+//@ lldb-check:[...] 68
 
-// lldb-command:v *i16_ref
-// lldb-check:[...] -16
+//@ lldb-command:v *i16_ref
+//@ lldb-check:[...] -16
 
-// lldb-command:v *i32_ref
-// lldb-check:[...] -32
+//@ lldb-command:v *i32_ref
+//@ lldb-check:[...] -32
 
-// lldb-command:v *i64_ref
-// lldb-check:[...] -64
+//@ lldb-command:v *i64_ref
+//@ lldb-check:[...] -64
 
-// lldb-command:v *uint_ref
-// lldb-check:[...] 1
+//@ lldb-command:v *uint_ref
+//@ lldb-check:[...] 1
 
-// lldb-command:v *u8_ref
-// lldb-check:[...] 'd'
+//@ lldb-command:v *u8_ref
+//@ lldb-check:[...] 100
 
-// lldb-command:v *u16_ref
-// lldb-check:[...] 16
+//@ lldb-command:v *u16_ref
+//@ lldb-check:[...] 16
 
-// lldb-command:v *u32_ref
-// lldb-check:[...] 32
+//@ lldb-command:v *u32_ref
+//@ lldb-check:[...] 32
 
-// lldb-command:v *u64_ref
-// lldb-check:[...] 64
+//@ lldb-command:v *u64_ref
+//@ lldb-check:[...] 64
 
-// lldb-command:v *f16_ref
-// lldb-check:[...] 1.5
+//@ lldb-command:v *f16_ref
+//@ lldb-check:[...] 1.5
 
-// lldb-command:v *f32_ref
-// lldb-check:[...] 2.5
+//@ lldb-command:v *f32_ref
+//@ lldb-check:[...] 2.5
 
-// lldb-command:v *f64_ref
-// lldb-check:[...] 3.5
+//@ lldb-command:v *f64_ref
+//@ lldb-check:[...] 3.5
 
-// lldb-command:v *f64_double_ref
-// lldb-check:[...] 3.5
+//@ lldb-command:v *f128_ref
+//@[not-apple] lldb-check:[...] 4.5
+
+//@ lldb-command:v *f64_double_ref
+//@ lldb-check:[...] 3.5
 
 #![allow(unused_variables)]
-#![feature(f16)]
+#![feature(f16, f128)]
 
 fn main() {
     let bool_val: bool = true;
@@ -155,6 +171,9 @@ fn main() {
     let f64_val: f64 = 3.5;
     let f64_ref: &f64 = &f64_val;
     let f64_double_ref: &f64 = &f64_ref;
+
+    let f128_val: f128 = 4.5;
+    let f128_ref: &f128 = &f128_val;
 
     zzz(); // #break
 }

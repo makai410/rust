@@ -16,18 +16,20 @@ mod proc_macros;
 
 use std::{any::TypeId, iter, ops::Range, sync};
 
-use base_db::RootQueryDb;
+use base_db::SourceDatabase;
 use expect_test::Expect;
 use hir_expand::{
-    AstId, InFile, MacroCallId, MacroCallKind, MacroKind,
+    AstId, ExpansionInfo, HirFileId, InFile, MacroCallId, MacroCallKind, MacroKind,
     builtin::quote::quote,
-    db::ExpandDatabase,
     proc_macro::{ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
-    span_map::SpanMapRef,
+    span_map::SpanMap,
 };
 use intern::{Symbol, sym};
 use itertools::Itertools;
-use span::{Edition, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext};
+use span::{
+    Edition, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor,
+    SyntaxContext,
+};
 use stdx::{format_to, format_to_acc};
 use syntax::{
     AstNode, AstPtr,
@@ -41,7 +43,7 @@ use tt::{TextRange, TextSize};
 
 use crate::{
     AdtId, Lookup, ModuleDefId,
-    db::DefDatabase,
+    expr_store::Body,
     nameres::{DefMap, ModuleSource, crate_def_map},
     src::HasSource,
     test_db::TestDB,
@@ -50,6 +52,8 @@ use crate::{
 
 #[track_caller]
 fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
+    crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
+
     let db = TestDB::with_files(ra_fixture);
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
@@ -57,9 +61,9 @@ fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
         .modules()
         .flat_map(|module| module.1.scope.all_macro_calls())
         .filter_map(|macro_call| {
-            let errors = db.parse_macro_expansion_error(macro_call)?;
+            let errors = macro_call.parse_macro_expansion_error(&db)?;
             let errors = errors.err.as_ref()?.render_to_string(&db);
-            let macro_loc = db.lookup_intern_macro_call(macro_call);
+            let macro_loc = macro_call.loc(&db);
             let ast_id = match macro_loc.kind {
                 MacroCallKind::FnLike { ast_id, .. } => ast_id.map(|it| it.erase()),
                 MacroCallKind::Derive { ast_id, .. } => ast_id.map(|it| it.erase()),
@@ -69,18 +73,23 @@ fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
             let editioned_file_id =
                 ast_id.file_id.file_id().expect("macros inside macros are not supported");
 
-            let ast = db.parse(editioned_file_id).syntax_node();
-            let ast_id_map = db.ast_id_map(ast_id.file_id);
+            let ast = editioned_file_id.parse(&db).syntax_node();
+            let ast_id_map = ast_id.file_id.ast_id_map(&db);
             let node = ast_id_map.get_erased(ast_id.value).to_node(&ast);
             Some((node.text_range(), errors))
         })
         .sorted_unstable_by_key(|(range, _)| range.start())
         .format_with("\n", |(range, err), format| format(&format_args!("{range:?}: {err}")))
         .to_string();
+
+    crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(true);
+
     expect.assert_eq(&errors);
 }
 
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, mut expect: Expect) {
+    crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
+
     let extra_proc_macros = vec![(
         r#"
 #[proc_macro_attribute]
@@ -97,42 +106,10 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         },
     )];
 
-    fn resolve(
-        db: &dyn DefDatabase,
-        def_map: &DefMap,
-        ast_id: AstId<ast::MacroCall>,
-        ast_ptr: InFile<AstPtr<ast::MacroCall>>,
-    ) -> Option<MacroCallId> {
-        def_map.modules().find_map(|module| {
-            for decl in
-                module.1.scope.declarations().chain(module.1.scope.unnamed_consts().map(Into::into))
-            {
-                let body = match decl {
-                    ModuleDefId::FunctionId(it) => it.into(),
-                    ModuleDefId::ConstId(it) => it.into(),
-                    ModuleDefId::StaticId(it) => it.into(),
-                    _ => continue,
-                };
-
-                let (body, sm) = db.body_with_source_map(body);
-                if let Some(it) =
-                    body.blocks(db).find_map(|block| resolve(db, block.1, ast_id, ast_ptr))
-                {
-                    return Some(it);
-                }
-                if let Some((_, res)) = sm.macro_calls().find(|it| it.0 == ast_ptr) {
-                    return Some(res);
-                }
-            }
-            module.1.scope.macro_invoc(ast_id)
-        })
-    }
-
     let db = TestDB::with_files_extra_proc_macros(ra_fixture, extra_proc_macros);
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
-    let local_id = DefMap::ROOT;
-    let source = def_map[local_id].definition_source(&db);
+    let source = def_map[def_map.root].definition_source(&db);
     let source_file = match source.value {
         ModuleSource::SourceFile(it) => it,
         ModuleSource::Module(_) | ModuleSource::BlockExpr(_) => panic!(),
@@ -142,12 +119,12 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
     let mut expansions = Vec::new();
 
     for macro_call_node in source_file.syntax().descendants().filter_map(ast::MacroCall::cast) {
-        let ast_id = db.ast_id_map(source.file_id).ast_id(&macro_call_node);
+        let ast_id = source.file_id.ast_id_map(&db).ast_id(&macro_call_node);
         let ast_id = InFile::new(source.file_id, ast_id);
         let ptr = InFile::new(source.file_id, AstPtr::new(&macro_call_node));
-        let macro_call_id = resolve(&db, def_map, ast_id, ptr)
+        let macro_call_id = resolve_macro_call_id(&db, def_map, ast_id, ptr)
             .unwrap_or_else(|| panic!("unable to find semantic macro call {macro_call_node}"));
-        let expansion_result = db.parse_macro_expansion(macro_call_id);
+        let expansion_result = macro_call_id.parse_macro_expansion(&db);
         expansions.push((macro_call_node.clone(), expansion_result));
     }
 
@@ -164,10 +141,10 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         }
 
         let mut expn_text = String::new();
-        if let Some(err) = exp.err {
+        if let Some(err) = &exp.err {
             format_to!(expn_text, "/* error: {} */", err.render_to_string(&db).message);
         }
-        let (parse, token_map) = exp.value;
+        let (parse, token_map) = &exp.value;
         if expect_errors {
             assert!(!parse.errors().is_empty(), "no parse errors in expansion");
             for e in parse.errors() {
@@ -183,7 +160,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         }
         let pp = pretty_print_macro_expansion(
             parse.syntax_node(),
-            SpanMapRef::ExpansionSpanMap(&token_map),
+            SpanMap::ExpansionSpanMap(token_map),
             show_spans,
             show_ctxt,
         );
@@ -209,7 +186,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         expanded_text.replace_range(range, &text);
     }
 
-    for decl_id in def_map[local_id].scope.declarations() {
+    for decl_id in def_map[def_map.root].scope.declarations() {
         // FIXME: I'm sure there's already better way to do this
         let src = match decl_id {
             ModuleDefId::AdtId(AdtId::StructId(struct_id)) => {
@@ -237,7 +214,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
             }
             let pp = pretty_print_macro_expansion(
                 src.value,
-                db.span_map(src.file_id).as_ref(),
+                src.file_id.span_map(&db),
                 show_spans,
                 show_ctxt,
             );
@@ -245,14 +222,14 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         }
     }
 
-    for impl_id in def_map[local_id].scope.impls() {
-        let src = impl_id.lookup(&db).source(&db);
-        if let Some(macro_file) = src.file_id.macro_file()
-            && let MacroKind::DeriveBuiltIn | MacroKind::Derive = macro_file.kind(&db)
-        {
+    for (_, module) in def_map.modules() {
+        let Some(src) = module.declaration_source(&db) else {
+            continue;
+        };
+        if let Some(macro_file) = src.file_id.macro_file() {
             let pp = pretty_print_macro_expansion(
                 src.value.syntax().clone(),
-                db.span_map(macro_file.into()).as_ref(),
+                HirFileId::from(macro_file).span_map(&db),
                 false,
                 false,
             );
@@ -260,8 +237,57 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         }
     }
 
+    for impl_id in def_map[def_map.root].scope.impls() {
+        let src = impl_id.lookup(&db).source(&db);
+        if let Some(macro_file) = src.file_id.macro_file()
+            && let MacroKind::DeriveBuiltIn | MacroKind::Derive = macro_file.kind(&db)
+        {
+            let pp = pretty_print_macro_expansion(
+                src.value.syntax().clone(),
+                HirFileId::from(macro_file).span_map(&db),
+                false,
+                false,
+            );
+            format_to!(expanded_text, "\n{}", pp)
+        }
+    }
+
+    crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(true);
+
     expect.indent(false);
     expect.assert_eq(&expanded_text);
+}
+
+fn resolve_macro_call_id(
+    db: &dyn SourceDatabase,
+    def_map: &DefMap,
+    ast_id: AstId<ast::MacroCall>,
+    ast_ptr: InFile<AstPtr<ast::MacroCall>>,
+) -> Option<MacroCallId> {
+    def_map.modules().find_map(|module| {
+        for decl in
+            module.1.scope.declarations().chain(module.1.scope.unnamed_consts().map(Into::into))
+        {
+            let body = match decl {
+                ModuleDefId::FunctionId(it) => it.into(),
+                ModuleDefId::ConstId(it) => it.into(),
+                ModuleDefId::StaticId(it) => it.into(),
+                _ => continue,
+            };
+
+            let (body, sm) = Body::with_source_map(db, body);
+            if let Some(it) = body
+                .blocks(db)
+                .find_map(|block| resolve_macro_call_id(db, block.1, ast_id, ast_ptr))
+            {
+                return Some(it);
+            }
+            if let Some((_, res)) = sm.macro_calls().find(|it| it.0 == ast_ptr) {
+                return Some(res);
+            }
+        }
+        module.1.scope.macro_invoc(ast_id)
+    })
 }
 
 fn reindent(indent: IndentLevel, pp: String) -> String {
@@ -282,7 +308,7 @@ fn reindent(indent: IndentLevel, pp: String) -> String {
 
 fn pretty_print_macro_expansion(
     expn: SyntaxNode,
-    map: SpanMapRef<'_>,
+    map: SpanMap<'_>,
     show_spans: bool,
     show_ctxt: bool,
 ) -> String {
@@ -360,6 +386,7 @@ struct IdentityWhenValidProcMacroExpander;
 impl ProcMacroExpander for IdentityWhenValidProcMacroExpander {
     fn expand(
         &self,
+        _: &dyn SourceDatabase,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &base_db::Env,
@@ -372,7 +399,6 @@ impl ProcMacroExpander for IdentityWhenValidProcMacroExpander {
             subtree,
             syntax_bridge::TopEntryPoint::MacroItems,
             &mut |_| span::Edition::CURRENT,
-            span::Edition::CURRENT,
         );
         if parse.errors().is_empty() {
             Ok(subtree.clone())
@@ -413,10 +439,52 @@ fn regression_20171() {
         #dollar_crate::panic::panic_2021!();
     }}
         };
-    token_tree_to_syntax_node(
-        &tt,
-        syntax_bridge::TopEntryPoint::MacroStmts,
-        &mut |_| Edition::CURRENT,
-        Edition::CURRENT,
-    );
+    token_tree_to_syntax_node(&tt, syntax_bridge::TopEntryPoint::MacroStmts, &mut |_| {
+        Edition::CURRENT
+    });
+}
+
+#[test]
+fn no_downmap() {
+    let fixture = r#"
+macro_rules! m {
+    ($func_name:ident) => {
+        fn $func_name() { todo!() }
+    };
+}
+m!(f);
+m!(g);
+    "#;
+
+    let (db, file_id) = TestDB::with_single_file(fixture);
+    let krate = db.test_crate();
+    let def_map = crate_def_map(&db, krate);
+    let source = def_map[def_map.root].definition_source(&db);
+    let source_file = match source.value {
+        ModuleSource::SourceFile(it) => it,
+        ModuleSource::Module(_) | ModuleSource::BlockExpr(_) => panic!(),
+    };
+    let span_map = HirFileId::from(file_id).span_map(&db);
+    let no_downmap_spans: Vec<_> = source_file
+        .syntax()
+        .descendants()
+        .map(|node| {
+            let mut span = span_map.span_for_range(node.text_range());
+            span.anchor.ast_id = NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER;
+            span
+        })
+        .collect();
+
+    for macro_call_node in source_file.syntax().descendants().filter_map(ast::MacroCall::cast) {
+        let ast_id = source.file_id.ast_id_map(&db).ast_id(&macro_call_node);
+        let ast_id = InFile::new(source.file_id, ast_id);
+        let ptr = InFile::new(source.file_id, AstPtr::new(&macro_call_node));
+        let macro_call_id = resolve_macro_call_id(&db, def_map, ast_id, ptr)
+            .unwrap_or_else(|| panic!("unable to find semantic macro call {macro_call_node}"));
+        let expansion_info = ExpansionInfo::new(&db, macro_call_id);
+        for &span in no_downmap_spans.iter() {
+            assert!(expansion_info.map_range_down(span).is_none());
+            assert!(expansion_info.map_range_down_exact(span).is_none());
+        }
+    }
 }

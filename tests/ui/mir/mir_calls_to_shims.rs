@@ -1,8 +1,8 @@
+//@ edition:2015..2021
 //@ run-pass
 //@ needs-unwind
 
 #![feature(fn_traits)]
-#![feature(never_type)]
 
 use std::panic;
 

@@ -1,5 +1,7 @@
-// skip-filecheck
-#![feature(never_type)]
+//@ skip-filecheck
+//
+// check that we mark blocks with `!` locals as unreachable.
+// (and currently don't do the same for other uninhabited types)
 
 #[derive(Copy, Clone)]
 pub enum Void {}

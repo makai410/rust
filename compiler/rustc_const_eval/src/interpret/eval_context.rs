@@ -1,28 +1,31 @@
-use std::assert_matches::debug_assert_matches;
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 
 use either::{Left, Right};
 use rustc_abi::{Align, HasDataLayout, Size, TargetDataLayout};
-use rustc_errors::DiagCtxtHandle;
+use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
+use rustc_middle::mir;
 use rustc_middle::mir::interpret::{ErrorHandled, InvalidMetaKind, ReportedErrorInfo};
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::{
     self, FnAbiError, FnAbiOf, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOf,
     LayoutOfHelpers, TyAndLayout,
 };
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypingEnv, Variance};
-use rustc_middle::{mir, span_bug};
-use rustc_session::Limit;
-use rustc_span::Span;
+use rustc_middle::ty::{
+    self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeVisitableExt, TypingEnv, Variance,
+};
+use rustc_span::{Span, span_bug};
+use rustc_structures::Limit;
 use rustc_target::callconv::FnAbi;
 use tracing::{debug, trace};
 
 use super::{
-    Frame, FrameInfo, GlobalId, InterpErrorInfo, InterpErrorKind, InterpResult, MPlaceTy, Machine,
-    MemPlaceMeta, Memory, OpTy, Place, PlaceTy, PointerArithmetic, Projectable, Provenance,
-    err_inval, interp_ok, throw_inval, throw_ub, throw_ub_custom,
+    Frame, FrameInfo, GlobalId, InterpErrorKind, InterpResult, MPlaceTy, Machine, MemPlaceMeta,
+    Memory, OpTy, Place, PlaceTy, PointerArithmetic, Projectable, Provenance, err_inval, interp_ok,
+    throw_inval, throw_ub, throw_ub_format,
 };
-use crate::{ReportErrorExt, enter_trace_span, fluent_generated as fluent, util};
+use crate::{enter_trace_span, util};
 
 pub struct InterpCx<'tcx, M: Machine<'tcx>> {
     /// Stores the `Machine` instance.
@@ -38,6 +41,9 @@ pub struct InterpCx<'tcx, M: Machine<'tcx>> {
     /// The current context in case we're evaluating in a
     /// polymorphic context. This always uses `ty::TypingMode::PostAnalysis`.
     pub(super) typing_env: ty::TypingEnv<'tcx>,
+
+    /// The query cache is slow so we have our own cache in front of it.
+    pub(super) layout_cache: RefCell<FxHashMap<Ty<'tcx>, rustc_abi::Layout<'tcx>>>,
 
     /// The virtual memory system.
     pub memory: Memory<'tcx, M>,
@@ -84,10 +90,30 @@ impl<'tcx, M: Machine<'tcx>> LayoutOfHelpers<'tcx> for InterpCx<'tcx, M> {
     #[inline]
     fn handle_layout_err(
         &self,
-        err: LayoutError<'tcx>,
+        mut err: LayoutError<'tcx>,
         _: Span,
         _: Ty<'tcx>,
     ) -> InterpErrorKind<'tcx> {
+        // FIXME(#149283): This is really hacky and is only used to hide type
+        // system bugs. We use it as a temporary fix for #149081.
+        //
+        // While it's expected that we sometimes get ambiguity errors when
+        // entering another generic environment while the current environment
+        // itself is still generic, we should never fail to entirely prove
+        // something.
+        match err {
+            LayoutError::NormalizationFailure(ty, _) => {
+                if ty.has_non_region_param() {
+                    err = LayoutError::TooGeneric(ty);
+                }
+            }
+
+            LayoutError::Unknown(_)
+            | LayoutError::SizeOverflow(_)
+            | LayoutError::InvalidSimd { .. }
+            | LayoutError::TooGeneric(_)
+            | LayoutError::ReferencesError(_) => {}
+        }
         err_inval!(Layout(err))
     }
 }
@@ -111,10 +137,19 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// This inherent method takes priority over the trait method with the same name in LayoutOf,
     /// and allows wrapping the actual [LayoutOf::layout_of] with a tracing span.
     /// See [LayoutOf::layout_of] for the original documentation.
-    #[inline(always)]
-    pub fn layout_of(&self, ty: Ty<'tcx>) -> <Self as LayoutOfHelpers<'tcx>>::LayoutOfResult {
-        let _trace = enter_trace_span!(M, layouting::layout_of, ty = ?ty.kind());
-        LayoutOf::layout_of(self, ty)
+    #[inline]
+    pub fn layout_of(&self, ty: Ty<'tcx>) -> Result<TyAndLayout<'tcx>, InterpErrorKind<'tcx>> {
+        match self.layout_cache.borrow_mut().entry(ty) {
+            Entry::Occupied(occupied_entry) => {
+                Ok(TyAndLayout { ty, layout: *occupied_entry.get() })
+            }
+            Entry::Vacant(vacant_entry) => {
+                let _trace = enter_trace_span!(M, layouting::layout_of, ty = ?ty.kind());
+                let layout = LayoutOf::layout_of(self, ty)?;
+                vacant_entry.insert(layout.layout);
+                Ok(layout)
+            }
+        }
     }
 
     /// This inherent method takes priority over the trait method with the same name in FnAbiOf,
@@ -131,39 +166,44 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     }
 
     /// This inherent method takes priority over the trait method with the same name in FnAbiOf,
-    /// and allows wrapping the actual [FnAbiOf::fn_abi_of_instance] with a tracing span.
-    /// See [FnAbiOf::fn_abi_of_instance] for the original documentation.
+    /// and allows wrapping the actual [FnAbiOf::fn_abi_of_instance_no_deduced_attrs] with a tracing span.
+    /// See [FnAbiOf::fn_abi_of_instance_no_deduced_attrs] for the original documentation.
     #[inline(always)]
-    pub fn fn_abi_of_instance(
+    pub fn fn_abi_of_instance_no_deduced_attrs(
         &self,
         instance: ty::Instance<'tcx>,
         extra_args: &'tcx ty::List<Ty<'tcx>>,
     ) -> <Self as FnAbiOfHelpers<'tcx>>::FnAbiOfResult {
         let _trace = enter_trace_span!(M, layouting::fn_abi_of_instance, ?instance, ?extra_args);
-        FnAbiOf::fn_abi_of_instance(self, instance, extra_args)
+        FnAbiOf::fn_abi_of_instance_no_deduced_attrs(self, instance, extra_args)
     }
 }
 
 /// Test if it is valid for a MIR assignment to assign `src`-typed place to `dest`-typed value.
-/// This test should be symmetric, as it is primarily about layout compatibility.
 pub(super) fn mir_assign_valid_types<'tcx>(
     tcx: TyCtxt<'tcx>,
     typing_env: TypingEnv<'tcx>,
     src: TyAndLayout<'tcx>,
     dest: TyAndLayout<'tcx>,
 ) -> bool {
-    // Type-changing assignments can happen when subtyping is used. While
-    // all normal lifetimes are erased, higher-ranked types with their
-    // late-bound lifetimes are still around and can lead to type
-    // differences.
+    // We *could* check `Invariant` here since all subtyping must be explicit post-borrowck.
+    // However, this check is also used by the interpreter to figure out if a transmute can be
+    // turned into a regular assignment (which has a more efficient codepath), so we want the check
+    // to consider as many assignments as possible to be valid. Therefore we are happy to accept
+    // one-way subtyping.
     if util::relate_types(tcx, typing_env, Variance::Covariant, src.ty, dest.ty) {
-        // Make sure the layout is equal, too -- just to be safe. Miri really
-        // needs layout equality. For performance reason we skip this check when
-        // the types are equal. Equal types *can* have different layouts when
-        // enum downcast is involved (as enum variants carry the type of the
-        // enum), but those should never occur in assignments.
+        // Make sure the layout is equal, too -- just to be safe. Miri really needs layout equality.
+        // For performance reason we skip this check when the types are equal. Equal types *can*
+        // have different layouts when enum downcast is involved (as enum variants carry the type of
+        // the enum), but those should never occur in assignments.
         if cfg!(debug_assertions) || src.ty != dest.ty {
-            assert_eq!(src.layout, dest.layout);
+            assert_eq!(
+                src.layout,
+                dest.layout,
+                "{src} is a subtype of {dest} but they have different layout",
+                src = src.ty,
+                dest = dest.ty,
+            );
         }
         true
     } else {
@@ -199,26 +239,6 @@ pub(super) fn from_known_layout<'tcx>(
     }
 }
 
-/// Turn the given error into a human-readable string. Expects the string to be printed, so if
-/// `RUSTC_CTFE_BACKTRACE` is set this will show a backtrace of the rustc internals that
-/// triggered the error.
-///
-/// This is NOT the preferred way to render an error; use `report` from `const_eval` instead.
-/// However, this is useful when error messages appear in ICEs.
-pub fn format_interp_error<'tcx>(dcx: DiagCtxtHandle<'_>, e: InterpErrorInfo<'tcx>) -> String {
-    let (e, backtrace) = e.into_parts();
-    backtrace.print_backtrace();
-    // FIXME(fee1-dead), HACK: we want to use the error as title therefore we can just extract the
-    // label and arguments from the InterpError.
-    #[allow(rustc::untranslatable_diagnostic)]
-    let mut diag = dcx.struct_allow("");
-    let msg = e.diagnostic_message();
-    e.add_args(&mut diag);
-    let s = dcx.eagerly_translate_to_string(msg, diag.args.iter());
-    diag.cancel();
-    s
-}
-
 impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
@@ -226,15 +246,13 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         typing_env: ty::TypingEnv<'tcx>,
         machine: M,
     ) -> Self {
-        // Const eval always happens in post analysis mode in order to be able to use the hidden types of
-        // opaque types. This is needed for trivial things like `size_of`, but also for using associated
-        // types that are not specified in the opaque type. We also use MIR bodies whose opaque types have
-        // already been revealed, so we'd be able to at least partially observe the hidden types anyways.
-        debug_assert_matches!(typing_env.typing_mode, ty::TypingMode::PostAnalysis);
+        crate::assert_typing_mode(typing_env.typing_mode());
+
         InterpCx {
             machine,
             tcx: tcx.at(root_span),
             typing_env,
+            layout_cache: RefCell::new(FxHashMap::default()),
             memory: Memory::new(),
             recursion_limit: tcx.recursion_limit(),
         }
@@ -267,12 +285,12 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
     #[inline(always)]
     pub fn frame(&self) -> &Frame<'tcx, M::Provenance, M::FrameExtra> {
-        self.stack().last().expect("no call frames exist")
+        self.stack().last().expect("a call frame should exist")
     }
 
     #[inline(always)]
     pub fn frame_mut(&mut self) -> &mut Frame<'tcx, M::Provenance, M::FrameExtra> {
-        self.stack_mut().last_mut().expect("no call frames exist")
+        self.stack_mut().last_mut().expect("a call frame should exist")
     }
 
     #[inline(always)]
@@ -332,7 +350,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             .try_instantiate_mir_and_normalize_erasing_regions(
                 *self.tcx,
                 self.typing_env,
-                ty::EarlyBinder::bind(value),
+                ty::EarlyBinder::bind(self.tcx.tcx, value),
             )
             .map_err(|_| ErrorHandled::TooGeneric(self.cur_span()))
     }
@@ -469,8 +487,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 }
                 interp_ok(Some((full_size, full_align)))
             }
-            ty::Dynamic(expected_trait, _, ty::Dyn) => {
-                let vtable = metadata.unwrap_meta().to_pointer(self)?;
+            ty::Dynamic(expected_trait, _) => {
+                let vtable = metadata.unwrap_meta().to_pointer(self);
                 // Read size and align from vtable (already checks size).
                 interp_ok(Some(self.get_vtable_size_and_align(vtable, Some(expected_trait))?))
             }
@@ -504,7 +522,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Jump to the given block.
     #[inline]
     pub fn go_to_block(&mut self, target: mir::BasicBlock) {
-        self.frame_mut().loc = Left(mir::Location { block: target, statement_index: 0 });
+        self.frame_mut().loc = Left(target.start_location());
     }
 
     /// *Return* to the given `target` basic block.
@@ -531,10 +549,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     #[cold] // usually we have normal returns, not unwinding
     pub fn unwind_to_block(&mut self, target: mir::UnwindAction) -> InterpResult<'tcx> {
         self.frame_mut().loc = match target {
-            mir::UnwindAction::Cleanup(block) => Left(mir::Location { block, statement_index: 0 }),
+            mir::UnwindAction::Cleanup(block) => Left(block.start_location()),
             mir::UnwindAction::Continue => Right(self.frame_mut().body.span),
             mir::UnwindAction::Unreachable => {
-                throw_ub_custom!(fluent::const_eval_unreachable_unwind);
+                throw_ub_format!("unwinding past a stack frame that does not allow unwinding");
             }
             mir::UnwindAction::Terminate(reason) => {
                 self.frame_mut().loc = Right(self.frame_mut().body.span);
@@ -612,7 +630,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
     #[must_use]
     pub fn generate_stacktrace(&self) -> Vec<FrameInfo<'tcx>> {
-        Frame::generate_stacktrace_from_stack(self.stack())
+        Frame::generate_stacktrace_from_stack(self.stack(), *self.tcx)
     }
 
     pub fn adjust_nan<F1, F2>(&self, f: F2, inputs: &[F1]) -> F2

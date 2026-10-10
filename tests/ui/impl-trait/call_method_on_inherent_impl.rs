@@ -1,6 +1,7 @@
 //@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
-//@[current] check-pass
+//@ check-pass
 
 trait MyDebug {
     fn my_debug(&self);
@@ -16,7 +17,6 @@ where
 fn my_foo() -> impl std::fmt::Debug {
     if false {
         let x = my_foo();
-        //[next]~^ ERROR type annotations needed
         x.my_debug();
     }
     ()

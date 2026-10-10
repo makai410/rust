@@ -5,9 +5,11 @@ cfg_select! {
         target_os = "android",
         target_os = "freebsd",
         target_os = "openbsd",
+        target_os = "motor",
         target_os = "dragonfly",
         all(target_family = "wasm", target_feature = "atomics"),
         target_os = "hermit",
+        all(target_os = "wasi", target_env = "p3"),
     ) => {
         mod futex;
         pub use futex::Mutex;
@@ -16,10 +18,7 @@ cfg_select! {
         mod fuchsia;
         pub use fuchsia::Mutex;
     }
-    any(
-        target_family = "unix",
-        target_os = "teeos",
-    ) => {
+    any(target_family = "unix", target_os = "teeos") => {
         mod pthread;
         pub use pthread::Mutex;
     }

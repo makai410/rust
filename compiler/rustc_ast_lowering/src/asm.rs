@@ -1,16 +1,15 @@
 use std::collections::hash_map::Entry;
-use std::fmt::Write;
 
 use rustc_ast::*;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
+use rustc_errors::msg;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_session::parse::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::{Span, sym};
 use rustc_target::asm;
 
-use super::LoweringContext;
-use super::errors::{
+use crate::diagnostics::{
     AbiSpecifiedMultipleTimes, AttSyntaxOnlyX86, ClobberAbiNotSupported,
     InlineAsmUnsupportedTarget, InvalidAbiClobberAbi, InvalidAsmTemplateModifierConst,
     InvalidAsmTemplateModifierLabel, InvalidAsmTemplateModifierRegClass,
@@ -19,11 +18,10 @@ use super::errors::{
     RegisterConflict,
 };
 use crate::{
-    AllowReturnTypeNotation, ImplTraitContext, ImplTraitPosition, ParamMode,
-    ResolverAstLoweringExt, fluent_generated as fluent,
+    AllowReturnTypeNotation, ImplTraitContext, ImplTraitPosition, LoweringContext, ParamMode,
 };
 
-impl<'a, 'hir> LoweringContext<'a, 'hir> {
+impl<'hir> LoweringContext<'_, 'hir> {
     pub(crate) fn lower_inline_asm(
         &mut self,
         sp: Span,
@@ -51,13 +49,23 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     | asm::InlineAsmArch::LoongArch32
                     | asm::InlineAsmArch::LoongArch64
                     | asm::InlineAsmArch::S390x
+                    | asm::InlineAsmArch::PowerPC
+                    | asm::InlineAsmArch::PowerPC64
             );
-            if !is_stable && !self.tcx.features().asm_experimental_arch() {
+            if !is_stable
+                && !self.tcx.features().asm_experimental_arch()
+                && sp
+                    .ctxt()
+                    .outer_expn_data()
+                    .allow_internal_unstable
+                    .filter(|features| features.contains(&sym::asm_experimental_arch))
+                    .is_none()
+            {
                 feature_err(
                     &self.tcx.sess,
                     sym::asm_experimental_arch,
                     sp,
-                    fluent::ast_lowering_unstable_inline_assembly,
+                    msg!("inline assembly is not stable yet on this architecture"),
                 )
                 .emit();
             }
@@ -74,7 +82,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 &self.tcx.sess,
                 sym::asm_unwind,
                 sp,
-                fluent::ast_lowering_unstable_may_unwind,
+                msg!("the `may_unwind` option is unstable"),
             )
             .emit();
         }
@@ -85,7 +93,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 match asm::InlineAsmClobberAbi::parse(
                     asm_arch,
                     &self.tcx.sess.target,
-                    &self.tcx.sess.unstable_target_features,
+                    &self.tcx.sess.internal_target_features,
                     *abi_name,
                 ) {
                     Ok(abi) => {
@@ -114,13 +122,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         self.dcx().emit_err(ClobberAbiNotSupported { abi_span: *abi_span });
                     }
                     Err(supported_abis) => {
-                        let mut abis = format!("`{}`", supported_abis[0]);
-                        for m in &supported_abis[1..] {
-                            let _ = write!(abis, ", `{m}`");
-                        }
                         self.dcx().emit_err(InvalidAbiClobberAbi {
                             abi_span: *abi_span,
-                            supported_abis: abis,
+                            supported_abis: supported_abis.to_vec().into(),
                         });
                     }
                 }
@@ -136,8 +140,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             .iter()
             .map(|(op, op_sp)| {
                 let lower_reg = |&reg: &_| match reg {
-                    InlineAsmRegOrRegClass::Reg(reg) => {
-                        asm::InlineAsmRegOrRegClass::Reg(if let Some(asm_arch) = asm_arch {
+                    InlineAsmRegOrRegClass::Reg(reg) => hir::InlineAsmRegOrRegClass::Reg {
+                        reg: if let Some(asm_arch) = asm_arch {
                             asm::InlineAsmReg::parse(asm_arch, reg).unwrap_or_else(|error| {
                                 self.dcx().emit_err(InvalidRegister {
                                     op_span: *op_sp,
@@ -148,21 +152,19 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                             })
                         } else {
                             asm::InlineAsmReg::Err
-                        })
-                    }
+                        },
+                        source_name: Some(reg),
+                    },
                     InlineAsmRegOrRegClass::RegClass(reg_class) => {
-                        asm::InlineAsmRegOrRegClass::RegClass(if let Some(asm_arch) = asm_arch {
+                        hir::InlineAsmRegOrRegClass::RegClass(if let Some(asm_arch) = asm_arch {
                             asm::InlineAsmRegClass::parse(asm_arch, reg_class).unwrap_or_else(
                                 |supported_register_classes| {
-                                    let mut register_classes =
-                                        format!("`{}`", supported_register_classes[0]);
-                                    for m in &supported_register_classes[1..] {
-                                        let _ = write!(register_classes, ", `{m}`");
-                                    }
                                     self.dcx().emit_err(InvalidRegisterClass {
                                         op_span: *op_sp,
                                         reg_class,
-                                        supported_register_classes: register_classes,
+                                        supported_register_classes: supported_register_classes
+                                            .to_vec()
+                                            .into(),
                                     });
                                     asm::InlineAsmRegClass::Err
                                 },
@@ -201,7 +203,6 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     },
                     InlineAsmOperand::Sym { sym } => {
                         let static_def_id = self
-                            .resolver
                             .get_partial_res(sym.id)
                             .and_then(|res| res.full_res())
                             .and_then(|res| match res {
@@ -262,23 +263,20 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         }
                         let valid_modifiers = class.valid_modifiers(asm_arch.unwrap());
                         if !valid_modifiers.contains(&modifier) {
-                            let sub = if !valid_modifiers.is_empty() {
-                                let mut mods = format!("`{}`", valid_modifiers[0]);
-                                for m in &valid_modifiers[1..] {
-                                    let _ = write!(mods, ", `{m}`");
-                                }
-                                InvalidAsmTemplateModifierRegClassSub::SupportModifier {
-                                    class_name: class.name(),
-                                    modifiers: mods,
-                                }
-                            } else {
+                            let sub = if valid_modifiers.is_empty() {
                                 InvalidAsmTemplateModifierRegClassSub::DoesNotSupportModifier {
                                     class_name: class.name(),
+                                }
+                            } else {
+                                InvalidAsmTemplateModifierRegClassSub::SupportModifier {
+                                    class_name: class.name(),
+                                    modifiers: valid_modifiers.to_vec().into(),
                                 }
                             };
                             self.dcx().emit_err(InvalidAsmTemplateModifierRegClass {
                                 placeholder_span,
                                 op_span: op_sp,
+                                modifier: modifier.to_string(),
                                 sub,
                             });
                         }
@@ -347,7 +345,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 }
 
                 // Check for conflicts between explicit register operands.
-                if let asm::InlineAsmRegOrRegClass::Reg(reg) = reg {
+                if let hir::InlineAsmRegOrRegClass::Reg { reg, .. } = reg {
                     let (input, output) = match op {
                         hir::InlineAsmOperand::In { .. } => (true, false),
 
@@ -396,24 +394,21 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                                     }
                                     _ => None,
                                 };
-                                let reg_str = |idx| -> &str {
-                                    // HIR asm doesn't preserve the original alias string of the explicit register,
-                                    // so we have to retrieve it from AST
-                                    let (op, _): &(InlineAsmOperand, Span) = &asm.operands[idx];
-                                    if let Some(ast::InlineAsmRegOrRegClass::Reg(reg_sym)) =
-                                        op.reg()
-                                    {
-                                        reg_sym.as_str()
-                                    } else {
-                                        unreachable!("{op:?} is not a register operand");
-                                    }
-                                };
+                                let reg1_name = op
+                                    .reg()
+                                    .and_then(|reg| reg.source_name())
+                                    .expect("{op:?} has no source register name");
+
+                                let reg2_name = op2
+                                    .reg()
+                                    .and_then(|reg| reg.source_name())
+                                    .expect("{op2:?} has no source register name");
 
                                 self.dcx().emit_err(RegisterConflict {
                                     op_span1: op_sp,
                                     op_span2: op_sp2,
-                                    reg1_name: reg_str(idx),
-                                    reg2_name: reg_str(idx2),
+                                    reg1_name: reg1_name.as_str(),
+                                    reg2_name: reg2_name.as_str(),
                                     in_out,
                                 });
                             }
@@ -460,7 +455,10 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 if !output_used {
                     operands.push((
                         hir::InlineAsmOperand::Out {
-                            reg: asm::InlineAsmRegOrRegClass::Reg(clobber),
+                            reg: hir::InlineAsmRegOrRegClass::Reg {
+                                reg: clobber,
+                                source_name: None,
+                            },
                             late: true,
                             expr: None,
                         },
@@ -489,7 +487,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     sess,
                     sym::asm_goto_with_outputs,
                     *op_sp,
-                    fluent::ast_lowering_unstable_inline_assembly_label_operand_with_outputs,
+                    msg!("using both label and output operands for inline assembly is unstable"),
                 )
                 .emit();
             }

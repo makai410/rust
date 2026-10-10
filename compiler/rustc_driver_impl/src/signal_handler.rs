@@ -115,7 +115,8 @@ unsafe extern "C" fn print_stack_trace(signum: libc::c_int) {
     written += rem.len() + 1;
 
     let random_depth = || 8 * 16; // chosen by random diceroll (2d20)
-    if (cyclic || stack.len() > random_depth()) && signum == libc::SIGSEGV {
+    let maybe_stack_overflow = (cyclic || stack.len() > random_depth()) && signum == libc::SIGSEGV;
+    if maybe_stack_overflow {
         // technically speculation, but assert it with confidence anyway.
         // rustc only arrived in this signal handler because bad things happened
         // and this message is for explaining it's not the programmer's fault
@@ -128,7 +129,7 @@ unsafe extern "C" fn print_stack_trace(signum: libc::c_int) {
     }
     raw_errln!("note: we would appreciate a report at https://github.com/rust-lang/rust");
     written += 1;
-    if signum == libc::SIGSEGV {
+    if maybe_stack_overflow {
         // get the current stack size WITHOUT blocking and double it
         let new_size = STACK_SIZE.get().copied().unwrap_or(DEFAULT_STACK_SIZE) * 2;
         raw_errln!(
@@ -152,7 +153,8 @@ pub(super) fn install() {
         libc::sigaltstack(&alt_stack, ptr::null_mut());
 
         let mut sa: libc::sigaction = mem::zeroed();
-        sa.sa_sigaction = print_stack_trace as libc::sighandler_t;
+        sa.sa_sigaction =
+            print_stack_trace as unsafe extern "C" fn(libc::c_int) as libc::sighandler_t;
         sa.sa_flags = libc::SA_NODEFER | libc::SA_RESETHAND | libc::SA_ONSTACK;
         libc::sigemptyset(&mut sa.sa_mask);
         for (signum, _signame) in KILL_SIGNALS {

@@ -53,7 +53,82 @@ fn result_methods() {
     let _ = opt_map!(res, |x| x + 1).unwrap_or_else(|_e| 0); // should not lint
 }
 
-fn main() {
-    option_methods();
-    result_methods();
+fn main() {}
+
+fn issue15714() {
+    let o: Option<i32> = Some(3);
+    let r: Result<i32, ()> = Ok(3);
+    println!("{}", o.map(|y| y + 1).unwrap_or(3));
+    //~^ map_unwrap_or
+    println!("{}", o.map(|y| y + 1).unwrap_or_else(|| 3));
+    //~^ map_unwrap_or
+    println!("{}", r.map(|y| y + 1).unwrap_or(3));
+    //~^ map_unwrap_or
+    println!("{}", r.map(|y| y + 1).unwrap_or_else(|()| 3));
+    //~^ map_unwrap_or
+
+    println!("{}", r.map(|y| y == 1).unwrap_or(false));
+    //~^ map_unwrap_or
+}
+
+fn issue15713() {
+    let x = &Some(3);
+    println!("{}", x.map(|y| y + 1).unwrap_or(3));
+    //~^ map_unwrap_or
+
+    let x: &Result<i32, ()> = &Ok(3);
+    println!("{}", x.map(|y| y + 1).unwrap_or(3));
+    //~^ map_unwrap_or
+
+    let x = &Some(3);
+    println!("{}", x.map(|y| y + 1).unwrap_or_else(|| 3));
+    //~^ map_unwrap_or
+
+    let x: &Result<i32, ()> = &Ok(3);
+    println!("{}", x.map(|y| y + 1).unwrap_or_else(|_| 3));
+    //~^ map_unwrap_or
+}
+
+// Support `map(_).unwrap_or_default()` pattern
+mod pr17644 {
+    macro_rules! identity {
+        // Inner bracket is necessary to detect macro expansion
+        ( $e:expr ) => {{ $e }};
+    }
+
+    #[clippy::msrv = "1.98"]
+    mod unwrap_or_default {
+        fn option(opt: Option<i32>) {
+            let _ = opt.map(|x| x * x).unwrap_or_default(); //~ map_unwrap_or
+            let _ = opt.map(|x| vec![x]).unwrap_or_default(); //~ map_unwrap_or
+            let _ = identity!(opt.map(|x| x + 1).unwrap_or_default()); //~ map_unwrap_or
+            let _ = identity!(opt.map(|x| x + 1)).unwrap_or_default();
+            let _ = identity!(opt).map(|x| x + 1).unwrap_or_default();
+        }
+        fn result(res: Result<i32, ()>) {
+            let _ = res.map(|x| x * x).unwrap_or_default(); //~ map_unwrap_or
+            let _ = res.map(|x| vec![x]).unwrap_or_default(); //~ map_unwrap_or
+            let _ = identity!(res.map(|x| x + 1).unwrap_or_default()); //~ map_unwrap_or
+            let _ = identity!(res.map(|x| x + 1)).unwrap_or_default();
+            let _ = identity!(res).map(|x| x + 1).unwrap_or_default();
+        }
+    }
+
+    #[clippy::msrv = "1.97"]
+    mod unwrap_or_default_before_msrv {
+        fn option(opt: Option<i32>) {
+            let _ = opt.map(|x| x * x).unwrap_or_default();
+            let _ = opt.map(|x| vec![x]).unwrap_or_default();
+            let _ = identity!(opt.map(|x| x + 1).unwrap_or_default());
+            let _ = identity!(opt.map(|x| x + 1)).unwrap_or_default();
+            let _ = identity!(opt).map(|x| x + 1).unwrap_or_default();
+        }
+        fn result(res: Result<i32, ()>) {
+            let _ = res.map(|x| x * x).unwrap_or_default();
+            let _ = res.map(|x| vec![x]).unwrap_or_default();
+            let _ = identity!(res.map(|x| x + 1).unwrap_or_default());
+            let _ = identity!(res.map(|x| x + 1)).unwrap_or_default();
+            let _ = identity!(res).map(|x| x + 1).unwrap_or_default();
+        }
+    }
 }

@@ -10,6 +10,8 @@
 //@ ignore-cross-compile
 //@ needs-dynamic-linking
 //@ only-nightly (requires unstable rustc flag)
+// FIXME: Once GCC backend is fixed, remove this `ignore-backends`.
+//@ ignore-backends: gcc
 
 // This test trips a check in the MSVC linker for an outdated processor:
 // "LNK1322: cannot avoid potential ARM hazard (Cortex-A53 MPCore processor bug #843419)"
@@ -49,21 +51,21 @@ fn main() {
     rustc()
         .input("proc.rs")
         .crate_type("proc-macro")
-        .edition("2021")
+        .edition("2024")
         .arg("-Cdebuginfo=line-tables-only")
         .run();
     rustc()
         .extern_("proc", dynamic_lib_name("proc"))
         .input("other.rs")
         .crate_type("rlib")
-        .edition("2021")
+        .edition("2024")
         .opt_level("3")
         .arg("-Cdebuginfo=line-tables-only")
         .run();
     rustc()
         .extern_("other", rust_lib_name("other"))
         .input("main.rs")
-        .edition("2021")
+        .edition("2024")
         .opt_level("3")
         .arg("-Cdebuginfo=line-tables-only")
         .arg("-Clto=fat")

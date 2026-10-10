@@ -27,7 +27,10 @@ declare global {
         /** Make the current theme easy to find */
         currentTheme: HTMLLinkElement|null;
         /** Generated in `render/context.rs` */
-        SIDEBAR_ITEMS?: { [key: string]: string[] };
+        SIDEBAR_ITEMS?: { [key: string]: Array<string | string[]> };
+        /** Notable trait data */
+        NOTABLE_TRAITS?: { [key: string]: string };
+        CURRENT_TOOLTIP_ELEMENT?: HTMLElement & { TOOLTIP_BASE: HTMLElement };
         /** Used by the popover tooltip code. */
         RUSTDOC_TOOLTIP_HOVER_MS: number;
         /** Used by the popover tooltip code. */
@@ -93,6 +96,10 @@ declare global {
         pending_type_impls?: rustdoc.TypeImpls,
         rustdoc_add_line_numbers_to_examples?: function(),
         rustdoc_remove_line_numbers_from_examples?: function(),
+        /** JSON-encoded raw search index */
+        searchIndex: string,
+        /** Used in search index shards in order to load data into the in-memory database */
+        rr_: function(string),
     }
     interface HTMLElement {
         /** Used by the popover tooltip code. */
@@ -130,6 +137,8 @@ declare namespace rustdoc {
         loadDesc: function({descShard: SearchDescShard, descIndex: number}): Promise<string|null>;
         loadedDescShard: function(string, number, string);
         isDisplayed: function(): boolean;
+        searchLoaded: boolean;
+        loadSearch: function();
     }
 
     interface SearchDescShard {
@@ -141,7 +150,7 @@ declare namespace rustdoc {
 
     /**
      * A single parsed "atom" in a search query. For example,
-     * 
+     *
      *     std::fmt::Formatter, Write -> Result<()>
      *     ┏━━━━━━━━━━━━━━━━━━  ┌────    ┏━━━━━┅┅┅┅┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐
      *     ┃                    │        ┗ QueryElement {          ┊
@@ -234,8 +243,31 @@ declare namespace rustdoc {
         modulePath: number?,
         exactModulePath: number?,
         parent: number?,
+        traitParent: number?,
         deprecated: boolean,
-        associatedItemDisambiguator: string?,
+        unstable: boolean,
+        associatedItemDisambiguatorOrExternCrateUrl: string?,
+        /**
+         * If `true`, this item is a `macro_rules!` macro that supports
+         * multiple usage syntaxes, as described in RFC 3697 and 3698.
+         * The syntax for such a macro looks like this:
+         *
+         * ```rust
+         * /// Doc Comment.
+         * macro_rules! NAME {
+         *     attr(key = $value:literal) ($attached:item) => { ... };
+         *     derive() ($attached:item) => { ... };
+         *     ($bang:tt) => { ... };
+         *  }
+         * ```
+         *
+         * Each usage syntax gets a separate EntryData---one for the attr,
+         * one for the derive, and one for the bang syntax---with a corresponding
+         * `ty` field that can be used for filtering and presenting results.
+         * But the documentation lives in a single `macro.NAME.html` page, and
+         * this boolean flag is used for generating that HREF.
+         */
+        forceMacroHref: boolean,
     }
 
     /**
@@ -263,8 +295,11 @@ declare namespace rustdoc {
      */
     interface TypeData {
         searchUnbox: boolean,
-        invertedFunctionSignatureIndex: RoaringBitmap[],
+        invertedFunctionInputsIndex: RoaringBitmap[],
+        invertedFunctionOutputIndex: RoaringBitmap[],
     }
+
+    type TypeInvertedIndexPolarity = "invertedFunctionInputsIndex" | "invertedFunctionOutputIndex";
 
     /**
      * A search entry of some sort.
@@ -279,14 +314,18 @@ declare namespace rustdoc {
         exactModulePath: string,
         entry: EntryData?,
         path: PathData?,
-        type: FunctionData?,
+        functionData: FunctionData?,
         deprecated: boolean,
-        parent: { path: PathData, name: string}?,
+        unstable: boolean,
+        parent: RowParent,
+        traitParent: RowParent,
     }
+
+    type RowParent = { path: PathData, name: string } | null;
 
     type ItemType = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
         11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 |
-        21 | 22 | 23 | 24 | 25 | 26;
+        21 | 22 | 23 | 24 | 25 | 26 | 28 | 29;
 
     /**
      * The viewmodel for the search engine results page.
@@ -306,7 +345,23 @@ declare namespace rustdoc {
     interface ResultObject {
         desc: Promise<string|null>,
         displayPath: string,
+        /**
+         * path to where the item was defined (not inlined),
+         * then `|`, then the `ItemType` of the item.
+         *
+         * This is often a private path, so it should not be displayed,
+         * but this allows us to use it to reliably deduplicate reexported and inlined items
+         */
         fullPath: string,
+        /**
+         * The `fullPath` of the corresponding item within a trait.
+         * For example, for `File::read`, this would be `std::io::Read::read|12`
+         *
+         * This is used to hide items from trait impls when the trait itself is in the search results.
+         *
+         * `null` if the item is not from a trait impl block.
+         */
+        traitPath: string | null,
         href: string,
         id: number,
         dist: number,
@@ -338,7 +393,7 @@ declare namespace rustdoc {
         returned: rustdoc.QueryElement[],
         is_alias: boolean,
         alias?: string,
-        original?: rustdoc.Rlow,
+        item: rustdoc.Row,
     }
 
     /**
@@ -458,10 +513,10 @@ declare namespace rustdoc {
 
     /**
      * A decoded function type, made from real objects.
-     * `ty` will be negative for generics, positive for types, and 0 for placeholders.
+     * `ty` will be negative for generics, positive for types, and `null` for placeholders (zero is not used).
      */
     interface FunctionType {
-        id: null|number,
+        id: number|null,
         ty: ItemType,
         name: string|null,
         path: string|null,
@@ -490,11 +545,12 @@ declare namespace rustdoc {
      * Provided by generated `trait.impl` files.
      */
     type Implementors = {
-        [key: string]: Array<[string, number, Array<string>]>
+        [key: string]: Array<[string, 0|1, number, Array<string>]>
     }
 
     type TypeImpls = {
-        [cratename: string]: Array<Array<string|0>>
+        /* [text, traitName (0 if not a trait), ...types] */
+        [cratename: string]: Array<[string, string|0, ...string[]]>
     }
 
     /**
@@ -523,4 +579,39 @@ declare namespace rustdoc {
      * Generated by `render_call_locations` in `render/mod.rs`.
      */
     type ScrapedLoc = [[number, number], string, string]
+
+    /**
+     * Each of these identifiers are used specially by
+     * type-driven search. Most of them are lang items
+     * in the compiler.
+     */
+    type TypeNameIds = {
+        "typeNameIdOfOutput": number,
+        "typeNameIdOfFnPtr": number,
+        "typeNameIdOfFn": number,
+        "typeNameIdOfFnMut": number,
+        "typeNameIdOfFnOnce": number,
+        "typeNameIdOfArray": number,
+        "typeNameIdOfSlice": number,
+        "typeNameIdOfArrayOrSlice": number,
+        "typeNameIdOfTuple": number,
+        "typeNameIdOfUnit": number,
+        "typeNameIdOfTupleOrUnit": number,
+        "typeNameIdOfReference": number,
+        "typeNameIdOfPointer": number,
+        "typeNameIdOfHof": number,
+        "typeNameIdOfNever": number,
+    };
+
+    type VarName = "name"
+        | "root-path"
+        | "static-root-path"
+        | "current-crate"
+        | "themes"
+        | "resource-suffix"
+        | "rustdoc-version"
+        | "channel"
+        | "search-js"
+        | "stringdex-js"
+        | "settings-js";
 }

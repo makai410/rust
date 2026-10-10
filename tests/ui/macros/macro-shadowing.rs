@@ -1,4 +1,5 @@
 //@ aux-build:two_macros.rs
+//@ reference: names.resolution.expansion.macros.ambiguity.more-expanded-vs-outer
 
 #![allow(unused_macros)]
 

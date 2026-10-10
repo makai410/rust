@@ -5,7 +5,7 @@
             Struct(
                 Struct {
                     id: StructId(
-                        3800,
+                        0680,
                     ),
                 },
             ),
@@ -13,18 +13,20 @@
         loc: DeclarationLocation {
             hir_file_id: FileId(
                 EditionedFileId(
-                    Id(2001),
+                    Id(481),
                 ),
             ),
             ptr: SyntaxNodePtr {
                 kind: STRUCT,
                 range: 0..15,
             },
-            name_ptr: AstPtr(
-                SyntaxNodePtr {
-                    kind: NAME,
-                    range: 11..14,
-                },
+            name_ptr: Some(
+                AstPtr(
+                    SyntaxNodePtr {
+                        kind: NAME,
+                        range: 11..14,
+                    },
+                ),
             ),
         },
         container_name: None,
@@ -39,7 +41,7 @@
             Struct(
                 Struct {
                     id: StructId(
-                        3800,
+                        0680,
                     ),
                 },
             ),
@@ -47,18 +49,20 @@
         loc: DeclarationLocation {
             hir_file_id: FileId(
                 EditionedFileId(
-                    Id(2000),
+                    Id(480),
                 ),
             ),
             ptr: SyntaxNodePtr {
                 kind: USE_TREE,
                 range: 17..25,
             },
-            name_ptr: AstPtr(
-                SyntaxNodePtr {
-                    kind: NAME_REF,
-                    range: 22..25,
-                },
+            name_ptr: Some(
+                AstPtr(
+                    SyntaxNodePtr {
+                        kind: NAME_REF,
+                        range: 22..25,
+                    },
+                ),
             ),
         },
         container_name: None,

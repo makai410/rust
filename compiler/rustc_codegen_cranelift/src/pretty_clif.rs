@@ -10,7 +10,7 @@
 //! function u0:22(i64) -> i8, i8 system_v {
 //! ; symbol _ZN97_$LT$example..IsNotEmpty$u20$as$u20$mini_core..FnOnce$LT$$LP$$RF$$RF$$u5b$u16$u5d$$C$$RP$$GT$$GT$9call_once17hd361e9f5c3d1c4deE
 //! ; instance Instance { def: Item(DefId(0:42 ~ example[3895]::{impl#0}::call_once)), args: ['{erased}, '{erased}] }
-//! ; abi FnAbi { args: [ArgAbi { layout: TyAndLayout { ty: IsNotEmpty, layout: Layout { size: Size(0 bytes), align: AbiAndPrefAlign { abi: Align(1 bytes), pref: Align(8 bytes) }, backend_repr: Memory { sized: true }, fields: Arbitrary { offsets: [], memory_index: [] }, largest_niche: None, uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(1 bytes), randomization_seed: 12266848898570219025 } }, mode: Ignore }, ArgAbi { layout: TyAndLayout { ty: &&[u16], layout: Layout { size: Size(8 bytes), align: AbiAndPrefAlign { abi: Align(8 bytes), pref: Align(8 bytes) }, backend_repr: Scalar(Initialized { value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), fields: Primitive, largest_niche: Some(Niche { offset: Size(0 bytes), value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(8 bytes), randomization_seed: 281492156579847 } }, mode: Direct(ArgAttributes { regular: NonNull | NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: Some(Align(8 bytes)) }) }], ret: ArgAbi { layout: TyAndLayout { ty: (u8, u8), layout: Layout { size: Size(2 bytes), align: AbiAndPrefAlign { abi: Align(1 bytes), pref: Align(8 bytes) }, backend_repr: ScalarPair(Initialized { value: Int(I8, false), valid_range: 0..=255 }, Initialized { value: Int(I8, false), valid_range: 0..=255 }), fields: Arbitrary { offsets: [Size(0 bytes), Size(1 bytes)], memory_index: [0, 1] }, largest_niche: None, uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(1 bytes), randomization_seed: 71776127651151873 } }, mode: Pair(ArgAttributes { regular: NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: None }, ArgAttributes { regular: NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: None }) }, c_variadic: false, fixed_count: 1, conv: Rust, can_unwind: false }
+//! ; abi FnAbi { args: [ArgAbi { layout: TyAndLayout { ty: IsNotEmpty, layout: Layout { size: Size(0 bytes), align: AbiAndPrefAlign { abi: Align(1 bytes), pref: Align(8 bytes) }, backend_repr: Memory { sized: true }, fields: Arbitrary { offsets: [], in_memory_order: [] }, largest_niche: None, uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(1 bytes), randomization_seed: 12266848898570219025 } }, mode: Ignore }, ArgAbi { layout: TyAndLayout { ty: &&[u16], layout: Layout { size: Size(8 bytes), align: AbiAndPrefAlign { abi: Align(8 bytes), pref: Align(8 bytes) }, backend_repr: Scalar(Initialized { value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), fields: Primitive, largest_niche: Some(Niche { offset: Size(0 bytes), value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(8 bytes), randomization_seed: 281492156579847 } }, mode: Direct(ArgAttributes { regular: NonNull | NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: Some(Align(8 bytes)) }) }], ret: ArgAbi { layout: TyAndLayout { ty: (u8, u8), layout: Layout { size: Size(2 bytes), align: AbiAndPrefAlign { abi: Align(1 bytes), pref: Align(8 bytes) }, backend_repr: ScalarPair(Initialized { value: Int(I8, false), valid_range: 0..=255 }, Initialized { value: Int(I8, false), valid_range: 0..=255 }), fields: Arbitrary { offsets: [Size(0 bytes), Size(1 bytes)], in_memory_order: [0, 1] }, largest_niche: None, uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(1 bytes), randomization_seed: 71776127651151873 } }, mode: Pair(ArgAttributes { regular: NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: None }, ArgAttributes { regular: NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: None }) }, c_variadic: false, fixed_count: 1, conv: Rust, can_unwind: false }
 //!
 //! ; kind  loc.idx   param    pass mode                            ty
 //! ; ssa   _0    (u8, u8)                          2b 1                var=(0, 1)
@@ -41,7 +41,7 @@
 //! ;
 //! ; _0 = <IsNotEmpty as mini_core::FnMut<(&&[u16],)>>::call_mut(move _3, copy _2)
 //!     v2 = stack_load.i64 ss0
-//! ; abi: FnAbi { args: [ArgAbi { layout: TyAndLayout { ty: &mut IsNotEmpty, layout: Layout { size: Size(8 bytes), align: AbiAndPrefAlign { abi: Align(8 bytes), pref: Align(8 bytes) }, backend_repr: Scalar(Initialized { value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), fields: Primitive, largest_niche: Some(Niche { offset: Size(0 bytes), value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(8 bytes), randomization_seed: 281492156579847 } }, mode: Direct(ArgAttributes { regular: NonNull | NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: Some(Align(1 bytes)) }) }, ArgAbi { layout: TyAndLayout { ty: &&[u16], layout: Layout { size: Size(8 bytes), align: AbiAndPrefAlign { abi: Align(8 bytes), pref: Align(8 bytes) }, backend_repr: Scalar(Initialized { value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), fields: Primitive, largest_niche: Some(Niche { offset: Size(0 bytes), value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(8 bytes), randomization_seed: 281492156579847 } }, mode: Direct(ArgAttributes { regular: NonNull | NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: Some(Align(8 bytes)) }) }], ret: ArgAbi { layout: TyAndLayout { ty: (u8, u8), layout: Layout { size: Size(2 bytes), align: AbiAndPrefAlign { abi: Align(1 bytes), pref: Align(8 bytes) }, backend_repr: ScalarPair(Initialized { value: Int(I8, false), valid_range: 0..=255 }, Initialized { value: Int(I8, false), valid_range: 0..=255 }), fields: Arbitrary { offsets: [Size(0 bytes), Size(1 bytes)], memory_index: [0, 1] }, largest_niche: None, uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(1 bytes), randomization_seed: 71776127651151873 } }, mode: Pair(ArgAttributes { regular: NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: None }, ArgAttributes { regular: NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: None }) }, c_variadic: false, fixed_count: 1, conv: Rust, can_unwind: false }
+//! ; abi: FnAbi { args: [ArgAbi { layout: TyAndLayout { ty: &mut IsNotEmpty, layout: Layout { size: Size(8 bytes), align: AbiAndPrefAlign { abi: Align(8 bytes), pref: Align(8 bytes) }, backend_repr: Scalar(Initialized { value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), fields: Primitive, largest_niche: Some(Niche { offset: Size(0 bytes), value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(8 bytes), randomization_seed: 281492156579847 } }, mode: Direct(ArgAttributes { regular: NonNull | NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: Some(Align(1 bytes)) }) }, ArgAbi { layout: TyAndLayout { ty: &&[u16], layout: Layout { size: Size(8 bytes), align: AbiAndPrefAlign { abi: Align(8 bytes), pref: Align(8 bytes) }, backend_repr: Scalar(Initialized { value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), fields: Primitive, largest_niche: Some(Niche { offset: Size(0 bytes), value: Pointer(AddressSpace(0)), valid_range: 1..=18446744073709551615 }), uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(8 bytes), randomization_seed: 281492156579847 } }, mode: Direct(ArgAttributes { regular: NonNull | NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: Some(Align(8 bytes)) }) }], ret: ArgAbi { layout: TyAndLayout { ty: (u8, u8), layout: Layout { size: Size(2 bytes), align: AbiAndPrefAlign { abi: Align(1 bytes), pref: Align(8 bytes) }, backend_repr: ScalarPair(Initialized { value: Int(I8, false), valid_range: 0..=255 }, Initialized { value: Int(I8, false), valid_range: 0..=255 }), fields: Arbitrary { offsets: [Size(0 bytes), Size(1 bytes)], in_memory_order: [0, 1] }, largest_niche: None, uninhabited: false, variants: Single { index: 0 }, max_repr_align: None, unadjusted_abi_align: Align(1 bytes), randomization_seed: 71776127651151873 } }, mode: Pair(ArgAttributes { regular: NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: None }, ArgAttributes { regular: NoUndef, arg_ext: None, pointee_size: Size(0 bytes), pointee_align: None }) }, c_variadic: false, fixed_count: 1, conv: Rust, can_unwind: false }
 //!     v3, v4 = call fn0(v1, v2)  ; v1 = 1
 //!     v5 -> v3
 //!     v6 -> v4
@@ -60,10 +60,11 @@ use std::fmt;
 use std::io::Write;
 
 use cranelift_codegen::entity::SecondaryMap;
-use cranelift_codegen::ir::Fact;
 use cranelift_codegen::ir::entities::AnyEntity;
+use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::write::{FuncWriter, PlainWriter};
 use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_session::Session;
 use rustc_session::config::{OutputFilenames, OutputType};
 use rustc_target::callconv::FnAbi;
 
@@ -83,7 +84,7 @@ impl CommentWriter {
         instance: Instance<'tcx>,
         fn_abi: &'tcx FnAbi<'tcx, Ty<'tcx>>,
     ) -> Self {
-        let enabled = should_write_ir(tcx);
+        let enabled = should_write_ir(tcx.sess);
         let global_comments = if enabled {
             with_no_trimmed_paths!({
                 vec![
@@ -181,13 +182,8 @@ impl FuncWriter for &'_ CommentWriter {
         _func: &Function,
         entity: AnyEntity,
         value: &dyn fmt::Display,
-        maybe_fact: Option<&Fact>,
     ) -> fmt::Result {
-        if let Some(fact) = maybe_fact {
-            write!(w, "    {} ! {} = {}", entity, fact, value)?;
-        } else {
-            write!(w, "    {} = {}", entity, value)?;
-        }
+        write!(w, "    {} = {}", entity, value)?;
 
         if let Some(comment) = self.entity_comments.get(&entity) {
             writeln!(w, " ; {}", comment.replace('\n', "\n; "))
@@ -247,8 +243,24 @@ impl FunctionCx<'_, '_, '_> {
     }
 }
 
-pub(crate) fn should_write_ir(tcx: TyCtxt<'_>) -> bool {
-    tcx.sess.opts.output_types.contains_key(&OutputType::LlvmAssembly)
+pub(crate) fn format_clif_ir_header(isa: &dyn TargetIsa, symbol_name: &str) -> String {
+    use std::fmt::Write;
+
+    let mut header = String::new();
+    for flag in isa.flags().iter() {
+        writeln!(header, "set {}", flag).unwrap();
+    }
+    write!(header, "target {}", isa.triple().architecture.to_string()).unwrap();
+    for isa_flag in isa.isa_flags().iter() {
+        write!(header, " {}", isa_flag).unwrap();
+    }
+    writeln!(header, "\n").unwrap();
+    writeln!(header, "; symbol {}", symbol_name).unwrap();
+    header
+}
+
+pub(crate) fn should_write_ir(sess: &Session) -> bool {
+    sess.opts.output_types.contains_key(&OutputType::LlvmAssembly)
 }
 
 pub(crate) fn write_ir_file(
@@ -285,18 +297,9 @@ pub(crate) fn write_clif_file(
 ) {
     // FIXME work around filename too long errors
     write_ir_file(output_filenames, &format!("{}.{}.clif", symbol_name, postfix), |file| {
-        let mut clif = String::new();
+        let mut clif = format_clif_ir_header(isa, symbol_name);
         cranelift_codegen::write::decorate_function(&mut clif_comments, &mut clif, func).unwrap();
 
-        for flag in isa.flags().iter() {
-            writeln!(file, "set {}", flag)?;
-        }
-        write!(file, "target {}", isa.triple().architecture)?;
-        for isa_flag in isa.isa_flags().iter() {
-            write!(file, " {}", isa_flag)?;
-        }
-        writeln!(file, "\n")?;
-        writeln!(file)?;
         file.write_all(clif.as_bytes())?;
         Ok(())
     });
@@ -311,7 +314,7 @@ impl fmt::Debug for FunctionCx<'_, '_, '_> {
         ::cranelift_codegen::write::decorate_function(
             &mut &self.clif_comments,
             &mut clif,
-            &self.bcx.func,
+            self.bcx.func,
         )
         .unwrap();
         writeln!(f, "\n{}", clif)

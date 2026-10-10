@@ -1,15 +1,17 @@
 error[E0532]: expected tuple struct or tuple variant, found unit variant `A::D`
   --> $DIR/pattern-error-continue.rs:20:9
    |
-LL |     B(isize, isize),
-   |     --------------- similarly named tuple variant `B` defined here
-LL |     C(isize, isize, isize),
 LL |     D
    |     - `A::D` defined here
 ...
 LL |         A::D(_) => (),
    |         ^^^^^^^
    |
+note: similarly named tuple variant `B` defined here
+  --> $DIR/pattern-error-continue.rs:6:5
+   |
+LL |     B(isize, isize),
+   |     ^^^^^^^^^^^^^^^
 help: use this syntax instead
    |
 LL -         A::D(_) => (),
@@ -52,14 +54,17 @@ note: function defined here
 LL | fn f(_c: char) {}
    |    ^ --------
 
-error[E0433]: failed to resolve: use of undeclared type `E`
+error[E0433]: cannot find type `E` in this scope
   --> $DIR/pattern-error-continue.rs:35:9
    |
 LL |         E::V => {}
-   |         ^
-   |         |
-   |         use of undeclared type `E`
-   |         help: an enum with a similar name exists: `A`
+   |         ^ use of undeclared type `E`
+   |
+help: an enum with a similar name exists
+   |
+LL -         E::V => {}
+LL +         A::V => {}
+   |
 
 error: aborting due to 5 previous errors
 

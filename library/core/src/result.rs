@@ -114,14 +114,15 @@
 //!
 //! You might instead, if you don't want to handle the error, simply
 //! assert success with [`expect`]. This will panic if the
-//! write fails, providing a marginally useful message indicating why:
+//! write fails, providing a message explaining why the write was expected
+//! to succeed:
 //!
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::prelude::*;
 //!
 //! let mut file = File::create("valuable_data.txt").unwrap();
-//! file.write_all(b"important message").expect("failed to write message");
+//! file.write_all(b"important message").expect("writing to the file should succeed");
 //! ```
 //!
 //! You might also simply assert success:
@@ -230,24 +231,31 @@
 //!
 //! # Representation
 //!
-//! In some cases, [`Result<T, E>`] will gain the same size, alignment, and ABI
-//! guarantees as [`Option<U>`] has. One of either the `T` or `E` type must be a
-//! type that qualifies for the `Option` [representation guarantees][opt-rep],
-//! and the *other* type must meet all of the following conditions:
-//! * Is a zero-sized type with alignment 1 (a "1-ZST").
-//! * Has no fields.
-//! * Does not have the `#[non_exhaustive]` attribute.
+//! In some cases, [`Result<T, E>`] comes with size, alignment, and ABI
+//! guarantees. Specifically, one of either the `T` or `E` type must be a type
+//! that qualifies for the `Option` [representation guarantees][opt-rep] (let's
+//! call that type `I`), and the *other* type is a zero-sized type with
+//! alignment 1 (a "1-ZST").
+//!
+//! If that is the case, then `Result<T, E>` has the same size, alignment, and
+//! [function call ABI] as `I` (and therefore, as `Option<I>`). If `I` is `T`,
+//! it is therefore sound to transmute a value `t` of type `I` to type
+//! `Result<T, E>` (producing the value `Ok(t)`) and to transmute a value
+//! `Ok(t)` of type `Result<T, E>` to type `I` (producing the value `t`). If `I`
+//! is `E`, the same applies with `Ok` replaced by `Err`.
 //!
 //! For example, `NonZeroI32` qualifies for the `Option` representation
-//! guarantees, and `()` is a zero-sized type with alignment 1, no fields, and
-//! it isn't `non_exhaustive`. This means that both `Result<NonZeroI32, ()>` and
-//! `Result<(), NonZeroI32>` have the same size, alignment, and ABI guarantees
-//! as `Option<NonZeroI32>`. The only difference is the implied semantics:
+//! guarantees and `()` is a zero-sized type with alignment 1. This means that
+//! both `Result<NonZeroI32, ()>` and `Result<(), NonZeroI32>` have the same
+//! size, alignment, and ABI as `NonZeroI32` (and `Option<NonZeroI32>`). The
+//! only difference between these is in the implied semantics:
+//!
 //! * `Option<NonZeroI32>` is "a non-zero i32 might be present"
 //! * `Result<NonZeroI32, ()>` is "a non-zero i32 success result, if any"
 //! * `Result<(), NonZeroI32>` is "a non-zero i32 error result, if any"
 //!
 //! [opt-rep]: ../option/index.html#representation "Option Representation"
+//! [function call ABI]: ../primitive.fn.html#abi-compatibility
 //!
 //! # Method overview
 //!
@@ -503,7 +511,7 @@
 //! [`Result`] of a collection of each contained value of the original
 //! [`Result`] values, or [`Err`] if any of the elements was [`Err`].
 //!
-//! [impl-FromIterator]: Result#impl-FromIterator%3CResult%3CA,+E%3E%3E-for-Result%3CV,+E%3E
+//! [impl-FromIterator]: Result#impl-FromIterator%3CResult%3CT,+E%3E%3E-for-Result%3CV,+E%3E
 //!
 //! ```
 //! let v = [Ok(2), Ok(4), Err("err!"), Ok(8)];
@@ -536,13 +544,14 @@
 use crate::iter::{self, FusedIterator, TrustedLen};
 use crate::marker::Destruct;
 use crate::ops::{self, ControlFlow, Deref, DerefMut};
-use crate::{convert, fmt, hint};
+use crate::{fmt, hint};
 
 /// `Result` is a type that represents either success ([`Ok`]) or failure ([`Err`]).
 ///
 /// See the [module documentation](self) for details.
 #[doc(search_unbox)]
-#[derive(Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
+#[derive(Copy, Debug, Hash)]
+#[derive_const(PartialEq, PartialOrd, Eq, Ord)]
 #[must_use = "this `Result` may be an `Err` variant, which should be handled"]
 #[rustc_diagnostic_item = "Result"]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -682,7 +691,7 @@ impl<T, E> Result<T, E> {
     /// Converts from `Result<T, E>` to [`Option<T>`].
     ///
     /// Converts `self` into an [`Option<T>`], consuming `self`,
-    /// and discarding the error, if any.
+    /// and converting the error to `None`, if any.
     ///
     /// # Examples
     ///
@@ -833,9 +842,9 @@ impl<T, E> Result<T, E> {
     /// Returns the provided default (if [`Err`]), or
     /// applies a function to the contained value (if [`Ok`]).
     ///
-    /// Arguments passed to `map_or` are eagerly evaluated; if you are passing
+    /// The `default` argument passed to `map_or` is eagerly evaluated; if you are passing
     /// the result of a function call, it is recommended to use [`map_or_else`],
-    /// which is lazily evaluated.
+    /// which lazily evaluates `default`.
     ///
     /// [`map_or_else`]: Result::map_or_else
     ///
@@ -904,8 +913,6 @@ impl<T, E> Result<T, E> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(result_option_map_or_default)]
-    ///
     /// let x: Result<_, &str> = Ok("foo");
     /// let y: Result<&str, _> = Err("bar");
     ///
@@ -915,7 +922,7 @@ impl<T, E> Result<T, E> {
     ///
     /// [default value]: Default::default
     #[inline]
-    #[unstable(feature = "result_option_map_or_default", issue = "138099")]
+    #[stable(feature = "result_option_map_or_default", since = "1.98.0")]
     #[rustc_const_unstable(feature = "const_result_trait_fn", issue = "144211")]
     pub const fn map_or_default<U, F>(self, f: F) -> U
     where
@@ -972,7 +979,7 @@ impl<T, E> Result<T, E> {
     ///     .parse::<u8>()
     ///     .inspect(|x| println!("original: {x}"))
     ///     .map(|x| x.pow(3))
-    ///     .expect("failed to parse number");
+    ///     .expect("literal `4` should parse as a `u8`");
     /// ```
     #[inline]
     #[stable(feature = "result_option_inspect", since = "1.76.0")]
@@ -1034,11 +1041,12 @@ impl<T, E> Result<T, E> {
     /// ```
     #[inline]
     #[stable(feature = "inner_deref", since = "1.47.0")]
-    pub fn as_deref(&self) -> Result<&T::Target, &E>
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    pub const fn as_deref(&self) -> Result<&T::Target, &E>
     where
-        T: Deref,
+        T: [const] Deref,
     {
-        self.as_ref().map(|t| t.deref())
+        self.as_ref().map(Deref::deref)
     }
 
     /// Converts from `Result<T, E>` (or `&mut Result<T, E>`) to `Result<&mut <T as DerefMut>::Target, &mut E>`.
@@ -1061,11 +1069,12 @@ impl<T, E> Result<T, E> {
     /// ```
     #[inline]
     #[stable(feature = "inner_deref", since = "1.47.0")]
-    pub fn as_deref_mut(&mut self) -> Result<&mut T::Target, &mut E>
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    pub const fn as_deref_mut(&mut self) -> Result<&mut T::Target, &mut E>
     where
-        T: DerefMut,
+        T: [const] DerefMut,
     {
-        self.as_mut().map(|t| t.deref_mut())
+        self.as_mut().map(DerefMut::deref_mut)
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1334,9 +1343,6 @@ impl<T, E> Result<T, E> {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(never_type)]
-    /// # #![feature(unwrap_infallible)]
-    ///
     /// fn only_good_news() -> Result<String, !> {
     ///     Ok("this is fine".into())
     /// }
@@ -1344,10 +1350,10 @@ impl<T, E> Result<T, E> {
     /// let s: String = only_good_news().into_ok();
     /// println!("{s}");
     /// ```
-    #[unstable(feature = "unwrap_infallible", reason = "newly added", issue = "61695")]
+    #[stable(feature = "unwrap_infallible", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     #[rustc_allow_const_fn_unstable(const_precise_live_drops)]
-    #[rustc_const_unstable(feature = "const_try", issue = "74935")]
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
     pub const fn into_ok(self) -> T
     where
         E: [const] Into<!>,
@@ -1371,9 +1377,6 @@ impl<T, E> Result<T, E> {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(never_type)]
-    /// # #![feature(unwrap_infallible)]
-    ///
     /// fn only_bad_news() -> Result<!, String> {
     ///     Err("Oops, it failed".into())
     /// }
@@ -1381,10 +1384,10 @@ impl<T, E> Result<T, E> {
     /// let error: String = only_bad_news().into_err();
     /// println!("{error}");
     /// ```
-    #[unstable(feature = "unwrap_infallible", reason = "newly added", issue = "61695")]
+    #[stable(feature = "unwrap_infallible", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     #[rustc_allow_const_fn_unstable(const_precise_live_drops)]
-    #[rustc_const_unstable(feature = "const_try", issue = "74935")]
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
     pub const fn into_err(self) -> E
     where
         T: [const] Into<!>,
@@ -1636,11 +1639,16 @@ impl<T, E> Result<T, E> {
     #[inline]
     #[track_caller]
     #[stable(feature = "option_result_unwrap_unchecked", since = "1.58.0")]
-    pub unsafe fn unwrap_unchecked(self) -> T {
+    #[rustc_const_unstable(feature = "const_result_unwrap_unchecked", issue = "148714")]
+    pub const unsafe fn unwrap_unchecked(self) -> T {
         match self {
             Ok(t) => t,
-            // SAFETY: the safety contract must be upheld by the caller.
-            Err(_) => unsafe { hint::unreachable_unchecked() },
+            Err(e) => {
+                // FIXME(const-hack): to avoid E: const Destruct bound
+                super::mem::forget(e);
+                // SAFETY: the safety contract must be upheld by the caller.
+                unsafe { hint::unreachable_unchecked() }
+            }
         }
     }
 
@@ -1667,7 +1675,12 @@ impl<T, E> Result<T, E> {
     #[inline]
     #[track_caller]
     #[stable(feature = "option_result_unwrap_unchecked", since = "1.58.0")]
-    pub unsafe fn unwrap_err_unchecked(self) -> E {
+    #[rustc_const_unstable(feature = "const_result_unwrap_unchecked", issue = "148714")]
+    pub const unsafe fn unwrap_err_unchecked(self) -> E
+    where
+        T: [const] Destruct,
+        E: [const] Destruct,
+    {
         match self {
             // SAFETY: the safety contract must be upheld by the caller.
             Ok(_) => unsafe { hint::unreachable_unchecked() },
@@ -1719,6 +1732,7 @@ impl<T, E> Result<&T, E> {
     /// ```
     #[inline]
     #[stable(feature = "result_cloned", since = "1.59.0")]
+    #[expect(clippy::map_clone, reason = "implements Result::cloned")]
     pub fn cloned(self) -> Result<T, E>
     where
         T: Clone,
@@ -1844,7 +1858,7 @@ impl<T, E> Result<Result<T, E>, E> {
 }
 
 // This is a separate function to reduce the code size of the methods
-#[cfg(not(feature = "panic_immediate_abort"))]
+#[cfg(not(panic = "immediate-abort"))]
 #[inline(never)]
 #[cold]
 #[track_caller]
@@ -1856,7 +1870,7 @@ fn unwrap_failed(msg: &str, error: &dyn fmt::Debug) -> ! {
 // that gets immediately thrown away, since vtables don't get cleaned up
 // by dead code elimination if a trait object is constructed even if it goes
 // unused
-#[cfg(feature = "panic_immediate_abort")]
+#[cfg(panic = "immediate-abort")]
 #[inline]
 #[cold]
 #[track_caller]
@@ -2093,7 +2107,7 @@ unsafe impl<A> TrustedLen for IntoIter<A> {}
 /////////////////////////////////////////////////////////////////////////////
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<A, E, V: FromIterator<A>> FromIterator<Result<A, E>> for Result<V, E> {
+impl<T, E, V: FromIterator<T>> FromIterator<Result<T, E>> for Result<V, E> {
     /// Takes each element in the `Iterator`: if it is an `Err`, no further
     /// elements are taken, and the `Err` is returned. Should no `Err` occur, a
     /// container with the values of each `Result` is returned.
@@ -2137,16 +2151,16 @@ impl<A, E, V: FromIterator<A>> FromIterator<Result<A, E>> for Result<V, E> {
     /// Since the third element caused an underflow, no further elements were taken,
     /// so the final value of `shared` is 6 (= `3 + 2 + 1`), not 16.
     #[inline]
-    fn from_iter<I: IntoIterator<Item = Result<A, E>>>(iter: I) -> Result<V, E> {
+    fn from_iter<I: IntoIterator<Item = Result<T, E>>>(iter: I) -> Result<V, E> {
         iter::try_process(iter.into_iter(), |i| i.collect())
     }
 }
 
 #[unstable(feature = "try_trait_v2", issue = "84277", old_name = "try_trait")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-impl<T, E> const ops::Try for Result<T, E> {
+const impl<T, E> ops::Try for Result<T, E> {
     type Output = T;
-    type Residual = Result<convert::Infallible, E>;
+    type Residual = Result<!, E>;
 
     #[inline]
     fn from_output(output: Self::Output) -> Self {
@@ -2164,12 +2178,10 @@ impl<T, E> const ops::Try for Result<T, E> {
 
 #[unstable(feature = "try_trait_v2", issue = "84277", old_name = "try_trait")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-impl<T, E, F: [const] From<E>> const ops::FromResidual<Result<convert::Infallible, E>>
-    for Result<T, F>
-{
+const impl<T, E, F: [const] From<E>> ops::FromResidual<Result<!, E>> for Result<T, F> {
     #[inline]
     #[track_caller]
-    fn from_residual(residual: Result<convert::Infallible, E>) -> Self {
+    fn from_residual(residual: Result<!, E>) -> Self {
         match residual {
             Err(e) => Err(From::from(e)),
         }
@@ -2178,7 +2190,7 @@ impl<T, E, F: [const] From<E>> const ops::FromResidual<Result<convert::Infallibl
 #[diagnostic::do_not_recommend]
 #[unstable(feature = "try_trait_v2_yeet", issue = "96374")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-impl<T, E, F: [const] From<E>> const ops::FromResidual<ops::Yeet<E>> for Result<T, F> {
+const impl<T, E, F: [const] From<E>> ops::FromResidual<ops::Yeet<E>> for Result<T, F> {
     #[inline]
     fn from_residual(ops::Yeet(e): ops::Yeet<E>) -> Self {
         Err(From::from(e))
@@ -2187,6 +2199,6 @@ impl<T, E, F: [const] From<E>> const ops::FromResidual<ops::Yeet<E>> for Result<
 
 #[unstable(feature = "try_trait_v2_residual", issue = "91285")]
 #[rustc_const_unstable(feature = "const_try", issue = "74935")]
-impl<T, E> const ops::Residual<T> for Result<convert::Infallible, E> {
+const impl<T, E> ops::Residual<T> for Result<!, E> {
     type TryType = Result<T, E>;
 }

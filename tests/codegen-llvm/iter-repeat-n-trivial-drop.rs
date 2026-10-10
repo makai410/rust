@@ -4,7 +4,6 @@
 
 #![crate_type = "lib"]
 #![feature(iter_repeat_n)]
-#![feature(array_repeat)]
 
 #[derive(Clone)]
 pub struct NotCopy(u16);
@@ -20,23 +19,23 @@ impl Drop for NotCopy {
 // CHECK-LABEL: @iter_repeat_n_next
 pub fn iter_repeat_n_next(it: &mut std::iter::RepeatN<NotCopy>) -> Option<NotCopy> {
     // CHECK-NEXT: start:
-    // CHECK-NOT: br
+    // CHECK-NOT: br {{.*}}
     // CHECK: %[[COUNT:.+]] = load i64
     // CHECK-NEXT: %[[COUNT_ZERO:.+]] = icmp eq i64 %[[COUNT]], 0
     // CHECK-NEXT: br i1 %[[COUNT_ZERO]], label %[[EMPTY:.+]], label %[[NOT_EMPTY:.+]]
 
     // CHECK: [[NOT_EMPTY]]:
-    // CHECK-NOT: br
+    // CHECK-NOT: br {{.*}}
     // CHECK: %[[DEC:.+]] = add i64 %[[COUNT]], -1
     // CHECK-NEXT: %[[VAL:.+]] = load i16
     // CHECK-NEXT: store i64 %[[DEC]]
     // CHECK-NEXT: br label %[[EMPTY]]
 
     // CHECK: [[EMPTY]]:
-    // CHECK-NOT: br
+    // CHECK-NOT: br {{.*}}
     // CHECK: phi i16
     // CHECK-SAME: [ %[[VAL]], %[[NOT_EMPTY]] ]
-    // CHECK-NOT: br
+    // CHECK-NOT: br {{.*}}
     // CHECK: ret
 
     it.next()
@@ -48,7 +47,7 @@ pub fn iter_repeat_n_next(it: &mut std::iter::RepeatN<NotCopy>) -> Option<NotCop
 #[no_mangle]
 // CHECK-LABEL: @vec_extend_via_iter_repeat_n
 pub fn vec_extend_via_iter_repeat_n() -> Vec<u8> {
-    // CHECK: %[[ADDR:.+]] = tail call {{(noalias )?}}noundef dereferenceable_or_null(1234) ptr @{{.*}}__rust_alloc(i64 noundef {{(range\(i64 1, 0\) )?}}1234, i64 noundef {{(range\(i64 1, -9223372036854775807\) )?}}1)
+    // CHECK: %[[ADDR:.+]] = tail call {{(noalias )?}}noundef dereferenceable_or_null(1234) ptr @{{.*}}__rust_alloc(i64 noundef {{(range\(i64 [0-9]+, -9223372036854775808\) )?}}1234, i64 noundef {{(range\(i64 1, -9223372036854775807\) )?}}1)
     // CHECK: tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(1234) %[[ADDR]], i8 42, i64 1234,
 
     let n = 1234_usize;

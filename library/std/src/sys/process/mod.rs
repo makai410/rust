@@ -11,6 +11,10 @@ cfg_select! {
         mod uefi;
         use uefi as imp;
     }
+    target_os = "motor" => {
+        mod motor;
+        use motor as imp;
+    }
     _ => {
         mod unsupported;
         use unsupported as imp;
@@ -23,8 +27,15 @@ cfg_select! {
 mod env;
 
 pub use env::CommandEnvs;
+#[unstable(feature = "command_resolved_envs", issue = "149070")]
+pub use env::CommandResolvedEnvs;
+#[cfg(target_os = "linux")]
+pub use imp::PidFd;
+#[cfg(target_family = "unix")]
+pub use imp::getppid;
 pub use imp::{
-    Command, CommandArgs, EnvKey, ExitCode, ExitStatus, ExitStatusError, Process, Stdio, StdioPipes,
+    ChildPipe, Command, CommandArgs, EnvKey, ExitCode, ExitStatus, ExitStatusError, Process, Stdio,
+    getpid, read_output,
 };
 
 #[cfg(any(
@@ -34,14 +45,13 @@ pub use imp::{
             target_os = "espidf",
             target_os = "horizon",
             target_os = "vita",
-            target_os = "nuttx"
+            target_os = "nuttx",
+            target_os = "l4re"
         ))
     ),
-    target_os = "windows",
+    target_os = "windows"
 ))]
 pub fn output(cmd: &mut Command) -> crate::io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    use crate::sys::pipe::read2;
-
     let (mut process, mut pipes) = cmd.spawn(Stdio::MakePipe, false)?;
 
     drop(pipes.stdin.take());
@@ -57,7 +67,7 @@ pub fn output(cmd: &mut Command) -> crate::io::Result<(ExitStatus, Vec<u8>, Vec<
             res.unwrap();
         }
         (Some(out), Some(err)) => {
-            let res = read2(out, &mut stdout, err, &mut stderr);
+            let res = read_output(out, &mut stdout, err, &mut stderr);
             res.unwrap();
         }
     }
@@ -73,9 +83,10 @@ pub fn output(cmd: &mut Command) -> crate::io::Result<(ExitStatus, Vec<u8>, Vec<
             target_os = "espidf",
             target_os = "horizon",
             target_os = "vita",
-            target_os = "nuttx"
+            target_os = "nuttx",
+            target_os = "l4re"
         ))
     ),
-    target_os = "windows",
+    target_os = "windows"
 )))]
 pub use imp::output;

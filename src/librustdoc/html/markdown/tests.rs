@@ -471,8 +471,8 @@ fn test_markdown_html_escape() {
     fn t(input: &str, expect: &str) {
         let mut idmap = IdMap::new();
         let mut output = String::new();
-        MarkdownItemInfo(input, &mut idmap).write_into(&mut output).unwrap();
-        assert_eq!(output, expect, "original: {}", input);
+        MarkdownItemInfo::new(input, &[], &mut idmap).write_into(&mut output).unwrap();
+        assert_eq!(output, format!("<p>{}</p>\n", expect), "original: {}", input);
     }
 
     t("`Struct<'a, T>`", "<code>Struct&lt;'a, T&gt;</code>");

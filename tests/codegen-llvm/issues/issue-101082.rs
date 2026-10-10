@@ -1,6 +1,5 @@
 //@ compile-flags: -Copt-level=3
 //@ revisions: host x86-64 x86-64-v3
-//@ min-llvm-version: 20
 
 //@[host] ignore-x86_64
 
@@ -12,7 +11,6 @@
 // at the time still sometimes fails, so only verify it for the power-of-two size
 // - https://github.com/llvm/llvm-project/issues/134735
 //@[x86-64-v3] only-x86_64
-//@[x86-64-v3] min-llvm-version: 21
 //@[x86-64-v3] compile-flags: -Ctarget-cpu=x86-64-v3
 
 #![crate_type = "lib"]

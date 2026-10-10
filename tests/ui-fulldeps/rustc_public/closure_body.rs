@@ -7,7 +7,6 @@
 //@ edition: 2021
 
 #![feature(rustc_private)]
-#![feature(assert_matches)]
 
 extern crate rustc_middle;
 
@@ -52,7 +51,7 @@ fn check_incr_closure_body(body: Body) {
         panic!("expected FnDef");
     };
 
-    assert_eq!(def_id.name(), "incr");
+    assert_eq!(def_id.name(), "crate_closure_body::incr");
 }
 
 fn main() {

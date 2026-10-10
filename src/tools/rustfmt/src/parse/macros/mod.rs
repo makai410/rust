@@ -2,15 +2,15 @@ use rustc_ast::ast;
 use rustc_ast::token::{Delimiter, NonterminalKind, NtExprKind::*, NtPatKind::*, TokenKind};
 use rustc_ast::tokenstream::TokenStream;
 use rustc_parse::MACRO_ARGUMENTS;
-use rustc_parse::parser::{ForceCollect, Parser, Recovery};
+use rustc_parse::parser::{AllowConstBlockItems, ForceCollect, Parser, Recovery};
 use rustc_session::parse::ParseSess;
 use rustc_span::symbol;
 
 use crate::macros::MacroArg;
 use crate::rewrite::RewriteContext;
 
-pub(crate) mod asm;
 pub(crate) mod cfg_if;
+pub(crate) mod cfg_select;
 pub(crate) mod lazy_static;
 
 fn build_stream_parser<'a>(psess: &'a ParseSess, tokens: TokenStream) -> Parser<'a> {
@@ -25,7 +25,9 @@ fn parse_macro_arg<'a, 'b: 'a>(parser: &'a mut Parser<'b>) -> Option<MacroArg> {
     macro_rules! parse_macro_arg {
         ($macro_arg:ident, $nt_kind:expr, $try_parse:expr, $then:expr) => {
             let mut cloned_parser = (*parser).clone();
-            if Parser::nonterminal_may_begin_with($nt_kind, &cloned_parser.token) {
+            if Parser::nonterminal_may_begin_with($nt_kind, &cloned_parser.token)
+                || matches!(cloned_parser.token.kind, TokenKind::DocComment(..))
+            {
                 match $try_parse(&mut cloned_parser) {
                     Ok(x) => {
                         if parser.psess.dcx().has_errors().is_some() {
@@ -61,13 +63,13 @@ fn parse_macro_arg<'a, 'b: 'a>(parser: &'a mut Parser<'b>) -> Option<MacroArg> {
         Pat,
         NonterminalKind::Pat(PatParam { inferred: false }),
         |parser: &mut Parser<'b>| parser.parse_pat_no_top_alt(None, None),
-        |x: Box<ast::Pat>| Some(x)
+        |x: ast::Pat| Some(Box::new(x))
     );
     // `parse_item` returns `Option<Box<ast::Item>>`.
     parse_macro_arg!(
         Item,
         NonterminalKind::Item,
-        |parser: &mut Parser<'b>| parser.parse_item(ForceCollect::No),
+        |parser: &mut Parser<'b>| parser.parse_item(ForceCollect::No, AllowConstBlockItems::Yes),
         |x: Option<Box<ast::Item>>| x
     );
 

@@ -12,7 +12,7 @@ codebase take a look at [Adding Lints] or [Common Tools].
   - [Building and Testing](#building-and-testing)
   - [`cargo dev`](#cargo-dev)
   - [lintcheck](#lintcheck)
-  - [PR](#pr)
+  - [PR](#on-prs)
   - [Common Abbreviations](#common-abbreviations)
   - [Install from source](#install-from-source)
 
@@ -72,7 +72,8 @@ cargo bless
 For example, this is necessary if you fix a typo in an error message of a lint,
 or if you modify a test file to add a test case.
 
-> _Note:_ This command may update more files than you intended. In that case
+> [!NOTE]
+> This command may update more files than you intended. In that case
 > only commit the files you wanted to update.
 
 [UI test]: https://rustc-dev-guide.rust-lang.org/tests/adding.html#ui-test-walkthrough
@@ -95,7 +96,7 @@ cargo dev new_lint
 cargo dev deprecate
 # automatically formatting all code before each commit
 cargo dev setup git-hook
-# (experimental) Setup Clippy to work with IntelliJ-Rust
+# (experimental) Setup Clippy to work with RustRover
 cargo dev setup intellij
 # runs the `dogfood` tests
 cargo dev dogfood
@@ -103,7 +104,7 @@ cargo dev dogfood
 
 More about [intellij] command usage and reasons.
 
-[intellij]: https://github.com/rust-lang/rust-clippy/blob/master/CONTRIBUTING.md#intellij-rust
+[intellij]: https://github.com/rust-lang/rust-clippy/blob/master/CONTRIBUTING.md#rustrover
 
 ## lintcheck
 
@@ -117,10 +118,13 @@ Refer to the tools [README] for more details.
 
 [README]: https://github.com/rust-lang/rust-clippy/blob/master/lintcheck/README.md
 
-## PR
+## On PRs
 
 We follow a rustc no merge-commit policy. See
 <https://rustc-dev-guide.rust-lang.org/contributing.html#opening-a-pr>.
+
+Before opening your pull request, know that we follow an LLM policy.
+See [LLM policy](llm_usage.md)
 
 ## Common Abbreviations
 

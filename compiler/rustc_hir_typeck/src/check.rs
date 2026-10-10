@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 
-use rustc_abi::ExternAbi;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
-use rustc_hir::lang_items::LangItem;
 use rustc_hir_analysis::check::check_function_signature;
 use rustc_infer::infer::RegionVariableOrigin;
 use rustc_infer::traits::WellFormedLoc;
+use rustc_lint_defs::builtin::UNSAFE_PANIC_HANDLERS;
 use rustc_middle::ty::{self, Binder, Ty, TyCtxt};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::sym;
@@ -14,6 +14,7 @@ use rustc_trait_selection::traits::{ObligationCause, ObligationCauseCode};
 use tracing::{debug, instrument};
 
 use crate::coercion::CoerceMany;
+use crate::diagnostics::UnsafePanicHandlers;
 use crate::gather_locals::GatherLocalsVisitor;
 use crate::{CoroutineTypes, Diverges, FnCtxt};
 
@@ -55,16 +56,15 @@ pub(super) fn check_fn<'a, 'tcx>(
 
     // C-variadic fns also have a `VaList` input that's not listed in `fn_sig`
     // (as it's created inside the body itself, not passed in from outside).
-    let maybe_va_list = fn_sig.c_variadic.then(|| {
+    let maybe_va_list = fn_sig.c_variadic().then(|| {
         let span = body.params.last().unwrap().span;
         let va_list_did = tcx.require_lang_item(LangItem::VaList, span);
         let region = fcx.next_region_var(RegionVariableOrigin::Misc(span));
 
-        tcx.type_of(va_list_did).instantiate(tcx, &[region.into()])
+        tcx.type_of(va_list_did).instantiate(tcx, &[region.into()]).skip_norm_wip()
     });
 
     // Add formal parameters.
-    let inputs_hir = tcx.hir_fn_decl_by_hir_id(fn_id).map(|decl| &decl.inputs);
     let inputs_fn = fn_sig.inputs().iter().copied();
     for (idx, (param_ty, param)) in inputs_fn.chain(maybe_va_list).zip(body.params).enumerate() {
         // We checked the root's signature during wfcheck, but not the child.
@@ -72,15 +72,15 @@ pub(super) fn check_fn<'a, 'tcx>(
             fcx.register_wf_obligation(
                 param_ty.into(),
                 param.span,
-                ObligationCauseCode::WellFormed(Some(WellFormedLoc::Param {
+                ObligationCauseCode::WellFormed(WellFormedLoc::Param {
                     function: fn_def_id,
                     param_idx: idx,
-                })),
+                }),
             );
         }
 
         // Check the pattern.
-        let ty: Option<&hir::Ty<'_>> = inputs_hir.and_then(|h| h.get(idx));
+        let ty: Option<&hir::Ty<'_>> = decl.inputs.get(idx);
         let ty_span = ty.map(|ty| ty.span);
         fcx.check_pat_top(param.pat, param_ty, ty_span, None, None);
         if param.pat.is_never_pattern() {
@@ -91,7 +91,7 @@ pub(super) fn check_fn<'a, 'tcx>(
         }
 
         // Check that argument is Sized.
-        if !params_can_be_unsized {
+        if !params_can_be_unsized || fn_sig.abi() == rustc_abi::ExternAbi::RustTail {
             fcx.require_type_is_sized(
                 param_ty,
                 param.ty_span,
@@ -178,17 +178,35 @@ fn check_panic_info_fn(tcx: TyCtxt<'_>, fn_id: LocalDefId, fn_sig: ty::FnSig<'_>
         tcx.dcx().span_err(span, "should have no const parameters");
     }
 
-    let panic_info_did = tcx.require_lang_item(hir::LangItem::PanicInfo, span);
+    if fn_sig.safety().is_unsafe() {
+        let hir_id = tcx.local_def_id_to_hir_id(fn_id);
+        let span = tcx.def_span(fn_id);
+        // If the function is implicitly "unsafe" because it has a `#[target_feature]` attribute,
+        // then we should already have emitted an error. Don't also emit a warning.
+        // See `tests/ui/panic-handler/panic-handler-with-target-feature.rs`
+        if let Some(hir_fn_sig) = tcx.hir_fn_sig_by_hir_id(hir_id)
+            && hir_fn_sig.header.safety == hir::HeaderSafety::SafeTargetFeatures
+        {
+            tcx.dcx().span_delayed_bug(span, "`unsafe_panic_handlers` lint suppressed because there should already be an error for `#[target_feature]`");
+        } else {
+            tcx.emit_node_span_lint(UNSAFE_PANIC_HANDLERS, hir_id, span, UnsafePanicHandlers);
+        }
+    }
+
+    let panic_info_did = tcx.require_lang_item(LangItem::PanicInfo, span);
 
     // build type `for<'a, 'b> fn(&'a PanicInfo<'b>) -> !`
-    let panic_info_ty = tcx.type_of(panic_info_did).instantiate(
-        tcx,
-        &[ty::GenericArg::from(ty::Region::new_bound(
+    let panic_info_ty = tcx
+        .type_of(panic_info_did)
+        .instantiate(
             tcx,
-            ty::INNERMOST,
-            ty::BoundRegion { var: ty::BoundVar::from_u32(1), kind: ty::BoundRegionKind::Anon },
-        ))],
-    );
+            &[ty::GenericArg::from(ty::Region::new_bound(
+                tcx,
+                ty::INNERMOST,
+                ty::BoundRegion { var: ty::BoundVar::from_u32(1), kind: ty::BoundRegionKind::Anon },
+            ))],
+        )
+        .skip_norm_wip();
     let panic_info_ref_ty = Ty::new_imm_ref(
         tcx,
         ty::Region::new_bound(
@@ -204,7 +222,7 @@ fn check_panic_info_fn(tcx: TyCtxt<'_>, fn_id: LocalDefId, fn_sig: ty::FnSig<'_>
         ty::BoundVariableKind::Region(ty::BoundRegionKind::Anon),
     ]);
     let expected_sig = ty::Binder::bind_with_vars(
-        tcx.mk_fn_sig([panic_info_ref_ty], tcx.types.never, false, fn_sig.safety, ExternAbi::Rust),
+        tcx.mk_fn_sig_rust_abi([panic_info_ref_ty], tcx.types.never, fn_sig.safety()),
         bounds,
     );
 
@@ -225,12 +243,10 @@ fn check_lang_start_fn<'tcx>(tcx: TyCtxt<'tcx>, fn_sig: ty::FnSig<'tcx>, def_id:
     let generics = tcx.generics_of(def_id);
     let fn_generic = generics.param_at(0, tcx);
     let generic_ty = Ty::new_param(tcx, fn_generic.index, fn_generic.name);
-    let main_fn_ty = Ty::new_fn_ptr(
-        tcx,
-        Binder::dummy(tcx.mk_fn_sig([], generic_ty, false, hir::Safety::Safe, ExternAbi::Rust)),
-    );
+    let main_fn_ty =
+        Ty::new_fn_ptr(tcx, Binder::dummy(tcx.mk_fn_sig_safe_rust_abi([], generic_ty)));
 
-    let expected_sig = ty::Binder::dummy(tcx.mk_fn_sig(
+    let expected_sig = ty::Binder::dummy(tcx.mk_fn_sig_rust_abi(
         [
             main_fn_ty,
             tcx.types.isize,
@@ -238,9 +254,7 @@ fn check_lang_start_fn<'tcx>(tcx: TyCtxt<'tcx>, fn_sig: ty::FnSig<'tcx>, def_id:
             tcx.types.u8,
         ],
         tcx.types.isize,
-        false,
-        fn_sig.safety,
-        ExternAbi::Rust,
+        fn_sig.safety(),
     ));
 
     let _ = check_function_signature(

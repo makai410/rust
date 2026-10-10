@@ -1,16 +1,16 @@
 use std::ops::ControlFlow;
 
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::graph::iterate::{
     NodeStatus, TriColorDepthFirstSearch, TriColorVisitor,
 };
-use rustc_hir::LangItem;
 use rustc_hir::def::DefKind;
+use rustc_lint_defs::builtin::UNCONDITIONAL_RECURSION;
 use rustc_middle::mir::{self, BasicBlock, BasicBlocks, Body, Terminator, TerminatorKind};
-use rustc_middle::ty::{self, GenericArg, GenericArgs, Instance, Ty, TyCtxt};
-use rustc_session::lint::builtin::UNCONDITIONAL_RECURSION;
+use rustc_middle::ty::{self, GenericArg, GenericArgs, Instance, Ty, TyCtxt, Unnormalized};
 use rustc_span::Span;
 
-use crate::errors::UnconditionalRecursion;
+use crate::diagnostics::UnconditionalRecursion;
 use crate::pass_manager::MirLint;
 
 pub(super) struct CheckCallRecursion;
@@ -44,10 +44,10 @@ impl<'tcx> MirLint<'tcx> for CheckDropRecursion {
         // First check if `body` is an `fn drop()` of `Drop`
         if let DefKind::AssocFn = tcx.def_kind(def_id)
         && let Some(impl_id) = tcx.trait_impl_of_assoc(def_id.to_def_id())
-        && let trait_ref = tcx.impl_trait_ref(impl_id).unwrap()
-        && tcx.is_lang_item(trait_ref.instantiate_identity().def_id, LangItem::Drop)
+        && let trait_ref = tcx.impl_trait_ref(impl_id)
+        && tcx.is_lang_item(trait_ref.def_id(), LangItem::Drop)
         // avoid erroneous `Drop` impls from causing ICEs below
-        && let sig = tcx.fn_sig(def_id).instantiate_identity()
+        && let sig = tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip()
         && sig.inputs().skip_binder().len() == 1
         {
             // It was. Now figure out for what type `Drop` is implemented and then
@@ -79,7 +79,7 @@ fn check_recursion<'tcx>(
             return;
         }
 
-        vis.reachable_recursive_calls.sort();
+        vis.reachable_recursive_calls.sort_by_key(|span| span.lo_hi());
 
         let sp = tcx.def_span(def_id);
         let hir_id = tcx.local_def_id_to_hir_id(def_id);
@@ -143,7 +143,10 @@ impl<'tcx> TerminatorClassifier<'tcx> for CallRecursion<'tcx> {
 
         let func_ty = func.ty(body, tcx);
         if let ty::FnDef(callee, args) = *func_ty.kind() {
-            let Ok(normalized_args) = tcx.try_normalize_erasing_regions(typing_env, args) else {
+            let args = args.no_bound_vars().unwrap();
+            let Ok(normalized_args) =
+                tcx.try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(args))
+            else {
                 return false;
             };
             let (callee, call_args) = if let Ok(Some(instance)) =

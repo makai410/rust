@@ -1,4 +1,7 @@
 //@ check-pass
+//@ revisions: old next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
 
 pub trait BufferTrait<'buffer> {
     type Subset<'channel>

@@ -5,21 +5,25 @@
 //! allows setting up things that cannot be simply captured inside the bootstrap.toml, in addition to
 //! leading people away from manually editing most of the bootstrap.toml values.
 
+use std::collections::BTreeMap;
 use std::env::consts::EXE_SUFFIX;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write;
 use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::{fmt, fs, io};
 
+use serde_derive::{Deserialize, Serialize};
 use sha2::Digest;
 
-use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
+use crate::core::build_steps::format;
+use crate::core::builder::{Builder, CommandLineStep, RunConfig, ShouldRun};
+use crate::core::config::Config;
 use crate::utils::change_tracker::CONFIG_CHANGE_HISTORY;
 use crate::utils::exec::command;
-use crate::utils::helpers::{self, hex_encode};
-use crate::{Config, t};
+use crate::utils::helpers::{self, hex_encode, t};
 
 #[cfg(test)]
 mod tests;
@@ -101,15 +105,21 @@ impl fmt::Display for Profile {
     }
 }
 
-impl Step for Profile {
+impl CommandLineStep for Profile {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(mut run: ShouldRun<'_>) -> ShouldRun<'_> {
         for choice in Profile::all() {
-            run = run.alias(choice.as_str());
+            // Some of the profile names happen to coincide with actual directory names
+            // ("compiler" and "library"), so avoid the usual assertion that aliases
+            // don't exist on disk.
+            run = run.alias_without_assert(choice.as_str());
         }
         run
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -133,7 +143,7 @@ impl Step for Profile {
                 }
                 _ => {
                     println!("Exiting.");
-                    crate::exit!(1);
+                    helpers::exit_process(1);
                 }
             }
         }
@@ -163,7 +173,7 @@ impl Step for Profile {
     }
 
     fn run(self, builder: &Builder<'_>) {
-        setup(&builder.build.config, self);
+        setup(&builder.sess.config, self);
     }
 }
 
@@ -229,12 +239,15 @@ fn setup_config_toml(path: &Path, profile: Profile, config: &Config) {
 /// Creates a toolchain link for stage1 using `rustup`
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Link;
-impl Step for Link {
+impl CommandLineStep for Link {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.alias("link")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -303,7 +316,7 @@ fn attempt_toolchain_link(builder: &Builder<'_>, stage_path: &str) {
         eprintln!(
             "To manually link stage 1 build to `stage1` toolchain, run:\n
             `rustup toolchain link stage1 {}`",
-            &stage_path
+            stage_path
         );
     }
 }
@@ -362,11 +375,7 @@ fn ensure_stage1_toolchain_placeholder_exists(stage_path: &str) -> bool {
 
     // Take care not to overwrite the file
     let result = File::options().append(true).create(true).open(&pathbuf);
-    if result.is_err() {
-        return false;
-    }
-
-    true
+    result.is_ok()
 }
 
 // Used to get the path for `Subcommand::Setup`
@@ -402,7 +411,7 @@ pub fn interactive_path() -> io::Result<Profile> {
         io::stdin().read_line(&mut input)?;
         if input.is_empty() {
             eprintln!("EOF on stdin, when expecting answer to question.  Giving up.");
-            crate::exit!(1);
+            helpers::exit_process(1);
         }
         break match parse_with_abbrev(&input) {
             Ok(profile) => profile,
@@ -448,12 +457,15 @@ fn prompt_user(prompt: &str) -> io::Result<Option<PromptResult>> {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Hook;
 
-impl Step for Hook {
+impl CommandLineStep for Hook {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.alias("hook")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -520,7 +532,8 @@ undesirable, simply delete the `pre-push` file from .git/hooks."
 }
 
 /// Handles editor-specific setup differences
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum EditorKind {
     Emacs,
     Helix,
@@ -528,6 +541,13 @@ enum EditorKind {
     VsCode,
     Zed,
 }
+
+static PARSED_HASHES: LazyLock<BTreeMap<EditorKind, Vec<&'static str>>> = LazyLock::new(|| {
+    const ALL_HASHES: &str = include_str!("setup/hashes.json");
+    let mut map: BTreeMap<_, Vec<_>> = serde_json::from_str(ALL_HASHES).unwrap();
+    map.insert(EditorKind::Vim, map.get(&EditorKind::VsCode).unwrap().clone());
+    map
+});
 
 impl EditorKind {
     // Used in `./tests.rs`.
@@ -579,46 +599,7 @@ Select which editor you would like to set up [default: None]: ";
     /// New entries should be appended whenever this is updated so we can detect
     /// outdated vs. user-modified settings files.
     fn hashes(&self) -> &'static [&'static str] {
-        match self {
-            EditorKind::Emacs => &[
-                "51068d4747a13732440d1a8b8f432603badb1864fa431d83d0fd4f8fa57039e0",
-                "d29af4d949bbe2371eac928a3c31cf9496b1701aa1c45f11cd6c759865ad5c45",
-                "b5dd299b93dca3ceeb9b335f929293cb3d4bf4977866fbe7ceeac2a8a9f99088",
-                "631c837b0e98ae35fd48b0e5f743b1ca60adadf2d0a2b23566ba25df372cf1a9",
-                "080955765db84bb6cbf178879f489c4e2369397626a6ecb3debedb94a9d0b3ce",
-                "f501475c6654187091c924ae26187fa5791d74d4a8ab3fb61fbbe4c0275aade1",
-            ],
-            EditorKind::Helix => &[
-                "2d3069b8cf1b977e5d4023965eb6199597755e6c96c185ed5f2854f98b83d233",
-                "6736d61409fbebba0933afd2e4c44ff2f97c1cb36cf0299a7f4a7819b8775040",
-                "f252dcc30ca85a193a699581e5e929d5bd6c19d40d7a7ade5e257a9517a124a5",
-                "198c195ed0c070d15907b279b8b4ea96198ca71b939f5376454f3d636ab54da5",
-                "1c43ead340b20792b91d02b08494ee68708e7e09f56b6766629b4b72079208f1",
-            ],
-            EditorKind::Vim | EditorKind::VsCode => &[
-                "ea67e259dedf60d4429b6c349a564ffcd1563cf41c920a856d1f5b16b4701ac8",
-                "56e7bf011c71c5d81e0bf42e84938111847a810eee69d906bba494ea90b51922",
-                "af1b5efe196aed007577899db9dae15d6dbc923d6fa42fa0934e68617ba9bbe0",
-                "3468fea433c25fff60be6b71e8a215a732a7b1268b6a83bf10d024344e140541",
-                "47d227f424bf889b0d899b9cc992d5695e1b78c406e183cd78eafefbe5488923",
-                "b526bd58d0262dd4dda2bff5bc5515b705fb668a46235ace3e057f807963a11a",
-                "828666b021d837a33e78d870b56d34c88a5e2c85de58b693607ec574f0c27000",
-                "811fb3b063c739d261fd8590dd30242e117908f5a095d594fa04585daa18ec4d",
-                "4eecb58a2168b252077369da446c30ed0e658301efe69691979d1ef0443928f4",
-                "c394386e6133bbf29ffd32c8af0bb3d4aac354cba9ee051f29612aa9350f8f8d",
-                "e53e9129ca5ee5dcbd6ec8b68c2d87376474eb154992deba3c6d9ab1703e0717",
-                "f954316090936c7e590c253ca9d524008375882fa13c5b41d7e2547a896ff893",
-                "701b73751efd7abd6487f2c79348dab698af7ac4427b79fa3d2087c867144b12",
-                "a61df796c0c007cb6512127330564e49e57d558dec715703916a928b072a1054",
-            ],
-            EditorKind::Zed => &[
-                "bbce727c269d1bd0c98afef4d612eb4ce27aea3c3a8968c5f10b31affbc40b6c",
-                "a5380cf5dd9328731aecc5dfb240d16dac46ed272126b9728006151ef42f5909",
-                "2e96bf0d443852b12f016c8fc9840ab3d0a2b4fe0b0fb3a157e8d74d5e7e0e26",
-                "4fadd4c87389a601a27db0d3d74a142fa3a2e656ae78982e934dbe24bee32ad6",
-                "f0bb3d23ab1a49175ab0ef5c4071af95bb03d01d460776cdb716d91333443382",
-            ],
-        }
+        PARSED_HASHES.get(self).unwrap()
     }
 
     fn settings_path(&self, config: &Config) -> PathBuf {
@@ -664,12 +645,15 @@ Select which editor you would like to set up [default: None]: ";
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Editor;
 
-impl Step for Editor {
+impl CommandLineStep for Editor {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.alias("editor")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -692,6 +676,10 @@ impl Step for Editor {
             Ok(editor_kind) => {
                 if let Some(editor_kind) = editor_kind {
                     while !t!(create_editor_settings_maybe(config, &editor_kind)) {}
+
+                    // Also pre-download stage 0 rustfmt, so that the IDE configs which point to
+                    // `build/host/rustfmt` have an available binary to work with.
+                    builder.ensure(format::InternalRustfmt);
                 } else {
                     println!("Ok, skipping editor setup!");
                 }

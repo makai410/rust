@@ -2,6 +2,7 @@
 //! constraining their hidden type to a trait object.
 
 //@ revisions: next old
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 
 trait Trait {}
@@ -9,6 +10,7 @@ trait Trait {}
 impl Trait for u32 {}
 
 fn hello() -> Box<impl Trait + ?Sized> {
+//[next]~^ ERROR: the trait bound `dyn Send: Trait` is not satisfied
     if true {
         let x = hello();
         //[next]~^ ERROR: the trait bound `dyn Send: Trait` is not satisfied

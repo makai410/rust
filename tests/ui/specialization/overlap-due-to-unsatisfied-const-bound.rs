@@ -1,13 +1,15 @@
 // Regression test for #140571. The compiler used to ICE
 
-#![feature(associated_const_equality, specialization)]
-//~^ WARN the feature `specialization` is incomplete
+#![feature(gca_min_const_items, specialization)]
+
+use std::gca;
 
 pub trait IsVoid {
+    #[rustc_always_gca]
     const IS_VOID: bool;
 }
 impl<T> IsVoid for T {
-    default const IS_VOID: bool = false;
+    default const IS_VOID: bool = gca!(false);
 }
 
 pub trait NotVoid {}

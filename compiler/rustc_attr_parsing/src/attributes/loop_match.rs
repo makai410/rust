@@ -1,22 +1,19 @@
-use rustc_hir::Target;
-use rustc_hir::attrs::AttributeKind;
-use rustc_span::{Span, Symbol, sym};
+use rustc_feature::AttributeStability;
 
-use crate::attributes::{NoArgsAttributeParser, OnDuplicate};
-use crate::context::MaybeWarn::Allow;
-use crate::context::{AllowedTargets, Stage};
+use super::prelude::*;
+
 pub(crate) struct LoopMatchParser;
-impl<S: Stage> NoArgsAttributeParser<S> for LoopMatchParser {
+impl NoArgsAttributeParser for LoopMatchParser {
     const PATH: &[Symbol] = &[sym::loop_match];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Expression)]);
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Loop)]);
+    const STABILITY: AttributeStability = unstable!(loop_match);
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::LoopMatch;
 }
 
 pub(crate) struct ConstContinueParser;
-impl<S: Stage> NoArgsAttributeParser<S> for ConstContinueParser {
+impl NoArgsAttributeParser for ConstContinueParser {
     const PATH: &[Symbol] = &[sym::const_continue];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Expression)]);
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Break)]);
+    const STABILITY: AttributeStability = unstable!(loop_match);
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::ConstContinue;
 }

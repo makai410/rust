@@ -1,5 +1,6 @@
+//@require-annotations-for-level: ERROR
 #![warn(clippy::map_identity)]
-#![allow(clippy::needless_return, clippy::disallowed_names)]
+#![expect(clippy::disallowed_names, clippy::needless_return)]
 
 fn main() {
     let x: [u16; 3] = [1, 2, 3];
@@ -78,20 +79,32 @@ fn issue11764() {
 }
 
 fn issue13904() {
-    // don't lint: `it.next()` would not be legal as `it` is immutable
+    // lint, but there's a catch:
+    // when we remove the `.map()`, `it.next()` would require `it` to be mutable
+    // therefore, include that in the suggestion as well
     let it = [1, 2, 3].into_iter();
     let _ = it.map(|x| x).next();
+    //~^ map_identity
+    //~| HELP: remove the call to `map`, and make `it` mutable
 
     // lint
-    #[allow(unused_mut)]
+    let mut index = [1, 2, 3].into_iter();
+    let subindex = (index.by_ref().take(3), 42);
+    let _ = subindex.0.map(|n| n).next();
+    //~^ map_identity
+    //~| HELP: remove the call to `map`, and make `subindex` mutable
+
+    // lint
     let mut it = [1, 2, 3].into_iter();
     let _ = it.map(|x| x).next();
     //~^ map_identity
+    //~| HELP: remove the call to `map`
 
     // lint
     let it = [1, 2, 3].into_iter();
     let _ = { it }.map(|x| x).next();
     //~^ map_identity
+    //~| HELP: remove the call to `map`
 }
 
 // same as `issue11764`, but for arrays

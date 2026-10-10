@@ -3,7 +3,7 @@
 //! Regression test for <https://github.com/rust-lang/rust/issues/90924>.
 
 //@ build-pass
-//@ ignore-pass
+//@ no-pass-override (LLVM remarks are produced during codegen)
 //@ revisions: all inline merge1 merge2
 //@ compile-flags: --crate-type=lib -Cdebuginfo=1 -Copt-level=2
 
@@ -17,6 +17,7 @@
 
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
+//@ ignore-backends: gcc
 
 #[no_mangle]
 #[inline(never)]

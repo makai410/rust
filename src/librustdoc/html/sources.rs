@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, fs};
@@ -8,7 +8,7 @@ use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
-use rustc_span::{FileName, FileNameDisplayPreference, RealFileName, sym};
+use rustc_span::{FileName, RealFileName, RemapPathScopeComponents};
 use tracing::info;
 
 use super::render::Context;
@@ -148,7 +148,10 @@ impl DocVisitor<'_> for SourceCollector<'_, '_> {
                         span,
                         format!(
                             "failed to render source code for `{filename}`: {e}",
-                            filename = filename.to_string_lossy(FileNameDisplayPreference::Local),
+                            filename = filename
+                                .path(RemapPathScopeComponents::DIAGNOSTICS)
+                                .to_string_lossy()
+                                .into_owned(),
                         ),
                     );
                     false
@@ -185,36 +188,33 @@ impl SourceCollector<'_, '_> {
         };
 
         // Remove the utf-8 BOM if any
-        let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
+        let contents = contents.trim_prefix('\u{feff}');
 
         let shared = &self.cx.shared;
         // Create the intermediate directories
         let cur = RefCell::new(PathBuf::new());
-        let root_path = RefCell::new(PathBuf::new());
+        // Tracks the extra directory depth accumulated during path traversal.
+        // Starts at 0; `PathBuf::pop()` on empty is a no-op, so we mirror that
+        // with `saturating_sub`. The base depth of 2 (for `src/<crate>/`) is added after.
+        let extra_depth = Cell::new(0usize);
 
         clean_path(
             &shared.src_root,
             &p,
             |component| {
                 cur.borrow_mut().push(component);
-                root_path.borrow_mut().push("..");
+                extra_depth.set(extra_depth.get() + 1);
             },
             || {
                 cur.borrow_mut().pop();
-                root_path.borrow_mut().pop();
+                extra_depth.set(extra_depth.get().saturating_sub(1));
             },
         );
 
+        let jump_to_def_path_depth = 2 + extra_depth.get();
+
         let src_fname = p.file_name().expect("source has no filename").to_os_string();
         let mut fname = src_fname.clone();
-
-        let root_path = PathBuf::from("../../").join(root_path.into_inner());
-        let mut root_path = root_path.to_string_lossy();
-        if let Some(c) = root_path.as_bytes().last()
-            && *c != b'/'
-        {
-            root_path += "/";
-        }
         let mut file_path = Path::new(&self.crate_name).join(&*cur.borrow());
         file_path.push(&fname);
         fname.push(".html");
@@ -224,10 +224,8 @@ impl SourceCollector<'_, '_> {
         cur.push(&fname);
 
         let title = format!("{} - source", src_fname.to_string_lossy());
-        let desc = format!(
-            "Source of the Rust file `{}`.",
-            file.to_string_lossy(FileNameDisplayPreference::Remapped)
-        );
+        let desc = format!("Source of the Rust file `{}`.", p.to_string_lossy());
+        let root_path = "../".repeat(jump_to_def_path_depth);
         let page = layout::Page {
             title: &title,
             short_title: &src_fname.to_string_lossy(),
@@ -236,7 +234,9 @@ impl SourceCollector<'_, '_> {
             static_root_path: shared.static_root_path.as_deref(),
             description: &desc,
             resource_suffix: &shared.resource_suffix,
-            rust_logo: has_doc_flag(self.cx.tcx(), LOCAL_CRATE.as_def_id(), sym::rust_logo),
+            rust_logo: has_doc_flag(self.cx.tcx(), LOCAL_CRATE.as_def_id(), |d| {
+                d.rust_logo.is_some()
+            }),
         };
         let source_context = SourceContext::Standalone { file_path };
         let v = layout::render(
@@ -249,7 +249,7 @@ impl SourceCollector<'_, '_> {
                     contents,
                     file_span,
                     self.cx,
-                    &root_path,
+                    jump_to_def_path_depth,
                     &highlight::DecorationInfo::default(),
                     &source_context,
                 )
@@ -327,8 +327,8 @@ pub(crate) fn print_src(
     mut writer: impl fmt::Write,
     s: &str,
     file_span: rustc_span::Span,
-    context: &Context<'_>,
-    root_path: &str,
+    cx: &Context<'_>,
+    jump_to_def_path_depth: usize,
     decoration_info: &highlight::DecorationInfo,
     source_context: &SourceContext<'_>,
 ) -> fmt::Result {
@@ -342,14 +342,25 @@ pub(crate) fn print_src(
         lines += line_info.start_line as usize;
     }
     let code = fmt::from_fn(move |fmt| {
-        let current_href = context
-            .href_from_span(clean::Span::new(file_span), false)
-            .expect("only local crates should have sources emitted");
+        // For scraped examples, use the URL from ScrapedInfo directly.
+        // For regular sources, derive it from the span.
+        let current_href = if let SourceContext::Embedded(info) = source_context {
+            info.url.to_string()
+        } else {
+            cx.href_from_span(clean::Span::new(file_span), false)
+                .expect("only local crates should have sources emitted")
+        };
         highlight::write_code(
             fmt,
             s,
-            Some(highlight::HrefContext { context, file_span, root_path, current_href }),
+            Some(highlight::HrefContext {
+                context: cx,
+                file_span: file_span.into(),
+                jump_to_def_path_depth,
+                current_href,
+            }),
             Some(decoration_info),
+            cx.tcx().sess.edition(),
             Some(line_info),
         );
         Ok(())

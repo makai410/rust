@@ -53,14 +53,23 @@ pub(crate) fn gather_pgo_profile<'a>(
 
     // Merge profiles into a single file
     let merged_profile = pgo_dir.join("merged.profdata");
-    let profile_files = std::fs::read_dir(pgo_dir)?.filter_map(|entry| {
-        let entry = entry.ok()?;
-        if entry.path().extension() == Some(OsStr::new("profraw")) {
-            Some(entry.path().to_str().unwrap().to_owned())
-        } else {
-            None
-        }
-    });
+    let profile_files = std::fs::read_dir(pgo_dir)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if entry.path().extension() == Some(OsStr::new("profraw")) {
+                Some(entry.path().to_str().unwrap().to_owned())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if profile_files.is_empty() {
+        anyhow::bail!(
+            "rust-analyzer analysis-stats produced no pgo files. This is a bug in rust-analyzer; please file an issue."
+        );
+    }
+
     cmd!(sh, "{llvm_profdata} merge {profile_files...} -o {merged_profile}").run().context(
         "cannot merge PGO profiles. Do you have the rustup `llvm-tools` component installed?",
     )?;
@@ -82,22 +91,9 @@ fn download_crate_for_training(sh: &Shell, pgo_dir: &Path, repo: &str) -> anyhow
     let target_path = pgo_dir.join(normalized_path);
     cmd!(sh, "git clone --depth 1 https://github.com/{repo} {revision...} {target_path}")
         .run()
-        .with_context(|| "cannot download PGO training crate from {repo}")?;
+        .with_context(|| format!("cannot download PGO training crate from {repo}"))?;
 
     Ok(target_path)
-}
-
-/// Helper function to create a build command for rust-analyzer
-pub(crate) fn build_command<'a>(
-    sh: &'a Shell,
-    command: &str,
-    target_name: &str,
-    features: &[&str],
-) -> Cmd<'a> {
-    cmd!(
-        sh,
-        "cargo {command} --manifest-path ./crates/rust-analyzer/Cargo.toml --bin rust-analyzer --target {target_name} {features...} --release"
-    )
 }
 
 pub(crate) fn apply_pgo_to_cmd<'a>(cmd: Cmd<'a>, profile_path: &Path) -> Cmd<'a> {

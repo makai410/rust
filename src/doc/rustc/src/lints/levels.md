@@ -38,7 +38,7 @@ talk about later in this section.
 
 Sometimes, it can be helpful to suppress lints, but at the same time ensure that
 the code in question still emits them. The 'expect' level does exactly this. If
-the lint in question is not emitted, the `unfulfilled_lint_expectation` lint
+the lint in question is not emitted, the `unfulfilled_lint_expectations` lint
 triggers on the `expect` attribute, notifying you that the expectation is no
 longer fulfilled.
 
@@ -104,7 +104,7 @@ level is capped via cap-lints.
 ## deny
 
 A 'deny' lint produces an error if you violate it. For example, this code
-runs into the `exceeding_bitshifts` lint.
+runs into the `arithmetic_overflow` lint.
 
 ```rust,no_run
 fn main() {
@@ -114,13 +114,13 @@ fn main() {
 
 ```bash
 $ rustc main.rs
-error: bitshift exceeds the type's number of bits
- --> main.rs:2:13
+error: this arithmetic operation will overflow
+ --> main.rs:2:5
   |
 2 |     100u8 << 10;
-  |     ^^^^^^^^^^^
+  |     ^^^^^^^^^^^ attempt to shift left by `10_i32`, which would overflow
   |
-  = note: `#[deny(exceeding_bitshifts)]` on by default
+  = note: `#[deny(arithmetic_overflow)]` on by default
 ```
 
 What's the difference between an error from a lint and a regular old error?
@@ -306,19 +306,13 @@ And we compile it, capping lints to warn:
 
 ```bash
 $ rustc lib.rs --cap-lints warn
-warning: bitshift exceeds the type's number of bits
+warning: this arithmetic operation will overflow
  --> lib.rs:2:5
   |
 2 |     100u8 << 10;
-  |     ^^^^^^^^^^^
+  |     ^^^^^^^^^^^ attempt to shift left by `10_i32`, which would overflow
   |
-  = note: `#[warn(exceeding_bitshifts)]` on by default
-
-warning: this expression will panic at run-time
- --> lib.rs:2:5
-  |
-2 |     100u8 << 10;
-  |     ^^^^^^^^^^^ attempt to shift left with overflow
+  = note: `#[warn(arithmetic_overflow)]` on by default
 ```
 
 It now only warns, rather than errors. We can go further and allow all lints:
@@ -393,7 +387,7 @@ Here’s how these different lint controls interact:
     warning: 1 warning emitted
    ```
 
-3. [CLI level flags](#via-compiler-flag) take precedence over attributes.
+3. [CLI level flags](#via-compiler-flag) override the default level of a lint. They essentially behave like crate-level attributes. Attributes within the source code take precedence over CLI flags, except for `-F`/`--forbid`, which cannot be overridden.
 
    The order of the flags matter; flags on the right take precedence over earlier flags.
 

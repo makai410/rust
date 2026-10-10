@@ -1,29 +1,28 @@
-//! A heuristic to tell whether an expression's type can be determined purely from its
-//! subexpressions, and the arguments and locals they use. Put another way, `expr_type_is_certain`
-//! tries to tell whether an expression's type can be determined without appeal to the surrounding
-//! context.
-//!
-//! This is, in some sense, a counterpart to `let_unit_value`'s `expr_needs_inferred_result`.
-//! Intuitively, that function determines whether an expression's type is needed for type inference,
-//! whereas `expr_type_is_certain` determines whether type inference is needed for an expression's
-//! type.
-//!
-//! As a heuristic, `expr_type_is_certain` may produce false negatives, but a false positive should
-//! be considered a bug.
-
 use crate::paths::{PathNS, lookup_path};
 use rustc_ast::{LitFloatType, LitIntType, LitKind};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::intravisit::{InferKind, Visitor, VisitorExt, walk_qpath, walk_ty};
+use rustc_hir::intravisit::{InferKind, Visitor, walk_qpath, walk_ty};
 use rustc_hir::{self as hir, AmbigArg, Expr, ExprKind, GenericArgs, HirId, Node, Param, PathSegment, QPath, TyKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::{self, AdtDef, GenericArgKind, Ty};
 use rustc_span::Span;
 
 mod certainty;
-use certainty::{Certainty, Meet, join, meet};
+use certainty::{Certainty, Meet as _, join, meet};
 
+/// A heuristic to tell whether an expression's type can be determined purely from its
+/// subexpressions, and the arguments and locals they use. Put another way, this function
+/// tries to tell whether an expression's type can be determined without appeal to the surrounding
+/// context.
+///
+/// This is, in some sense, a counterpart to `let_unit_value`'s `expr_needs_inferred_result`.
+/// Intuitively, that function determines whether an expression's type is needed for type inference,
+/// whereas this function determines whether type inference is needed for an expression's
+/// type.
+///
+/// As a heuristic, this may produce false negatives, but a false positive should
+/// be considered a bug.
 pub fn expr_type_is_certain(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     expr_type_certainty(cx, expr, false).is_certain()
 }
@@ -197,19 +196,6 @@ fn qpath_certainty(cx: &LateContext<'_>, qpath: &QPath<'_>, resolves_to_type: bo
         QPath::TypeRelative(ty, path_segment) => {
             path_segment_certainty(cx, type_certainty(cx, ty), path_segment, resolves_to_type)
         },
-
-        QPath::LangItem(lang_item, ..) => cx
-            .tcx
-            .lang_items()
-            .get(*lang_item)
-            .map_or(Certainty::Uncertain, |def_id| {
-                let generics = cx.tcx.generics_of(def_id);
-                if generics.is_empty() {
-                    Certainty::Certain(if resolves_to_type { Some(def_id) } else { None })
-                } else {
-                    Certainty::Uncertain
-                }
-            }),
     };
     debug_assert!(resolves_to_type || certainty.to_def_id().is_none());
     certainty
@@ -262,7 +248,7 @@ fn path_segment_certainty(
                 let certainty = lhs.join_clearing_def_ids(rhs);
                 if resolves_to_type {
                     if let DefKind::TyAlias = cx.tcx.def_kind(def_id) {
-                        adt_def_id(cx.tcx.type_of(def_id).instantiate_identity())
+                        adt_def_id(cx.tcx.type_of(def_id).instantiate_identity().skip_norm_wip())
                             .map_or(certainty, |def_id| certainty.with_def_id(def_id))
                     } else {
                         certainty.with_def_id(def_id)
@@ -329,7 +315,7 @@ fn update_res(
     None
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn type_is_inferable_from_arguments(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     let Some(callee_def_id) = (match expr.kind {
         ExprKind::Call(callee, _) => {

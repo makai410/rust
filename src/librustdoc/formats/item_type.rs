@@ -3,10 +3,15 @@
 use std::fmt;
 
 use rustc_hir::def::{CtorOf, DefKind, MacroKinds};
+use rustc_hir::def_id::DefId;
+use rustc_middle::ty::TyCtxt;
 use rustc_span::hygiene::MacroKind;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::clean;
+
+macro_rules! item_type {
+    ($($variant:ident = $number:literal,)+) => {
 
 /// Item type. Corresponds to `clean::ItemEnum` variants.
 ///
@@ -29,6 +34,44 @@ use crate::clean;
 #[derive(Copy, PartialEq, Eq, Hash, Clone, Debug, PartialOrd, Ord)]
 #[repr(u8)]
 pub(crate) enum ItemType {
+    $($variant = $number,)+
+}
+
+impl Serialize for ItemType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (*self as u8).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ItemType {
+    fn deserialize<D>(deserializer: D) -> Result<ItemType, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ItemTypeVisitor;
+        impl<'de> de::Visitor<'de> for ItemTypeVisitor {
+            type Value = ItemType;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "an integer between 0 and 27")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ItemType, E> {
+                Ok(match v {
+                    $($number => ItemType::$variant,)+
+                    _ => return Err(E::missing_field("unknown number for `ItemType` enum")),
+                })
+            }
+        }
+        deserializer.deserialize_any(ItemTypeVisitor)
+    }
+}
+
+    }
+}
+
+item_type! {
     Keyword = 0,
     Primitive = 1,
     Module = 2,
@@ -57,67 +100,19 @@ pub(crate) enum ItemType {
     TraitAlias = 25,
     // This number is reserved for use in JavaScript
     // Generic = 26,
-}
-
-impl Serialize for ItemType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        (*self as u8).serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for ItemType {
-    fn deserialize<D>(deserializer: D) -> Result<ItemType, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ItemTypeVisitor;
-        impl<'de> de::Visitor<'de> for ItemTypeVisitor {
-            type Value = ItemType;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(formatter, "an integer between 0 and 25")
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<ItemType, E> {
-                Ok(match v {
-                    0 => ItemType::Keyword,
-                    1 => ItemType::Primitive,
-                    2 => ItemType::Module,
-                    3 => ItemType::ExternCrate,
-                    4 => ItemType::Import,
-                    5 => ItemType::Struct,
-                    6 => ItemType::Enum,
-                    7 => ItemType::Function,
-                    8 => ItemType::TypeAlias,
-                    9 => ItemType::Static,
-                    10 => ItemType::Trait,
-                    11 => ItemType::Impl,
-                    12 => ItemType::TyMethod,
-                    13 => ItemType::Method,
-                    14 => ItemType::StructField,
-                    15 => ItemType::Variant,
-                    16 => ItemType::Macro,
-                    17 => ItemType::AssocType,
-                    18 => ItemType::Constant,
-                    19 => ItemType::AssocConst,
-                    20 => ItemType::Union,
-                    21 => ItemType::ForeignType,
-                    23 => ItemType::ProcAttribute,
-                    24 => ItemType::ProcDerive,
-                    25 => ItemType::TraitAlias,
-                    _ => return Err(E::missing_field("unknown number")),
-                })
-            }
-        }
-        deserializer.deserialize_any(ItemTypeVisitor)
-    }
+    Attribute = 27,
+    // The two next ones represent an attr/derive macro declared as a `macro_rules!`. We need this
+    // distinction because they will point to a `macro.[name].html` file and not
+    // `[attr|derive].[name].html` file, so the link generation needs to take it into account while
+    // still having the filtering working as expected.
+    DeclMacroAttribute = 28,
+    DeclMacroDerive = 29,
 }
 
 impl<'a> From<&'a clean::Item> for ItemType {
     fn from(item: &'a clean::Item) -> ItemType {
         let kind = match &item.kind {
-            clean::StrippedItem(box item) => item,
+            clean::StrippedItem(item) => item,
             kind => kind,
         };
 
@@ -133,7 +128,7 @@ impl<'a> From<&'a clean::Item> for ItemType {
             clean::StaticItem(..) => ItemType::Static,
             clean::ConstantItem(..) => ItemType::Constant,
             clean::TraitItem(..) => ItemType::Trait,
-            clean::ImplItem(..) => ItemType::Impl,
+            clean::ImplItem(..) | clean::PlaceholderImplItem => ItemType::Impl,
             clean::RequiredMethodItem(..) => ItemType::TyMethod,
             clean::MethodItem(..) => ItemType::Method,
             clean::StructFieldItem(..) => ItemType::StructField,
@@ -148,6 +143,7 @@ impl<'a> From<&'a clean::Item> for ItemType {
             clean::RequiredAssocTypeItem(..) | clean::AssocTypeItem(..) => ItemType::AssocType,
             clean::ForeignTypeItem => ItemType::ForeignType,
             clean::KeywordItem => ItemType::Keyword,
+            clean::AttributeItem => ItemType::Attribute,
             clean::TraitAliasItem(..) => ItemType::TraitAlias,
             clean::ProcMacroItem(mac) => match mac.kind {
                 MacroKind::Bang => ItemType::Macro,
@@ -159,17 +155,10 @@ impl<'a> From<&'a clean::Item> for ItemType {
     }
 }
 
-impl From<DefKind> for ItemType {
-    fn from(other: DefKind) -> Self {
-        Self::from_def_kind(other, None)
-    }
-}
-
 impl ItemType {
-    /// Depending on the parent kind, some variants have a different translation (like a `Method`
-    /// becoming a `TyMethod`).
-    pub(crate) fn from_def_kind(kind: DefKind, parent_kind: Option<DefKind>) -> Self {
-        match kind {
+    pub(crate) fn from_def_id(def_id: DefId, tcx: TyCtxt<'_>) -> Self {
+        let def_kind = tcx.def_kind(def_id);
+        match def_kind {
             DefKind::Enum => Self::Enum,
             DefKind::Fn => Self::Function,
             DefKind::Mod => Self::Module,
@@ -180,16 +169,20 @@ impl ItemType {
             DefKind::Trait => Self::Trait,
             DefKind::TyAlias => Self::TypeAlias,
             DefKind::TraitAlias => Self::TraitAlias,
-            DefKind::Macro(MacroKinds::BANG) => ItemType::Macro,
             DefKind::Macro(MacroKinds::ATTR) => ItemType::ProcAttribute,
             DefKind::Macro(MacroKinds::DERIVE) => ItemType::ProcDerive,
-            DefKind::Macro(_) => todo!("Handle macros with multiple kinds"),
+            DefKind::Macro(_) => ItemType::Macro,
             DefKind::ForeignTy => Self::ForeignType,
             DefKind::Variant => Self::Variant,
             DefKind::Field => Self::StructField,
             DefKind::AssocTy => Self::AssocType,
-            DefKind::AssocFn if let Some(DefKind::Trait) = parent_kind => Self::TyMethod,
-            DefKind::AssocFn => Self::Method,
+            DefKind::AssocFn => {
+                if tcx.associated_item(def_id).defaultness(tcx).has_value() {
+                    Self::Method
+                } else {
+                    Self::TyMethod
+                }
+            }
             DefKind::Ctor(CtorOf::Struct, _) => Self::Struct,
             DefKind::Ctor(CtorOf::Variant, _) => Self::Variant,
             DefKind::AssocConst => Self::AssocConst,
@@ -199,13 +192,13 @@ impl ItemType {
             | DefKind::Use
             | DefKind::ForeignMod
             | DefKind::AnonConst
-            | DefKind::InlineConst
             | DefKind::OpaqueTy
             | DefKind::LifetimeParam
             | DefKind::GlobalAsm
             | DefKind::Impl { .. }
             | DefKind::Closure
-            | DefKind::SyntheticCoroutineBody => Self::ForeignType,
+            | DefKind::SyntheticCoroutineBody
+            | DefKind::TestBinderConstraints => Self::ForeignType,
         }
     }
 
@@ -233,9 +226,10 @@ impl ItemType {
             ItemType::AssocConst => "associatedconstant",
             ItemType::ForeignType => "foreigntype",
             ItemType::Keyword => "keyword",
-            ItemType::ProcAttribute => "attr",
-            ItemType::ProcDerive => "derive",
+            ItemType::ProcAttribute | ItemType::DeclMacroAttribute => "attr",
+            ItemType::ProcDerive | ItemType::DeclMacroDerive => "derive",
             ItemType::TraitAlias => "traitalias",
+            ItemType::Attribute => "attribute",
         }
     }
     pub(crate) fn is_method(&self) -> bool {
