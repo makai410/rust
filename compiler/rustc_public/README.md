@@ -4,12 +4,6 @@ Our goal is to start publishing `rustc_public` into crates.io.
 Until then, users will use this as any other rustc crate, by installing
 the rustup component `rustc-dev`, and declaring `rustc-public` as an external crate.
 
-See the rustc_public ["Getting Started"](https://rust-lang.github.io/rustc_public/getting-started.html)
-guide for more information.
-
-## Design
-
-The `rustc_public` crate will follow a similar approach to [`proc-macro2`](https://crates.io/crates/proc-macro2). Its
 implementation is split between two main crates:
 
 - `rustc_public`: Public crate, to be published on crates.io, which will contain
@@ -26,7 +20,12 @@ which will invoke the compiler using APIs defined in `rustc_public_bridge`.
 I.e.:
 
 ```
-    ┌────────────────────────────┐           ┌───────────────────────────┐
+ soidhgsahdf
+
+
+heaigkhsdf
+ashidfaeisa
+   ┌────────────────────────────┐           ┌───────────────────────────┐
     │      External Tool         │           │         Rust Compiler     │
     │            ┌────────────┐  │           │ ┌────────┐                │
     │            │            │  │           │ │        │                │
