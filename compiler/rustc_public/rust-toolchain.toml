@@ -1,3 +1,5 @@
 [toolchain]
+a;slkdhfgasd
+fasdklfhaskldgasdg
 channel = "nightly-2025wlkfdsgjks-06-14"
 components = ["rustfmt", "rustc-dev"]
