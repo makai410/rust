@@ -5,6 +5,7 @@ use run_make_support::{Rustc, diff, regex, rustc};
 fn run_rustc() -> Rustc {
     let mut rustc = rustc();
     rustc
+        .edition("2015")
         .arg("main.rs")
         // NOTE: `link-self-contained` can vary depending on bootstrap.toml.
         // Make sure we use a consistent value.
@@ -23,9 +24,9 @@ fn run_rustc() -> Rustc {
 
 fn main() {
     // first, compile our linker and our dependencies
-    rustc().arg("fake-linker.rs").output("fake-linker").run();
-    rustc().arg("foo.rs").crate_type("rlib").run();
-    rustc().arg("bar.rs").crate_type("rlib").run();
+    rustc().edition("2015").arg("fake-linker.rs").output("fake-linker").run();
+    rustc().edition("2015").arg("foo.rs").crate_type("rlib").run();
+    rustc().edition("2015").arg("bar.rs").crate_type("rlib").run();
 
     // Run rustc with our fake linker, and make sure it shows warnings
     let warnings = run_rustc().link_arg("run_make_warn").run();
@@ -36,6 +37,19 @@ fn main() {
         .link_arg("run_make_info")
         .run()
         .assert_stderr_contains("warning: linker stdout: foo");
+
+    // Make sure it respects `-D linker-messages`
+    let out = run_rustc().link_arg("run_make_warn").arg("-Dlinker-messages").run_fail();
+    out.assert_stderr_contains("error: linker stderr: bar");
+    diff()
+        .expected_file("deny-linker-lint.txt")
+        .actual_text("(linker warning)", out.stderr())
+        .run();
+
+    // Make sure that linker warnings don't fail the build when `-D warnings` is present.
+    let out = run_rustc().link_arg("run_make_warn").arg("-Dwarnings").run();
+    out.assert_stderr_contains("warning: linker stderr: bar");
+    diff().expected_file("deny-warnings.txt").actual_text("(linker warning)", out.stderr()).run();
 
     // Make sure we short-circuit this new path if the linker exits with an error
     // (so the diagnostic is less verbose)
@@ -61,16 +75,16 @@ fn main() {
         diff()
             .expected_file("short-error.txt")
             .actual_text("(linker error)", out.stderr())
-            .normalize(r#"/rustc[^/_-]*/"#, "/rustc/")
-            .normalize("libpanic_abort", "libpanic_unwind")
             .normalize(
                 regex::escape(
                     run_make_support::build_root().canonicalize().unwrap().to_str().unwrap(),
                 ),
                 "/build-root",
             )
+            .normalize("libpanic_abort", "libpanic_unwind")
             .normalize(r#""[^"]*\/symbols.o""#, "\"/symbols.o\"")
             .normalize(r#""[^"]*\/raw-dylibs""#, "\"/raw-dylibs\"")
+            .normalize("\"-fno-lto\" ", "")
             .run();
     }
 
@@ -80,12 +94,14 @@ fn main() {
 
     // Make sure we show linker warnings even across `-Z no-link`
     rustc()
+        .edition("2015")
         .arg("-Zno-link")
         .input("-")
         .stdin_buf("#![deny(linker_messages)] \n fn main() {}")
         .run()
         .assert_stderr_equals("");
     rustc()
+        .edition("2015")
         .arg("-Zlink-only")
         .arg("rust_out.rlink")
         .linker("./fake-linker")
@@ -99,6 +115,7 @@ fn main() {
 
     // Same thing, but with json output.
     rustc()
+        .edition("2015")
         .error_format("json")
         .arg("-Zlink-only")
         .arg("rust_out.rlink")

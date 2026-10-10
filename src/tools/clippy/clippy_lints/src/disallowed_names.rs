@@ -3,8 +3,7 @@ use clippy_utils::diagnostics::span_lint;
 use clippy_utils::{is_from_proc_macro, is_in_test};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::{Pat, PatKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_span::Symbol;
 
 declare_clippy_lint! {
@@ -26,6 +25,8 @@ declare_clippy_lint! {
     "usage of a disallowed/placeholder name"
 }
 
+impl_lint_pass!(DisallowedNames => [DISALLOWED_NAMES]);
+
 pub struct DisallowedNames {
     disallow: FxHashSet<Symbol>,
 }
@@ -37,8 +38,6 @@ impl DisallowedNames {
         }
     }
 }
-
-impl_lint_pass!(DisallowedNames => [DISALLOWED_NAMES]);
 
 impl<'tcx> LateLintPass<'tcx> for DisallowedNames {
     fn check_pat(&mut self, cx: &LateContext<'tcx>, pat: &'tcx Pat<'_>) {

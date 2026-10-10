@@ -8,17 +8,19 @@ use std::sync::Arc;
 use rustc_ast::token::{Delimiter, TokenKind};
 use rustc_ast::tokenstream::TokenTree;
 use rustc_ast::{self as ast, AttrStyle, HasAttrs, StmtKind};
-use rustc_errors::emitter::stderr_destination;
-use rustc_errors::{ColorConfig, DiagCtxtHandle};
+use rustc_errors::emitter::get_stderr_color_choice;
+use rustc_errors::{AutoStream, ColorChoice, ColorConfig, DiagCtxtHandle};
+use rustc_parse::lexer::StripTokens;
 use rustc_parse::new_parser_from_source_str;
 use rustc_session::parse::ParseSess;
 use rustc_span::edition::{DEFAULT_EDITION, Edition};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::sym;
-use rustc_span::{DUMMY_SP, FileName, Span, kw};
+use rustc_span::{DUMMY_SP, FileName, InnerSpan, Span, kw};
 use tracing::debug;
 
-use super::GlobalTestOptions;
+use super::{CodeLineMapping, GlobalTestOptions};
+use crate::config::MergeDoctests;
 use crate::display::Joined as _;
 use crate::html::markdown::LangString;
 
@@ -31,8 +33,11 @@ struct ParseSourceInfo {
     has_macro_def: bool,
     everything_else: String,
     crates: String,
+    /// Inner attributes (`#![...]`) from the source that have to be put at the crate level.
     crate_attrs: String,
-    maybe_crate_attrs: String,
+    /// Inner attributes (`#![...]`) from the source that can be put into a module and therefore do
+    /// not inhibit merging: even in the merged test, the attributes can be isolated to the test.
+    module_attrs: String,
 }
 
 /// Builder type for `DocTestBuilder`.
@@ -40,11 +45,12 @@ pub(crate) struct BuildDocTestBuilder<'a> {
     source: &'a str,
     crate_name: Option<&'a str>,
     edition: Edition,
-    can_merge_doctests: bool,
+    can_merge_doctests: MergeDoctests,
     // If `test_id` is `None`, it means we're generating code for a code example "run" link.
     test_id: Option<String>,
     lang_str: Option<&'a LangString>,
     span: Span,
+    code_mappings: &'a [CodeLineMapping],
     global_crate_attrs: Vec<String>,
 }
 
@@ -54,10 +60,11 @@ impl<'a> BuildDocTestBuilder<'a> {
             source,
             crate_name: None,
             edition: DEFAULT_EDITION,
-            can_merge_doctests: false,
+            can_merge_doctests: MergeDoctests::Never,
             test_id: None,
             lang_str: None,
             span: DUMMY_SP,
+            code_mappings: &[],
             global_crate_attrs: Vec::new(),
         }
     }
@@ -69,7 +76,7 @@ impl<'a> BuildDocTestBuilder<'a> {
     }
 
     #[inline]
-    pub(crate) fn can_merge_doctests(mut self, can_merge_doctests: bool) -> Self {
+    pub(crate) fn can_merge_doctests(mut self, can_merge_doctests: MergeDoctests) -> Self {
         self.can_merge_doctests = can_merge_doctests;
         self
     }
@@ -89,6 +96,12 @@ impl<'a> BuildDocTestBuilder<'a> {
     #[inline]
     pub(crate) fn span(mut self, span: Span) -> Self {
         self.span = span;
+        self
+    }
+
+    #[inline]
+    pub(crate) fn code_mappings(mut self, code_mappings: &'a [CodeLineMapping]) -> Self {
+        self.code_mappings = code_mappings;
         self
     }
 
@@ -114,16 +127,13 @@ impl<'a> BuildDocTestBuilder<'a> {
             test_id,
             lang_str,
             span,
+            code_mappings,
             global_crate_attrs,
         } = self;
-        let can_merge_doctests = can_merge_doctests
-            && lang_str.is_some_and(|lang_str| {
-                !lang_str.compile_fail && !lang_str.test_harness && !lang_str.standalone_crate
-            });
 
         let result = rustc_driver::catch_fatal_errors(|| {
             rustc_span::create_session_if_not_set_then(edition, |_| {
-                parse_source(source, &crate_name, dcx, span)
+                parse_source(source, &crate_name, dcx, span, code_mappings)
             })
         });
 
@@ -136,7 +146,7 @@ impl<'a> BuildDocTestBuilder<'a> {
             everything_else,
             crates,
             crate_attrs,
-            maybe_crate_attrs,
+            module_attrs,
         })) = result
         else {
             // If the AST returned an error, we don't want this doctest to be merged with the
@@ -151,23 +161,36 @@ impl<'a> BuildDocTestBuilder<'a> {
             );
         };
 
-        debug!("crate_attrs:\n{crate_attrs}{maybe_crate_attrs}");
+        debug!("crate_attrs:\n{crate_attrs}{module_attrs}");
         debug!("crates:\n{crates}");
         debug!("after:\n{everything_else}");
+        debug!("merge-doctests: {can_merge_doctests:?}");
 
-        // If it contains `#[feature]` or `#[no_std]`, we don't want it to be merged either.
-        let can_be_merged = can_merge_doctests
-            && !has_global_allocator
-            && crate_attrs.is_empty()
-            // If this is a merged doctest and a defined macro uses `$crate`, then the path will
-            // not work, so better not put it into merged doctests.
-            && !(has_macro_def && everything_else.contains("$crate"));
+        // Up until now, we've been dealing with settings for the whole crate.
+        // Now, infer settings for this particular test.
+        //
+        // Avoid tests with incompatible attributes.
+        let opt_out = lang_str.is_some_and(|lang_str| {
+            lang_str.compile_fail || lang_str.test_harness || lang_str.standalone_crate
+        });
+        let can_be_merged = if can_merge_doctests == MergeDoctests::Auto {
+            // We try to look at the contents of the test to detect whether it should be merged.
+            // This is not a complete list of possible failures, but it catches many cases.
+            let will_probably_fail = has_global_allocator
+                || !crate_attrs.is_empty()
+                // If this is a merged doctest and a defined macro uses `$crate`, then the path will
+                // not work, so better not put it into merged doctests.
+                || (has_macro_def && everything_else.contains("$crate"));
+            !opt_out && !will_probably_fail
+        } else {
+            can_merge_doctests != MergeDoctests::Never && !opt_out
+        };
         DocTestBuilder {
             supports_color,
             has_main_fn,
             global_crate_attrs,
             crate_attrs,
-            maybe_crate_attrs,
+            module_attrs,
             crates,
             everything_else,
             already_has_extern_crate,
@@ -188,7 +211,7 @@ pub(crate) struct DocTestBuilder {
     pub(crate) crate_attrs: String,
     /// If this is a merged doctest, it will be put into `everything_else`, otherwise it will
     /// put into `crate_attrs`.
-    pub(crate) maybe_crate_attrs: String,
+    pub(crate) module_attrs: String,
     pub(crate) crates: String,
     pub(crate) everything_else: String,
     pub(crate) test_id: Option<String>,
@@ -274,7 +297,7 @@ impl DocTestBuilder {
     fn invalid(
         global_crate_attrs: Vec<String>,
         crate_attrs: String,
-        maybe_crate_attrs: String,
+        module_attrs: String,
         crates: String,
         everything_else: String,
         test_id: Option<String>,
@@ -284,7 +307,7 @@ impl DocTestBuilder {
             has_main_fn: false,
             global_crate_attrs,
             crate_attrs,
-            maybe_crate_attrs,
+            module_attrs,
             crates,
             everything_else,
             already_has_extern_crate: false,
@@ -327,17 +350,16 @@ impl DocTestBuilder {
             line_offset += 1;
         }
 
-        // Now push any outer attributes from the example, assuming they
-        // are intended to be crate attributes.
+        // Now push any outer attributes from the example (both crate and module attributes).
         if !self.crate_attrs.is_empty() {
             crate_level_code.push_str(&self.crate_attrs);
             if !self.crate_attrs.ends_with('\n') {
                 crate_level_code.push('\n');
             }
         }
-        if !self.maybe_crate_attrs.is_empty() {
-            crate_level_code.push_str(&self.maybe_crate_attrs);
-            if !self.maybe_crate_attrs.ends_with('\n') {
+        if !self.module_attrs.is_empty() {
+            crate_level_code.push_str(&self.module_attrs);
+            if !self.module_attrs.ends_with('\n') {
                 crate_level_code.push('\n');
             }
         }
@@ -443,9 +465,10 @@ fn parse_source(
     crate_name: &Option<&str>,
     parent_dcx: Option<DiagCtxtHandle<'_>>,
     span: Span,
+    code_mappings: &[CodeLineMapping],
 ) -> Result<ParseSourceInfo, ()> {
     use rustc_errors::DiagCtxt;
-    use rustc_errors::emitter::{Emitter, HumanEmitter};
+    use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
     use rustc_span::source_map::FilePathMapping;
 
     let mut info =
@@ -456,26 +479,30 @@ fn parse_source(
     let filename = FileName::anon_source_code(&wrapped_source);
 
     let sm = Arc::new(SourceMap::new(FilePathMapping::empty()));
-    let translator = rustc_driver::default_translator();
-    info.supports_color =
-        HumanEmitter::new(stderr_destination(ColorConfig::Auto), translator.clone())
-            .supports_color();
+    let supports_color = match get_stderr_color_choice(ColorConfig::Auto, &std::io::stderr()) {
+        ColorChoice::Auto => unreachable!(),
+        ColorChoice::AlwaysAnsi | ColorChoice::Always => true,
+        ColorChoice::Never => false,
+    };
+    info.supports_color = supports_color;
     // Any errors in parsing should also appear when the doctest is compiled for real, so just
     // send all the errors that the parser emits directly into a `Sink` instead of stderr.
-    let emitter = HumanEmitter::new(Box::new(io::sink()), translator);
+    let emitter = AnnotateSnippetEmitter::new(AutoStream::never(Box::new(io::sink())));
 
     // FIXME(misdreavus): pass `-Z treat-err-as-bug` to the doctest parser
     let dcx = DiagCtxt::new(Box::new(emitter)).disable_warnings();
     let psess = ParseSess::with_dcx(dcx, sm);
 
-    let mut parser = match new_parser_from_source_str(&psess, filename, wrapped_source) {
-        Ok(p) => p,
-        Err(errs) => {
-            errs.into_iter().for_each(|err| err.cancel());
-            reset_error_count(&psess);
-            return Err(());
-        }
-    };
+    // Don't strip any tokens; it wouldn't matter anyway because the source is wrapped in a function.
+    let mut parser =
+        match new_parser_from_source_str(&psess, filename, wrapped_source, StripTokens::Nothing) {
+            Ok(p) => p,
+            Err(errs) => {
+                errs.into_iter().for_each(|err| err.cancel());
+                reset_error_count(&psess);
+                return Err(());
+            }
+        };
 
     fn push_to_s(s: &mut String, source: &str, span: rustc_span::Span, prev_span_hi: &mut usize) {
         let extra_len = DOCTEST_CODE_WRAPPER.len();
@@ -487,6 +514,24 @@ fn parse_source(
         }
         s.push_str(&source[*prev_span_hi..hi]);
         *prev_span_hi = hi;
+    }
+
+    fn span_in_doctest_source(span: Span, code_mappings: &[CodeLineMapping]) -> Option<Span> {
+        let extra_len = DOCTEST_CODE_WRAPPER.len();
+        let lo = (span.lo().0 as usize).checked_sub(extra_len)?;
+        let hi = (span.hi().0 as usize).checked_sub(extra_len)?;
+        if hi < lo {
+            return None;
+        }
+        code_mappings.iter().find_map(|mapping| {
+            if mapping.generated.start <= lo && hi <= mapping.generated.end {
+                let start = lo - mapping.generated.start;
+                let end = hi - mapping.generated.start;
+                Some(mapping.original.from_inner(InnerSpan::new(start, end)))
+            } else {
+                None
+            }
+        })
     }
 
     fn check_item(item: &ast::Item, info: &mut ParseSourceInfo, crate_name: &Option<&str>) -> bool {
@@ -523,7 +568,10 @@ fn parse_source(
 
     let mut prev_span_hi = 0;
     let not_crate_attrs = &[sym::forbid, sym::allow, sym::warn, sym::deny, sym::expect];
-    let parsed = parser.parse_item(rustc_parse::parser::ForceCollect::No);
+    let parsed = parser.parse_item(
+        rustc_parse::parser::ForceCollect::No,
+        rustc_parse::parser::AllowConstBlockItems::No,
+    );
 
     let result = match parsed {
         Ok(Some(ref item))
@@ -537,22 +585,21 @@ fn parse_source(
                     // consider it only as a crate-level attribute.
                     if attr.has_name(sym::allow)
                         && let Some(list) = attr.meta_item_list()
-                        && list.iter().any(|sub_attr| sub_attr.has_name(sym::internal_features))
+                        && list.iter().any(|sub_attr| {
+                            sub_attr.has_name(sym::internal_features)
+                                || sub_attr.has_name(sym::incomplete_features)
+                        })
                     {
                         push_to_s(&mut info.crate_attrs, source, attr.span, &mut prev_span_hi);
                     } else {
-                        push_to_s(
-                            &mut info.maybe_crate_attrs,
-                            source,
-                            attr.span,
-                            &mut prev_span_hi,
-                        );
+                        push_to_s(&mut info.module_attrs, source, attr.span, &mut prev_span_hi);
                     }
                 } else {
                     push_to_s(&mut info.crate_attrs, source, attr.span, &mut prev_span_hi);
                 }
             }
             let mut has_non_items = false;
+            let mut first_non_item_span = None;
             for stmt in &body.stmts {
                 let mut is_extern_crate = false;
                 match stmt.kind {
@@ -590,8 +637,12 @@ fn parse_source(
                             return Err(());
                         }
                         has_non_items = true;
+                        first_non_item_span.get_or_insert(stmt.span);
                     }
-                    StmtKind::Let(_) | StmtKind::Semi(_) | StmtKind::Empty => has_non_items = true,
+                    StmtKind::Let(_) | StmtKind::Semi(_) | StmtKind::Empty => {
+                        has_non_items = true;
+                        first_non_item_span.get_or_insert(stmt.span);
+                    }
                 }
 
                 // Weirdly enough, the `Stmt` span doesn't include its attributes, so we need to
@@ -603,7 +654,7 @@ fn parse_source(
                     span = span.with_lo(attr.span.lo());
                 }
                 if info.everything_else.is_empty()
-                    && (!info.maybe_crate_attrs.is_empty() || !info.crate_attrs.is_empty())
+                    && (!info.module_attrs.is_empty() || !info.crate_attrs.is_empty())
                 {
                     // To keep the doctest code "as close as possible" to the original, we insert
                     // all the code located between this new span and the previous span which
@@ -617,12 +668,15 @@ fn parse_source(
                 }
             }
             if has_non_items {
+                let warning_span = first_non_item_span
+                    .and_then(|span| span_in_doctest_source(span, code_mappings))
+                    .unwrap_or(span);
                 if info.has_main_fn
                     && let Some(dcx) = parent_dcx
-                    && !span.is_dummy()
+                    && !warning_span.is_dummy()
                 {
                     dcx.span_warn(
-                        span,
+                        warning_span,
                         "the `main` function of this doctest won't be run as it contains \
                          expressions at the top level, meaning that the whole doctest code will be \
                          wrapped in a function",

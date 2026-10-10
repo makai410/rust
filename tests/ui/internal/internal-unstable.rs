@@ -8,6 +8,7 @@ extern crate internal_unstable;
 
 struct Baz {
     #[allow_internal_unstable] //~ ERROR `allow_internal_unstable` expects a list of feature names
+    //~^ ERROR cannot be used on
     baz: u8,
 }
 
@@ -57,6 +58,7 @@ fn main() {
 
     match true {
         #[allow_internal_unstable] //~ ERROR `allow_internal_unstable` expects a list of feature names
+        //~^ ERROR cannot be used on
         _ => {}
     }
 

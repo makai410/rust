@@ -22,9 +22,9 @@ macro_rules! show_error {
 }
 pub(crate) use show_error;
 
-/// The information to run a crate with the given environment.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CrateRunEnv {
+/// The information Miri needs to run a crate. Stored as JSON when the crate is "compiled".
+#[derive(Serialize, Deserialize)]
+pub struct CrateRunInfo {
     /// The command-line arguments.
     pub args: Vec<String>,
     /// The environment.
@@ -35,11 +35,27 @@ pub struct CrateRunEnv {
     pub stdin: Vec<u8>,
 }
 
-impl CrateRunEnv {
+impl CrateRunInfo {
     /// Gather all the information we need.
     pub fn collect(args: impl Iterator<Item = String>, capture_stdin: bool) -> Self {
         let args = args.collect();
-        let env = env::vars_os().collect();
+        let env = env::vars_os()
+            .filter(|(var, _val)| {
+                // We only need to bother with env vars cargo actually sets.
+                var.to_str().is_some_and(|var| {
+                    (   // Env vars cargo sets for crates.
+                        // <https://doc.rust-lang.org/nightly/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-crates>
+                        var == "OUT_DIR"
+                        || var.starts_with("CARGO_")
+                        // Env vars rustdoc sets for its rustc invocation.
+                        || var.starts_with("UNSTABLE_RUSTDOC_")
+                        || var.starts_with("RUSTDOC_")
+                    )
+                    // We try to avoid storing anything that may contain secrets.
+                    && !var.ends_with("_TOKEN")
+                })
+            })
+            .collect();
         let current_dir = env::current_dir().unwrap().into_os_string();
 
         let mut stdin = Vec::new();
@@ -47,20 +63,9 @@ impl CrateRunEnv {
             std::io::stdin().lock().read_to_end(&mut stdin).expect("cannot read stdin");
         }
 
-        CrateRunEnv { args, env, current_dir, stdin }
+        CrateRunInfo { args, env, current_dir, stdin }
     }
-}
 
-/// The information Miri needs to run a crate. Stored as JSON when the crate is "compiled".
-#[derive(Serialize, Deserialize)]
-pub enum CrateRunInfo {
-    /// Run it with the given environment.
-    RunWith(CrateRunEnv),
-    /// Skip it as Miri does not support interpreting such kind of crates.
-    SkipProcMacroTest,
-}
-
-impl CrateRunInfo {
     pub fn store(&self, filename: &Path) {
         let file = File::create(filename)
             .unwrap_or_else(|_| show_error!("cannot create `{}`", filename.display()));
@@ -213,7 +218,11 @@ fn cargo_extra_flags() -> Vec<String> {
 
 pub fn get_cargo_metadata() -> Metadata {
     // This will honor the `CARGO` env var the same way our `cargo()` does.
-    MetadataCommand::new().no_deps().other_options(cargo_extra_flags()).exec().unwrap()
+    MetadataCommand::new()
+        .no_deps()
+        .other_options(cargo_extra_flags())
+        .exec()
+        .unwrap_or_else(|err| show_error!("{}", err))
 }
 
 /// Pulls all the crates in this workspace from the cargo metadata.

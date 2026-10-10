@@ -9,6 +9,14 @@ be useful.
 CG_RUSTFLAGS="-Clink-args=-save-temps -v" ../y.sh cargo build
 ```
 
+### How to send arguments to GCC
+
+The `-Cllvm-args` `rustc` flag is repurposed by `rustc_codegen_gcc` to pass arguments directly to the GCC backend. You can use it via the `CG_RUSTFLAGS` environment variable. For example, to pass a `-f` flag to GCC:
+
+```
+CG_RUSTFLAGS="-Cllvm-args=-fflag-name" ../y.sh cargo build
+```
+
 ### How to see the personality functions in the asm dump
 
 ```
@@ -33,7 +41,7 @@ COLLECT_NO_DEMANGLE=1
 ### How to use a custom-build rustc
 
  * Build the stage2 compiler (`rustup toolchain link debug-current build/x86_64-unknown-linux-gnu/stage2`).
- * Clean and rebuild the codegen with `debug-current` in the file `rust-toolchain`.
+ * Clean and rebuild the codegen with `debug-current` in the file `rust-toolchain.toml`.
 
 ### How to use a custom sysroot source path
 
@@ -45,12 +53,12 @@ If you wish to build a custom sysroot, pass the path of your sysroot source to `
 
 ### How to use [mem-trace](https://github.com/antoyo/mem-trace)
 
-`rustc` needs to be built without `jemalloc` so that `mem-trace` can overload `malloc` since `jemalloc` is linked statically, so a `LD_PRELOAD`-ed library won't a chance to intercept the calls to `malloc`.
+`rustc` needs to be built without `jemalloc` so that `mem-trace` can overload `malloc` since `jemalloc` is linked statically, so a `LD_PRELOAD`-ed library won't have a chance to intercept the calls to `malloc`.
 
 ### How to generate GIMPLE
 
 If you need to check what gccjit is generating (GIMPLE), then take a look at how to
-generate it in [gimple.md](./doc/gimple.md).
+generate it in [gimple.md](./gimple.md).
 
 ### How to build a cross-compiling libgccjit
 

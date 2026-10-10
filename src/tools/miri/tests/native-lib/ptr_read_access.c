@@ -19,6 +19,13 @@ typedef struct Simple {
 EXPORT int32_t access_simple(const Simple *s_ptr) {
   return s_ptr->field;
 }
+// Some copies so Rust can import them at different types.
+EXPORT int32_t access_simple2(const Simple *s_ptr) {
+  return s_ptr->field;
+}
+EXPORT int32_t access_simple3(const Simple *s_ptr) {
+  return s_ptr->field;
+}
 
 /* Test: test_access_nested */
 

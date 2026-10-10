@@ -1,4 +1,4 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ compile-flags: --crate-type=rlib -Copt-level=0
 //@ revisions: force-on aarch64-apple aarch64-apple-on aarch64-apple-off
 //@ [force-on] compile-flags: -Cforce-frame-pointers=on
@@ -45,7 +45,7 @@ Specific cases where platforms or tools rely on frame pointers for sound or corr
 
 extern crate minicore;
 
-// CHECK: i32 @peach{{.*}}[[PEACH_ATTRS:\#[0-9]+]] {
+// CHECK: i32 @peach{{.*}}[[PEACH_ATTRS:\#[0-9]+]]
 #[no_mangle]
 pub fn peach(x: u32) -> u32 {
     x

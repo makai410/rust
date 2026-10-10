@@ -13,8 +13,8 @@
 //! the panics are recognized reliably or on a best-effort basis depend on the
 //! primitive. See [Overview](#overview) below.
 //!
-//! For the alternative implementations that do not employ poisoning,
-//! see [`std::sync::nonpoison`].
+//! The synchronization objects in this module have alternative implementations that do not employ
+//! poisoning in the [`std::sync::nonpoison`] module.
 //!
 //! [`std::sync::nonpoison`]: crate::sync::nonpoison
 //!
@@ -42,14 +42,6 @@
 //!   [`Mutex::lock()`] returns a [`LockResult`], providing a way to deal with
 //!   the poisoned state. See [`Mutex`'s documentation](Mutex#poisoning) for more.
 //!
-//! - [`Once`]: A thread-safe way to run a piece of code only once.
-//!   Mostly useful for implementing one-time global initialization.
-//!
-//!   [`Once`] is reliably poisoned if the piece of code passed to
-//!   [`Once::call_once()`] or [`Once::call_once_force()`] panics.
-//!   When in poisoned state, subsequent calls to [`Once::call_once()`] will panic too.
-//!   [`Once::call_once_force()`] can be used to clear the poisoned state.
-//!
 //! - [`RwLock`]: Provides a mutual exclusion mechanism which allows
 //!   multiple readers at the same time, while allowing only one
 //!   writer at a time. In some cases, this can be more efficient than
@@ -59,18 +51,18 @@
 //!   Note, however, that an `RwLock` may only be poisoned if a panic occurs
 //!   while it is locked exclusively (write mode). If a panic occurs in any reader,
 //!   then the lock will not be poisoned.
+//!
+//! Note that the [`Once`] type also employs poisoning, but since it has non-poisoning `force`
+//! methods available on it, there is no separate `nonpoison` and `poison` version.
+//!
+//! [`Once`]: crate::sync::Once
 
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use self::condvar::{Condvar, WaitTimeoutResult};
+pub use self::condvar::Condvar;
 #[unstable(feature = "mapped_lock_guards", issue = "117108")]
 pub use self::mutex::MappedMutexGuard;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::mutex::{Mutex, MutexGuard};
-#[stable(feature = "rust1", since = "1.0.0")]
-#[expect(deprecated)]
-pub use self::once::ONCE_INIT;
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use self::once::{Once, OnceState};
 #[unstable(feature = "mapped_lock_guards", issue = "117108")]
 pub use self::rwlock::{MappedRwLockReadGuard, MappedRwLockWriteGuard};
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -85,7 +77,6 @@ use crate::thread;
 mod condvar;
 #[stable(feature = "rust1", since = "1.0.0")]
 mod mutex;
-pub(crate) mod once;
 mod rwlock;
 
 pub(crate) struct Flag {
@@ -106,7 +97,7 @@ pub(crate) struct Flag {
 
 impl Flag {
     #[inline]
-    pub const fn new() -> Flag {
+    pub(crate) const fn new() -> Flag {
         Flag {
             #[cfg(panic = "unwind")]
             failed: AtomicBool::new(false),
@@ -115,13 +106,13 @@ impl Flag {
 
     /// Checks the flag for an unguarded borrow, where we only care about existing poison.
     #[inline]
-    pub fn borrow(&self) -> LockResult<()> {
+    pub(crate) fn borrow(&self) -> LockResult<()> {
         if self.get() { Err(PoisonError::new(())) } else { Ok(()) }
     }
 
     /// Checks the flag for a guarded borrow, where we may also set poison when `done`.
     #[inline]
-    pub fn guard(&self) -> LockResult<Guard> {
+    pub(crate) fn guard(&self) -> LockResult<Guard> {
         let ret = Guard {
             #[cfg(panic = "unwind")]
             panicking: thread::panicking(),
@@ -131,7 +122,7 @@ impl Flag {
 
     #[inline]
     #[cfg(panic = "unwind")]
-    pub fn done(&self, guard: &Guard) {
+    pub(crate) fn done(&self, guard: &Guard) {
         if !guard.panicking && thread::panicking() {
             self.failed.store(true, Ordering::Relaxed);
         }
@@ -139,22 +130,22 @@ impl Flag {
 
     #[inline]
     #[cfg(not(panic = "unwind"))]
-    pub fn done(&self, _guard: &Guard) {}
+    pub(crate) fn done(&self, _guard: &Guard) {}
 
     #[inline]
     #[cfg(panic = "unwind")]
-    pub fn get(&self) -> bool {
+    pub(crate) fn get(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
     #[cfg(not(panic = "unwind"))]
-    pub fn get(&self) -> bool {
+    pub(crate) fn get(&self) -> bool {
         false
     }
 
     #[inline]
-    pub fn clear(&self) {
+    pub(crate) fn clear(&self) {
         #[cfg(panic = "unwind")]
         self.failed.store(false, Ordering::Relaxed)
     }
@@ -263,12 +254,7 @@ impl<T> fmt::Display for PoisonError<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> Error for PoisonError<T> {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "poisoned lock: another task failed inside"
-    }
-}
+impl<T> Error for PoisonError<T> {}
 
 impl<T> PoisonError<T> {
     /// Creates a `PoisonError`.
@@ -277,6 +263,7 @@ impl<T> PoisonError<T> {
     /// or [`RwLock::read`](crate::sync::RwLock::read).
     ///
     /// This method may panic if std was built with `panic="abort"`.
+    #[doc(auto_cfg = false)]
     #[cfg(panic = "unwind")]
     #[stable(feature = "sync_poison", since = "1.2.0")]
     pub fn new(data: T) -> PoisonError<T> {
@@ -289,6 +276,7 @@ impl<T> PoisonError<T> {
     /// or [`RwLock::read`](crate::sync::RwLock::read).
     ///
     /// This method may panic if std was built with `panic="abort"`.
+    #[doc(auto_cfg = false)]
     #[cfg(not(panic = "unwind"))]
     #[stable(feature = "sync_poison", since = "1.2.0")]
     #[track_caller]
@@ -376,17 +364,6 @@ impl<T> fmt::Display for TryLockError<T> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> Error for TryLockError<T> {
-    #[allow(deprecated, deprecated_in_future)]
-    fn description(&self) -> &str {
-        match *self {
-            #[cfg(panic = "unwind")]
-            TryLockError::Poisoned(ref p) => p.description(),
-            #[cfg(not(panic = "unwind"))]
-            TryLockError::Poisoned(ref p) => match p._never {},
-            TryLockError::WouldBlock => "try_lock failed because the operation would block",
-        }
-    }
-
     #[allow(deprecated)]
     fn cause(&self) -> Option<&dyn Error> {
         match *self {

@@ -1,21 +1,15 @@
 //! HIR for references to types. Paths in these are not yet resolved. They can
 //! be directly created from an ast::TypeRef, without further queries.
 
-use std::fmt::Write;
-
 use hir_expand::name::Name;
-use intern::Symbol;
 use la_arena::Idx;
+use rustc_abi::ExternAbi;
 use thin_vec::ThinVec;
 
 use crate::{
     LifetimeParamId, TypeParamId,
-    builtin_type::{BuiltinInt, BuiltinType, BuiltinUint},
-    expr_store::{
-        ExpressionStore,
-        path::{GenericArg, Path},
-    },
-    hir::{ExprId, Literal},
+    expr_store::{ExpressionStore, path::Path},
+    hir::{ExprId, PatId},
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -100,10 +94,11 @@ pub struct TraitRef {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FnType {
+    pub binder: Option<Box<[Name]>>,
     pub params: Box<[(Option<Name>, TypeRefId)]>,
     pub is_varargs: bool,
     pub is_unsafe: bool,
-    pub abi: Option<Symbol>,
+    pub abi: ExternAbi,
 }
 
 impl FnType {
@@ -145,6 +140,7 @@ pub enum TypeRef {
     ImplTrait(ThinVec<TypeBound>),
     DynTrait(ThinVec<TypeBound>),
     TypeParam(TypeParamId),
+    PatternType(TypeRefId, PatId),
     Error,
 }
 
@@ -194,67 +190,6 @@ impl TypeRef {
     pub(crate) fn unit() -> TypeRef {
         TypeRef::Tuple(ThinVec::new())
     }
-
-    pub fn walk(this: TypeRefId, map: &ExpressionStore, f: &mut impl FnMut(&TypeRef)) {
-        go(this, f, map);
-
-        fn go(type_ref: TypeRefId, f: &mut impl FnMut(&TypeRef), map: &ExpressionStore) {
-            let type_ref = &map[type_ref];
-            f(type_ref);
-            match type_ref {
-                TypeRef::Fn(fn_) => {
-                    fn_.params.iter().for_each(|&(_, param_type)| go(param_type, f, map))
-                }
-                TypeRef::Tuple(types) => types.iter().for_each(|&t| go(t, f, map)),
-                TypeRef::RawPtr(type_ref, _) | TypeRef::Slice(type_ref) => go(*type_ref, f, map),
-                TypeRef::Reference(it) => go(it.ty, f, map),
-                TypeRef::Array(it) => go(it.ty, f, map),
-                TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
-                    for bound in bounds {
-                        match bound {
-                            &TypeBound::Path(path, _) | &TypeBound::ForLifetime(_, path) => {
-                                go_path(&map[path], f, map)
-                            }
-                            TypeBound::Lifetime(_) | TypeBound::Error | TypeBound::Use(_) => (),
-                        }
-                    }
-                }
-                TypeRef::Path(path) => go_path(path, f, map),
-                TypeRef::Never | TypeRef::Placeholder | TypeRef::Error | TypeRef::TypeParam(_) => {}
-            };
-        }
-
-        fn go_path(path: &Path, f: &mut impl FnMut(&TypeRef), map: &ExpressionStore) {
-            if let Some(type_ref) = path.type_anchor() {
-                go(type_ref, f, map);
-            }
-            for segment in path.segments().iter() {
-                if let Some(args_and_bindings) = segment.args_and_bindings {
-                    for arg in args_and_bindings.args.iter() {
-                        match arg {
-                            GenericArg::Type(type_ref) => {
-                                go(*type_ref, f, map);
-                            }
-                            GenericArg::Const(_) | GenericArg::Lifetime(_) => {}
-                        }
-                    }
-                    for binding in args_and_bindings.bindings.iter() {
-                        if let Some(type_ref) = binding.type_ref {
-                            go(type_ref, f, map);
-                        }
-                        for bound in binding.bounds.iter() {
-                            match bound {
-                                &TypeBound::Path(path, _) | &TypeBound::ForLifetime(_, path) => {
-                                    go_path(&map[path], f, map)
-                                }
-                                TypeBound::Lifetime(_) | TypeBound::Error | TypeBound::Use(_) => (),
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl TypeBound {
@@ -270,57 +205,4 @@ impl TypeBound {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct ConstRef {
     pub expr: ExprId,
-}
-
-/// A literal constant value
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum LiteralConstRef {
-    Int(i128),
-    UInt(u128),
-    Bool(bool),
-    Char(char),
-
-    /// Case of an unknown value that rustc might know but we don't
-    // FIXME: this is a hack to get around chalk not being able to represent unevaluatable
-    // constants
-    // https://github.com/rust-lang/rust-analyzer/pull/8813#issuecomment-840679177
-    // https://rust-lang.zulipchat.com/#narrow/stream/144729-wg-traits/topic/Handling.20non.20evaluatable.20constants'.20equality/near/238386348
-    Unknown,
-}
-
-impl LiteralConstRef {
-    pub fn builtin_type(&self) -> BuiltinType {
-        match self {
-            LiteralConstRef::UInt(_) | LiteralConstRef::Unknown => {
-                BuiltinType::Uint(BuiltinUint::U128)
-            }
-            LiteralConstRef::Int(_) => BuiltinType::Int(BuiltinInt::I128),
-            LiteralConstRef::Char(_) => BuiltinType::Char,
-            LiteralConstRef::Bool(_) => BuiltinType::Bool,
-        }
-    }
-}
-
-impl From<Literal> for LiteralConstRef {
-    fn from(literal: Literal) -> Self {
-        match literal {
-            Literal::Char(c) => Self::Char(c),
-            Literal::Bool(flag) => Self::Bool(flag),
-            Literal::Int(num, _) => Self::Int(num),
-            Literal::Uint(num, _) => Self::UInt(num),
-            _ => Self::Unknown,
-        }
-    }
-}
-
-impl std::fmt::Display for LiteralConstRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match self {
-            LiteralConstRef::Int(num) => num.fmt(f),
-            LiteralConstRef::UInt(num) => num.fmt(f),
-            LiteralConstRef::Bool(flag) => flag.fmt(f),
-            LiteralConstRef::Char(c) => write!(f, "'{c}'"),
-            LiteralConstRef::Unknown => f.write_char('_'),
-        }
-    }
 }

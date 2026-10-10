@@ -1,19 +1,25 @@
-use rustc_feature::{AttributeTemplate, template};
-use rustc_hir::attrs::AttributeKind;
+use rustc_attr_ir::AttributeKind;
+use rustc_feature::AttributeStability;
 use rustc_span::{Symbol, sym};
 
-use crate::attributes::{AttributeOrder, OnDuplicate, SingleAttributeParser};
-use crate::context::{ALL_TARGETS, AcceptContext, AllowedTargets, Stage};
+use crate::attributes::{OnDuplicate, SingleAttributeParser};
+use crate::context::AcceptContext;
 use crate::parser::ArgParser;
-pub(crate) struct DummyParser;
-impl<S: Stage> SingleAttributeParser<S> for DummyParser {
-    const PATH: &[Symbol] = &[sym::rustc_dummy];
-    const ATTRIBUTE_ORDER: AttributeOrder = AttributeOrder::KeepInnermost;
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Ignore;
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(ALL_TARGETS);
-    const TEMPLATE: AttributeTemplate = template!(Word); // Anything, really
+use crate::target_checking::AllowedTargets;
+use crate::{AttributeTemplate, template, unstable};
 
-    fn convert(_: &mut AcceptContext<'_, '_, S>, _: &ArgParser<'_>) -> Option<AttributeKind> {
-        Some(AttributeKind::Dummy)
+pub(crate) struct RustcDummyParser;
+impl SingleAttributeParser for RustcDummyParser {
+    const PATH: &[Symbol] = &[sym::rustc_dummy];
+    const ON_DUPLICATE: OnDuplicate = OnDuplicate::Ignore;
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::ManuallyChecked;
+    const TEMPLATE: AttributeTemplate = template!(Word); // Anything, really
+    const STABILITY: AttributeStability =
+        unstable!(rustc_attrs, "the `rustc_dummy` attribute is used for rustc unit tests");
+
+    fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
+        args.ignore_args();
+        cx.ignore_target_checks();
+        Some(AttributeKind::RustcDummy)
     }
 }

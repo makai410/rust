@@ -25,6 +25,43 @@ We encourage new contributors to join our communication channels and introduce t
 
 ## Understanding Core Concepts
 
+### Sysroot & compilation flags
+
+#### What *is* the sysroot?
+The **sysroot** is the directory that stores the compiled standard
+library (`core`, `alloc`, `std`, `test`, …) and compiler built-ins.
+Rustup ships these libraries **pre-compiled with LLVM**.
+
+**rustc_codegen_gcc** replaces LLVM with the GCC backend.
+
+The freshly compiled sysroot ends up in
+`build/build_sysroot/...`.
+
+A rebuild of sysroot is needed when
+
+* the backend changes in a way that affects code generation, or
+* the user switches toolchains / updates submodules.
+
+Both backend and sysroot can be built using different [profiles](https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles).
+That is exactly what the `--sysroot`, `--release-sysroot` and `--release` flag supported by the build system script `y.sh` take care of.
+
+
+#### Typical flag combinations
+
+| Command                                   | Backend Profile               | Sysroot Profile                  | Usage Scenario                                              |
+|--------------------------------------------|-------------------------------|----------------------------------|------------------------------------------------------------|
+| `./y.sh build`                            | &nbsp;dev*                          | &nbsp;n/a                                | &nbsp;Build backend in dev mode with optimized dependencies without rebuilding sysroot                |
+| `./y.sh build --release`                  | &nbsp;release (optimized)           | &nbsp;n/a                                | &nbsp;Build backend in release mode with optimized dependencies without rebuilding sysroot                 |
+| `./y.sh build --release --sysroot`        | &nbsp;release (optimized)           | &nbsp;dev                          | &nbsp;Build backend in release mode with optimized dependencies and sysroot in dev mode (unoptimized)              |
+| `./y.sh build --sysroot`                  | &nbsp;dev*                          | &nbsp;dev                          | &nbsp;Build backend in dev mode with optimized dependencies and sysroot in dev mode (unoptimized)              |
+| `./y.sh build --release-sysroot --sysroot`| &nbsp;dev*                          | &nbsp;release (optimized)              | &nbsp;Build backend in dev mode and sysroot in release mode, both with optimized dependencies             |
+
+\* In `dev` mode, dependencies are compiled with optimizations, while the code of the backend itself is not.
+
+
+Note: `--release-sysroot` must be used together with `--sysroot`.
+
+
 ### Common Development Tasks
 
 #### Running Specific Tests
@@ -75,7 +112,7 @@ Full list of debugging options can be found in the [README](Readme.md#env-vars).
 ### Code Style Guidelines
 
 - Follow Rust standard coding conventions
-- Ensure your code passes `rustfmt` and `clippy`
+- Ensure your code passes `rustfmt` and `clippy` (you can run them with `y.sh fmt` and `y.sh clippy`)
 - Add comments explaining complex logic, especially in GCC interface code
 
 ## Additional Resources

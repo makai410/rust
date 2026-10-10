@@ -3,14 +3,15 @@
 use stdx::always;
 
 use crate::{
-    AstNode, SyntaxNode,
+    AstNode, Direction, SyntaxNode, T,
+    algo::skip_trivia_token,
     ast::{self, BinaryOp, Expr, HasArgList, RangeItem},
     match_ast,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub enum ExprPrecedence {
-    // return val, break val, yield val, closures
+    // return, break, continue, yield, yeet, become (with or without value)
     Jump,
     // = += -= *= /= %= &= |= ^= <<= >>=
     Assign,
@@ -76,18 +77,12 @@ pub fn precedence(expr: &ast::Expr) -> ExprPrecedence {
             Some(_) => ExprPrecedence::Unambiguous,
         },
 
-        Expr::BreakExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
-        Expr::BecomeExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
-        Expr::ReturnExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
-        Expr::YeetExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
-        Expr::YieldExpr(e) if e.expr().is_some() => ExprPrecedence::Jump,
-
         Expr::BreakExpr(_)
         | Expr::BecomeExpr(_)
         | Expr::ReturnExpr(_)
         | Expr::YeetExpr(_)
         | Expr::YieldExpr(_)
-        | Expr::ContinueExpr(_) => ExprPrecedence::Unambiguous,
+        | Expr::ContinueExpr(_) => ExprPrecedence::Jump,
 
         Expr::RangeExpr(..) => ExprPrecedence::Range,
 
@@ -139,7 +134,8 @@ pub fn precedence(expr: &ast::Expr) -> ExprPrecedence {
         | Expr::RecordExpr(_)
         | Expr::TupleExpr(_)
         | Expr::UnderscoreExpr(_)
-        | Expr::WhileExpr(_) => ExprPrecedence::Unambiguous,
+        | Expr::WhileExpr(_)
+        | Expr::IncludeBytesExpr(_) => ExprPrecedence::Unambiguous,
     }
 }
 
@@ -157,6 +153,11 @@ fn check_ancestry(ancestor: &SyntaxNode, descendent: &SyntaxNode) -> bool {
     }
 
     bail()
+}
+
+fn next_token_of(node: &SyntaxNode) -> Option<ast::SyntaxToken> {
+    let last = node.last_token()?;
+    skip_trivia_token(last.next_token()?, Direction::Next)
 }
 
 impl Expr {
@@ -202,6 +203,8 @@ impl Expr {
         if is_parent_call_expr && is_field_expr {
             return true;
         }
+        let place_of_parent =
+            || place_of.ancestors().find(|it| it.parent().is_none_or(|p| &p == parent.syntax()));
 
         // Special-case block weirdness
         if parent.child_is_followed_by_a_block() {
@@ -226,6 +229,29 @@ impl Expr {
             return false;
         }
 
+        // Keep parens when a ret-like expr is followed by `||` or `&&`.
+        // For `||`, removing parens could reparse as `<ret-like> || <closure>`.
+        // For `&&`, we avoid introducing `<ret-like> && <expr>` into a binary chain.
+
+        if self.precedence() == ExprPrecedence::Jump
+            && let Some(node) = place_of_parent()
+            && let Some(next) = next_token_of(&node)
+            && matches!(next.kind(), T![||] | T![&&])
+        {
+            return true;
+        }
+
+        // Special-case `2 as x < 3`
+        if let ast::Expr::CastExpr(it) = self
+            && let Some(ty) = it.ty()
+            && ty.syntax().last_token().and_then(|it| ast::NameLike::cast(it.parent()?)).is_some()
+            && let Some(node) = place_of_parent()
+            && let Some(next) = next_token_of(&node)
+            && matches!(next.kind(), T![<] | T![<<])
+        {
+            return true;
+        }
+
         if self.is_paren_like()
             || parent.is_paren_like()
             || self.is_prefix()
@@ -234,6 +260,14 @@ impl Expr {
             || self.is_postfix()
                 && (parent.is_postfix()
                     || self.is_ordered_before_parent_in_place_of(parent, place_of))
+        {
+            return false;
+        }
+
+        // Special-case `cond && <let-chain>`
+        if let ast::Expr::BinExpr(parent) = parent
+            && parent.op_kind() == Some(ast::BinaryOp::LogicOp(ast::LogicOp::And))
+            && self.contains_let_expr()
         {
             return false;
         }
@@ -350,7 +384,7 @@ impl Expr {
 
             ArrayExpr(_) | TupleExpr(_) | Literal(_) | PathExpr(_) | ParenExpr(_) | IfExpr(_)
             | WhileExpr(_) | ForExpr(_) | LoopExpr(_) | MatchExpr(_) | BlockExpr(_)
-            | RecordExpr(_) | UnderscoreExpr(_) => (0, 0),
+            | RecordExpr(_) | UnderscoreExpr(_) | IncludeBytesExpr(_) => (0, 0),
         }
     }
 
@@ -494,7 +528,8 @@ impl Expr {
                 AsmExpr(e) => e.builtin_token(),
                 ArrayExpr(_) | TupleExpr(_) | Literal(_) | PathExpr(_) | ParenExpr(_)
                 | IfExpr(_) | WhileExpr(_) | ForExpr(_) | LoopExpr(_) | MatchExpr(_)
-                | BlockExpr(_) | RecordExpr(_) | UnderscoreExpr(_) | MacroExpr(_) => None,
+                | BlockExpr(_) | RecordExpr(_) | UnderscoreExpr(_) | MacroExpr(_)
+                | IncludeBytesExpr(_) => None,
             };
 
             token.map(|t| t.text_range()).unwrap_or_else(|| this.syntax().text_range()).start()
@@ -521,7 +556,34 @@ impl Expr {
                 .map(|e| e.child_is_followed_by_a_block())
                 .unwrap_or(false),
 
-            ForExpr(_) | IfExpr(_) | MatchExpr(_) | WhileExpr(_) => true,
+            ForExpr(_) | IfExpr(_) | MatchExpr(_) | WhileExpr(_) | IncludeBytesExpr(_) => true,
         }
+    }
+
+    fn contains_let_expr(&self) -> bool {
+        use Expr::*;
+
+        match self {
+            LetExpr(_) => true,
+            BinExpr(e) => {
+                // if we find something other than a `&&`, then this can't be a let chain
+                e.op_kind() == Some(ast::BinaryOp::LogicOp(ast::LogicOp::And))
+                    && (e.lhs().is_none_or(|it| it.contains_let_expr())
+                        || e.rhs().is_none_or(|it| it.contains_let_expr()))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ast::Type {
+    pub fn needs_parens_in(&self, parent: &SyntaxNode) -> bool {
+        if !matches!(self, ast::Type::DynTraitType(_) | ast::Type::ImplTraitType(_)) {
+            return false;
+        }
+        let kind = parent.kind();
+        ast::CastExpr::can_cast(kind)
+            || ast::RefType::can_cast(kind)
+            || ast::PtrType::can_cast(kind)
     }
 }

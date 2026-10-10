@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::diagnostics::{CheckId, TidyCtx};
 use crate::iter_header::{HeaderLine, iter_header};
 use crate::walk::filter_not_rust;
 
@@ -12,11 +13,15 @@ const COMPILE_FLAGS_HEADER: &str = "compile-flags:";
 
 #[derive(Default, Debug)]
 struct RevisionInfo<'a> {
+    /// Target architecture specified with `--target=`
     target_arch: Option<Option<&'a str>>,
+    /// LLVM components configured with `//@ needs-llvm-components: ...`
     llvm_components: Option<Vec<&'a str>>,
 }
 
-pub fn check(tests_path: &Path, bad: &mut bool) {
+pub fn check(tests_path: &Path, tidy_ctx: TidyCtx) {
+    let check = tidy_ctx.start_check(CheckId::new("target-specific-tests").path(tests_path));
+
     crate::walk::walk(tests_path, |path, _is_dir| filter_not_rust(path), &mut |entry, content| {
         if content.contains("// ignore-tidy-target-specific-tests") {
             return;
@@ -44,15 +49,34 @@ pub fn check(tests_path: &Path, bad: &mut bool) {
                 } else if let Some((arch, _)) = v.split_once("-") {
                     info.target_arch.replace(Some(arch));
                 } else {
-                    eprintln!("{file}: seems to have a malformed --target value");
-                    *bad = true;
+                    check.error(format!("{file}: seems to have a malformed --target value"));
                 }
             }
         });
 
-        // Skip run-make tests as revisions are not supported.
-        if entry.path().strip_prefix(tests_path).is_ok_and(|rest| rest.starts_with("run-make")) {
+        // Skip run-make/run-make-cargo tests as revisions are not supported.
+        if entry
+            .path()
+            .strip_prefix(tests_path)
+            .is_ok_and(|rest| rest.starts_with("run-make") || rest.starts_with("run-make-cargo"))
+        {
             return;
+        }
+
+        // Directives without an explicit revision. These are inherited by all revisions.
+        let global = header_map.remove(&None).unwrap_or_default();
+
+        if header_map.is_empty() {
+            // `//@ revisions` is not used.
+            header_map.insert(None, global);
+        } else {
+            // Make all revisions inherit global directives.
+            for info in header_map.values_mut() {
+                info.target_arch = info.target_arch.or(global.target_arch);
+                if let Some(components) = &global.llvm_components {
+                    info.llvm_components.get_or_insert_with(Vec::new).extend(components);
+                }
+            }
         }
 
         for (rev, RevisionInfo { target_arch, llvm_components }) in &header_map {
@@ -62,25 +86,22 @@ pub fn check(tests_path: &Path, bad: &mut bool) {
                 (Some(target_arch), None) => {
                     let llvm_component =
                         target_arch.map_or_else(|| "<arch>".to_string(), arch_to_llvm_component);
-                    eprintln!(
+                    check.error(format!(
                         "{file}: revision {rev} should specify `{LLVM_COMPONENTS_HEADER} {llvm_component}` as it has `--target` set"
-                    );
-                    *bad = true;
+                    ));
                 }
                 (None, Some(_)) => {
-                    eprintln!(
+                    check.error(format!(
                         "{file}: revision {rev} should not specify `{LLVM_COMPONENTS_HEADER}` as it doesn't need `--target`"
-                    );
-                    *bad = true;
+                    ));
                 }
                 (Some(target_arch), Some(llvm_components)) => {
                     if let Some(target_arch) = target_arch {
                         let llvm_component = arch_to_llvm_component(target_arch);
                         if !llvm_components.contains(&llvm_component.as_str()) {
-                            eprintln!(
+                            check.error(format!(
                                 "{file}: revision {rev} should specify `{LLVM_COMPONENTS_HEADER} {llvm_component}` as it has `--target` set"
-                            );
-                            *bad = true;
+                            ));
                         }
                     }
                 }
@@ -95,7 +116,7 @@ fn arch_to_llvm_component(arch: &str) -> String {
     // enough for the purpose of this tidy check.
     match arch {
         "amdgcn" => "amdgpu".into(),
-        "aarch64_be" | "arm64_32" | "arm64e" | "arm64ec" => "aarch64".into(),
+        "aarch64v8r" | "aarch64_be" | "arm64_32" | "arm64e" | "arm64ec" => "aarch64".into(),
         "i386" | "i586" | "i686" | "x86" | "x86_64" | "x86_64h" => "x86".into(),
         "loongarch32" | "loongarch64" => "loongarch".into(),
         "nvptx64" => "nvptx".into(),

@@ -8,13 +8,13 @@ use rustc_ast::util::parser::AssocOp;
 use rustc_ast::{UnOp, ast};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
-use rustc_hir::{self as hir, Closure, ExprKind, HirId, MutTy, Node, TyKind};
+use rustc_hir::{self as hir, Closure, ExprKind, HirId, MatchSource, Node, TyKind};
 use rustc_hir_typeck::expr_use_visitor::{Delegate, ExprUseVisitor, PlaceBase, PlaceWithHirId};
 use rustc_lint::{EarlyContext, LateContext, LintContext};
 use rustc_middle::hir::place::ProjectionKind;
 use rustc_middle::mir::{FakeReadCause, Mutability};
 use rustc_middle::ty;
-use rustc_span::{BytePos, CharPos, Pos, Span, SyntaxContext};
+use rustc_span::{BytePos, CharPos, Pos as _, Span, SyntaxContext};
 use std::borrow::Cow;
 use std::fmt::{self, Display, Write as _};
 use std::ops::{Add, Neg, Not, Sub};
@@ -33,7 +33,7 @@ pub enum Sugg<'a> {
     /// or `-`, but only if the type with and without the operator is kept identical.
     /// It means that doubling the operator can be used to remove it instead, in
     /// order to provide better suggestions.
-    UnOp(UnOp, Box<Sugg<'a>>),
+    UnOp(UnOp, Box<Self>),
 }
 
 /// Literal constant `0`, for convenience.
@@ -59,7 +59,7 @@ impl<'a> Sugg<'a> {
     pub fn hir_opt(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Self> {
         let ctxt = expr.span.ctxt();
         let get_snippet = |span| snippet_with_context(cx, span, ctxt, "", &mut Applicability::Unspecified).0;
-        snippet_opt(cx, expr.span).map(|_| Self::hir_from_snippet(expr, get_snippet))
+        snippet_opt(cx, expr.span).map(|_| Self::hir_from_snippet(cx, expr, get_snippet))
     }
 
     /// Convenience function around `hir_opt` for suggestions with a default
@@ -72,8 +72,8 @@ impl<'a> Sugg<'a> {
     ///
     /// - Applicability level `Unspecified` will never be changed.
     /// - If the span is inside a macro, change the applicability level to `MaybeIncorrect`.
-    /// - If the default value is used and the applicability level is `MachineApplicable`, change it
-    ///   to `HasPlaceholders`
+    /// - If the default value is used and the applicability level is `MachineApplicable`, change it to
+    ///   `HasPlaceholders`
     pub fn hir_with_applicability(
         cx: &LateContext<'_>,
         expr: &hir::Expr<'_>,
@@ -115,7 +115,7 @@ impl<'a> Sugg<'a> {
                     Box::new(Self::hir_with_context(cx, inner, ctxt, default, applicability)),
                 )
             } else {
-                Self::hir_from_snippet(expr, |span| {
+                Self::hir_from_snippet(cx, expr, |span| {
                     snippet_with_context(cx, span, ctxt, default, applicability).0
                 })
             }
@@ -127,9 +127,13 @@ impl<'a> Sugg<'a> {
 
     /// Generate a suggestion for an expression with the given snippet. This is used by the `hir_*`
     /// function variants of `Sugg`, since these use different snippet functions.
-    fn hir_from_snippet(expr: &hir::Expr<'_>, mut get_snippet: impl FnMut(Span) -> Cow<'a, str>) -> Self {
-        if let Some(range) = higher::Range::hir(expr) {
-            let op = AssocOp::Range(range.limits);
+    pub fn hir_from_snippet(
+        cx: &LateContext<'_>,
+        expr: &hir::Expr<'_>,
+        mut get_snippet: impl FnMut(Span) -> Cow<'a, str>,
+    ) -> Self {
+        if let Some(range) = higher::Range::hir(cx, expr) {
+            let op = AssocOp::Range(range.ty.limits());
             let start = range.start.map_or("".into(), |expr| get_snippet(expr.span));
             let end = range.end.map_or("".into(), |expr| get_snippet(expr.span));
 
@@ -142,7 +146,9 @@ impl<'a> Sugg<'a> {
             | ExprKind::Let(..)
             | ExprKind::Closure { .. }
             | ExprKind::Unary(..)
-            | ExprKind::Match(..) => Sugg::MaybeParen(get_snippet(expr.span)),
+            | ExprKind::Match(_, _,
+                MatchSource::Normal | MatchSource::Postfix | MatchSource::ForLoopDesugar
+            ) => Sugg::MaybeParen(get_snippet(expr.span)),
             ExprKind::Continue(..)
             | ExprKind::Yield(..)
             | ExprKind::Array(..)
@@ -165,8 +171,11 @@ impl<'a> Sugg<'a> {
             | ExprKind::Tup(..)
             | ExprKind::Use(..)
             | ExprKind::Err(_)
-            | ExprKind::UnsafeBinderCast(..) => Sugg::NonParen(get_snippet(expr.span)),
-            ExprKind::DropTemps(inner) => Self::hir_from_snippet(inner, get_snippet),
+            | ExprKind::UnsafeBinderCast(..)
+            | ExprKind::Match(_, _,
+                MatchSource::AwaitDesugar | MatchSource::TryDesugar(_) | MatchSource::FormatArgs
+            ) => Sugg::NonParen(get_snippet(expr.span)),
+            ExprKind::DropTemps(inner) => Self::hir_from_snippet(cx, inner, get_snippet),
             ExprKind::Assign(lhs, rhs, _) => {
                 Sugg::BinOp(AssocOp::Assign, get_snippet(lhs.span), get_snippet(rhs.span))
             },
@@ -222,6 +231,7 @@ impl<'a> Sugg<'a> {
             | ast::ExprKind::Loop(..)
             | ast::ExprKind::MacCall(..)
             | ast::ExprKind::MethodCall(..)
+            | ast::ExprKind::Move(..)
             | ast::ExprKind::Paren(..)
             | ast::ExprKind::Underscore
             | ast::ExprKind::Path(..)
@@ -238,6 +248,7 @@ impl<'a> Sugg<'a> {
             | ast::ExprKind::Array(..)
             | ast::ExprKind::While(..)
             | ast::ExprKind::Await(..)
+            | ast::ExprKind::GcaMacro(..)
             | ast::ExprKind::Err(_)
             | ast::ExprKind::Dummy
             | ast::ExprKind::UnsafeBinderCast(..) => Sugg::NonParen(snippet(expr.span)),
@@ -326,6 +337,11 @@ impl<'a> Sugg<'a> {
         Sugg::NonParen(Cow::Owned(format!("{{ {self} }}")))
     }
 
+    /// Convenience method to wrap the expression in an `unsafe` block.
+    pub fn unsafeify(self) -> Sugg<'static> {
+        Sugg::NonParen(Cow::Owned(format!("unsafe {{ {self} }}")))
+    }
+
     /// Convenience method to prefix the expression with the `async` keyword.
     /// Can be used after `blockify` to create an async block.
     pub fn asyncify(self) -> Sugg<'static> {
@@ -358,6 +374,20 @@ impl<'a> Sugg<'a> {
                 Sugg::NonParen(format!("({sugg})").into())
             },
             Sugg::UnOp(op, inner) => Sugg::NonParen(format!("({}{})", op.as_str(), inner.maybe_inner_paren()).into()),
+        }
+    }
+
+    /// Strip enclosing parentheses if present. This method must be called when
+    /// it is known that removing those will not change the meaning. For example,
+    /// if `self` is known to represent a reference and the suggestion will be
+    /// used as the argument of a function call, it is safe to remove the enclosing
+    /// parentheses. It would not be safe to do so for an expression that might
+    /// represent a tuple.
+    #[must_use]
+    pub fn strip_paren(self) -> Self {
+        match self {
+            Sugg::NonParen(s) | Sugg::MaybeParen(s) => Sugg::NonParen(strip_enclosing_paren(s)),
+            sugg => sugg,
         }
     }
 
@@ -418,6 +448,22 @@ pub fn has_enclosing_paren(sugg: impl AsRef<str>) -> bool {
         chars.next().is_none()
     } else {
         false
+    }
+}
+
+/// Strip enclosing parentheses from a snippet if present.
+fn strip_enclosing_paren(snippet: Cow<'_, str>) -> Cow<'_, str> {
+    if has_enclosing_paren(&snippet) {
+        match snippet {
+            Cow::Borrowed(s) => Cow::Borrowed(&s[1..s.len() - 1]),
+            Cow::Owned(mut s) => {
+                s.pop();
+                s.remove(0);
+                Cow::Owned(s)
+            },
+        }
+    } else {
+        snippet
     }
 }
 
@@ -670,19 +716,19 @@ pub trait DiagExt<T: LintContext> {
         applicability: Applicability,
     );
 
-    /// Suggest to add an item before another.
+    /// Suggest to add an item after another.
     ///
     /// The item should not be indented (except for inner indentation).
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// diag.suggest_prepend_item(cx, item,
+    /// diag.suggest_append_item(cx, item,
     /// "fn foo() {
     ///     bar();
     /// }");
     /// ```
-    fn suggest_prepend_item(&mut self, cx: &T, item: Span, msg: &str, new_item: &str, applicability: Applicability);
+    fn suggest_append_item(&mut self, cx: &T, item: Span, msg: &str, new_item: &str, applicability: Applicability);
 
     /// Suggest to completely remove an item.
     ///
@@ -698,7 +744,7 @@ pub trait DiagExt<T: LintContext> {
     fn suggest_remove_item(&mut self, cx: &T, item: Span, msg: &str, applicability: Applicability);
 }
 
-impl<T: LintContext> DiagExt<T> for rustc_errors::Diag<'_, ()> {
+impl<T: LintContext> DiagExt<T> for rustc_errors::Diag<'_> {
     fn suggest_item_with_attr<D: Display + ?Sized>(
         &mut self,
         cx: &T,
@@ -714,24 +760,19 @@ impl<T: LintContext> DiagExt<T> for rustc_errors::Diag<'_, ()> {
         }
     }
 
-    fn suggest_prepend_item(&mut self, cx: &T, item: Span, msg: &str, new_item: &str, applicability: Applicability) {
+    fn suggest_append_item(&mut self, cx: &T, item: Span, msg: &str, new_item: &str, applicability: Applicability) {
         if let Some(indent) = indentation(cx, item) {
-            let span = item.with_hi(item.lo());
-
-            let mut first = true;
-            let new_item = new_item
-                .lines()
-                .map(|l| {
-                    if first {
-                        first = false;
-                        format!("{l}\n")
-                    } else {
-                        format!("{indent}{l}\n")
-                    }
-                })
-                .collect::<String>();
-
-            self.span_suggestion(span, msg.to_string(), format!("{new_item}\n{indent}"), applicability);
+            let span = item.shrink_to_hi();
+            let mut new_item_code = String::new();
+            for l in new_item.lines() {
+                writeln!(new_item_code, "{indent}{l}").unwrap();
+            }
+            self.span_suggestion(
+                span,
+                msg.to_string(),
+                format!("\n\n{}", new_item_code.strip_suffix('\n').unwrap()),
+                applicability,
+            );
         }
     }
 
@@ -765,7 +806,7 @@ pub struct DerefClosure {
 /// such as explicit deref and borrowing cases.
 /// Returns `None` if no such use cases have been triggered in closure body
 ///
-/// note: this only works on single line immutable closures with exactly one input parameter.
+/// note: This only works on immutable closures with exactly one input parameter.
 pub fn deref_closure_args(cx: &LateContext<'_>, closure: &hir::Expr<'_>) -> Option<DerefClosure> {
     if let ExprKind::Closure(&Closure {
         fn_decl, def_id, body, ..
@@ -774,9 +815,8 @@ pub fn deref_closure_args(cx: &LateContext<'_>, closure: &hir::Expr<'_>) -> Opti
         let closure_body = cx.tcx.hir_body(body);
         // is closure arg a type annotated double reference (i.e.: `|x: &&i32| ...`)
         // a type annotation is present if param `kind` is different from `TyKind::Infer`
-        let closure_arg_is_type_annotated_double_ref = if let TyKind::Ref(_, MutTy { ty, .. }) = fn_decl.inputs[0].kind
-        {
-            matches!(ty.kind, TyKind::Ref(_, MutTy { .. }))
+        let closure_arg_is_type_annotated_double_ref = if let TyKind::Ref(_, ty, ..) = fn_decl.inputs[0].kind {
+            matches!(ty.kind, TyKind::Ref(..))
         } else {
             false
         };
@@ -852,7 +892,14 @@ impl<'tcx> DerefDelegate<'_, 'tcx> {
                     .cx
                     .typeck_results()
                     .type_dependent_def_id(parent_expr.hir_id)
-                    .map(|did| self.cx.tcx.fn_sig(did).instantiate_identity().skip_binder())
+                    .map(|did| {
+                        self.cx
+                            .tcx
+                            .fn_sig(did)
+                            .instantiate_identity()
+                            .skip_norm_wip()
+                            .skip_binder()
+                    })
                 {
                     std::iter::once(receiver)
                         .chain(call_args.iter())
@@ -918,8 +965,8 @@ impl<'tcx> Delegate<'tcx> for DerefDelegate<'_, 'tcx> {
                 // Note about method calls:
                 // - compiler automatically dereference references if the target type is a reference (works also for
                 //   function call)
-                // - `self` arguments in the case of `x.is_something()` are also automatically (de)referenced, and
-                //   no projection should be suggested
+                // - `self` arguments in the case of `x.is_something()` are also automatically (de)referenced, and no
+                //   projection should be suggested
                 if let Some(parent_expr) = get_parent_expr_for_hir(self.cx, cmt.hir_id) {
                     match &parent_expr.kind {
                         // given expression is the self argument and will be handled completely by the compiler

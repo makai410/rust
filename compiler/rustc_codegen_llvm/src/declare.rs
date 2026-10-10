@@ -14,7 +14,8 @@
 use std::borrow::Borrow;
 
 use itertools::Itertools;
-use rustc_codegen_ssa::traits::TypeMembershipCodegenMethods;
+use rustc_abi::AddressSpace;
+use rustc_codegen_ssa::traits::{MiscCodegenMethods, TypeMembershipCodegenMethods};
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_middle::ty::{Instance, Ty};
 use rustc_sanitizers::{cfi, kcfi};
@@ -23,13 +24,10 @@ use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::abi::FnAbiLlvmExt;
-use crate::common::AsCCharPtr;
+use crate::attributes;
 use crate::context::{CodegenCx, GenericCx, SCx, SimpleCx};
 use crate::llvm::AttributePlace::Function;
-use crate::llvm::Visibility;
-use crate::type_::Type;
-use crate::value::Value;
-use crate::{attributes, llvm};
+use crate::llvm::{self, FromGeneric, Type, Value, Visibility};
 
 /// Declare a function with a SimpleCx.
 ///
@@ -44,9 +42,7 @@ pub(crate) fn declare_simple_fn<'ll>(
     ty: &'ll Type,
 ) -> &'ll Value {
     debug!("declare_simple_fn(name={:?}, ty={:?})", name, ty);
-    let llfn = unsafe {
-        llvm::LLVMRustGetOrInsertFunction(cx.llmod, name.as_c_char_ptr(), name.len(), ty)
-    };
+    let llfn = unsafe { llvm::LLVMGetOrInsertFunction(cx.llmod, name.as_ptr(), name.len(), ty) };
 
     llvm::SetFunctionCallConv(llfn, callconv);
     llvm::set_unnamed_address(llfn, unnamed);
@@ -72,11 +68,18 @@ pub(crate) fn declare_raw_fn<'ll, 'tcx>(
 
     let mut attrs = SmallVec::<[_; 4]>::new();
 
+    if cx.sess().target.is_like_gpu {
+        // Conservatively apply convergent to all functions in case they may call
+        // a convergent function. Rely on LLVM to optimize away the unnecessary
+        // convergent attributes.
+        attrs.push(llvm::AttributeKind::Convergent.create_attr(cx.llcx));
+    }
+
     if cx.tcx.sess.opts.cg.no_redzone.unwrap_or(cx.tcx.sess.target.disable_redzone) {
         attrs.push(llvm::AttributeKind::NoRedZone.create_attr(cx.llcx));
     }
 
-    attrs.extend(attributes::non_lazy_bind_attr(cx));
+    attrs.extend(attributes::non_lazy_bind_attr(cx, cx.tcx.sess));
 
     attributes::apply_to_llfn(llfn, Function, &attrs);
 
@@ -91,11 +94,28 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
     pub(crate) fn declare_global(&self, name: &str, ty: &'ll Type) -> &'ll Value {
         debug!("declare_global(name={:?})", name);
         unsafe {
-            llvm::LLVMRustGetOrInsertGlobal(
+            llvm::LLVMRustGetOrInsertGlobal((**self).borrow().llmod, name.as_ptr(), name.len(), ty)
+        }
+    }
+
+    /// Declare a global value in a specific address space.
+    ///
+    /// If there’s a value with the same name already declared, the function will
+    /// return its Value instead.
+    pub(crate) fn declare_global_in_addrspace(
+        &self,
+        name: &str,
+        ty: &'ll Type,
+        addr_space: AddressSpace,
+    ) -> &'ll Value {
+        debug!("declare_global(name={name:?}, addrspace={addr_space:?})");
+        unsafe {
+            llvm::LLVMRustGetOrInsertGlobalInAddrspace(
                 (**self).borrow().llmod,
-                name.as_c_char_ptr(),
+                name.as_ptr(),
                 name.len(),
                 ty,
+                addr_space.0,
             )
         }
     }
@@ -204,13 +224,12 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
                 options.insert(kcfi::TypeIdOptions::NORMALIZE_INTEGERS);
             }
 
-            if let Some(instance) = instance {
-                let kcfi_typeid = kcfi::typeid_for_instance(self.tcx, instance, options);
-                self.set_kcfi_type_metadata(llfn, kcfi_typeid);
+            let kcfi_typeid = if let Some(instance) = instance {
+                kcfi::typeid_for_instance(self.tcx, instance, options)
             } else {
-                let kcfi_typeid = kcfi::typeid_for_fnabi(self.tcx, fn_abi, options);
-                self.set_kcfi_type_metadata(llfn, kcfi_typeid);
-            }
+                kcfi::typeid_for_fnabi(self.tcx, fn_abi, options)
+            };
+            self.set_kcfi_type_metadata(llfn, kcfi_typeid);
         }
 
         llfn
@@ -232,17 +251,10 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
         }
     }
 
-    /// Declare a private global
-    ///
-    /// Use this function when you intend to define a global without a name.
-    pub(crate) fn define_private_global(&self, ty: &'ll Type) -> &'ll Value {
-        unsafe { llvm::LLVMRustInsertPrivateGlobal(self.llmod(), ty) }
-    }
-
     /// Gets declared value by name.
     pub(crate) fn get_declared_value(&self, name: &str) -> Option<&'ll Value> {
         debug!("get_declared_value(name={:?})", name);
-        unsafe { llvm::LLVMRustGetNamedValue(self.llmod(), name.as_c_char_ptr(), name.len()) }
+        unsafe { llvm::LLVMRustGetNamedValue(self.llmod(), name.as_ptr(), name.len()) }
     }
 
     /// Gets defined or externally defined (AvailableExternally linkage) value by

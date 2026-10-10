@@ -6,9 +6,8 @@ use rustc_ast::ast::{LitIntType, LitKind};
 use rustc_data_structures::packed::Pu128;
 use rustc_errors::Applicability;
 use rustc_hir::{AssignOpKind, BinOpKind, Block, Expr, ExprKind, Stmt, StmtKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_middle::ty::{IntTy, Ty, UintTy};
-use rustc_session::declare_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -36,6 +35,7 @@ declare_clippy_lint! {
     style,
     "Perform saturating addition instead of implicitly checking max bound of data type"
 }
+
 declare_lint_pass!(ImplicitSaturatingAdd => [IMPLICIT_SATURATING_ADD]);
 
 impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingAdd {
@@ -66,7 +66,7 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingAdd {
             && let ctxt = expr.span.ctxt()
             && ex.span.ctxt() == ctxt
             && cond.span.ctxt() == ctxt
-            && clippy_utils::SpanlessEq::new(cx).eq_expr(l, target)
+            && clippy_utils::SpanlessEq::new(cx).eq_expr(ctxt, l, target)
             && AssignOpKind::AddAssign == op1.node
             && let ExprKind::Lit(lit) = value.kind
             && let LitKind::Int(Pu128(1), LitIntType::Unsuffixed) = lit.node
@@ -117,10 +117,11 @@ fn get_int_max(ty: Ty<'_>) -> Option<u128> {
 fn get_const<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<(u128, BinOpKind, &'tcx Expr<'tcx>)> {
     if let ExprKind::Binary(op, l, r) = expr.kind {
         let ecx = ConstEvalCtxt::new(cx);
-        if let Some(Constant::Int(c)) = ecx.eval(r) {
+        let ctxt = expr.span.ctxt();
+        if let Some(Constant::Int(c)) = ecx.eval_local(r, ctxt) {
             return Some((c, op.node, l));
         }
-        if let Some(Constant::Int(c)) = ecx.eval(l) {
+        if let Some(Constant::Int(c)) = ecx.eval_local(l, ctxt) {
             return Some((c, invert_op(op.node)?, r));
         }
     }

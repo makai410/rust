@@ -7,7 +7,6 @@
 pub fn noop(v: &mut Vec<u8>) {
     // CHECK-NOT: grow_one
     // CHECK-NOT: call
-    // CHECK: tail call void @llvm.assume
     // CHECK-NOT: grow_one
     // CHECK-NOT: call
     // CHECK: {{ret|[}]}}

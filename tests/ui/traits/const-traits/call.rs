@@ -1,11 +1,11 @@
-// FIXME(const_trait_impl) check-pass
-//@ compile-flags: -Znext-solver
+//@ check-pass
+//@[next] compile-flags: -Znext-solver
+//@revisions: next old
+//@ ignore-compare-mode-next-solver (explicit revisions)
 #![feature(const_closures, const_trait_impl)]
-#![allow(incomplete_features)]
 
-pub const _: () = {
+const _: () = {
     assert!((const || true)());
-    //~^ ERROR }: [const] Fn()` is not satisfied
 };
 
 fn main() {}

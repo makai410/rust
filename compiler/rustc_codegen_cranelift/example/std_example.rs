@@ -1,13 +1,12 @@
-#![feature(
-    core_intrinsics,
-    coroutines,
-    stmt_expr_attributes,
-    coroutine_trait,
-    repr_simd,
-    tuple_trait,
-    unboxed_closures
-)]
 #![allow(internal_features)]
+#![cfg_attr(target_has_reliable_f128, feature(f128))]
+#![feature(cfg_target_has_reliable_f16_f128)]
+#![feature(core_intrinsics)]
+#![feature(coroutine_trait)]
+#![feature(coroutines)]
+#![feature(repr_simd)]
+#![feature(tuple_trait)]
+#![feature(unboxed_closures)]
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -99,6 +98,8 @@ fn main() {
     assert_eq!(houndred_f32 as i128, 100);
     assert_eq!(houndred_f64 as i128, 100);
     assert_eq!(1u128.rotate_left(2), 4);
+    #[cfg(target_has_reliable_f128)]
+    assert_eq!(std::hint::black_box(300.0f128) as u8, 255);
 
     assert_eq!(black_box(f32::NAN) as i128, 0);
     assert_eq!(black_box(f32::NAN) as u128, 0);
@@ -173,6 +174,9 @@ fn main() {
 
     rust_call_abi();
 
+    // #[cfg(target_arch = "x86_64")]
+    // inline_asm_call_custom_abi();
+
     const fn no_str() -> Option<Box<str>> {
         None
     }
@@ -230,51 +234,80 @@ unsafe fn test_crc32() {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn test_simd() {
-    assert!(is_x86_feature_detected!("sse2"));
+    unsafe {
+        assert!(is_x86_feature_detected!("sse2"));
 
-    let x = _mm_setzero_si128();
-    let y = _mm_set1_epi16(7);
-    let or = _mm_or_si128(x, y);
-    let cmp_eq = _mm_cmpeq_epi8(y, y);
-    let cmp_lt = _mm_cmplt_epi8(y, y);
+        let x = _mm_setzero_si128();
+        let y = _mm_set1_epi16(7);
+        let or = _mm_or_si128(x, y);
+        let cmp_eq = _mm_cmpeq_epi8(y, y);
+        let cmp_lt = _mm_cmplt_epi8(y, y);
 
-    let (zero0, zero1) = std::mem::transmute::<_, (u64, u64)>(x);
-    assert_eq!((zero0, zero1), (0, 0));
-    assert_eq!(std::mem::transmute::<_, [u16; 8]>(or), [7, 7, 7, 7, 7, 7, 7, 7]);
-    assert_eq!(
-        std::mem::transmute::<_, [u16; 8]>(cmp_eq),
-        [0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff]
-    );
-    assert_eq!(std::mem::transmute::<_, [u16; 8]>(cmp_lt), [0, 0, 0, 0, 0, 0, 0, 0]);
+        let (zero0, zero1) = std::mem::transmute::<_, (u64, u64)>(x);
+        assert_eq!((zero0, zero1), (0, 0));
+        assert_eq!(std::mem::transmute::<_, [u16; 8]>(or), [7, 7, 7, 7, 7, 7, 7, 7]);
+        assert_eq!(
+            std::mem::transmute::<_, [u16; 8]>(cmp_eq),
+            [0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff]
+        );
+        assert_eq!(std::mem::transmute::<_, [u16; 8]>(cmp_lt), [0, 0, 0, 0, 0, 0, 0, 0]);
 
-    test_mm_slli_si128();
-    test_mm_movemask_epi8();
-    test_mm256_movemask_epi8();
-    test_mm_add_epi8();
-    test_mm_add_pd();
-    test_mm_cvtepi8_epi16();
-    #[cfg(not(jit))]
-    test_mm_cvtps_epi32();
-    test_mm_cvttps_epi32();
-    test_mm_cvtsi128_si64();
+        test_mm_slli_si128();
+        test_mm_movemask_epi8();
+        test_mm256_movemask_epi8();
+        test_mm_add_epi8();
+        test_mm_add_pd();
+        test_mm_cvtepi8_epi16();
+        #[cfg(not(jit))]
+        test_mm_cvtps_epi32();
+        test_mm_cvttps_epi32();
+        test_mm_cvtsi128_si64();
 
-    test_mm_extract_epi8();
-    test_mm_insert_epi16();
-    test_mm_shuffle_epi8();
+        #[cfg(not(jit))]
+        test_mm_cvtps_ph();
 
-    #[cfg(not(jit))]
-    test_mm_cmpestri();
+        test_mm_extract_epi8();
+        test_mm_insert_epi16();
+        test_mm_shuffle_epi8();
 
-    test_mm256_shuffle_epi8();
-    test_mm256_permute2x128_si256();
-    test_mm256_permutevar8x32_epi32();
+        #[cfg(not(jit))]
+        test_mm_cmpestri();
 
-    #[rustfmt::skip]
+        test_mm256_shuffle_epi8();
+        test_mm256_permute2x128_si256();
+        test_mm256_permutevar8x32_epi32();
+
+        #[rustfmt::skip]
     let mask1 = _mm_movemask_epi8(dbg!(_mm_setr_epi8(255u8 as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)));
-    assert_eq!(mask1, 1);
+        assert_eq!(mask1, 1);
 
-    #[cfg(not(jit))]
-    test_crc32();
+        #[cfg(not(jit))]
+        test_crc32();
+
+        #[cfg(not(jit))]
+        test_xmm_roundtrip();
+        #[cfg(not(jit))]
+        if is_x86_feature_detected!("avx") {
+            test_ymm_roundtrip();
+        }
+        #[cfg(not(jit))]
+        if is_x86_feature_detected!("avx512f") {
+            test_zmm_roundtrip();
+        }
+
+        #[cfg(not(jit))]
+        {
+            if is_x86_feature_detected!("pclmulqdq") {
+                test_mm_clmulepi64_si128();
+            }
+            if is_x86_feature_detected!("vpclmulqdq") {
+                test_mm256_clmulepi64_epi128();
+            }
+            if is_x86_feature_detected!("vpclmulqdq") && is_x86_feature_detected!("avx512f") {
+                test_mm512_clmulepi64_epi128();
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -361,7 +394,7 @@ fn assert_eq_m128i(x: std::arch::x86_64::__m128i, y: std::arch::x86_64::__m128i)
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-pub unsafe fn assert_eq_m128d(a: __m128d, b: __m128d) {
+pub fn assert_eq_m128d(a: __m128d, b: __m128d) {
     if _mm_movemask_pd(_mm_cmpeq_pd(a, b)) != 0b11 {
         panic!("{:?} != {:?}", a, b);
     }
@@ -369,15 +402,27 @@ pub unsafe fn assert_eq_m128d(a: __m128d, b: __m128d) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-pub unsafe fn assert_eq_m256i(a: __m256i, b: __m256i) {
-    assert_eq!(std::mem::transmute::<_, [u64; 4]>(a), std::mem::transmute::<_, [u64; 4]>(b))
+pub fn assert_eq_m256i(a: __m256i, b: __m256i) {
+    unsafe {
+        assert_eq!(std::mem::transmute::<_, [u64; 4]>(a), std::mem::transmute::<_, [u64; 4]>(b))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+pub fn assert_eq_m512i(a: __m512i, b: __m512i) {
+    unsafe {
+        assert_eq!(std::mem::transmute::<_, [u64; 8]>(a), std::mem::transmute::<_, [u64; 8]>(b))
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn test_mm_cvtsi128_si64() {
-    let r = _mm_cvtsi128_si64(std::mem::transmute::<[i64; 2], _>([5, 0]));
-    assert_eq!(r, 5);
+    unsafe {
+        let r = _mm_cvtsi128_si64(std::mem::transmute::<[i64; 2], _>([5, 0]));
+        assert_eq!(r, 5);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -445,20 +490,24 @@ unsafe fn test_mm_shuffle_epi8() {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 unsafe fn str_to_m128i(s: &[u8]) -> __m128i {
-    assert!(s.len() <= 16);
-    let slice = &mut [0u8; 16];
-    std::ptr::copy_nonoverlapping(s.as_ptr(), slice.as_mut_ptr(), s.len());
-    _mm_loadu_si128(slice.as_ptr() as *const _)
+    unsafe {
+        assert!(s.len() <= 16);
+        let slice = &mut [0u8; 16];
+        std::ptr::copy_nonoverlapping(s.as_ptr(), slice.as_mut_ptr(), s.len());
+        _mm_loadu_si128(slice.as_ptr() as *const _)
+    }
 }
 
 #[cfg(not(jit))]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 unsafe fn test_mm_cmpestri() {
-    let a = str_to_m128i(b"bar - garbage");
-    let b = str_to_m128i(b"foobar");
-    let i = _mm_cmpestri::<_SIDD_CMP_EQUAL_ORDERED>(a, 3, b, 6);
-    assert_eq!(3, i);
+    unsafe {
+        let a = str_to_m128i(b"bar - garbage");
+        let b = str_to_m128i(b"foobar");
+        let i = _mm_cmpestri::<_SIDD_CMP_EQUAL_ORDERED>(a, 3, b, 6);
+        assert_eq!(3, i);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -510,38 +559,172 @@ unsafe fn test_mm256_permutevar8x32_epi32() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq")]
+#[cfg(not(jit))]
+unsafe fn test_mm_clmulepi64_si128() {
+    // Constants taken from https://software.intel.com/sites/default/files/managed/72/cc/clmul-wp-rev-2.02-2014-04-20.pdf
+    let a = _mm_set_epi64x(0x7b5b546573745665, 0x63746f725d53475d);
+    let b = _mm_set_epi64x(0x4869285368617929, 0x5b477565726f6e5d);
+    let r00 = _mm_set_epi64x(0x1d4d84c85c3440c0, 0x929633d5d36f0451u64.cast_signed());
+    let r01 = _mm_set_epi64x(0x1bd17c8d556ab5a1, 0x7fa540ac2a281315);
+    let r10 = _mm_set_epi64x(0x1a2bf6db3a30862f, 0xbabf262df4b7d5c9u64.cast_signed());
+    let r11 = _mm_set_epi64x(0x1d1e1f2c592e7c45, 0xd66ee03e410fd4edu64.cast_signed());
+
+    assert_eq_m128i(_mm_clmulepi64_si128::<0x00>(a, b), r00);
+    assert_eq_m128i(_mm_clmulepi64_si128::<0x10>(a, b), r01);
+    assert_eq_m128i(_mm_clmulepi64_si128::<0x01>(a, b), r10);
+    assert_eq_m128i(_mm_clmulepi64_si128::<0x11>(a, b), r11);
+
+    let a0 = _mm_set_epi64x(0x0000000000000000, 0x8000000000000000u64.cast_signed());
+    let r = _mm_set_epi64x(0x4000000000000000, 0x0000000000000000);
+    assert_eq_m128i(_mm_clmulepi64_si128::<0x00>(a0, a0), r);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "vpclmulqdq")]
+#[cfg(not(jit))]
+unsafe fn test_mm256_clmulepi64_epi128() {
+    let a = _mm256_setr_epi64x(1, 2, 3, 4);
+    let b = _mm256_setr_epi64x(5, 6, 7, 8);
+
+    assert_eq_m256i(_mm256_clmulepi64_epi128::<0x00>(a, b), _mm256_setr_epi64x(5, 0, 9, 0));
+    assert_eq_m256i(_mm256_clmulepi64_epi128::<0x01>(a, b), _mm256_setr_epi64x(10, 0, 28, 0));
+    assert_eq_m256i(_mm256_clmulepi64_epi128::<0x10>(a, b), _mm256_setr_epi64x(6, 0, 24, 0));
+    assert_eq_m256i(_mm256_clmulepi64_epi128::<0x11>(a, b), _mm256_setr_epi64x(12, 0, 32, 0));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "vpclmulqdq,avx512f")]
+#[cfg(not(jit))]
+unsafe fn test_mm512_clmulepi64_epi128() {
+    let a = _mm512_setr_epi64(1, 2, 3, 4, 5, 6, 7, 8);
+    let b = _mm512_setr_epi64(9, 10, 11, 12, 13, 14, 15, 16);
+
+    assert_eq_m512i(
+        _mm512_clmulepi64_epi128::<0x00>(a, b),
+        _mm512_setr_epi64(9, 0, 29, 0, 57, 0, 45, 0),
+    );
+    assert_eq_m512i(
+        _mm512_clmulepi64_epi128::<0x10>(a, b),
+        _mm512_setr_epi64(10, 0, 20, 0, 54, 0, 112, 0),
+    );
+    assert_eq_m512i(
+        _mm512_clmulepi64_epi128::<0x11>(a, b),
+        _mm512_setr_epi64(20, 0, 48, 0, 36, 0, 128, 0),
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[cfg(not(jit))]
 unsafe fn test_mm_cvtps_epi32() {
-    let floats: [f32; 4] = [1.5, -2.5, i32::MAX as f32 + 1.0, f32::NAN];
+    unsafe {
+        let floats: [f32; 4] = [1.5, -2.5, i32::MAX as f32 + 1.0, f32::NAN];
 
-    let float_vec = _mm_loadu_ps(floats.as_ptr());
-    let int_vec = _mm_cvtps_epi32(float_vec);
+        let float_vec = _mm_loadu_ps(floats.as_ptr());
+        let int_vec = _mm_cvtps_epi32(float_vec);
 
-    let mut ints: [i32; 4] = [0; 4];
-    _mm_storeu_si128(ints.as_mut_ptr() as *mut __m128i, int_vec);
+        let mut ints: [i32; 4] = [0; 4];
+        _mm_storeu_si128(ints.as_mut_ptr() as *mut __m128i, int_vec);
 
-    // this is very different from `floats.map(|f| f as i32)`!
-    let expected_ints: [i32; 4] = [2, -2, i32::MIN, i32::MIN];
+        // this is very different from `floats.map(|f| f as i32)`!
+        let expected_ints: [i32; 4] = [2, -2, i32::MIN, i32::MIN];
 
-    assert_eq!(ints, expected_ints);
+        assert_eq!(ints, expected_ints);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn test_mm_cvttps_epi32() {
-    let floats: [f32; 4] = [1.5, -2.5, i32::MAX as f32 + 1.0, f32::NAN];
+    unsafe {
+        let floats: [f32; 4] = [1.5, -2.5, i32::MAX as f32 + 1.0, f32::NAN];
 
-    let float_vec = _mm_loadu_ps(floats.as_ptr());
-    let int_vec = _mm_cvttps_epi32(float_vec);
+        let float_vec = _mm_loadu_ps(floats.as_ptr());
+        let int_vec = _mm_cvttps_epi32(float_vec);
 
-    let mut ints: [i32; 4] = [0; 4];
-    _mm_storeu_si128(ints.as_mut_ptr() as *mut __m128i, int_vec);
+        let mut ints: [i32; 4] = [0; 4];
+        _mm_storeu_si128(ints.as_mut_ptr() as *mut __m128i, int_vec);
 
-    // this is very different from `floats.map(|f| f as i32)`!
-    let expected_ints: [i32; 4] = [1, -2, i32::MIN, i32::MIN];
+        // this is very different from `floats.map(|f| f as i32)`!
+        let expected_ints: [i32; 4] = [1, -2, i32::MIN, i32::MIN];
 
-    assert_eq!(ints, expected_ints);
+        assert_eq!(ints, expected_ints);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+#[cfg(not(jit))]
+unsafe fn test_mm_cvtps_ph() {
+    const F16_ONE: i16 = 0x3c00;
+    const F16_TWO: i16 = 0x4000;
+    const F16_THREE: i16 = 0x4200;
+    const F16_FOUR: i16 = 0x4400;
+
+    let a = _mm_set_ps(1.0, 2.0, 3.0, 4.0);
+    let r = _mm_cvtps_ph::<_MM_FROUND_CUR_DIRECTION>(a);
+    let e = _mm_set_epi16(0, 0, 0, 0, F16_ONE, F16_TWO, F16_THREE, F16_FOUR);
+    assert_eq_m128i(r, e);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cfg(not(jit))]
+unsafe fn test_xmm_roundtrip() {
+    unsafe {
+        let input = [1u8; 16];
+        let mut output = [0u8; 16];
+
+        std::arch::asm!(
+            "movups {xmm}, [{input}]",
+            "movups [{output}], {xmm}",
+            input = in(reg) input.as_ptr(),
+            output = in(reg) output.as_mut_ptr(),
+            xmm = out(xmm_reg) _,
+        );
+
+        assert_eq!(input, output);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+#[cfg(not(jit))]
+unsafe fn test_ymm_roundtrip() {
+    unsafe {
+        let input = [1u8; 32];
+        let mut output = [0u8; 32];
+
+        std::arch::asm!(
+            "vmovups {ymm}, [{input}]",
+            "vmovups [{output}], {ymm}",
+            input = in(reg) input.as_ptr(),
+            output = in(reg) output.as_mut_ptr(),
+            ymm = out(ymm_reg) _,
+        );
+
+        assert_eq!(input, output);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[cfg(not(jit))]
+unsafe fn test_zmm_roundtrip() {
+    unsafe {
+        let input = [1u8; 64];
+        let mut output = [0u8; 64];
+
+        std::arch::asm!(
+            "vmovups {zmm}, [{input}]",
+            "vmovups [{output}], {zmm}",
+            input = in(reg) input.as_ptr(),
+            output = in(reg) output.as_mut_ptr(),
+            zmm = out(zmm_reg) _,
+        );
+
+        assert_eq!(input, output);
+    }
 }
 
 fn test_checked_mul() {
@@ -582,3 +765,18 @@ fn map(a: Option<(u8, Box<Instruction>)>) -> Option<Box<Instruction>> {
         Some((_, instr)) => Some(instr),
     }
 }
+
+// FIXME enable once inline asm sym references are stabilized in cg_clif
+// #[cfg(target_arch = "x86_64")]
+// fn inline_asm_call_custom_abi() {
+//     use std::arch::{asm, naked_asm};
+//
+//     #[unsafe(naked)]
+//     unsafe extern "custom" fn double() {
+//         naked_asm!("add rax, rax", "ret");
+//     }
+//
+//     let mut x: u64 = 21;
+//     unsafe { asm!("call {}", sym double, inout("rax") x) };
+//     assert_eq!(x, 42);
+// }

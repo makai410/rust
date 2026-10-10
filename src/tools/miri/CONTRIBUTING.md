@@ -3,15 +3,27 @@
 If you want to hack on Miri yourself, great!  Here are some resources you might
 find useful.
 
+## AI policy
+
+Before opening a PR or issue, please note our AI policy:
+
+* Using LLMs privately (any use where the output is not part of what you submit to Miri) is allowed.
+* Using LLMs to generate code, documentation, or text that you post in a PR or issue is disallowed, except:
+  - Machine translation is okay, but we recommend tools like https://www.deepl.com/ instead of general-purpose LLMs to reduce the chance of the meaning of the text being altered by the translation.
+  - For issues, it's okay to have a clearly separated LLM-generated section, but the rest of the issue without that section must be written and verified by you personally and must stand on its own.
+  - For PRs, if a Miri maintainer has previously agreed to mentor you, it's okay to submit LLM-generated code and have it reviewed by that maintainer. The PR needs to clearly indicate that it contains LLM-generated code and who the mentor is, and the PR description needs to be written and verified by you personally.
+
+If you have any doubts or questions, please come talk to us on [Zulip].
+
+[Zulip]: https://rust-lang.zulipchat.com/#narrow/channel/269128-miri
+
 ## Getting started
 
 Check out the issues on this GitHub repository for some ideas. In particular,
 look for the green `E-*` labels which mark issues that should be rather
 well-suited for onboarding. For more ideas or help with hacking on Miri, you can
-contact us on the [Rust Zulip]. See the [Rust website](https://www.rust-lang.org/governance/teams/compiler#team-miri)
+contact us on the [Rust Zulip][Zulip]. See the [Rust website](https://www.rust-lang.org/governance/teams/compiler#team-miri)
 for a list of Miri maintainers.
-
-[Rust Zulip]: https://rust-lang.zulipchat.com
 
 ### PR review process
 
@@ -66,6 +78,23 @@ process for such contributions:
 This process is largely informal, and its primary goal is to more clearly communicate expectations.
 Please get in touch with us if you have any questions!
 
+## Scope of Miri shims
+
+Miri has "shims" to implement functionality that is usually implemented in C libraries which are
+invoked from Rust code, such as opening files or spawning threads, as well as for
+CPU-vendor-provided SIMD intrinsics. However, the set of C functions that Rust code invokes this way
+is enormous, and for obvious reasons we have no intention of implementing every C API ever written
+in Miri.
+
+At the moment, the general guideline for "could this function have a shim in Miri" is: we will
+generally only add shims for functions that can be implemented in a portable way using just what is
+provided by the Rust standard library. The function should also be reasonably widely-used in Rust
+code to justify the review and maintenance effort (i.e. the easier the function is to implement, the
+lower the barrier). Other than that, we might make exceptions for certain cases if (a) there is a
+good case for why Miri should support those APIs, and (b) robust and widely-used portable libraries
+exist in the Rust ecosystem. We will generally not add shims to Miri that would require Miri to
+directly interact with platform-specific APIs (such as `libc` or `windows-sys`).
+
 ## Preparing the build environment
 
 Miri heavily relies on internal and unstable rustc interfaces to execute MIR,
@@ -82,12 +111,35 @@ install that exact version of rustc as a toolchain:
 This will set up a rustup toolchain called `miri` and set it as an override for
 the current directory.
 
-You can also create a `.auto-everything` file (contents don't matter, can be empty), which
-will cause any `./miri` command to automatically call `./miri toolchain`, `clippy` and `rustfmt`
-for you. If you don't want all of these to happen, you can add individual `.auto-toolchain`,
-`.auto-clippy` and `.auto-fmt` files respectively.
-
 [`rustup-toolchain-install-master`]: https://github.com/kennytm/rustup-toolchain-install-master
+
+### Configuring `./miri`
+
+The `./miri` script supports optional configuration via a `miri.toml` file.
+The following configuration keys are currently supported, with the given default values:
+
+```toml
+[toolchain]
+# Overwrite the default toolchain name used by `./miri toolchain`.
+# Note that all other commands will just use the currently active rustup toolchain!
+# (Though note that if you have `auto.toolchain` enabled, most commands will run `./miri toolchain`
+# first, which will activate the toolchain given here.)
+name = "miri"
+# Additional components to install with the toolchain. Note that if you remove `clippy` or `rustfmt`
+# from this list then obviously `./miri clippy`/`./miri fmt` will not work.
+# Only takes effect when a new toolchain is installed. Run `rustup toolchain remove <name>` followed
+# by `./miri toolchain` to force this to have effect.
+components = ["clippy", "rustfmt"]
+
+[auto]
+# Automatically run `./miri toolchain` before most commands.
+# Uses the toolchain name configured above, if any.
+toolchain = false
+# Automatically run `./miri clippy` before most commands.
+clippy = false
+# Automatically run `./miri fmt` before most commands.
+fmt = false
+```
 
 ## Building and testing Miri
 
@@ -154,8 +206,8 @@ MIRI_LOG=rustc_mir::interpret=info,miri::stacked_borrows ./miri run tests/pass/v
 ```
 
 Note that you will only get `info`, `warn` or `error` messages if you use a prebuilt compiler.
-In order to get `debug` and `trace` level messages, you need to build miri with a locally built
-compiler that has `debug=true` set in `bootstrap.toml`.
+In order to get `debug` and `trace` level messages, you need to build miri with a [locally built
+compiler](#advanced-topic-building-miri-against-a-locally-compiled-rustc) that has `debug=true` set in `bootstrap.toml`.
 
 #### Debugging error messages
 
@@ -171,6 +223,8 @@ you can visualize in [Perfetto](https://ui.perfetto.dev/). For example:
 ```sh
 MIRI_TRACING=1 ./miri run --features=tracing tests/pass/hello.rs
 ```
+
+See [doc/tracing.md](./doc/tracing.md) for more information.
 
 ### UI testing
 
@@ -221,7 +275,7 @@ and on macOS, `rm -rf ~/Library/Caches/org.rust-lang.miri`).
 
 Miri comes with a few benchmarks; you can run `./miri bench` to run them with the locally built
 Miri. Note: this will run `./miri install` as a side-effect. Also requires `hyperfine` to be
-installed (`cargo install hyperfine`).
+installed (`cargo install --locked hyperfine`).
 
 To compare the benchmark results with a baseline, do the following:
 - Before applying your changes, run `./miri bench --save-baseline=baseline.json`.
@@ -254,6 +308,12 @@ when installing the Miri toolchain. Alternatively, set the `RUSTUP_TOOLCHAIN` en
 [the documentation](https://rust-analyzer.github.io/manual.html#toolchain).
 
 [`etc/rust_analyzer_helix.toml`]: https://github.com/rust-lang/miri/blob/master/etc/rust_analyzer_helix.toml
+
+### Zed
+
+Copy [`etc/rust_analyzer_zed.json`] to `.zed/settings.json` in the project root directory.
+
+[`etc/rust_analyzer_zed.json`]: https://github.com/rust-lang/miri/blob/master/etc/rust_analyzer_zed.json
 
 ### Advanced configuration
 
@@ -293,6 +353,33 @@ You can also directly run Miri on a Rust source file:
 
 ```
 ./x.py run miri --stage 1 --args src/tools/miri/tests/pass/hello.rs
+```
+
+## Advanced topic: Building Miri against a locally compiled rustc
+
+Very rarely, it can be necessary to work with an out-of-tree Miri but build it against a rustc that
+was locally compiled. (Usually, you should instead work on the Miri that's in the Rust tree, as
+described in the previous subsection.)
+
+This requires a fully bootstrapped build:
+
+```sh
+# Build rustc, then build rustc with that rustc. This can take a while.
+./x build library --stage 3
+```
+
+You also need to set up a linked toolchain with rustup:
+
+```sh
+rustup toolchain link stage2 build/host/stage2
+```
+
+Then in the Miri folder, you can set this as the current toolchain and build against it:
+
+```sh
+rustup override set stage2
+# Prevent `./miri` from reseting the toolchain.
+export MIRI_AUTO_OPS=no
 ```
 
 ## Advanced topic: Syncing with the rustc repo
@@ -345,7 +432,7 @@ you need to pull rustc changes into Miri first, and then re-do the rustc push.
 If this fails due to authentication problems, it can help to make josh push via ssh instead of
 https. Add the following to your `.gitconfig`:
 
-```toml
+```text
 [url "git@github.com:"]
     pushInsteadOf = https://github.com/
 ```

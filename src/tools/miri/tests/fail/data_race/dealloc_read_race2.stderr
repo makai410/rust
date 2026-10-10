@@ -17,11 +17,19 @@ help: ALLOC was deallocated here:
 LL | /             __rust_dealloc(
 LL | |                 ptr.0 as *mut _,
 LL | |                 std::mem::size_of::<usize>(),
-LL | |                 std::mem::align_of::<usize>(),
+LL | |                 std::mem::align_of::<usize>().try_into().unwrap(),
 LL | |             )
    | |_____________^
-   = note: BACKTRACE (of the first span) on thread `unnamed-ID`:
-   = note: inside closure at tests/fail/data_race/dealloc_read_race2.rs:LL:CC
+   = note: this is on thread `unnamed-ID`
+note: the current function got called indirectly due to this code
+  --> tests/fail/data_race/dealloc_read_race2.rs:LL:CC
+   |
+LL |           let j2 = spawn(move || {
+   |  __________________^
+LL | |             let ptr = ptr; // avoid field capturing
+...  |
+LL | |         });
+   | |__________^
 
 note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
 

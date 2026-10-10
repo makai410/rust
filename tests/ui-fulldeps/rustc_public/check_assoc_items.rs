@@ -8,7 +8,6 @@
 //@ edition: 2021
 
 #![feature(rustc_private)]
-#![feature(assert_matches)]
 
 extern crate rustc_middle;
 
@@ -77,7 +76,7 @@ fn test_assoc_items() -> ControlFlow<()> {
 /// Note that order doesn't matter.
 fn check_items<T: CrateDef>(items: &[T], expected: &[&str]) {
     let expected: HashSet<_> = expected.iter().map(|s| s.to_string()).collect();
-    let item_names: HashSet<_> = items.iter().map(|item| item.name()).collect();
+    let item_names: HashSet<_> = items.iter().map(|item| item.trimmed_name()).collect();
     assert_eq!(item_names, expected);
 }
 

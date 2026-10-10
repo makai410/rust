@@ -19,14 +19,6 @@ Default: `false`
 Prefer to use `Self` over the type name when inserting a type (e.g. in "fill match arms" assist).
 
 
-## rust-analyzer.assist.termSearch.borrowcheck {#assist.termSearch.borrowcheck}
-
-Default: `true`
-
-Enable borrow checking for term search code assists. If set to false, also there will be
-more suggestions, but some of them may not borrow-check.
-
-
 ## rust-analyzer.assist.termSearch.fuel {#assist.termSearch.fuel}
 
 Default: `1800`
@@ -142,6 +134,15 @@ To enable a name with a value, use `"key=value"`.
 To disable, prefix the entry with a `!`.
 
 
+## rust-analyzer.cargo.configPath {#cargo.configPath}
+
+Default: `null`
+
+Path to a `.cargo/config.toml` style file to pass to cargo via `--config`
+for every cargo invocation (metadata, build scripts, config discovery).
+Useful to give rust-analyzer a consistent view of the project configuration.
+
+
 ## rust-analyzer.cargo.extraArgs {#cargo.extraArgs}
 
 Default: `[]`
@@ -164,6 +165,14 @@ Default: `[]`
 List of features to activate.
 
 Set this to `"all"` to pass `--all-features` to cargo.
+
+
+## rust-analyzer.cargo.metadataExtraArgs {#cargo.metadataExtraArgs}
+
+Default: `[]`
+
+Extra arguments passed only to `cargo metadata`, not to other cargo invocations.
+Useful for flags like `--config` that `cargo metadata` supports.
 
 
 ## rust-analyzer.cargo.noDefaultFeatures {#cargo.noDefaultFeatures}
@@ -323,10 +332,18 @@ each of them, with the working directory being the workspace root
 (i.e., the folder containing the `Cargo.toml`). This can be overwritten
 by changing `#rust-analyzer.check.invocationStrategy#`.
 
-If `$saved_file` is part of the command, rust-analyzer will pass
-the absolute path of the saved file to the provided command. This is
-intended to be used with non-Cargo build systems.
-Note that `$saved_file` is experimental and may be removed in the future.
+It supports two interpolation syntaxes, both mainly intended to be used with
+[non-Cargo build systems](./non_cargo_based_projects.md):
+
+- If `{saved_file}` is part of the command, rust-analyzer will pass
+  the absolute path of the saved file to the provided command.
+  (A previous version, `$saved_file`, also works.)
+- If `{label}` is part of the command, rust-analyzer will pass the
+  Cargo package ID, which can be used with `cargo check -p`, or a build label from
+  `rust-project.json`. If `{label}` is included, rust-analyzer behaves much like
+  [`"rust-analyzer.check.workspace": false`](#check.workspace).
+
+
 
 An example command would be:
 
@@ -357,6 +374,15 @@ Default: `true`
 Whether `--workspace` should be passed to `cargo check`.
 If false, `-p <package>` will be passed instead if applicable. In case it is not, no
 check will be performed.
+
+
+## rust-analyzer.completion.addColonsToModule {#completion.addColonsToModule}
+
+Default: `true`
+
+Automatically add `::` when completing the module.
+
+Will not be completed in `use`.
 
 
 ## rust-analyzer.completion.addSemicolonToUnit {#completion.addSemicolonToUnit}
@@ -419,6 +445,12 @@ You can either specify a string path which defaults to type "always" or use the 
 verbose form `{ "path": "path::to::item", type: "always" }`.
 
 For traits the type "methods" can be used to only exclude the methods but not the trait
+itself.
+
+For modules the type "sub_items" can be used to only exclude the all items in it but not the module
+itself. This does not include items defined in nested modules.
+
+For enums the type "variants" can be used to only exclude the all variants in it but not the enum
 itself.
 
 This setting also inherits `#rust-analyzer.completion.excludeTraits#`.
@@ -610,6 +642,22 @@ The warnings will be indicated by a blue squiggly underline in code and a blue i
 the `Problems Panel`.
 
 
+## rust-analyzer.disableFixtureSupport {#disableFixtureSupport}
+
+Default: `false`
+
+Disable support for `#[rust_analyzer::rust_fixture]` snippets.
+
+If you are not working on rust-analyzer itself, you should ignore this config.
+
+
+## rust-analyzer.document.symbol.search.excludeLocals {#document.symbol.search.excludeLocals}
+
+Default: `true`
+
+Exclude all locals from document symbol search.
+
+
 ## rust-analyzer.files.exclude {#files.exclude}
 
 Default: `[]`
@@ -626,6 +674,13 @@ Code's `files.watcherExclude`.
 Default: `"client"`
 
 Controls file watching implementation.
+
+
+## rust-analyzer.gotoImplementations.filterAdjacentDerives {#gotoImplementations.filterAdjacentDerives}
+
+Default: `false`
+
+If this is `true`, when "Goto Implementations" and in "Implementations" lens, are triggered on a `struct` or `enum` or `union`, we filter out trait implementations that originate from `derive`s above the type.
 
 
 ## rust-analyzer.highlightRelated.branchExitPoints.enable {#highlightRelated.branchExitPoints.enable}
@@ -928,7 +983,7 @@ to always show them).
 
 Default: `false`
 
-Show inlay hints for closure captures.
+Show inlay hints for closure and coroutine captures.
 
 
 ## rust-analyzer.inlayHints.closureReturnTypeHints.enable {#inlayHints.closureReturnTypeHints.enable}
@@ -950,6 +1005,17 @@ Closure notation in type and chaining inlay hints.
 Default: `"never"`
 
 Show enum variant discriminant hints.
+
+
+## rust-analyzer.inlayHints.expressionAdjustmentHints.disableReborrows {#inlayHints.expressionAdjustmentHints.disableReborrows}
+
+Default: `true`
+
+Disable reborrows in expression adjustments inlay hints.
+
+Reborrows are a pair of a builtin deref then borrow, i.e. `&*`. They are inserted by the compiler but are mostly useless to the programmer.
+
+Note: if the deref is not builtin (an overloaded deref), or the borrow is `&raw const`/`&raw mut`, they are not removed.
 
 
 ## rust-analyzer.inlayHints.expressionAdjustmentHints.enable {#inlayHints.expressionAdjustmentHints.enable}
@@ -1008,6 +1074,13 @@ Default: `false`
 Show inlay hints for the implied type parameter `Sized` bound.
 
 
+## rust-analyzer.inlayHints.impliedDynTraitHints.enable {#inlayHints.impliedDynTraitHints.enable}
+
+Default: `true`
+
+Show inlay hints for the implied `dyn` keyword in trait object types.
+
+
 ## rust-analyzer.inlayHints.lifetimeElisionHints.enable {#inlayHints.lifetimeElisionHints.enable}
 
 Default: `"never"`
@@ -1028,12 +1101,21 @@ Default: `25`
 
 Maximum length for inlay hints. Set to null to have an unlimited length.
 
+**Note:** This is mostly a hint, and we don't guarantee to strictly follow the limit.
+
 
 ## rust-analyzer.inlayHints.parameterHints.enable {#inlayHints.parameterHints.enable}
 
 Default: `true`
 
 Show function parameter name inlay hints at the call site.
+
+
+## rust-analyzer.inlayHints.parameterHints.missingArguments.enable {#inlayHints.parameterHints.missingArguments.enable}
+
+Default: `false`
+
+Show parameter name inlay hints for missing arguments at the call site.
 
 
 ## rust-analyzer.inlayHints.rangeExclusiveHints.enable {#inlayHints.rangeExclusiveHints.enable}
@@ -1084,11 +1166,25 @@ Default: `false`
 Hide inlay parameter type hints for closures.
 
 
+## rust-analyzer.inlayHints.typeHints.hideInferredTypes {#inlayHints.typeHints.hideInferredTypes}
+
+Default: `false`
+
+Hide inlay type hints for inferred types.
+
+
 ## rust-analyzer.inlayHints.typeHints.hideNamedConstructor {#inlayHints.typeHints.hideNamedConstructor}
 
 Default: `false`
 
 Hide inlay type hints for constructors.
+
+
+## rust-analyzer.inlayHints.typeHints.location {#inlayHints.typeHints.location}
+
+Default: `"inline"`
+
+Where to render type hints relative to their binding pattern.
 
 
 ## rust-analyzer.interpret.tests {#interpret.tests}
@@ -1262,11 +1358,31 @@ These proc-macros will be ignored when trying to expand them.
 This config takes a map of crate names with the exported proc-macro names to ignore as values.
 
 
+## rust-analyzer.procMacro.processes {#procMacro.processes}
+
+Default: `2`
+
+Number of proc-macro server processes to spawn.
+
+Controls how many independent `proc-macro-srv` processes rust-analyzer
+runs in parallel to handle macro expansion.
+
+
 ## rust-analyzer.procMacro.server {#procMacro.server}
 
 Default: `null`
 
 Internal config, path to proc-macro server executable.
+
+
+## rust-analyzer.profiling.memoryProfile {#profiling.memoryProfile}
+
+Default: `null`
+
+The path where to save memory profiling output.
+
+**Note:** Memory profiling is not enabled by default in rust-analyzer builds, you need to build
+from source for it.
 
 
 ## rust-analyzer.references.excludeImports {#references.excludeImports}
@@ -1283,11 +1399,61 @@ Default: `false`
 Exclude tests from find-all-references and call-hierarchy.
 
 
+## rust-analyzer.rename.showConflicts {#rename.showConflicts}
+
+Default: `true`
+
+Whether to warn when a rename will cause conflicts (change the meaning of the code).
+
+
+## rust-analyzer.runnables.bench.command {#runnables.bench.command}
+
+Default: `"bench"`
+
+Subcommand used for bench runnables instead of `bench`.
+
+
+## rust-analyzer.runnables.bench.overrideCommand {#runnables.bench.overrideCommand}
+
+Default: `null`
+
+Override the command used for bench runnables.
+The first element of the array should be the program to execute (for example, `cargo`).
+
+Use the placeholders:
+- `${package}`: package name.
+- `${target_arg}`: target option such as `--bin`, `--test`, `--lib`, etc.
+- `${target}`: target name (empty for `--lib`).
+- `${test_name}`: the test path filter, e.g. `module::bench_func`.
+- `${exact}`: `--exact` for single benchmarks, empty for modules.
+- `${include_ignored}`: always empty for benchmarks.
+- `${executable_args}`: all of the above binary args bundled together
+  (includes `rust-analyzer.runnables.extraTestBinaryArgs`).
+
+
 ## rust-analyzer.runnables.command {#runnables.command}
 
 Default: `null`
 
 Command to be executed instead of 'cargo' for runnables.
+
+
+## rust-analyzer.runnables.doctest.overrideCommand {#runnables.doctest.overrideCommand}
+
+Default: `null`
+
+Override the command used for doc-test runnables.
+The first element of the array should be the program to execute (for example, `cargo`).
+
+Use the placeholders:
+- `${package}`: package name.
+- `${target_arg}`: target option such as `--bin`, `--test`, `--lib`, etc.
+- `${target}`: target name (empty for `--lib`).
+- `${test_name}`: the test path filter, e.g. `module::func`.
+- `${exact}`: always empty for doc-tests.
+- `${include_ignored}`: always empty for doc-tests.
+- `${executable_args}`: all of the above binary args bundled together
+  (includes `rust-analyzer.runnables.extraTestBinaryArgs`).
 
 
 ## rust-analyzer.runnables.extraArgs {#runnables.extraArgs}
@@ -1303,7 +1469,7 @@ tests or binaries. For example, it may be `--release`.
 Default:
 ```json
 [
-  "--show-output"
+  "--nocapture"
 ]
 ```
 
@@ -1314,6 +1480,31 @@ Unless the launched target uses a
 [custom test harness](https://doc.rust-lang.org/cargo/reference/cargo-targets.html#the-harness-field),
 they will end up being interpreted as options to
 [`rustc`’s built-in test harness (“libtest”)](https://doc.rust-lang.org/rustc/tests/index.html#cli-arguments).
+
+
+## rust-analyzer.runnables.test.command {#runnables.test.command}
+
+Default: `"test"`
+
+Subcommand used for test runnables instead of `test`.
+
+
+## rust-analyzer.runnables.test.overrideCommand {#runnables.test.overrideCommand}
+
+Default: `null`
+
+Override the command used for test runnables.
+The first element of the array should be the program to execute (for example, `cargo`).
+
+Available placeholders:
+- `${package}`: package name.
+- `${target_arg}`: target option such as `--bin`, `--test`, `--lib`, etc.
+- `${target}`: target name (empty for `--lib`).
+- `${test_name}`: the test path filter, e.g. `module::test_func`.
+- `${exact}`: `--exact` for single tests, empty for modules.
+- `${include_ignored}`: `--include-ignored` for single tests, empty otherwise.
+- `${executable_args}`: all of the above binary args bundled together
+  (includes `rust-analyzer.runnables.extraTestBinaryArgs`).
 
 
 ## rust-analyzer.rustc.source {#rustc.source}
@@ -1358,6 +1549,17 @@ Default: `false`
 Enables the use of rustfmt's unstable range formatting command for the
 `textDocument/rangeFormatting` request. The rustfmt option is unstable and only
 available on a nightly build.
+
+
+## rust-analyzer.semanticHighlighting.comments.enable {#semanticHighlighting.comments.enable}
+
+Default: `true`
+
+Use semantic tokens for comments.
+
+In some editors (e.g. vscode) semantic tokens override other highlighting grammars.
+By disabling semantic tokens for comments, other grammars can be used to highlight
+their contents.
 
 
 ## rust-analyzer.semanticHighlighting.doc.comment.inject.enable {#semanticHighlighting.doc.comment.inject.enable}
@@ -1485,33 +1687,83 @@ though Cargo might be the eventual consumer.
 
 Default: `null`
 
-Enables automatic discovery of projects using [`DiscoverWorkspaceConfig::command`].
+Configure a command that rust-analyzer can invoke to
+obtain configuration.
 
-[`DiscoverWorkspaceConfig`] also requires setting `progress_label` and `files_to_watch`.
-`progress_label` is used for the title in progress indicators, whereas `files_to_watch`
-is used to determine which build system-specific files should be watched in order to
-reload rust-analyzer.
+This is an alternative to manually generating
+`rust-project.json`: it enables rust-analyzer to generate
+rust-project.json on the fly, and regenerate it when
+switching or modifying projects.
 
-Below is an example of a valid configuration:
+This is an object with three fields:
+
+* `command`: the shell command to invoke
+
+* `filesToWatch`: which build system-specific files should
+be watched to trigger regenerating the configuration
+
+* `progressLabel`: the name of the command, used in
+progress indicators in the IDE
+
+Here's an example of a valid configuration:
+
 ```json
 "rust-analyzer.workspace.discoverConfig": {
     "command": [
         "rust-project",
-        "develop-json"
+        "develop-json",
+        "{arg}"
     ],
-    "progressLabel": "rust-analyzer",
+    "progressLabel": "buck2/rust-project",
     "filesToWatch": [
         "BUCK"
     ]
 }
 ```
 
-## On `DiscoverWorkspaceConfig::command`
+## Argument Substitutions
+
+If `command` includes the argument `{arg}`, that argument will be substituted
+with the JSON-serialized form of the following enum:
+
+```norun
+#[derive(PartialEq, Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscoverArgument {
+   Path(AbsPathBuf),
+   Buildfile(AbsPathBuf),
+}
+```
+
+rust-analyzer will use the path invocation to find and
+generate a `rust-project.json` and therefore a
+workspace. Example:
+
+
+```norun
+rust-project develop-json '{ "path": "myproject/src/main.rs" }'
+```
+
+rust-analyzer will use build file invocations to update an
+existing workspace. Example:
+
+Or with a build file and the configuration above:
+
+```norun
+rust-project develop-json '{ "buildfile": "myproject/BUCK" }'
+```
+
+As a reference for implementors, buck2's `rust-project`
+will likely be useful:
+<https://github.com/facebook/buck2/tree/main/integrations/rust-project>.
+
+## Discover Command Output
 
 **Warning**: This format is provisional and subject to change.
 
-[`DiscoverWorkspaceConfig::command`] *must* return a JSON object corresponding to
-`DiscoverProjectData::Finished`:
+The discover command should output JSON objects to stdout,
+one per line (JSONL format). These objects should correspond
+to this Rust data type:
 
 ```norun
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1524,7 +1776,14 @@ enum DiscoverProjectData {
 }
 ```
 
-As JSON, `DiscoverProjectData::Finished` is:
+For example, a progress event:
+
+```json
+{"kind":"progress","message":"generating rust-project.json"}
+```
+
+A finished event can look like this (expanded and
+commented for readability):
 
 ```json
 {
@@ -1532,7 +1791,7 @@ As JSON, `DiscoverProjectData::Finished` is:
     "kind": "finished",
     // the file used by a non-Cargo build system to define
     // a package or target.
-    "buildfile": "rust-analyzer/BUILD",
+    "buildfile": "rust-analyzer/BUCK",
     // the contents of a rust-project.json, elided for brevity
     "project": {
         "sysroot": "foo",
@@ -1541,41 +1800,12 @@ As JSON, `DiscoverProjectData::Finished` is:
 }
 ```
 
-It is encouraged, but not required, to use the other variants on `DiscoverProjectData`
-to provide a more polished end-user experience.
+Only the finished event is required, but the other
+variants are encouraged to give users more feedback about
+progress or errors.
 
-`DiscoverWorkspaceConfig::command` may *optionally* include an `{arg}`, which will be
-substituted with the JSON-serialized form of the following enum:
-
-```norun
-#[derive(PartialEq, Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DiscoverArgument {
-   Path(AbsPathBuf),
-   Buildfile(AbsPathBuf),
-}
-```
-
-The JSON representation of `DiscoverArgument::Path` is:
-
-```json
-{
-    "path": "src/main.rs"
-}
-```
-
-Similarly, the JSON representation of `DiscoverArgument::Buildfile` is:
-
-```json
-{
-    "buildfile": "BUILD"
-}
-```
-
-`DiscoverArgument::Path` is used to find and generate a `rust-project.json`, and
-therefore, a workspace, whereas `DiscoverArgument::buildfile` is used to to update an
-existing workspace. As a reference for implementors, buck2's `rust-project` will likely
-be useful: https://github.com/facebook/buck2/tree/main/integrations/rust-project.
+Stderr is not parsed as JSONL. It is treated as command log
+output and forwarded to rust-analyzer's own logs.
 
 
 ## rust-analyzer.workspace.symbol.search.excludeImports {#workspace.symbol.search.excludeImports}

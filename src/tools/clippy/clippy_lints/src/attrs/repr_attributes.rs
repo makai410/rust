@@ -1,5 +1,4 @@
-use rustc_hir::attrs::{AttributeKind, ReprAttr};
-use rustc_hir::{Attribute, find_attr};
+use rustc_attr_ir::{Attribute, ReprAttr, find_attr};
 use rustc_lint::LateContext;
 use rustc_span::Span;
 
@@ -9,7 +8,7 @@ use clippy_utils::msrvs::{self, Msrv};
 use super::REPR_PACKED_WITHOUT_ABI;
 
 pub(super) fn check(cx: &LateContext<'_>, item_span: Span, attrs: &[Attribute], msrv: Msrv) {
-    if let Some(reprs) = find_attr!(attrs, AttributeKind::Repr { reprs, .. } => reprs) {
+    if let Some(reprs) = find_attr!(attrs, Repr { reprs, .. } => reprs) {
         let packed_span = reprs
             .iter()
             .find(|(r, _)| matches!(r, ReprAttr::ReprPacked(..)))

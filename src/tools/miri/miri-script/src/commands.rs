@@ -14,6 +14,7 @@ use walkdir::WalkDir;
 use xshell::{Shell, cmd};
 
 use crate::Command;
+use crate::config::{Config, Toolchain};
 use crate::util::*;
 
 impl MiriEnv {
@@ -55,9 +56,11 @@ impl MiriEnv {
             .cargo_cmd("cargo-miri", "run", &[])
             .arg("--quiet")
             .arg("--")
-            .args(&["miri", "setup", "--print-sysroot"])
+            .args(["miri", "setup", "--print-sysroot"])
             .args(target_flag);
-        cmd.set_quiet(quiet);
+        if quiet {
+            cmd = cmd.arg("--quiet");
+        }
         let output = cmd.read()?;
         self.sh.set_var("MIRI_SYSROOT", &output);
         Ok(output.into())
@@ -65,25 +68,19 @@ impl MiriEnv {
 }
 
 impl Command {
-    fn auto_actions() -> Result<()> {
+    fn auto_actions(config: &Config) -> Result<()> {
         if env::var_os("MIRI_AUTO_OPS").is_some_and(|x| x == "no") {
             return Ok(());
         }
 
-        let miri_dir = miri_dir()?;
-        let auto_everything = path!(miri_dir / ".auto-everything").exists();
-        let auto_toolchain = auto_everything || path!(miri_dir / ".auto-toolchain").exists();
-        let auto_fmt = auto_everything || path!(miri_dir / ".auto-fmt").exists();
-        let auto_clippy = auto_everything || path!(miri_dir / ".auto-clippy").exists();
-
         // `toolchain` goes first as it could affect the others
-        if auto_toolchain {
-            Self::toolchain(vec![])?;
+        if config.auto.toolchain {
+            Self::toolchain(None, None, vec![], config)?;
         }
-        if auto_fmt {
+        if config.auto.fmt {
             Self::fmt(vec![])?;
         }
-        if auto_clippy {
+        if config.auto.clippy {
             // no features for auto actions, see
             // https://github.com/rust-lang/miri/pull/4396#discussion_r2149654845
             Self::clippy(vec![], vec![])?;
@@ -92,7 +89,7 @@ impl Command {
         Ok(())
     }
 
-    pub fn exec(self) -> Result<()> {
+    pub fn exec(self, config: &Config) -> Result<()> {
         // First, and crucially only once, run the auto-actions -- but not for all commands.
         match &self {
             Command::Install { .. }
@@ -102,7 +99,7 @@ impl Command {
             | Command::Run { .. }
             | Command::Fmt { .. }
             | Command::Doc { .. }
-            | Command::Clippy { .. } => Self::auto_actions()?,
+            | Command::Clippy { .. } => Self::auto_actions(config)?,
             | Command::Toolchain { .. } | Command::Bench { .. } | Command::Squash => {}
         }
         // Then run the actual command.
@@ -112,51 +109,75 @@ impl Command {
             Command::Check { features, flags } => Self::check(features, flags),
             Command::Test { bless, target, coverage, features, flags } =>
                 Self::test(bless, target, coverage, features, flags),
-            Command::Run { dep, verbose, target, edition, features, flags } =>
-                Self::run(dep, verbose, target, edition, features, flags),
+            Command::Run { dep, native, quiet, target, edition, features, flags } =>
+                Self::run(dep, native, quiet, target, edition, features, flags),
             Command::Doc { features, flags } => Self::doc(features, flags),
             Command::Fmt { flags } => Self::fmt(flags),
             Command::Clippy { features, flags } => Self::clippy(features, flags),
             Command::Bench { target, no_install, save_baseline, load_baseline, benches } =>
                 Self::bench(target, no_install, save_baseline, load_baseline, benches),
-            Command::Toolchain { flags } => Self::toolchain(flags),
+            Command::Toolchain { name, commit, flags } =>
+                Self::toolchain(name, commit, flags, config),
             Command::Squash => Self::squash(),
         }
     }
 
-    fn toolchain(flags: Vec<String>) -> Result<()> {
+    fn toolchain(
+        name: Option<String>,
+        new_commit: Option<String>,
+        flags: Vec<String>,
+        config: &Config,
+    ) -> Result<()> {
+        let name =
+            name.as_deref().or(config.toolchain.name.as_deref()).unwrap_or(Toolchain::DEFAULT_NAME);
+
         let sh = Shell::new()?;
         sh.change_dir(miri_dir()?);
-        let new_commit = sh.read_file("rust-version")?.trim().to_owned();
+        let new_commit = match new_commit {
+            Some(c) => c,
+            None => sh.read_file("rust-version")?.trim().to_owned(),
+        };
         let current_commit = {
-            let rustc_info = cmd!(sh, "rustc +miri --version -v").read();
-            if rustc_info.is_err() {
-                None
-            } else {
-                let metadata = rustc_version::version_meta_for(&rustc_info.unwrap())?;
+            let rustc_info = cmd!(sh, "rustc +{name} --version -v").read();
+            if let Ok(rustc_info) = rustc_info {
+                let metadata = rustc_version::version_meta_for(&rustc_info)?;
                 Some(
                     metadata
                         .commit_hash
                         .ok_or_else(|| anyhow!("rustc metadata did not contain commit hash"))?,
                 )
+            } else {
+                None
             }
         };
         // Check if we already are at that commit.
         if current_commit.as_ref() == Some(&new_commit) {
-            if active_toolchain()? != "miri" {
-                cmd!(sh, "rustup override set miri").run()?;
+            // The toolchain is already at the right version. Make sure it is active in `miri_dir`.
+            // Ignore errors from `active_toolchain`, the active toolchain might be uninstalled.
+            if active_toolchain().ok().is_none_or(|toolchain| toolchain != name) {
+                cmd!(sh, "rustup override set {name}").run()?;
             }
             return Ok(());
         }
-        // Install and setup new toolchain.
-        cmd!(sh, "rustup toolchain uninstall miri").run()?;
 
-        cmd!(sh, "rustup-toolchain-install-master -n miri -c cargo -c rust-src -c rustc-dev -c llvm-tools -c rustfmt -c clippy {flags...} -- {new_commit}")
+        // Compute rustup-toolchain-install-master flags for additional components.
+        let components =
+            config.toolchain.components.as_deref().unwrap_or(Toolchain::DEFAULT_COMPONENTS);
+        let component_flags = components.iter().flat_map(|component| ["-c", component]);
+
+        // Install and setup new toolchain.
+        cmd!(sh, "rustup toolchain uninstall {name}").run()?;
+        cmd!(sh, "rustup-toolchain-install-master -n {name} -c cargo -c rust-src -c rustc-dev -c llvm-tools {component_flags...} {flags...} -- {new_commit}")
             .run()
-            .context("Failed to run rustup-toolchain-install-master. If it is not installed, run 'cargo install rustup-toolchain-install-master'.")?;
-        cmd!(sh, "rustup override set miri").run()?;
+            .context("Failed to run rustup-toolchain-install-master. If it is not installed, run 'cargo install --locked rustup-toolchain-install-master'.")?;
+        cmd!(sh, "rustup override set {name}").run()?;
         // Cleanup.
         cmd!(sh, "cargo clean").run()?;
+        // Call `cargo metadata` on the sources in case that changes the lockfile
+        // (works around <https://github.com/rust-lang/rust-analyzer/issues/23392>).
+        let sysroot = cmd!(sh, "rustc --print sysroot").read()?;
+        let sysroot = sysroot.trim();
+        cmd!(sh, "cargo metadata --format-version 1 --manifest-path {sysroot}/lib/rustlib/rustc-src/rust/compiler/rustc/Cargo.toml").ignore_stdout().run()?;
         Ok(())
     }
 
@@ -389,7 +410,8 @@ impl Command {
         Ok(())
     }
 
-    fn check(features: Vec<String>, flags: Vec<String>) -> Result<()> {
+    fn check(mut features: Vec<String>, flags: Vec<String>) -> Result<()> {
+        features.push("check_only".into());
         let e = MiriEnv::new()?;
         e.check(".", &features, &flags)?;
         e.check("cargo-miri", &[], &flags)?;
@@ -403,7 +425,8 @@ impl Command {
         Ok(())
     }
 
-    fn clippy(features: Vec<String>, flags: Vec<String>) -> Result<()> {
+    fn clippy(mut features: Vec<String>, flags: Vec<String>) -> Result<()> {
+        features.push("check_only".into());
         let e = MiriEnv::new()?;
         e.clippy(".", &features, &flags)?;
         e.clippy("cargo-miri", &[], &flags)?;
@@ -458,17 +481,20 @@ impl Command {
 
     fn run(
         dep: bool,
-        verbose: bool,
+        native: bool,
+        quiet: bool,
         target: Option<String>,
         edition: Option<String>,
         features: Vec<String>,
         flags: Vec<String>,
     ) -> Result<()> {
         let mut e = MiriEnv::new()?;
+        let run_via_ui_test = dep || native;
 
         // Preparation: get a sysroot, and get the miri binary.
+        // We do this even for native run as it also builds Miri itself.
         let miri_sysroot =
-            e.build_miri_sysroot(/* quiet */ !verbose, target.as_deref(), &features)?;
+            e.build_miri_sysroot(/* quiet */ quiet, target.as_deref(), &features)?;
         let miri_bin = e
             .build_get_binary(".", &features)
             .context("failed to get filename of miri executable")?;
@@ -477,8 +503,8 @@ impl Command {
         // (because `flags` may contain `--`).
         let mut early_flags = Vec::<OsString>::new();
 
-        // In `dep` mode, the target is already passed via `MIRI_TEST_TARGET`
-        if !dep {
+        // In ui_test mode, the target is already passed via `MIRI_TEST_TARGET`
+        if !run_via_ui_test {
             if let Some(target) = &target {
                 early_flags.push("--target".into());
                 early_flags.push(target.into());
@@ -486,35 +512,36 @@ impl Command {
         }
         early_flags.push("--edition".into());
         early_flags.push(edition.as_deref().unwrap_or("2021").into());
-        early_flags.push("--sysroot".into());
-        early_flags.push(miri_sysroot.into());
+        if !native {
+            early_flags.push("--sysroot".into());
+            early_flags.push(miri_sysroot.into());
+        }
 
         // Compute flags.
         let miri_flags = e.sh.var("MIRIFLAGS").unwrap_or_default();
         let miri_flags = flagsplit(&miri_flags);
-        let quiet_flag = if verbose { None } else { Some("--quiet") };
 
         // Run Miri.
         // The basic command that executes the Miri driver.
-        let mut cmd = if dep {
+        let mut cmd = if run_via_ui_test {
             // We invoke the test suite as that has all the logic for running with dependencies.
-            e.cargo_cmd(".", "test", &features)
-                .args(&["--test", "ui"])
-                .args(quiet_flag)
+            let mut cmd = e
+                .cargo_cmd(".", "test", &features)
+                .args(["--test", "ui"])
+                // This does not show anything useful so we always hide it.
+                .arg("--quiet")
                 .arg("--")
-                .args(&["--miri-run-dep-mode"])
-        } else {
-            cmd!(e.sh, "{miri_bin}")
-        };
-        cmd.set_quiet(!verbose);
-        // Add Miri flags
-        let mut cmd = cmd.args(&miri_flags).args(&early_flags).args(&flags);
-        // For `--dep` we also need to set the target in the env var.
-        if dep {
+                .env("MIRI_RUN_MODE", if native { "native" } else { "1" });
             if let Some(target) = &target {
                 cmd = cmd.env("MIRI_TEST_TARGET", target);
             }
-        }
+            cmd
+        } else {
+            cmd!(e.sh, "{miri_bin}")
+        };
+        cmd.set_quiet(quiet);
+        // Add Miri flags
+        let cmd = cmd.args(&miri_flags).args(&early_flags).args(&flags);
         // Finally, run the thing.
         Ok(cmd.run()?)
     }

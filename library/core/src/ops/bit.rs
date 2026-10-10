@@ -32,8 +32,7 @@
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
 #[doc(alias = "!")]
-#[const_trait]
-pub trait Not {
+pub const trait Not {
     /// The resulting type after applying the `!` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
     type Output;
@@ -57,7 +56,7 @@ macro_rules! not_impl {
     ($($t:ty)*) => ($(
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const Not for $t {
+        const impl Not for $t {
             type Output = $t;
 
             #[inline]
@@ -74,7 +73,7 @@ not_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 
 #[stable(feature = "not_never", since = "1.60.0")]
 #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-impl const Not for ! {
+const impl Not for ! {
     type Output = !;
 
     #[inline]
@@ -148,8 +147,7 @@ impl const Not for ! {
     message = "no implementation for `{Self} & {Rhs}`",
     label = "no implementation for `{Self} & {Rhs}`"
 )]
-#[const_trait]
-pub trait BitAnd<Rhs = Self> {
+pub const trait BitAnd<Rhs = Self> {
     /// The resulting type after applying the `&` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
     type Output;
@@ -173,7 +171,7 @@ macro_rules! bitand_impl {
     ($($t:ty)*) => ($(
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const BitAnd for $t {
+        const impl BitAnd for $t {
             type Output = $t;
 
             #[inline]
@@ -253,8 +251,7 @@ bitand_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
     message = "no implementation for `{Self} | {Rhs}`",
     label = "no implementation for `{Self} | {Rhs}`"
 )]
-#[const_trait]
-pub trait BitOr<Rhs = Self> {
+pub const trait BitOr<Rhs = Self> {
     /// The resulting type after applying the `|` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
     type Output;
@@ -278,7 +275,7 @@ macro_rules! bitor_impl {
     ($($t:ty)*) => ($(
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const BitOr for $t {
+        const impl BitOr for $t {
             type Output = $t;
 
             #[inline]
@@ -358,8 +355,7 @@ bitor_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
     message = "no implementation for `{Self} ^ {Rhs}`",
     label = "no implementation for `{Self} ^ {Rhs}`"
 )]
-#[const_trait]
-pub trait BitXor<Rhs = Self> {
+pub const trait BitXor<Rhs = Self> {
     /// The resulting type after applying the `^` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
     type Output;
@@ -383,7 +379,7 @@ macro_rules! bitxor_impl {
     ($($t:ty)*) => ($(
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const BitXor for $t {
+        const impl BitXor for $t {
             type Output = $t;
 
             #[inline]
@@ -462,8 +458,7 @@ bitxor_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
     message = "no implementation for `{Self} << {Rhs}`",
     label = "no implementation for `{Self} << {Rhs}`"
 )]
-#[const_trait]
-pub trait Shl<Rhs = Self> {
+pub const trait Shl<Rhs = Self> {
     /// The resulting type after applying the `<<` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
     type Output;
@@ -485,10 +480,11 @@ macro_rules! shl_impl {
     ($t:ty, $f:ty) => {
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const Shl<$f> for $t {
+        const impl Shl<$f> for $t {
             type Output = $t;
 
             #[inline]
+            #[track_caller]
             #[rustc_inherit_overflow_checks]
             fn shl(self, other: $f) -> $t {
                 self << other
@@ -585,8 +581,7 @@ shl_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
     message = "no implementation for `{Self} >> {Rhs}`",
     label = "no implementation for `{Self} >> {Rhs}`"
 )]
-#[const_trait]
-pub trait Shr<Rhs = Self> {
+pub const trait Shr<Rhs = Self> {
     /// The resulting type after applying the `>>` operator.
     #[stable(feature = "rust1", since = "1.0.0")]
     type Output;
@@ -608,10 +603,11 @@ macro_rules! shr_impl {
     ($t:ty, $f:ty) => {
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const Shr<$f> for $t {
+        const impl Shr<$f> for $t {
             type Output = $t;
 
             #[inline]
+            #[track_caller]
             #[rustc_inherit_overflow_checks]
             fn shr(self, other: $f) -> $t {
                 self >> other
@@ -717,8 +713,7 @@ shr_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
     message = "no implementation for `{Self} &= {Rhs}`",
     label = "no implementation for `{Self} &= {Rhs}`"
 )]
-#[const_trait]
-pub trait BitAndAssign<Rhs = Self> {
+pub const trait BitAndAssign<Rhs = Self> {
     /// Performs the `&=` operation.
     ///
     /// # Examples
@@ -748,7 +743,7 @@ macro_rules! bitand_assign_impl {
     ($($t:ty)+) => ($(
         #[stable(feature = "op_assign_traits", since = "1.8.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const BitAndAssign for $t {
+        const impl BitAndAssign for $t {
             #[inline]
             fn bitand_assign(&mut self, other: $t) { *self &= other }
         }
@@ -793,8 +788,7 @@ bitand_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
     message = "no implementation for `{Self} |= {Rhs}`",
     label = "no implementation for `{Self} |= {Rhs}`"
 )]
-#[const_trait]
-pub trait BitOrAssign<Rhs = Self> {
+pub const trait BitOrAssign<Rhs = Self> {
     /// Performs the `|=` operation.
     ///
     /// # Examples
@@ -824,7 +818,7 @@ macro_rules! bitor_assign_impl {
     ($($t:ty)+) => ($(
         #[stable(feature = "op_assign_traits", since = "1.8.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const BitOrAssign for $t {
+        const impl BitOrAssign for $t {
             #[inline]
             fn bitor_assign(&mut self, other: $t) { *self |= other }
         }
@@ -869,8 +863,7 @@ bitor_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
     message = "no implementation for `{Self} ^= {Rhs}`",
     label = "no implementation for `{Self} ^= {Rhs}`"
 )]
-#[const_trait]
-pub trait BitXorAssign<Rhs = Self> {
+pub const trait BitXorAssign<Rhs = Self> {
     /// Performs the `^=` operation.
     ///
     /// # Examples
@@ -900,7 +893,7 @@ macro_rules! bitxor_assign_impl {
     ($($t:ty)+) => ($(
         #[stable(feature = "op_assign_traits", since = "1.8.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const BitXorAssign for $t {
+        const impl BitXorAssign for $t {
             #[inline]
             fn bitxor_assign(&mut self, other: $t) { *self ^= other }
         }
@@ -943,8 +936,7 @@ bitxor_assign_impl! { bool usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
     message = "no implementation for `{Self} <<= {Rhs}`",
     label = "no implementation for `{Self} <<= {Rhs}`"
 )]
-#[const_trait]
-pub trait ShlAssign<Rhs = Self> {
+pub const trait ShlAssign<Rhs = Self> {
     /// Performs the `<<=` operation.
     ///
     /// # Examples
@@ -966,8 +958,9 @@ macro_rules! shl_assign_impl {
     ($t:ty, $f:ty) => {
         #[stable(feature = "op_assign_traits", since = "1.8.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const ShlAssign<$f> for $t {
+        const impl ShlAssign<$f> for $t {
             #[inline]
+            #[track_caller]
             #[rustc_inherit_overflow_checks]
             fn shl_assign(&mut self, other: $f) {
                 *self <<= other
@@ -1030,8 +1023,7 @@ shl_assign_impl_all! { u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize }
     message = "no implementation for `{Self} >>= {Rhs}`",
     label = "no implementation for `{Self} >>= {Rhs}`"
 )]
-#[const_trait]
-pub trait ShrAssign<Rhs = Self> {
+pub const trait ShrAssign<Rhs = Self> {
     /// Performs the `>>=` operation.
     ///
     /// # Examples
@@ -1053,8 +1045,9 @@ macro_rules! shr_assign_impl {
     ($t:ty, $f:ty) => {
         #[stable(feature = "op_assign_traits", since = "1.8.0")]
         #[rustc_const_unstable(feature = "const_ops", issue = "143802")]
-        impl const ShrAssign<$f> for $t {
+        const impl ShrAssign<$f> for $t {
             #[inline]
+            #[track_caller]
             #[rustc_inherit_overflow_checks]
             fn shr_assign(&mut self, other: $f) {
                 *self >>= other

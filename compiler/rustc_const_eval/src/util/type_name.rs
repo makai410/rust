@@ -3,9 +3,9 @@ use std::fmt::Write;
 use rustc_data_structures::intern::Interned;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::DisambiguatedDefPathData;
-use rustc_middle::bug;
 use rustc_middle::ty::print::{PrettyPrinter, PrintError, Printer};
 use rustc_middle::ty::{self, GenericArg, Ty, TyCtxt};
+use rustc_span::bug;
 
 struct TypeNamePrinter<'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -41,7 +41,7 @@ impl<'tcx> Printer<'tcx> for TypeNamePrinter<'tcx> {
             | ty::FnPtr(..)
             | ty::Never
             | ty::Tuple(_)
-            | ty::Dynamic(_, _, _)
+            | ty::Dynamic(_, _)
             | ty::UnsafeBinder(_) => self.pretty_print_type(ty),
 
             // Placeholders (all printed as `_` to uniformize them).
@@ -52,15 +52,24 @@ impl<'tcx> Printer<'tcx> for TypeNamePrinter<'tcx> {
 
             // Types with identity (print the module path).
             ty::Adt(ty::AdtDef(Interned(&ty::AdtDefData { did: def_id, .. }, _)), args)
-            | ty::FnDef(def_id, args)
-            | ty::Alias(ty::Projection | ty::Opaque, ty::AliasTy { def_id, args, .. })
+            | ty::Alias(
+                _,
+                ty::AliasTy {
+                    kind: ty::Projection { def_id } | ty::Opaque { def_id }, args, ..
+                },
+            )
             | ty::Closure(def_id, args)
             | ty::CoroutineClosure(def_id, args)
             | ty::Coroutine(def_id, args) => self.print_def_path(def_id, args),
             ty::Foreign(def_id) => self.print_def_path(def_id, &[]),
 
-            ty::Alias(ty::Free, _) => bug!("type_name: unexpected free alias"),
-            ty::Alias(ty::Inherent, _) => bug!("type_name: unexpected inherent projection"),
+            ty::FnDef(def_id, args) => self.print_def_path(def_id, args.no_bound_vars().unwrap()),
+            ty::Alias(_, ty::AliasTy { kind: ty::Free { .. }, .. }) => {
+                bug!("type_name: unexpected free alias")
+            }
+            ty::Alias(_, ty::AliasTy { kind: ty::Inherent { .. }, .. }) => {
+                bug!("type_name: unexpected inherent projection")
+            }
             ty::CoroutineWitness(..) => bug!("type_name: unexpected `CoroutineWitness`"),
         }
     }
@@ -141,7 +150,9 @@ impl<'tcx> Printer<'tcx> for TypeNamePrinter<'tcx> {
     ) -> Result<(), PrintError> {
         self.print_def_path(def_id, parent_args)?;
 
-        let ty::Coroutine(_, args) = self.tcx.type_of(def_id).instantiate_identity().kind() else {
+        let ty::Coroutine(_, args) =
+            self.tcx.type_of(def_id).instantiate_identity().skip_norm_wip().kind()
+        else {
             // Could be `ty::Error`.
             return Ok(());
         };
@@ -164,14 +175,15 @@ impl<'tcx> Printer<'tcx> for TypeNamePrinter<'tcx> {
 }
 
 impl<'tcx> PrettyPrinter<'tcx> for TypeNamePrinter<'tcx> {
-    fn should_print_optional_region(&self, _region: ty::Region<'_>) -> bool {
+    fn should_print_optional_region(&self, region: ty::Region<'_>) -> bool {
         // Bound regions are always printed (as `'_`), which gives some idea that they are special,
         // even though the `for` is omitted by the pretty printer.
         // E.g. `for<'a, 'b> fn(&'a u32, &'b u32)` is printed as "fn(&'_ u32, &'_ u32)".
-        match _region.kind() {
-            ty::ReErased => false,
+        let kind = region.kind();
+        match region.kind() {
+            ty::ReErased | ty::ReEarlyParam(_) | ty::ReStatic => false,
             ty::ReBound(..) => true,
-            _ => unreachable!(),
+            _ => panic!("type_name unhandled region: {kind:?}"),
         }
     }
 

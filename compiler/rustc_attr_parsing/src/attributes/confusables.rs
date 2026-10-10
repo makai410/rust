@@ -1,38 +1,28 @@
-use rustc_feature::template;
-use rustc_hir::attrs::AttributeKind;
-use rustc_hir::{MethodKind, Target};
-use rustc_span::{Span, Symbol, sym};
-use thin_vec::ThinVec;
+use rustc_feature::AttributeStability;
 
-use super::{AcceptMapping, AttributeParser};
-use crate::context::MaybeWarn::Allow;
-use crate::context::{AllowedTargets, FinalizeContext, Stage};
-use crate::session_diagnostics;
+use super::prelude::*;
+use crate::diagnostics::EmptyConfusables;
+
 #[derive(Default)]
 pub(crate) struct ConfusablesParser {
     confusables: ThinVec<Symbol>,
     first_span: Option<Span>,
 }
 
-impl<S: Stage> AttributeParser<S> for ConfusablesParser {
-    const ATTRIBUTES: AcceptMapping<Self, S> = &[(
+impl AttributeParser for ConfusablesParser {
+    const ATTRIBUTES: AcceptMapping<Self> = &[(
         &[sym::rustc_confusables],
         template!(List: &[r#""name1", "name2", ..."#]),
+        unstable!(rustc_attrs),
         |this, cx, args| {
-            let Some(list) = args.list() else {
-                cx.expected_list(cx.attr_span);
-                return;
-            };
+            let Some(list) = cx.expect_list(args, cx.attr_span) else { return };
 
             if list.is_empty() {
-                cx.emit_err(session_diagnostics::EmptyConfusables { span: cx.attr_span });
+                cx.emit_err(EmptyConfusables { span: cx.attr_span });
             }
 
             for param in list.mixed() {
-                let span = param.span();
-
-                let Some(lit) = param.lit().and_then(|i| i.value_str()) else {
-                    cx.expected_string_literal(span, param.lit());
+                let Some(lit) = cx.expect_string_literal(param) else {
                     continue;
                 };
 
@@ -42,17 +32,14 @@ impl<S: Stage> AttributeParser<S> for ConfusablesParser {
             this.first_span.get_or_insert(cx.attr_span);
         },
     )];
-    const ALLOWED_TARGETS: AllowedTargets =
+    const ALLOWED_TARGETS: AllowedTargets<'_> =
         AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::Inherent))]);
 
-    fn finalize(self, _cx: &FinalizeContext<'_, '_, S>) -> Option<AttributeKind> {
+    fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
         if self.confusables.is_empty() {
             return None;
         }
 
-        Some(AttributeKind::Confusables {
-            symbols: self.confusables,
-            first_span: self.first_span.unwrap(),
-        })
+        Some(AttributeKind::RustcConfusables { confusables: self.confusables })
     }
 }

@@ -1,7 +1,5 @@
 //@error-in-other-file: aborted
-//@normalize-stderr-test: "\|.*::abort\(\).*" -> "| ABORT()"
-//@normalize-stderr-test: "\| +\^+" -> "| ^"
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 use std::alloc::*;
 

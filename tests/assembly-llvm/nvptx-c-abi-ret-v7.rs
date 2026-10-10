@@ -1,5 +1,5 @@
-//@ assembly-output: ptx-linker
-//@ compile-flags: --crate-type cdylib -C target-cpu=sm_86 -Z unstable-options -Clinker-flavor=llbc
+//@ assembly-output: emit-asm
+//@ compile-flags: --crate-type cdylib -C target-cpu=sm_86
 //@ only-nvptx64
 
 // The PTX ABI stability is tied to major versions of the PTX ISA

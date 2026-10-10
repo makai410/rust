@@ -1,9 +1,9 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::source::SpanExt as _;
 use rustc_errors::Applicability;
 use rustc_hir::{Block, Expr, ExprKind, Stmt, StmtKind};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -35,6 +35,7 @@ declare_clippy_lint! {
     restriction,
     "add a semicolon inside the block"
 }
+
 declare_clippy_lint! {
     /// ### What it does
     ///
@@ -63,6 +64,7 @@ declare_clippy_lint! {
     restriction,
     "add a semicolon outside the block"
 }
+
 impl_lint_pass!(SemicolonBlock => [SEMICOLON_INSIDE_BLOCK, SEMICOLON_OUTSIDE_BLOCK]);
 
 pub struct SemicolonBlock {
@@ -81,6 +83,19 @@ impl SemicolonBlock {
     fn semicolon_inside_block(&self, cx: &LateContext<'_>, block: &Block<'_>, tail: &Expr<'_>, semi_span: Span) {
         let insert_span = tail.span.source_callsite().shrink_to_hi();
         let remove_span = semi_span.with_lo(block.span.hi());
+
+        // If the block is surrounded by parens (`({ 0 });`), the author probably knows what
+        // they're doing and why, so don't get in their way.
+        //
+        // This has the additional benefit of stopping the block being parsed as a function call:
+        // ```
+        // fn foo() {
+        //     ({ 0 }); // if we remove this `;`, this will parse as a `({ 0 })(5);` function call
+        //     (5);
+        // }
+        if remove_span.check_text(cx, |src| src.contains(')')) {
+            return;
+        }
 
         if self.semicolon_inside_block_ignore_singleline && get_line(cx, remove_span) == get_line(cx, insert_span) {
             return;
@@ -154,7 +169,12 @@ impl LateLintPass<'_> for SemicolonBlock {
             StmtKind::Semi(Expr {
                 kind: ExprKind::Block(block, _),
                 ..
-            }) if !block.span.from_expansion() => {
+            }) if !block.span.from_expansion() && !block.targeted_by_break => {
+                let attrs = cx.tcx.hir_attrs(stmt.hir_id);
+                if !attrs.is_empty() && !cx.tcx.features().stmt_expr_attributes() {
+                    return;
+                }
+
                 if let Some(tail) = block.expr {
                     self.semicolon_inside_block(cx, block, tail, stmt.span);
                 }

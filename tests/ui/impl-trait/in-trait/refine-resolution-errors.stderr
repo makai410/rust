@@ -16,6 +16,7 @@ LL |     type Assoc = T;
 note: required by a bound in `Mirror::Assoc`
   --> $DIR/refine-resolution-errors.rs:7:5
    |
+LL | pub trait Mirror {
 LL |     type Assoc;
    |     ^^^^^^^^^^^ required by this bound in `Mirror::Assoc`
 help: consider removing the `?Sized` bound to make the type parameter `Sized`
@@ -28,7 +29,13 @@ help: consider relaxing the implicit `Sized` restriction
 LL |     type Assoc: ?Sized;
    |               ++++++++
 
-error: aborting due to 2 previous errors
+error[E0282]: type annotations needed
+  --> $DIR/refine-resolution-errors.rs:16:25
+   |
+LL |     async fn first() -> <() as Mirror>::Assoc;
+   |                         ^^^^^^^^^^^^^^^^^^^^^ cannot infer type
 
-Some errors have detailed explanations: E0207, E0277.
+error: aborting due to 3 previous errors
+
+Some errors have detailed explanations: E0207, E0277, E0282.
 For more information about an error, try `rustc --explain E0207`.

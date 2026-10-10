@@ -2,19 +2,18 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use Context::*;
+use rustc_attr_ir::find_attr;
 use rustc_hir as hir;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{Destination, Node, find_attr};
+use rustc_hir::{Destination, Node};
 use rustc_middle::hir::nested_filter;
-use rustc_middle::span_bug;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::hygiene::DesugaringKind;
-use rustc_span::{BytePos, Span};
+use rustc_span::{BytePos, OrdSpan, Span, span_bug};
 
-use crate::errors::{
+use crate::diagnostics::{
     BreakInsideClosure, BreakInsideCoroutine, BreakNonLoop, ConstContinueBadLabel,
     ContinueLabeledBlock, OutsideLoop, OutsideLoopSuggestion, UnlabeledCfInWhileCondition,
     UnlabeledInLabeledBlock,
@@ -32,7 +31,10 @@ enum Context {
         kind: hir::CoroutineDesugaring,
         source: hir::CoroutineSource,
     },
-    UnlabeledBlock(Span),
+    UnlabeledBlock {
+        label_span: Span,
+        wrap_end: Option<Span>,
+    },
     UnlabeledIfBlock(Span),
     LabeledBlock,
     /// E.g. The labeled block inside `['_'; 'block: { break 'block 1 + 2; }]`.
@@ -51,6 +53,7 @@ struct BlockInfo {
     name: String,
     spans: Vec<Span>,
     suggs: Vec<Span>,
+    wrap_end: Option<Span>,
 }
 
 #[derive(PartialEq)]
@@ -77,7 +80,7 @@ struct CheckLoopVisitor<'tcx> {
     // such as adding a label for an `if`.
     // e.g. `if 'foo: {}` would be incorrect.
     cx_stack: Vec<Context>,
-    block_breaks: BTreeMap<Span, BlockInfo>,
+    block_breaks: BTreeMap<OrdSpan, BlockInfo>,
 }
 
 pub(crate) fn check<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, body: &'tcx hir::Body<'tcx>) {
@@ -119,7 +122,7 @@ impl<'hir> Visitor<'hir> for CheckLoopVisitor<'hir> {
                             ck_loop.cx_stack.last(),
                             Some(&Normal)
                                 | Some(&AnonConst)
-                                | Some(&UnlabeledBlock(_))
+                                | Some(&UnlabeledBlock { .. })
                                 | Some(&UnlabeledIfBlock(_))
                         )
                     {
@@ -147,7 +150,7 @@ impl<'hir> Visitor<'hir> for CheckLoopVisitor<'hir> {
                     }
                 }
             }
-            hir::ExprKind::Loop(ref b, _, source, _) => {
+            hir::ExprKind::Loop(b, _, source, _) => {
                 let cx = match self.is_loop_match(e, b) {
                     Some(labeled_block) => LoopMatch { labeled_block },
                     None => Loop(source),
@@ -155,9 +158,7 @@ impl<'hir> Visitor<'hir> for CheckLoopVisitor<'hir> {
 
                 self.with_context(cx, |v| v.visit_block(b));
             }
-            hir::ExprKind::Closure(&hir::Closure {
-                ref fn_decl, body, fn_decl_span, kind, ..
-            }) => {
+            hir::ExprKind::Closure(&hir::Closure { fn_decl, body, fn_decl_span, kind, .. }) => {
                 let cx = match kind {
                     hir::ClosureKind::Coroutine(hir::CoroutineKind::Desugared(kind, source)) => {
                         Coroutine { coroutine_span: fn_decl_span, kind, source }
@@ -167,23 +168,29 @@ impl<'hir> Visitor<'hir> for CheckLoopVisitor<'hir> {
                 self.visit_fn_decl(fn_decl);
                 self.with_context(cx, |v| v.visit_nested_body(body));
             }
-            hir::ExprKind::Block(ref b, Some(_label)) => {
+            hir::ExprKind::Block(b, Some(_label)) => {
                 self.with_context(LabeledBlock, |v| v.visit_block(b));
             }
-            hir::ExprKind::Block(ref b, None)
+            hir::ExprKind::Block(b, None)
                 if matches!(self.cx_stack.last(), Some(&Fn) | Some(&ConstBlock)) =>
             {
                 self.with_context(Normal, |v| v.visit_block(b));
             }
             hir::ExprKind::Block(
-                ref b @ hir::Block { rules: hir::BlockCheckMode::DefaultBlock, .. },
+                b @ hir::Block { rules: hir::BlockCheckMode::DefaultBlock, .. },
                 None,
             ) if matches!(
                 self.cx_stack.last(),
-                Some(&Normal) | Some(&AnonConst) | Some(&UnlabeledBlock(_))
+                Some(&Normal) | Some(&AnonConst) | Some(&UnlabeledBlock { .. })
             ) =>
             {
-                self.with_context(UnlabeledBlock(b.span.shrink_to_lo()), |v| v.visit_block(b));
+                // An unlabeled block targeted by `break` may comes from a `try` block.
+                // Since `try 'block: {}` is invalid, nest a labeled block inside its body.
+                let wrap_end = b.targeted_by_break.then(|| b.span.shrink_to_hi());
+                self.with_context(
+                    UnlabeledBlock { label_span: b.span.shrink_to_lo(), wrap_end },
+                    |v| v.visit_block(b),
+                );
             }
             hir::ExprKind::Break(break_destination, ref opt_expr) => {
                 if let Some(e) = opt_expr {
@@ -210,7 +217,7 @@ impl<'hir> Visitor<'hir> for CheckLoopVisitor<'hir> {
                 };
 
                 // A `#[const_continue]` must break to a block in a `#[loop_match]`.
-                if find_attr!(self.tcx.hir_attrs(e.hir_id), AttributeKind::ConstContinue(_)) {
+                if find_attr!(self.tcx, e.hir_id, ConstContinue(_)) {
                     let Some(label) = break_destination.label else {
                         let span = e.span;
                         self.tcx.dcx().emit_fatal(ConstContinueBadLabel { span });
@@ -273,7 +280,13 @@ impl<'hir> Visitor<'hir> for CheckLoopVisitor<'hir> {
                     }
                 }
 
-                let sp_lo = e.span.with_lo(e.span.lo() + BytePos("break".len() as u32));
+                let sp_lo = if let Ok(snippet) = self.tcx.sess.source_map().span_to_snippet(e.span)
+                    && let Some(break_pos) = snippet.find("break")
+                {
+                    e.span.with_lo(e.span.lo() + BytePos((break_pos + "break".len()) as u32))
+                } else {
+                    e.span.with_lo(e.span.lo() + BytePos("break".len() as u32))
+                };
                 let label_sp = match break_destination.label {
                     Some(label) => sp_lo.with_hi(label.ident.span.hi()),
                     None => sp_lo.shrink_to_lo(),
@@ -362,21 +375,23 @@ impl<'hir> CheckLoopVisitor<'hir> {
                     source,
                 });
             }
-            UnlabeledBlock(block_span)
-                if br_cx_kind == BreakContextKind::Break && block_span.eq_ctxt(break_span) =>
+            UnlabeledBlock { label_span, wrap_end }
+                if br_cx_kind == BreakContextKind::Break && label_span.eq_ctxt(break_span) =>
             {
-                let block = self.block_breaks.entry(block_span).or_insert_with(|| BlockInfo {
-                    name: br_cx_kind.to_string(),
-                    spans: vec![],
-                    suggs: vec![],
-                });
+                let block =
+                    self.block_breaks.entry(OrdSpan(label_span)).or_insert_with(|| BlockInfo {
+                        name: br_cx_kind.to_string(),
+                        spans: vec![],
+                        suggs: vec![],
+                        wrap_end,
+                    });
                 block.spans.push(span);
                 block.suggs.push(break_span);
             }
             UnlabeledIfBlock(_) if br_cx_kind == BreakContextKind::Break => {
                 self.require_break_cx(br_cx_kind, span, break_span, cx_pos - 1);
             }
-            Normal | AnonConst | Fn | UnlabeledBlock(_) | UnlabeledIfBlock(_) | ConstBlock => {
+            Normal | AnonConst | Fn | UnlabeledBlock { .. } | UnlabeledIfBlock(_) | ConstBlock => {
                 self.tcx.dcx().emit_err(OutsideLoop {
                     spans: vec![span],
                     name: &br_cx_kind.to_string(),
@@ -410,8 +425,10 @@ impl<'hir> CheckLoopVisitor<'hir> {
                 name: &block.name,
                 is_break: true,
                 suggestion: Some(OutsideLoopSuggestion {
-                    block_span: *s,
+                    block_span: s.0,
                     break_spans: block.suggs.clone(),
+                    block_prefix: if block.wrap_end.is_some() { "{ 'block: " } else { "'block: " },
+                    wrap_end: block.wrap_end,
                 }),
             });
         }
@@ -423,7 +440,7 @@ impl<'hir> CheckLoopVisitor<'hir> {
         e: &'hir hir::Expr<'hir>,
         body: &'hir hir::Block<'hir>,
     ) -> Option<Destination> {
-        if !find_attr!(self.tcx.hir_attrs(e.hir_id), AttributeKind::LoopMatch(_)) {
+        if !find_attr!(self.tcx, e.hir_id, LoopMatch(_)) {
             return None;
         }
 
@@ -431,10 +448,7 @@ impl<'hir> CheckLoopVisitor<'hir> {
 
         // Accept either `state = expr` or `state = expr;`.
         let loop_body_expr = match body.stmts {
-            [] => match body.expr {
-                Some(expr) => expr,
-                None => return None,
-            },
+            [] => body.expr?,
             [single] if body.expr.is_none() => match single.kind {
                 hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) => expr,
                 _ => return None,

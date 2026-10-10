@@ -9,8 +9,8 @@ LL |     let _ = <T as Bop>::Bar::default();
 note: required by a bound in `Bop::Bar`
   --> $DIR/assoc_type_bounds_sized_used.rs:7:15
    |
+LL | trait Bop {
 LL |     type Bar: Default
-   |          --- required by a bound in this associated type
 LL |     where
 LL |         Self: Sized;
    |               ^^^^^ required by this bound in `Bop::Bar`
@@ -24,21 +24,6 @@ help: consider relaxing the implicit `Sized` restriction
 LL |     type Bar: Default + ?Sized
    |                       ++++++++
 
-error[E0599]: the function or associated item `default` exists for associated type `<T as Bop>::Bar`, but its trait bounds were not satisfied
-  --> $DIR/assoc_type_bounds_sized_used.rs:11:30
-   |
-LL |     let _ = <T as Bop>::Bar::default();
-   |                              ^^^^^^^ function or associated item cannot be called on `<T as Bop>::Bar` due to unsatisfied trait bounds
-   |
-   = note: the following trait bounds were not satisfied:
-           `T: Sized`
-           which is required by `<T as Bop>::Bar: Default`
-help: consider restricting the type parameter to satisfy the trait bound
-   |
-LL | fn bop<T: Bop + ?Sized>() where T: Sized {
-   |                           ++++++++++++++
+error: aborting due to 1 previous error
 
-error: aborting due to 2 previous errors
-
-Some errors have detailed explanations: E0277, E0599.
-For more information about an error, try `rustc --explain E0277`.
+For more information about this error, try `rustc --explain E0277`.

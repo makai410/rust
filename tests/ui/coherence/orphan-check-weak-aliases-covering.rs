@@ -2,12 +2,13 @@
 
 //@ check-pass
 //@ revisions: classic next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 
 //@ aux-crate:foreign=parametrized-trait.rs
 //@ edition:2021
 
-#![feature(lazy_type_alias)]
+#![feature(checked_type_aliases)]
 #![allow(incomplete_features)]
 
 type Alias<T> = LocalWrapper<T>;

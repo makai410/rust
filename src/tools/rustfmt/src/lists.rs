@@ -3,12 +3,12 @@
 use std::cmp;
 use std::iter::Peekable;
 
-use rustc_span::BytePos;
+use rustc_span::{BytePos, Span};
 
 use crate::comment::{FindUncommented, find_comment_end, rewrite_comment};
 use crate::config::lists::*;
 use crate::config::{Config, IndentStyle};
-use crate::rewrite::{RewriteContext, RewriteError, RewriteResult};
+use crate::rewrite::{ExceedsMaxWidthError, RewriteContext, RewriteError, RewriteResult};
 use crate::shape::{Indent, Shape};
 use crate::utils::{
     count_newlines, first_line_width, last_line_width, mk_sp, starts_with_newline,
@@ -425,7 +425,8 @@ where
 
         if tactic != DefinitiveListTactic::Horizontal && item.post_comment.is_some() {
             let comment = item.post_comment.as_ref().unwrap();
-            let overhead = last_line_width(&result) + first_line_width(comment.trim());
+            let overhead = last_line_width(&result, formatting.config.tab_spaces())
+                + first_line_width(comment.trim());
 
             let rewrite_post_comment = |item_max_width: &mut Option<usize>| {
                 if item_max_width.is_none() && !last && !inner_item.contains('\n') {
@@ -471,7 +472,7 @@ where
                     let mut comment_alignment =
                         post_comment_alignment(item_max_width, unicode_str_width(inner_item));
                     if first_line_width(&formatted_comment)
-                        + last_line_width(&result)
+                        + last_line_width(&result, formatting.config.tab_spaces())
                         + comment_alignment
                         + 1
                         > formatting.config.max_width()
@@ -865,12 +866,13 @@ pub(crate) fn struct_lit_shape(
     context: &RewriteContext<'_>,
     prefix_width: usize,
     suffix_width: usize,
-) -> Option<(Option<Shape>, Shape)> {
+    span: Span,
+) -> Result<(Option<Shape>, Shape), ExceedsMaxWidthError> {
     let v_shape = match context.config.indent_style() {
         IndentStyle::Visual => shape
             .visual_indent(0)
-            .shrink_left(prefix_width)?
-            .sub_width(suffix_width)?,
+            .shrink_left(prefix_width, span)?
+            .sub_width(suffix_width, span)?,
         IndentStyle::Block => {
             let shape = shape.block_indent(context.config.tab_spaces());
             Shape {
@@ -879,13 +881,14 @@ pub(crate) fn struct_lit_shape(
             }
         }
     };
-    let shape_width = shape.width.checked_sub(prefix_width + suffix_width);
-    if let Some(w) = shape_width {
-        let shape_width = cmp::min(w, context.config.struct_lit_width());
-        Some((Some(Shape::legacy(shape_width, shape.indent)), v_shape))
-    } else {
-        Some((None, v_shape))
-    }
+    let h_shape = shape
+        .width
+        .checked_sub(prefix_width + suffix_width)
+        .map(|w| {
+            let shape_width = cmp::min(w, context.config.struct_lit_width());
+            Shape::legacy(shape_width, shape.indent)
+        });
+    Ok((h_shape, v_shape))
 }
 
 // Compute the tactic for the internals of a struct-lit-like thing.

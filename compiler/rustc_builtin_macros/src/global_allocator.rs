@@ -9,7 +9,7 @@ use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_span::{Ident, Span, Symbol, kw, sym};
 use thin_vec::{ThinVec, thin_vec};
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::check_builtin_macro_attribute;
 
 pub(crate) fn expand(
@@ -25,18 +25,25 @@ pub(crate) fn expand(
     // Allow using `#[global_allocator]` on an item statement
     // FIXME - if we get deref patterns, use them to reduce duplication here
     let (item, ident, is_stmt, ty_span) = if let Annotatable::Item(item) = &item
-        && let ItemKind::Static(box ast::StaticItem { ident, ty, .. }) = &item.kind
+        && let ItemKind::Static(ast::StaticItem { ident, ty, .. }) = &item.kind
     {
         (item, *ident, false, ecx.with_def_site_ctxt(ty.span))
     } else if let Annotatable::Stmt(stmt) = &item
         && let StmtKind::Item(item) = &stmt.kind
-        && let ItemKind::Static(box ast::StaticItem { ident, ty, .. }) = &item.kind
+        && let ItemKind::Static(ast::StaticItem { ident, ty, .. }) = &item.kind
     {
         (item, *ident, true, ecx.with_def_site_ctxt(ty.span))
     } else {
-        ecx.dcx().emit_err(errors::AllocMustStatics { span: item.span() });
+        ecx.dcx().emit_err(diagnostics::AllocMustStatics { span: item.span() });
         return vec![orig_item];
     };
+
+    // Forbid `#[thread_local]` attributes on the item
+    if let Some(attr) = item.attrs.iter().find(|x| x.has_name(sym::thread_local)) {
+        ecx.dcx()
+            .emit_err(diagnostics::AllocCannotThreadLocal { span: item.span, attr: attr.span });
+        return vec![orig_item];
+    }
 
     // Generate a bunch of new items using the AllocFnFactory
     let span = ecx.with_def_site_ctxt(item.span);
@@ -48,7 +55,8 @@ pub(crate) fn expand(
     // Generate anonymous constant serving as container for the allocator methods.
     let const_ty = ecx.ty(ty_span, TyKind::Tup(ThinVec::new()));
     let const_body = ecx.expr_block(ecx.block(span, stmts));
-    let const_item = ecx.item_const(span, Ident::new(kw::Underscore, span), const_ty, const_body);
+    let const_item =
+        ecx.item_const(span, Ident::new(kw::Underscore, span), const_ty, Some(const_body));
     let const_item = if is_stmt {
         Annotatable::Stmt(Box::new(ecx.stmt_item(span, const_item)))
     } else {
@@ -77,15 +85,16 @@ impl AllocFnFactory<'_, '_> {
         let sig = FnSig { decl, header, span: self.span };
         let body = Some(self.cx.block_expr(result));
         let kind = ItemKind::Fn(Box::new(Fn {
-            defaultness: ast::Defaultness::Final,
+            defaultness: ast::Defaultness::Implicit,
             sig,
             ident: Ident::from_str_and_span(&global_fn_name(method.name), self.span),
             generics: Generics::default(),
             contract: None,
             body,
             define_opaque: None,
+            eii_impl: None,
         }));
-        let item = self.cx.item(self.span, self.attrs(), kind);
+        let item = self.cx.item(self.span, self.attrs(method), kind);
         self.cx.stmt_item(self.ty_span, item)
     }
 
@@ -100,8 +109,18 @@ impl AllocFnFactory<'_, '_> {
         self.cx.expr_call(self.ty_span, method, args)
     }
 
-    fn attrs(&self) -> AttrVec {
-        thin_vec![self.cx.attr_word(sym::rustc_std_internal_symbol, self.span)]
+    fn attrs(&self, method: &AllocatorMethod) -> AttrVec {
+        let alloc_attr = match method.name {
+            sym::alloc => sym::rustc_allocator,
+            sym::dealloc => sym::rustc_deallocator,
+            sym::realloc => sym::rustc_reallocator,
+            sym::alloc_zeroed => sym::rustc_allocator_zeroed,
+            _ => unreachable!("Unknown allocator method!"),
+        };
+        thin_vec![
+            self.cx.attr_word(sym::rustc_std_internal_symbol, self.span),
+            self.cx.attr_word(alloc_attr, self.span)
+        ]
     }
 
     fn arg_ty(&self, input: &AllocatorMethodInput, args: &mut ThinVec<Param>) -> Box<Expr> {
@@ -112,16 +131,20 @@ impl AllocFnFactory<'_, '_> {
                 // disambiguated somehow. Currently the generated code would
                 // fail to compile with "identifier is bound more than once in
                 // this parameter list".
-                let size = Ident::from_str_and_span("size", self.span);
-                let align = Ident::from_str_and_span("align", self.span);
+                let size = Ident::new(sym::size, self.span);
+                let align = Ident::new(sym::align, self.span);
 
                 let usize = self.cx.path_ident(self.span, Ident::new(sym::usize, self.span));
                 let ty_usize = self.cx.ty_path(usize);
-                args.push(self.cx.param(self.span, size, ty_usize.clone()));
-                args.push(self.cx.param(self.span, align, ty_usize));
+                args.push(self.cx.param(self.span, size, ty_usize));
+                let ty_align = self.ptr_alignment();
+                args.push(self.cx.param(self.span, align, ty_align));
 
-                let layout_new =
-                    self.cx.std_path(&[sym::alloc, sym::Layout, sym::from_size_align_unchecked]);
+                let layout_new = self.cx.std_path(&[
+                    sym::alloc,
+                    sym::Layout,
+                    sym::from_size_alignment_unchecked,
+                ]);
                 let layout_new = self.cx.expr_path(self.cx.path(self.span, layout_new));
                 let size = self.cx.expr_ident(self.span, size);
                 let align = self.cx.expr_ident(self.span, align);
@@ -141,7 +164,7 @@ impl AllocFnFactory<'_, '_> {
                 self.cx.expr_ident(self.span, ident)
             }
 
-            AllocatorTy::ResultPtr | AllocatorTy::Unit => {
+            AllocatorTy::Never | AllocatorTy::ResultPtr | AllocatorTy::Unit => {
                 panic!("can't convert AllocatorTy to an argument")
             }
         }
@@ -153,7 +176,7 @@ impl AllocFnFactory<'_, '_> {
 
             AllocatorTy::Unit => self.cx.ty(self.span, TyKind::Tup(ThinVec::new())),
 
-            AllocatorTy::Layout | AllocatorTy::Usize | AllocatorTy::Ptr => {
+            AllocatorTy::Layout | AllocatorTy::Never | AllocatorTy::Usize | AllocatorTy::Ptr => {
                 panic!("can't convert `AllocatorTy` to an output")
             }
         }
@@ -162,6 +185,12 @@ impl AllocFnFactory<'_, '_> {
     fn usize(&self) -> Box<Ty> {
         let usize = self.cx.path_ident(self.span, Ident::new(sym::usize, self.span));
         self.cx.ty_path(usize)
+    }
+
+    fn ptr_alignment(&self) -> Box<Ty> {
+        let path = self.cx.std_path(&[sym::mem, sym::Alignment]);
+        let path = self.cx.path(self.span, path);
+        self.cx.ty_path(path)
     }
 
     fn ptr_u8(&self) -> Box<Ty> {

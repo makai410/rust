@@ -20,16 +20,18 @@ define-function: (
             {"color": |code_header_color|, "background-color": "rgba(0, 0, 0, 0)"},
             ALL,
         )
-        go-to: "file://" + |DOC_PATH| + "/test_docs/struct.Foo.html#impl-Foo"
-        assert-css: (
+        // First we hover the element to make the anchor appear.
+        move-cursor-to: "#impl-Foo"
+        // Then we click on it.
+        click: "a.anchor[href='#impl-Foo']"
+        wait-for-css: (
             "#impl-Foo",
             {"color": |color|, "background-color": |focus_background_color|},
         )
-        go-to: "file://" + |DOC_PATH| + "/test_docs/struct.Foo.html#method.must_use"
-        assert-css: (
+        click: "a.fn[href='#method.must_use']"
+        wait-for-css: (
             "#method\.must_use",
             {"color": |color|, "background-color": |focus_background_color|},
-            ALL,
         )
         go-to: "file://" + |DOC_PATH| + "/test_docs/index.html"
         assert-css: (".section-header a", {"color": |color|}, ALL)

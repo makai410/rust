@@ -4,7 +4,7 @@
 // x86 only.
 
 //@ revisions: ENABLED DISABLED
-//@ add-core-stubs
+//@ add-minicore
 //@ compile-flags: --target i686-unknown-linux-gnu -Cno-prepopulate-passes -Copt-level=3
 //@ [ENABLED] compile-flags: -Zreg-struct-return
 //@ needs-llvm-components: x86
@@ -90,10 +90,7 @@ pub struct FooFloat3 {
 }
 
 pub mod tests {
-    use {
-        Foo, Foo1, Foo2, Foo3, Foo4, Foo5, FooFloat1, FooFloat2, FooFloat3, FooOversize1,
-        FooOversize2,
-    };
+    use super::*;
 
     // ENABLED: i64 @f1()
     // DISABLED: void @f1(ptr {{.*}}sret

@@ -1,52 +1,53 @@
 #![allow(rustc::symbol_intern_string_literal)]
-
-use std::assert_matches::assert_matches;
 use std::io::prelude::*;
 use std::iter::Peekable;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::{io, str};
+use std::{assert_matches, io, str};
 
-use ast::token::IdentIsRaw;
+use ast::token::IdentKind;
 use rustc_ast::token::{self, Delimiter, Token};
 use rustc_ast::tokenstream::{DelimSpacing, DelimSpan, Spacing, TokenStream, TokenTree};
 use rustc_ast::{self as ast, PatKind, visit};
 use rustc_ast_pretty::pprust::item_to_string;
-use rustc_errors::emitter::{HumanEmitter, OutputTheme};
-use rustc_errors::translation::Translator;
-use rustc_errors::{DiagCtxt, MultiSpan, PResult};
+use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
+use rustc_errors::emitter::OutputTheme;
+use rustc_errors::{AutoStream, DiagCtxt, MultiSpan, PResult};
 use rustc_session::parse::ParseSess;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
 use rustc_span::{
     BytePos, FileName, Pos, Span, Symbol, create_default_session_globals_then, kw, sym,
 };
-use termcolor::WriteColor;
 
-use crate::parser::{ForceCollect, Parser};
+use crate::lexer::StripTokens;
+use crate::parser::{AllowConstBlockItems, ForceCollect, Parser};
 use crate::{new_parser_from_source_str, source_str_to_stream, unwrap_or_emit_fatal};
 
-fn psess() -> ParseSess {
-    ParseSess::new(vec![crate::DEFAULT_LOCALE_RESOURCE])
+fn filename(sm: &SourceMap, path: &str) -> FileName {
+    FileName::Real(sm.path_mapping().to_real_filename(sm.working_dir(), PathBuf::from(path)))
 }
 
 /// Map string to parser (via tts).
 fn string_to_parser(psess: &ParseSess, source_str: String) -> Parser<'_> {
     unwrap_or_emit_fatal(new_parser_from_source_str(
         psess,
-        PathBuf::from("bogofile").into(),
+        filename(psess.source_map(), "bogofile"),
         source_str,
+        StripTokens::Nothing,
     ))
 }
 
 fn create_test_handler(theme: OutputTheme) -> (DiagCtxt, Arc<SourceMap>, Arc<Mutex<Vec<u8>>>) {
     let output = Arc::new(Mutex::new(Vec::new()));
     let source_map = Arc::new(SourceMap::new(FilePathMapping::empty()));
-    let translator = Translator::with_fallback_bundle(vec![crate::DEFAULT_LOCALE_RESOURCE], false);
-    let mut emitter = HumanEmitter::new(Box::new(Shared { data: output.clone() }), translator)
-        .sm(Some(source_map.clone()))
-        .diagnostic_width(Some(140));
-    emitter = emitter.theme(theme);
-    let dcx = DiagCtxt::new(Box::new(emitter));
+    let shared: Box<dyn Write + Send> = Box::new(Shared { data: output.clone() });
+    let auto_stream = AutoStream::never(shared);
+    let dcx = DiagCtxt::new(Box::new(
+        AnnotateSnippetEmitter::new(auto_stream)
+            .sm(Some(source_map.clone()))
+            .diagnostic_width(Some(140))
+            .theme(theme),
+    ));
     (dcx, source_map, output)
 }
 
@@ -85,10 +86,10 @@ where
 
 /// Maps a string to tts, using a made-up filename.
 pub(crate) fn string_to_stream(source_str: String) -> TokenStream {
-    let psess = psess();
+    let psess = ParseSess::new();
     unwrap_or_emit_fatal(source_str_to_stream(
         &psess,
-        PathBuf::from("bogofile").into(),
+        filename(psess.source_map(), "bogofile"),
         source_str,
         None,
     ))
@@ -158,20 +159,6 @@ struct Shared<T: Write> {
     data: Arc<Mutex<T>>,
 }
 
-impl<T: Write> WriteColor for Shared<T> {
-    fn supports_color(&self) -> bool {
-        false
-    }
-
-    fn set_color(&mut self, _spec: &termcolor::ColorSpec) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn reset(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 impl<T: Write> Write for Shared<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.data.lock().unwrap().write(buf)
@@ -182,7 +169,6 @@ impl<T: Write> Write for Shared<T> {
     }
 }
 
-#[allow(rustc::untranslatable_diagnostic)] // no translation needed for tests
 fn test_harness(
     file_text: &str,
     span_labels: Vec<SpanLabel>,
@@ -196,8 +182,7 @@ fn test_harness(
             (OutputTheme::Unicode, expected_output_unicode),
         ] {
             let (dcx, source_map, output) = create_test_handler(theme);
-            source_map
-                .new_source_file(Path::new("test.rs").to_owned().into(), file_text.to_owned());
+            source_map.new_source_file(filename(&source_map, "test.rs"), file_text.to_owned());
 
             let primary_span = make_span(&file_text, &span_labels[0].start, &span_labels[0].end);
             let mut msp = MultiSpan::from_span(primary_span);
@@ -2240,8 +2225,8 @@ fn parse_item_from_source_str(
     source: String,
     psess: &ParseSess,
 ) -> PResult<'_, Option<Box<ast::Item>>> {
-    unwrap_or_emit_fatal(new_parser_from_source_str(psess, name, source))
-        .parse_item(ForceCollect::No)
+    unwrap_or_emit_fatal(new_parser_from_source_str(psess, name, source, StripTokens::Nothing))
+        .parse_item(ForceCollect::No, AllowConstBlockItems::Yes)
 }
 
 // Produces a `rustc_span::span`.
@@ -2251,12 +2236,14 @@ fn sp(a: u32, b: u32) -> Span {
 
 /// Parses a string, return an expression.
 fn string_to_expr(source_str: String) -> Box<ast::Expr> {
-    with_error_checking_parse(source_str, &psess(), |p| p.parse_expr())
+    with_error_checking_parse(source_str, &ParseSess::new(), |p| p.parse_expr())
 }
 
 /// Parses a string, returns an item.
 fn string_to_item(source_str: String) -> Option<Box<ast::Item>> {
-    with_error_checking_parse(source_str, &psess(), |p| p.parse_item(ForceCollect::No))
+    with_error_checking_parse(source_str, &ParseSess::new(), |p| {
+        p.parse_item(ForceCollect::No, AllowConstBlockItems::Yes)
+    })
 }
 
 #[test]
@@ -2281,11 +2268,11 @@ fn string_to_tts_macro() {
         match tts {
             [
                 TokenTree::Token(
-                    Token { kind: token::Ident(name_macro_rules, IdentIsRaw::No), .. },
+                    Token { kind: token::Ident(name_macro_rules, IdentKind::Normal), .. },
                     _,
                 ),
                 TokenTree::Token(Token { kind: token::Bang, .. }, _),
-                TokenTree::Token(Token { kind: token::Ident(name_zip, IdentIsRaw::No), .. }, _),
+                TokenTree::Token(Token { kind: token::Ident(name_zip, IdentKind::Normal), .. }, _),
                 TokenTree::Delimited(.., macro_delim, macro_tts),
             ] if name_macro_rules == &kw::MacroRules && name_zip.as_str() == "zip" => {
                 let tts = &macro_tts.iter().collect::<Vec<_>>();
@@ -2300,7 +2287,7 @@ fn string_to_tts_macro() {
                             [
                                 TokenTree::Token(Token { kind: token::Dollar, .. }, _),
                                 TokenTree::Token(
-                                    Token { kind: token::Ident(name, IdentIsRaw::No), .. },
+                                    Token { kind: token::Ident(name, IdentKind::Normal), .. },
                                     _,
                                 ),
                             ] if first_delim == &Delimiter::Parenthesis && name.as_str() == "a" => {
@@ -2312,7 +2299,7 @@ fn string_to_tts_macro() {
                             [
                                 TokenTree::Token(Token { kind: token::Dollar, .. }, _),
                                 TokenTree::Token(
-                                    Token { kind: token::Ident(name, IdentIsRaw::No), .. },
+                                    Token { kind: token::Ident(name, IdentKind::Normal), .. },
                                     _,
                                 ),
                             ] if second_delim == &Delimiter::Parenthesis
@@ -2334,9 +2321,9 @@ fn string_to_tts_1() {
         let tts = string_to_stream("fn a(b: i32) { b; }".to_string());
 
         let expected = TokenStream::new(vec![
-            TokenTree::token_alone(token::Ident(kw::Fn, IdentIsRaw::No), sp(0, 2)),
+            TokenTree::token_alone(token::Ident(kw::Fn, IdentKind::Normal), sp(0, 2)),
             TokenTree::token_joint_hidden(
-                token::Ident(Symbol::intern("a"), IdentIsRaw::No),
+                token::Ident(sym::character('a'), IdentKind::Normal),
                 sp(3, 4),
             ),
             TokenTree::Delimited(
@@ -2347,13 +2334,13 @@ fn string_to_tts_1() {
                 Delimiter::Parenthesis,
                 TokenStream::new(vec![
                     TokenTree::token_joint(
-                        token::Ident(Symbol::intern("b"), IdentIsRaw::No),
+                        token::Ident(sym::character('b'), IdentKind::Normal),
                         sp(5, 6),
                     ),
                     TokenTree::token_alone(token::Colon, sp(6, 7)),
                     // `JointHidden` because the `i32` is immediately followed by the `)`.
                     TokenTree::token_joint_hidden(
-                        token::Ident(sym::i32, IdentIsRaw::No),
+                        token::Ident(sym::i32, IdentKind::Normal),
                         sp(8, 11),
                     ),
                 ]),
@@ -2367,7 +2354,7 @@ fn string_to_tts_1() {
                 Delimiter::Brace,
                 TokenStream::new(vec![
                     TokenTree::token_joint(
-                        token::Ident(Symbol::intern("b"), IdentIsRaw::No),
+                        token::Ident(sym::character('b'), IdentKind::Normal),
                         sp(15, 16),
                     ),
                     // `Alone` because the `;` is followed by whitespace.
@@ -2490,7 +2477,7 @@ let mut fflags: c_int = wb();
 #[test]
 fn crlf_doc_comments() {
     create_default_session_globals_then(|| {
-        let psess = psess();
+        let psess = ParseSess::new();
 
         let name_1 = FileName::Custom("crlf_source_1".to_string());
         let source = "/// doc comment\r\nfn foo() {}".to_string();
@@ -2520,13 +2507,14 @@ fn ttdelim_span() {
         source: String,
         psess: &ParseSess,
     ) -> PResult<'_, Box<ast::Expr>> {
-        unwrap_or_emit_fatal(new_parser_from_source_str(psess, name, source)).parse_expr()
+        unwrap_or_emit_fatal(new_parser_from_source_str(psess, name, source, StripTokens::Nothing))
+            .parse_expr()
     }
 
     create_default_session_globals_then(|| {
-        let psess = psess();
+        let psess = ParseSess::new();
         let expr = parse_expr_from_source_str(
-            PathBuf::from("foo").into(),
+            filename(psess.source_map(), "foo"),
             "foo!( fn main() { body } )".to_string(),
             &psess,
         )
@@ -2554,28 +2542,28 @@ fn look(p: &Parser<'_>, dist: usize, kind: rustc_ast::token::TokenKind) {
 #[test]
 fn look_ahead() {
     create_default_session_globals_then(|| {
-        let sym_f = Symbol::intern("f");
-        let sym_x = Symbol::intern("x");
+        let sym_f = sym::character('f');
+        let sym_x = sym::character('x');
         #[allow(non_snake_case)]
-        let sym_S = Symbol::intern("S");
-        let raw_no = IdentIsRaw::No;
+        let sym_S = sym::character('S');
+        let normal = IdentKind::Normal;
 
-        let psess = psess();
+        let psess = ParseSess::new();
         let mut p = string_to_parser(&psess, "fn f(x: u32) { x } struct S;".to_string());
 
         // Current position is the `fn`.
-        look(&p, 0, token::Ident(kw::Fn, raw_no));
-        look(&p, 1, token::Ident(sym_f, raw_no));
+        look(&p, 0, token::Ident(kw::Fn, normal));
+        look(&p, 1, token::Ident(sym_f, normal));
         look(&p, 2, token::OpenParen);
-        look(&p, 3, token::Ident(sym_x, raw_no));
+        look(&p, 3, token::Ident(sym_x, normal));
         look(&p, 4, token::Colon);
-        look(&p, 5, token::Ident(sym::u32, raw_no));
+        look(&p, 5, token::Ident(sym::u32, normal));
         look(&p, 6, token::CloseParen);
         look(&p, 7, token::OpenBrace);
-        look(&p, 8, token::Ident(sym_x, raw_no));
+        look(&p, 8, token::Ident(sym_x, normal));
         look(&p, 9, token::CloseBrace);
-        look(&p, 10, token::Ident(kw::Struct, raw_no));
-        look(&p, 11, token::Ident(sym_S, raw_no));
+        look(&p, 10, token::Ident(kw::Struct, normal));
+        look(&p, 11, token::Ident(sym_S, normal));
         look(&p, 12, token::Semi);
         // Any lookahead past the end of the token stream returns `Eof`.
         look(&p, 13, token::Eof);
@@ -2587,15 +2575,15 @@ fn look_ahead() {
         for _ in 0..3 {
             p.bump();
         }
-        look(&p, 0, token::Ident(sym_x, raw_no));
+        look(&p, 0, token::Ident(sym_x, normal));
         look(&p, 1, token::Colon);
-        look(&p, 2, token::Ident(sym::u32, raw_no));
+        look(&p, 2, token::Ident(sym::u32, normal));
         look(&p, 3, token::CloseParen);
         look(&p, 4, token::OpenBrace);
-        look(&p, 5, token::Ident(sym_x, raw_no));
+        look(&p, 5, token::Ident(sym_x, normal));
         look(&p, 6, token::CloseBrace);
-        look(&p, 7, token::Ident(kw::Struct, raw_no));
-        look(&p, 8, token::Ident(sym_S, raw_no));
+        look(&p, 7, token::Ident(kw::Struct, normal));
+        look(&p, 8, token::Ident(sym_S, normal));
         look(&p, 9, token::Semi);
         look(&p, 10, token::Eof);
         look(&p, 11, token::Eof);
@@ -2629,13 +2617,13 @@ fn look_ahead() {
 #[test]
 fn look_ahead_non_outermost_stream() {
     create_default_session_globals_then(|| {
-        let sym_f = Symbol::intern("f");
-        let sym_x = Symbol::intern("x");
+        let sym_f = sym::character('f');
+        let sym_x = sym::character('x');
         #[allow(non_snake_case)]
-        let sym_S = Symbol::intern("S");
-        let raw_no = IdentIsRaw::No;
+        let sym_S = sym::character('S');
+        let normal = IdentKind::Normal;
 
-        let psess = psess();
+        let psess = ParseSess::new();
         let mut p = string_to_parser(&psess, "mod m { fn f(x: u32) { x } struct S; }".to_string());
 
         // Move forward to the `fn`, which is not within the outermost token
@@ -2643,18 +2631,18 @@ fn look_ahead_non_outermost_stream() {
         for _ in 0..3 {
             p.bump();
         }
-        look(&p, 0, token::Ident(kw::Fn, raw_no));
-        look(&p, 1, token::Ident(sym_f, raw_no));
+        look(&p, 0, token::Ident(kw::Fn, normal));
+        look(&p, 1, token::Ident(sym_f, normal));
         look(&p, 2, token::OpenParen);
-        look(&p, 3, token::Ident(sym_x, raw_no));
+        look(&p, 3, token::Ident(sym_x, normal));
         look(&p, 4, token::Colon);
-        look(&p, 5, token::Ident(sym::u32, raw_no));
+        look(&p, 5, token::Ident(sym::u32, normal));
         look(&p, 6, token::CloseParen);
         look(&p, 7, token::OpenBrace);
-        look(&p, 8, token::Ident(sym_x, raw_no));
+        look(&p, 8, token::Ident(sym_x, normal));
         look(&p, 9, token::CloseBrace);
-        look(&p, 10, token::Ident(kw::Struct, raw_no));
-        look(&p, 11, token::Ident(sym_S, raw_no));
+        look(&p, 10, token::Ident(kw::Struct, normal));
+        look(&p, 11, token::Ident(sym_S, normal));
         look(&p, 12, token::Semi);
         look(&p, 13, token::CloseBrace);
         // Any lookahead past the end of the token stream returns `Eof`.
@@ -2664,11 +2652,10 @@ fn look_ahead_non_outermost_stream() {
     });
 }
 
-// FIXME(nnethercote) All the output is currently wrong.
 #[test]
 fn debug_lookahead() {
     create_default_session_globals_then(|| {
-        let psess = psess();
+        let psess = ParseSess::new();
         let mut p = string_to_parser(&psess, "fn f(x: u32) { x } struct S;".to_string());
 
         // Current position is the `fn`.
@@ -2710,21 +2697,21 @@ fn debug_lookahead() {
     tokens: [
         Ident(
             \"fn\",
-            No,
+            Normal,
         ),
         Ident(
             \"f\",
-            No,
+            Normal,
         ),
         OpenParen,
         Ident(
             \"x\",
-            No,
+            Normal,
         ),
         Colon,
         Ident(
             \"u32\",
-            No,
+            Normal,
         ),
         CloseParen,
     ],
@@ -2751,36 +2738,36 @@ fn debug_lookahead() {
     tokens: [
         Ident(
             \"fn\",
-            No,
+            Normal,
         ),
         Ident(
             \"f\",
-            No,
+            Normal,
         ),
         OpenParen,
         Ident(
             \"x\",
-            No,
+            Normal,
         ),
         Colon,
         Ident(
             \"u32\",
-            No,
+            Normal,
         ),
         CloseParen,
         OpenBrace,
         Ident(
             \"x\",
-            No,
+            Normal,
         ),
         CloseBrace,
         Ident(
             \"struct\",
-            No,
+            Normal,
         ),
         Ident(
             \"S\",
-            No,
+            Normal,
         ),
         Semi,
         Eof,
@@ -2812,7 +2799,7 @@ fn debug_lookahead() {
     tokens: [
         Ident(
             \"x\",
-            No,
+            Normal,
         ),
     ],
     approx_token_stream_pos: 8,
@@ -2837,16 +2824,16 @@ fn debug_lookahead() {
     tokens: [
         Ident(
             \"x\",
-            No,
+            Normal,
         ),
         CloseBrace,
         Ident(
             \"struct\",
-            No,
+            Normal,
         ),
         Ident(
             \"S\",
-            No,
+            Normal,
         ),
     ],
     approx_token_stream_pos: 8,
@@ -2889,10 +2876,11 @@ fn debug_lookahead() {
 #[test]
 fn out_of_line_mod() {
     create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
         let item = parse_item_from_source_str(
-            PathBuf::from("foo").into(),
+            filename(psess.source_map(), "foo"),
             "mod foo { struct S; mod this_does_not_exist; }".to_owned(),
-            &psess(),
+            &psess,
         )
         .unwrap()
         .unwrap();

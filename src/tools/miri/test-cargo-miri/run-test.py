@@ -35,9 +35,9 @@ def cargo_miri(cmd, quiet = True, targets = None):
 
     return args
 
-def normalize_stdout(str):
+def normalize_output(str):
     str = str.replace("src\\", "src/") # normalize paths across platforms
-    str = re.sub("finished in \\d+\\.\\d\\ds", "finished in $TIME", str) # the time keeps changing, obviously
+    str = re.sub("\\b\\d+\\.\\d+s\\b", "$TIME", str) # the time keeps changing, obviously
     return str
 
 def check_output(actual, path, name):
@@ -49,6 +49,7 @@ def check_output(actual, path, name):
     if expected == actual:
         return True
     print(f"{name} output did not match reference in {path}!")
+    print("Run `./run-test.py --bless` to update reference files.")
     print(f"--- BEGIN diff {name} ---")
     for text in difflib.unified_diff(expected.split("\n"), actual.split("\n")):
         print(text)
@@ -70,8 +71,8 @@ def test(name, cmd, stdout_ref, stderr_ref, stdin=b'', env=None):
         env=p_env,
     )
     (stdout, stderr) = p.communicate(input=stdin)
-    stdout = normalize_stdout(stdout.decode("UTF-8"))
-    stderr = stderr.decode("UTF-8")
+    stdout = normalize_output(stdout.decode("UTF-8"))
+    stderr = normalize_output(stderr.decode("UTF-8"))
 
     stdout_matches = check_output(stdout, stdout_ref, "stdout")
     stderr_matches = check_output(stderr, stderr_ref, "stderr")
@@ -170,10 +171,19 @@ def test_cargo_miri_test():
         "test.empty.ref",
         env={'MIRIFLAGS': "-Zmiri-disable-isolation"},
     )
-    test("`cargo miri test` (proc-macro crate)",
-        cargo_miri("test") + ["-p", "proc_macro_crate"],
-        "test.empty.ref", "test.proc-macro.stderr.ref",
+    test("`cargo miri test` (entire workspace, no isolation)",
+        cargo_miri("test") + ["--workspace"],
+        "test.workspace.stdout.ref", "test.workspace.stderr.ref",
+        env={'MIRIFLAGS': "-Zmiri-disable-isolation"},
     )
+    # FIXME: test is disabled for cross-compiled targets because it fails to link.
+    # Related to <https://github.com/rust-lang/cargo/issues/17200>.
+    if not os.environ.get('MIRI_TESTS_CROSS_COMPILED'):
+        test("`cargo miri test` (entire workspace, no isolation, host-config)",
+            cargo_miri("test") + ["--workspace", "-Ztarget-applies-to-host", "-Zhost-config"],
+            "test.workspace.stdout.ref", "test.workspace.stderr.ref",
+            env={'MIRIFLAGS': "-Zmiri-disable-isolation"},
+        )
     test("`cargo miri test` (custom target dir)",
         cargo_miri("test") + ["--target-dir=custom-test"],
         "test.default.stdout.ref", "test.empty.ref",
@@ -215,7 +225,7 @@ for target_dir in ["target", "custom-run", "custom-test", "config-cli"]:
     if os.listdir(target_dir) != ["miri"]:
         fail(f"`{target_dir}` contains unexpected files")
     # Ensure something exists inside that target dir.
-    os.access(os.path.join(target_dir, "miri", "debug", "deps"), os.F_OK)
+    os.access(os.path.join(target_dir, "miri", "debug"), os.F_OK)
 
 print("\nTEST SUCCESSFUL!")
 sys.exit(0)

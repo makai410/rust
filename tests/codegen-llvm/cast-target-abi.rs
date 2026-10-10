@@ -1,5 +1,5 @@
-// ignore-tidy-linelength
-//@ add-core-stubs
+// ignore-tidy-file-linelength
+//@ add-minicore
 //@ revisions:aarch64 loongarch64 powerpc64 sparc64 x86_64
 //@ compile-flags: -Copt-level=3 -Cno-prepopulate-passes -Zlint-llvm-ir
 
@@ -119,7 +119,7 @@ pub extern "C" fn returns_twou16s() -> TwoU16s {
 // aarch64-SAME:     ([[ABI_TYPE:\[2 x i64\]]] {{.*}}[[ABI_VALUE:%.+]])
 // loongarch64-SAME: ([[ABI_TYPE:\[2 x i64\]]] {{.*}}[[ABI_VALUE:%.+]])
 // powerpc64-SAME:   ([[ABI_TYPE:\[2 x i64\]]] {{.*}}[[ABI_VALUE:%.+]])
-// sparc64-SAME:     ([[ABI_TYPE:\[2 x i64\]]] {{.*}}[[ABI_VALUE:%.+]])
+// sparc64-SAME:     ([[ABI_TYPE:{ i64, i64 }]] {{.*}}[[ABI_VALUE:%.+]])
 // x86_64-SAME:      ([[ABI_TYPE:{ i64, i16 }]] {{.*}}[[ABI_VALUE:%.+]])
 #[no_mangle]
 #[inline(never)]
@@ -148,7 +148,7 @@ pub extern "C" fn returns_fiveu16s() -> FiveU16s {
 
     // aarch64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // loongarch64: [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ i64, i64 }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ i64, i16 }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
     // aarch64:     ret [[ABI_TYPE]] [[ABI_VALUE]]
@@ -171,7 +171,15 @@ pub extern "C" fn receives_doubledouble(x: DoubleDouble) {
 
     // CHECK: [[RUST_ALLOCA:%.+]] = alloca [16 x i8], align [[RUST_ALIGN:8]]
 
-    // CHECK: store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // aarch64: store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_0:%.+]] = extractvalue [[ABI_TYPE]] [[ABI_VALUE:%.+]], 0
+    // loongarch64: [[ABI_VALUE_1:%.+]] = extractvalue [[ABI_TYPE]] [[ABI_VALUE:%.+]], 1
+    // loongarch64: store double [[ABI_VALUE_0]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_ALLOCA_1:%.+]] = getelementptr inbounds i8, ptr [[ABI_ALLOCA]], i64 8
+    // loongarch64: store double [[ABI_VALUE_1]], ptr [[ABI_ALLOCA_1]], align [[ABI_ALIGN]]
+    // powerpc64: store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // sparc64: store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // x86_64: store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
     // CHECK: call void @llvm.memcpy.{{.+}}(ptr align [[RUST_ALIGN]] [[RUST_ALLOCA]], ptr align [[ABI_ALIGN]] [[ABI_ALLOCA]], i64 16, i1 false)
 }
@@ -190,7 +198,11 @@ pub extern "C" fn returns_doubledouble() -> DoubleDouble {
     // x86_64:      [[ABI_ALLOCA:%.+]] = alloca [16 x i8], align [[ABI_ALIGN:8]]
 
     // aarch64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x double\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // loongarch64: [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, double }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_0:%.+]] = load double, ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_ALLOCA_1:%.+]] = getelementptr inbounds i8, ptr [[ABI_ALLOCA]], i64 8
+    // loongarch64: [[ABI_VALUE_1:%.+]] = load double, ptr [[ABI_ALLOCA_1]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_2:%.+]] = insertvalue [[ABI_TYPE:{ double, double }]] poison, double [[ABI_VALUE_0]], 0
+    // loongarch64: [[ABI_VALUE:%.+]] = insertvalue { double, double } [[ABI_VALUE_2]], double [[ABI_VALUE_1]], 1
     // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, double }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, double }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
@@ -205,7 +217,7 @@ pub extern "C" fn returns_doubledouble() -> DoubleDouble {
 // aarch64-SAME:     ([[ABI_TYPE:\[2 x i64\]]] {{.*}}[[ABI_VALUE:%.+]])
 // loongarch64-SAME: ([[ABI_TYPE:\[2 x i64\]]] {{.*}}[[ABI_VALUE:%.+]])
 // powerpc64-SAME:   ([[ABI_TYPE:\[2 x i64\]]] {{.*}}[[ABI_VALUE:%.+]])
-// sparc64-SAME:     ([[ABI_TYPE:\[2 x i64\]]] {{.*}}[[ABI_VALUE:%.+]])
+// sparc64-SAME:     ([[ABI_TYPE:{ i64, i64 }]] {{.*}}[[ABI_VALUE:%.+]])
 // x86_64-SAME:      ([[ABI_TYPE:{ i64, i32 }]] {{.*}}[[ABI_VALUE:%.+]])
 #[no_mangle]
 #[inline(never)]
@@ -234,7 +246,7 @@ pub extern "C" fn returns_three32s() -> Three32s {
 
     // aarch64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // loongarch64: [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ i64, i64 }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ i64, i32 }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
     // aarch64:     ret [[ABI_TYPE]] [[ABI_VALUE]]
@@ -269,7 +281,11 @@ pub extern "C" fn receives_doublefloat(x: DoubleFloat) {
     // x86_64:      [[RUST_ALLOCA:%.+]] = alloca [16 x i8], align [[RUST_ALIGN:8]]
 
     // aarch64:     store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // loongarch64: store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_0:%.+]] = extractvalue { double, float } [[ABI_VALUE]], 0
+    // loongarch64: [[ABI_VALUE_1:%.+]] = extractvalue { double, float } [[ABI_VALUE]], 1
+    // loongarch64: store double [[ABI_VALUE_0]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_ALLOCA_1:%.+]] = getelementptr inbounds i8, ptr [[ABI_ALLOCA]], i64 8
+    // loongarch64: store float [[ABI_VALUE_1]], ptr [[ABI_ALLOCA_1]], align [[ABI_ALIGN]]
     // powerpc64:   store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
@@ -297,7 +313,11 @@ pub extern "C" fn returns_doublefloat() -> DoubleFloat {
     // x86_64:      [[ABI_ALLOCA:%.+]] = alloca [16 x i8], align [[ABI_ALIGN:8]]
 
     // aarch64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // loongarch64: [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, float }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_0:%.+]] = load double, ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_ALLOCA_1:%.+]] = getelementptr inbounds i8, ptr [[ABI_ALLOCA]], i64 8
+    // loongarch64: [[ABI_VALUE_1:%.+]] = load float, ptr [[ABI_ALLOCA_1]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_2:%.+]] = insertvalue [[ABI_TYPE:{ double, float }]] poison, double [[ABI_VALUE_0]], 0
+    // loongarch64: [[ABI_VALUE:%.+]] = insertvalue { double, float } [[ABI_VALUE_2]], float [[ABI_VALUE_1]], 1
     // x86_64:      [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, double }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
     // aarch64:     ret [[ABI_TYPE]] [[ABI_VALUE]]
@@ -379,7 +399,7 @@ pub fn call_fiveu16s() {
     // aarch64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // loongarch64: [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // powerpc64:   [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ i64, i64 }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ i64, i16 }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
     // CHECK: call void @receives_fiveu16s([[ABI_TYPE]] [[ABI_VALUE]])
@@ -404,7 +424,7 @@ pub fn return_fiveu16s() -> FiveU16s {
 
     // aarch64:     [[ABI_VALUE:%.+]] = call [[ABI_TYPE:\[2 x i64\]]] @returns_fiveu16s()
     // loongarch64: [[ABI_VALUE:%.+]] = call [[ABI_TYPE:\[2 x i64\]]] @returns_fiveu16s()
-    // sparc64:     [[ABI_VALUE:%.+]] = call [[ABI_TYPE:\[2 x i64\]]] @returns_fiveu16s()
+    // sparc64:     [[ABI_VALUE:%.+]] = call [[ABI_TYPE:{ i64, i64 }]] @returns_fiveu16s()
     // x86_64:      [[ABI_VALUE:%.+]] = call [[ABI_TYPE:{ i64, i16 }]] @returns_fiveu16s()
 
     // aarch64:     store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
@@ -429,7 +449,11 @@ pub fn call_doubledouble() {
     // CHECK: call void @llvm.memcpy.{{.+}}(ptr align [[ABI_ALIGN]] [[ABI_ALLOCA]], ptr align [[RUST_ALIGN]] [[RUST_ALLOCA]], i64 16, i1 false)
 
     // aarch64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x double\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // loongarch64: [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, double }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_0:%.+]] = load double, ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_ALLOCA_1:%.+]] = getelementptr inbounds i8, ptr [[ABI_ALLOCA]], i64 8
+    // loongarch64: [[ABI_VALUE_1:%.+]] = load double, ptr [[ABI_ALLOCA_1]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_2:%.+]] = insertvalue [[ABI_TYPE:{ double, double }]] poison, double [[ABI_VALUE_0]], 0
+    // loongarch64: [[ABI_VALUE:%.+]] = insertvalue { double, double } [[ABI_VALUE_2]], double [[ABI_VALUE_1]], 1
     // powerpc64:   [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, double }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, double }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
@@ -465,7 +489,11 @@ pub fn return_doubledouble() -> DoubleDouble {
     // x86_64:      [[ABI_VALUE:%.+]] = call [[ABI_TYPE:{ double, double }]] @returns_doubledouble()
 
     // aarch64:     store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // loongarch64: store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_0:%.+]] = extractvalue { double, double } [[ABI_VALUE]], 0
+    // loongarch64: [[ABI_VALUE_1:%.+]] = extractvalue { double, double } [[ABI_VALUE]], 1
+    // loongarch64: store double [[ABI_VALUE_0]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_ALLOCA_1:%.+]] = getelementptr inbounds i8, ptr [[ABI_ALLOCA]], i64 8
+    // loongarch64: store double [[ABI_VALUE_1]], ptr [[ABI_ALLOCA_1]], align [[ABI_ALIGN]]
     // sparc64:     store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
@@ -500,7 +528,11 @@ pub fn call_doublefloat() {
     // x86_64:      call void @llvm.memcpy.{{.+}}(ptr align [[ABI_ALIGN]] [[ABI_ALLOCA]], ptr align [[RUST_ALIGN]] [[RUST_ALLOCA]], i64 16, i1 false)
 
     // aarch64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // loongarch64: [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, float }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_0:%.+]] = load double, ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_ALLOCA_1:%.+]] = getelementptr inbounds i8, ptr [[ABI_ALLOCA]], i64 8
+    // loongarch64: [[ABI_VALUE_1:%.+]] = load float, ptr [[ABI_ALLOCA_1]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_2:%.+]] = insertvalue [[ABI_TYPE:{ double, float }]] poison, double [[ABI_VALUE_0]], 0
+    // loongarch64: [[ABI_VALUE:%.+]] = insertvalue { double, float } [[ABI_VALUE_2]], float [[ABI_VALUE_1]], 1
     // powerpc64:   [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ double, double }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
@@ -540,7 +572,11 @@ pub fn return_doublefloat() -> DoubleFloat {
     // x86_64:      [[ABI_VALUE:%.+]] = call [[ABI_TYPE:{ double, double }]] @returns_doublefloat()
 
     // aarch64:     store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // loongarch64: store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_VALUE_0:%.+]] = extractvalue { double, float } [[ABI_VALUE]], 0
+    // loongarch64: [[ABI_VALUE_1:%.+]] = extractvalue { double, float } [[ABI_VALUE]], 1
+    // loongarch64: store double [[ABI_VALUE_0]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // loongarch64: [[ABI_ALLOCA_1:%.+]] = getelementptr inbounds i8, ptr [[ABI_ALLOCA]], i64 8
+    // loongarch64: store float [[ABI_VALUE_1]], ptr [[ABI_ALLOCA_1]], align [[ABI_ALIGN]]
     // x86_64:      store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
     // aarch64:     call void @llvm.memcpy.{{.+}}(ptr align [[RUST_ALIGN]] [[RUST_ALLOCA]], ptr align [[ABI_ALIGN]] [[ABI_ALLOCA]], i64 16, i1 false)
@@ -559,7 +595,7 @@ pub fn call_three32s() {
     // aarch64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // loongarch64: [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // powerpc64:   [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
-    // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:\[2 x i64\]]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
+    // sparc64:     [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ i64, i64 }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
     // x86_64:      [[ABI_VALUE:%.+]] = load [[ABI_TYPE:{ i64, i32 }]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]
 
     // CHECK: call void @receives_three32s([[ABI_TYPE]] [[ABI_VALUE]])
@@ -583,7 +619,7 @@ pub fn return_three32s() -> Three32s {
 
     // aarch64:     [[ABI_VALUE:%.+]] = call [[ABI_TYPE:\[2 x i64\]]] @returns_three32s()
     // loongarch64: [[ABI_VALUE:%.+]] = call [[ABI_TYPE:\[2 x i64\]]] @returns_three32s()
-    // sparc64:     [[ABI_VALUE:%.+]] = call [[ABI_TYPE:\[2 x i64\]]] @returns_three32s()
+    // sparc64:     [[ABI_VALUE:%.+]] = call [[ABI_TYPE:{ i64, i64 }]] @returns_three32s()
     // x86_64:      [[ABI_VALUE:%.+]] = call [[ABI_TYPE:{ i64, i32 }]] @returns_three32s()
 
     // aarch64:     store [[ABI_TYPE]] [[ABI_VALUE]], ptr [[ABI_ALLOCA]], align [[ABI_ALIGN]]

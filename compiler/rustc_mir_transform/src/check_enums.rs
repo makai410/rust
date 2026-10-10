@@ -1,13 +1,14 @@
 use rustc_abi::{Scalar, Size, TagEncoding, Variants, WrappingRange};
-use rustc_hir::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_index::IndexVec;
-use rustc_middle::bug;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::PrimitiveExt;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypingEnv};
-use rustc_session::Session;
+use rustc_span::bug;
 use tracing::debug;
+
+use crate::PassPolicy;
 
 /// This pass inserts checks for a valid enum discriminant where they are most
 /// likely to find UB, because checking everywhere like Miri would generate too
@@ -15,8 +16,9 @@ use tracing::debug;
 pub(super) struct CheckEnums;
 
 impl<'tcx> crate::MirPass<'tcx> for CheckEnums {
-    fn is_enabled(&self, sess: &Session) -> bool {
-        sess.ub_checks()
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // When UB checks are enabled this is part of their semantics, not an optimization.
+        PassPolicy::optional(ctx.ub_checks())
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -48,6 +50,21 @@ impl<'tcx> crate::MirPass<'tcx> for CheckEnums {
                     let new_block = split_block(basic_blocks, location);
 
                     match check {
+                        EnumCheckType::Direct { op_size, .. }
+                        | EnumCheckType::WithNiche { op_size, .. }
+                            if op_size.bytes() == 0 =>
+                        {
+                            // It is never valid to use a ZST as a discriminant for an inhabited enum, but that will
+                            // have been caught by the type checker. Do nothing but ensure that a bug has been signaled.
+                            tcx.dcx().span_delayed_bug(
+                                source_info.span,
+                                "cannot build enum discriminant from zero-sized type",
+                            );
+                            basic_blocks[block].terminator = Some(Terminator {
+                                source_info,
+                                kind: TerminatorKind::goto(new_block),
+                            });
+                        }
                         EnumCheckType::Direct { source_op, discr, op_size, valid_discrs } => {
                             insert_direct_enum_check(
                                 tcx,
@@ -91,10 +108,6 @@ impl<'tcx> crate::MirPass<'tcx> for CheckEnums {
                 }
             }
         }
-    }
-
-    fn is_required(&self) -> bool {
-        true
     }
 }
 
@@ -415,11 +428,14 @@ fn insert_uninhabited_enum_check<'tcx>(
         source_info,
         StatementKind::Assign(Box::new((
             is_ok,
-            Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                span: source_info.span,
-                user_ty: None,
-                const_: Const::Val(ConstValue::from_bool(false), tcx.types.bool),
-            }))),
+            Rvalue::Use(
+                Operand::Constant(Box::new(ConstOperand {
+                    span: source_info.span,
+                    user_ty: None,
+                    const_: Const::Val(ConstValue::from_bool(false), tcx.types.bool),
+                })),
+                WithRetag::Yes, // it's a bool, retag doesn't matter
+            ),
         ))),
     ));
 

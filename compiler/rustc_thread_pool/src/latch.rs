@@ -117,7 +117,7 @@ impl CoreLatch {
     /// latch code.
     #[inline]
     unsafe fn set(this: *const Self) -> bool {
-        let old_state = unsafe { (*this).state.swap(SET, Ordering::AcqRel) };
+        let old_state = unsafe { (*this).state.swap(SET, Ordering::SeqCst) };
         old_state == SLEEPING
     }
 
@@ -220,7 +220,7 @@ pub(super) struct LockLatch {
 
 impl LockLatch {
     #[inline]
-    pub(super) fn new() -> LockLatch {
+    pub(super) const fn new() -> LockLatch {
         LockLatch { m: Mutex::new(false), v: Condvar::new() }
     }
 
@@ -388,13 +388,17 @@ impl Latch for CountLatch {
     #[inline]
     unsafe fn set(this: *const Self) {
         if unsafe { (*this).counter.fetch_sub(1, Ordering::SeqCst) == 1 } {
-            // NOTE: Once we call `set` on the internal `latch`,
+            // SAFETY: Once we call `set` on the internal `latch`,
             // the target may proceed and invalidate `this`!
             match unsafe { &(*this).kind } {
                 CountLatchKind::Stealing { latch, registry, worker_index } => {
                     let registry = Arc::clone(registry);
+                    let worker_index = *worker_index;
+                    // SAFETY: We don't use any references from `this` after this call.
                     if unsafe { CoreLatch::set(latch) } {
-                        registry.notify_worker_latch_is_set(*worker_index);
+                        // We **must not** access any part of `this` anymore, which
+                        // is why we read and shadowed these fields beforehand.
+                        registry.notify_worker_latch_is_set(worker_index);
                     }
                 }
                 CountLatchKind::Blocking { latch } => unsafe { LockLatch::set(latch) },

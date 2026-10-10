@@ -2,7 +2,7 @@
 // llvm. Also checks that the abi_x86_interrupt feature gate allows usage
 // of the x86-interrupt abi.
 
-//@ add-core-stubs
+//@ add-minicore
 //@ needs-llvm-components: x86
 //@ compile-flags: -C no-prepopulate-passes --target=x86_64-unknown-linux-gnu -Copt-level=0
 
@@ -15,4 +15,4 @@ use minicore::*;
 
 // CHECK: define x86_intrcc void @has_x86_interrupt_abi
 #[no_mangle]
-pub extern "x86-interrupt" fn has_x86_interrupt_abi() {}
+pub extern "x86-interrupt" fn has_x86_interrupt_abi(_p: *const u8) {}

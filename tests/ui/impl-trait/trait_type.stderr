@@ -9,7 +9,7 @@ LL |    fn fmt(&self, x: &str) -> () { }
 help: change the parameter type to match the trait
    |
 LL -    fn fmt(&self, x: &str) -> () { }
-LL +    fn fmt(&self, x: &mut Formatter<'_>) -> () { }
+LL +    fn fmt(&self, x: &mut std::fmt::Formatter<'_>) -> () { }
    |
 
 error[E0050]: method `fmt` has 1 parameter but the declaration in trait `std::fmt::Display::fmt` has 2
@@ -19,6 +19,10 @@ LL |    fn fmt(&self) -> () { }
    |           ^^^^^ expected 2 parameters, found 1
    |
    = note: `fmt` from trait: `fn(&Self, &mut Formatter<'_>) -> Result<(), std::fmt::Error>`
+help: add the missing parameter from the trait
+   |
+LL |    fn fmt(&self, f: &mut Formatter<'_>) -> () { }
+   |                +++++++++++++++++++++++
 
 error[E0186]: method `fmt` has a `&self` declaration in the trait, but not in the impl
   --> $DIR/trait_type.rs:17:4

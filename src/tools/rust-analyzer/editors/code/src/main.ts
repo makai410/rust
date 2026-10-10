@@ -13,6 +13,12 @@ const RUST_PROJECT_CONTEXT_NAME = "inRustProject";
 export interface RustAnalyzerExtensionApi {
     // FIXME: this should be non-optional
     readonly client?: lc.LanguageClient;
+
+    // Allows adding a configuration override from another extension.
+    // `extensionId` is used to only merge configuration override from present
+    // extensions. `configuration` is map of rust-analyzer-specific setting
+    // overrides, e.g., `{"cargo.cfgs": ["foo", "bar"]}`.
+    addConfiguration(extensionId: string, configuration: Record<string, unknown>): Promise<void>;
 }
 
 export async function deactivate() {
@@ -155,6 +161,12 @@ function createCommands(): Record<string, CommandFactory> {
         memoryUsage: { enabled: commands.memoryUsage },
         reloadWorkspace: { enabled: commands.reloadWorkspace },
         rebuildProcMacros: { enabled: commands.rebuildProcMacros },
+        newProject: {
+            // Project creation is a pure VS Code-side workflow and should stay available even in
+            // empty windows before rust-analyzer has started or a Rust workspace exists.
+            enabled: commands.newProject,
+            disabled: commands.newProject,
+        },
         matchingBrace: { enabled: commands.matchingBrace },
         joinLines: { enabled: commands.joinLines },
         parentModule: { enabled: commands.parentModule },
@@ -181,6 +193,7 @@ function createCommands(): Record<string, CommandFactory> {
         clearFlycheck: { enabled: commands.clearFlycheck },
         runFlycheck: { enabled: commands.runFlycheck },
         ssr: { enabled: commands.ssr },
+        evaluatePredicate: { enabled: commands.evaluatePredicate },
         serverVersion: { enabled: commands.serverVersion },
         viewMemoryLayout: { enabled: commands.viewMemoryLayout },
         toggleCheckOnSave: { enabled: commands.toggleCheckOnSave },
@@ -209,6 +222,7 @@ function createCommands(): Record<string, CommandFactory> {
         syntaxTreeShowWhitespace: {
             enabled: commands.syntaxTreeShowWhitespace,
         },
+        getFailedObligations: { enabled: commands.getFailedObligations },
     };
 }
 

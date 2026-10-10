@@ -1,5 +1,5 @@
 #![warn(clippy::while_let_loop)]
-#![allow(clippy::uninlined_format_args)]
+#![expect(clippy::uninlined_format_args)]
 //@no-rustfix
 fn main() {
     let y = Some(true);
@@ -20,6 +20,19 @@ fn main() {
             let _v = 1;
         }
         break;
+    }
+
+    loop {
+        //~^ while_let_loop
+        let Some(_x) = y else { break };
+    }
+
+    loop {
+        // no error, else branch does something other than break
+        let Some(_x) = y else {
+            let _z = 1;
+            break;
+        };
     }
 
     loop {
@@ -238,5 +251,73 @@ fn let_assign() {
         if x == 3 {
             break;
         }
+    }
+}
+
+fn issue16378() {
+    // This does not lint today because of the extra statement(s)
+    // before the `break`.
+    // TODO: When the `break` statement/expr in the `let`/`else` is the
+    // only way to leave the loop, the lint could trigger and move
+    // the statements preceeding the `break` after the loop, as in:
+    // ```rust
+    // while let Some(x) = std::hint::black_box(None::<i32>) {
+    //     println!("x = {x}");
+    // }
+    // println!("fail");
+    // ```
+    loop {
+        let Some(x) = std::hint::black_box(None::<i32>) else {
+            println!("fail");
+            break;
+        };
+        println!("x = {x}");
+    }
+}
+
+fn issue17590_labeled_loop() {
+    let mut it = [1, 2, 3].iter();
+    'cool: loop {
+        //~^ while_let_loop
+        match it.next() {
+            Some(_) => {},
+            None => break 'cool,
+        }
+    }
+}
+
+fn issue17590_labeled_if_let() {
+    let mut it = [1, 2, 3].iter();
+    'outer: loop {
+        //~^ while_let_loop
+        if let Some(x) = it.next() {
+            println!("{x}");
+        } else {
+            break 'outer;
+        }
+    }
+}
+
+fn issue17590_labeled_let_else() {
+    let mut it = [1, 2, 3].iter();
+    'outer: loop {
+        //~^ while_let_loop
+        let Some(x) = it.next() else { break 'outer };
+        println!("{x}");
+    }
+}
+
+fn issue17590_labeled_loop_false_positive() {
+    let mut it = [1, 2, 3].iter();
+    'cool: loop {
+        match it.next() {
+            Some(_) => {},
+            None => 'cool: {
+                break 'cool;
+            },
+        }
+        println!(
+            "this is an infinite loop, but clippy would rewrite this loop to terminate when it reaches the end of the list"
+        );
     }
 }

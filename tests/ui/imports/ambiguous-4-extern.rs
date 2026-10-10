@@ -1,7 +1,5 @@
-//@ check-pass
+//@ edition:2015
 // https://github.com/rust-lang/rust/pull/112743#issuecomment-1601986883
-
-#![warn(ambiguous_glob_imports)]
 
 macro_rules! m {
     () => {
@@ -23,6 +21,5 @@ mod handwritten {
 
 fn main() {
     id();
-    //~^ WARNING `id` is ambiguous
-    //~| WARNING this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    //~^ ERROR `id` is ambiguous
 }

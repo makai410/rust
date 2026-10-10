@@ -6,14 +6,12 @@ extern crate clippy_utils;
 extern crate rustc_ast;
 extern crate rustc_errors;
 extern crate rustc_lint;
-extern crate rustc_session;
 extern crate rustc_span;
 
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_note, span_lint_and_sugg, span_lint_and_then};
 use rustc_ast::ast::Expr;
 use rustc_errors::Applicability;
-use rustc_lint::{EarlyContext, EarlyLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_lint::{EarlyContext, EarlyLintPass, declare_lint_pass, declare_tool_lint};
 
 declare_tool_lint! {
     pub clippy::TEST_LINT,
@@ -64,6 +62,35 @@ impl EarlyLintPass for Pass {
         // Issue #8798
         span_lint_and_then(cx, TEST_LINT, expr.span, lint_msg, |db| {
             db.help(help_msg).help(help_msg);
+        });
+
+        // Issue #15880
+        #[expect(clippy::disallowed_names)]
+        let foo = "foo";
+        span_lint_and_then(cx, TEST_LINT, expr.span, lint_msg, |db| {
+            //~^ collapsible_span_lint_calls
+            db.span_suggestion(
+                expr.span,
+                format!("try using {foo}"),
+                format!("{foo}.use"),
+                Applicability::MachineApplicable,
+            );
+        });
+        span_lint_and_then(cx, TEST_LINT, expr.span, lint_msg, |db| {
+            //~^ collapsible_span_lint_calls
+            db.span_help(expr.span, format!("try using {foo}"));
+        });
+        span_lint_and_then(cx, TEST_LINT, expr.span, lint_msg, |db| {
+            //~^ collapsible_span_lint_calls
+            db.help(format!("try using {foo}"));
+        });
+        span_lint_and_then(cx, TEST_LINT, expr.span, lint_msg, |db| {
+            //~^ collapsible_span_lint_calls
+            db.span_note(expr.span, format!("required because of {foo}"));
+        });
+        span_lint_and_then(cx, TEST_LINT, expr.span, lint_msg, |db| {
+            //~^ collapsible_span_lint_calls
+            db.note(format!("required because of {foo}"));
         });
     }
 }

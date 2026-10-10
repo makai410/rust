@@ -3,8 +3,7 @@ use std::fmt;
 use clippy_utils::diagnostics::span_lint_and_then;
 use rustc_ast::ast::{Expr, ExprKind, InlineAsmOptions};
 use rustc_ast::{InlineAsm, Item, ItemKind};
-use rustc_lint::{EarlyContext, EarlyLintPass, Lint, LintContext};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, Lint, LintContext as _, declare_lint_pass};
 use rustc_span::Span;
 use rustc_target::asm::InlineAsmArch;
 
@@ -59,54 +58,6 @@ fn check_asm_syntax(
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usage of Intel x86 assembly syntax.
-    ///
-    /// ### Why restrict this?
-    /// To enforce consistent use of AT&T x86 assembly syntax.
-    ///
-    /// ### Example
-    ///
-    /// ```rust,no_run
-    /// # #![feature(asm)]
-    /// # #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    /// # unsafe { let ptr = "".as_ptr();
-    /// # use std::arch::asm;
-    /// asm!("lea {}, [{}]", lateout(reg) _, in(reg) ptr);
-    /// # }
-    /// ```
-    /// Use instead:
-    /// ```rust,no_run
-    /// # #![feature(asm)]
-    /// # #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    /// # unsafe { let ptr = "".as_ptr();
-    /// # use std::arch::asm;
-    /// asm!("lea ({}), {}", in(reg) ptr, lateout(reg) _, options(att_syntax));
-    /// # }
-    /// ```
-    #[clippy::version = "1.49.0"]
-    pub INLINE_ASM_X86_INTEL_SYNTAX,
-    restriction,
-    "prefer AT&T x86 assembly syntax"
-}
-
-declare_lint_pass!(InlineAsmX86IntelSyntax => [INLINE_ASM_X86_INTEL_SYNTAX]);
-
-impl EarlyLintPass for InlineAsmX86IntelSyntax {
-    fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {
-        if let ExprKind::InlineAsm(inline_asm) = &expr.kind {
-            check_asm_syntax(INLINE_ASM_X86_INTEL_SYNTAX, cx, inline_asm, expr.span, AsmStyle::Intel);
-        }
-    }
-
-    fn check_item(&mut self, cx: &EarlyContext<'_>, item: &Item) {
-        if let ItemKind::GlobalAsm(inline_asm) = &item.kind {
-            check_asm_syntax(INLINE_ASM_X86_INTEL_SYNTAX, cx, inline_asm, item.span, AsmStyle::Intel);
-        }
-    }
-}
-
-declare_clippy_lint! {
-    /// ### What it does
     /// Checks for usage of AT&T x86 assembly syntax.
     ///
     /// ### Why restrict this?
@@ -137,7 +88,55 @@ declare_clippy_lint! {
     "prefer Intel x86 assembly syntax"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for usage of Intel x86 assembly syntax.
+    ///
+    /// ### Why restrict this?
+    /// To enforce consistent use of AT&T x86 assembly syntax.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,no_run
+    /// # #![feature(asm)]
+    /// # #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    /// # unsafe { let ptr = "".as_ptr();
+    /// # use std::arch::asm;
+    /// asm!("lea {}, [{}]", lateout(reg) _, in(reg) ptr);
+    /// # }
+    /// ```
+    /// Use instead:
+    /// ```rust,no_run
+    /// # #![feature(asm)]
+    /// # #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    /// # unsafe { let ptr = "".as_ptr();
+    /// # use std::arch::asm;
+    /// asm!("lea ({}), {}", in(reg) ptr, lateout(reg) _, options(att_syntax));
+    /// # }
+    /// ```
+    #[clippy::version = "1.49.0"]
+    pub INLINE_ASM_X86_INTEL_SYNTAX,
+    restriction,
+    "prefer AT&T x86 assembly syntax"
+}
+
 declare_lint_pass!(InlineAsmX86AttSyntax => [INLINE_ASM_X86_ATT_SYNTAX]);
+
+declare_lint_pass!(InlineAsmX86IntelSyntax => [INLINE_ASM_X86_INTEL_SYNTAX]);
+
+impl EarlyLintPass for InlineAsmX86IntelSyntax {
+    fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {
+        if let ExprKind::InlineAsm(inline_asm) = &expr.kind {
+            check_asm_syntax(INLINE_ASM_X86_INTEL_SYNTAX, cx, inline_asm, expr.span, AsmStyle::Intel);
+        }
+    }
+
+    fn check_item(&mut self, cx: &EarlyContext<'_>, item: &Item) {
+        if let ItemKind::GlobalAsm(inline_asm) = &item.kind {
+            check_asm_syntax(INLINE_ASM_X86_INTEL_SYNTAX, cx, inline_asm, item.span, AsmStyle::Intel);
+        }
+    }
+}
 
 impl EarlyLintPass for InlineAsmX86AttSyntax {
     fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {

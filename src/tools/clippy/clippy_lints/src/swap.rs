@@ -1,53 +1,22 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::source::{snippet_indent, snippet_with_context};
 use clippy_utils::sugg::Sugg;
-use clippy_utils::ty::is_type_diagnostic_item;
 
-use clippy_utils::{can_mut_borrow_both, eq_expr_value, is_in_const_context, path_to_local, std_or_core};
-use itertools::Itertools;
+use clippy_utils::msrvs::{self, Msrv};
+use clippy_utils::{can_mut_borrow_both, eq_expr_value, is_in_const_context, std_or_core, sym};
+use itertools::Itertools as _;
 
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_hir::intravisit::{Visitor, walk_expr};
 
 use rustc_errors::Applicability;
 use rustc_hir::{AssignOpKind, Block, Expr, ExprKind, LetStmt, PatKind, QPath, Stmt, StmtKind};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
 use rustc_middle::ty;
-use rustc_session::declare_lint_pass;
-use rustc_span::source_map::Spanned;
 use rustc_span::symbol::Ident;
-use rustc_span::{Span, SyntaxContext, sym};
-
-declare_clippy_lint! {
-    /// ### What it does
-    /// Checks for manual swapping.
-    ///
-    /// Note that the lint will not be emitted in const blocks, as the suggestion would not be applicable.
-    ///
-    /// ### Why is this bad?
-    /// The `std::mem::swap` function exposes the intent better
-    /// without deinitializing or copying either variable.
-    ///
-    /// ### Example
-    /// ```no_run
-    /// let mut a = 42;
-    /// let mut b = 1337;
-    ///
-    /// let t = b;
-    /// b = a;
-    /// a = t;
-    /// ```
-    /// Use std::mem::swap():
-    /// ```no_run
-    /// let mut a = 1;
-    /// let mut b = 2;
-    /// std::mem::swap(&mut a, &mut b);
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub MANUAL_SWAP,
-    complexity,
-    "manual swap of two variables"
-}
+use rustc_span::{Span, Spanned, SyntaxContext};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -75,17 +44,58 @@ declare_clippy_lint! {
     "`foo = bar; bar = foo` sequence"
 }
 
-declare_lint_pass!(Swap => [MANUAL_SWAP, ALMOST_SWAPPED]);
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for manual swapping.
+    ///
+    /// Note that the lint will not be emitted in const blocks, as the suggestion would not be applicable.
+    ///
+    /// ### Why is this bad?
+    /// The `std::mem::swap` function exposes the intent better
+    /// without deinitializing or copying either variable.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let mut a = 42;
+    /// let mut b = 1337;
+    ///
+    /// let t = b;
+    /// b = a;
+    /// a = t;
+    /// ```
+    /// Use `std::mem::swap()`:
+    /// ```no_run
+    /// let mut a = 1;
+    /// let mut b = 2;
+    /// std::mem::swap(&mut a, &mut b);
+    /// ```
+    #[clippy::version = "pre 1.29.0"]
+    pub MANUAL_SWAP,
+    complexity,
+    "manual swap of two variables"
+}
+
+impl_lint_pass!(Swap => [ALMOST_SWAPPED, MANUAL_SWAP]);
+
+pub struct Swap {
+    msrv: Msrv,
+}
+
+impl Swap {
+    pub fn new(conf: &'static Conf) -> Self {
+        Self { msrv: conf.msrv.into() }
+    }
+}
 
 impl<'tcx> LateLintPass<'tcx> for Swap {
     fn check_block(&mut self, cx: &LateContext<'tcx>, block: &'tcx Block<'_>) {
-        check_manual_swap(cx, block);
+        check_manual_swap(cx, block, self.msrv);
         check_suspicious_swap(cx, block);
         check_xor_swap(cx, block);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn generate_swap_warning<'tcx>(
     block: &'tcx Block<'tcx>,
     cx: &LateContext<'tcx>,
@@ -99,21 +109,21 @@ fn generate_swap_warning<'tcx>(
     let ctxt = span.ctxt();
     let mut applicability = Applicability::MachineApplicable;
 
-    if !can_mut_borrow_both(cx, e1, e2) {
+    if !can_mut_borrow_both(cx, ctxt, e1, e2) {
         if let ExprKind::Index(lhs1, idx1, _) = e1.kind
             && let ExprKind::Index(lhs2, idx2, _) = e2.kind
-            && eq_expr_value(cx, lhs1, lhs2)
             && e1.span.ctxt() == ctxt
             && e2.span.ctxt() == ctxt
+            && eq_expr_value(cx, ctxt, lhs1, lhs2)
         {
             let ty = cx.typeck_results().expr_ty(lhs1).peel_refs();
 
             if matches!(ty.kind(), ty::Slice(_))
                 || matches!(ty.kind(), ty::Array(_, _))
-                || is_type_diagnostic_item(cx, ty, sym::Vec)
-                || is_type_diagnostic_item(cx, ty, sym::VecDeque)
+                || ty.is_diag_item(cx, sym::Vec)
+                || ty.is_diag_item(cx, sym::VecDeque)
             {
-                let slice = Sugg::hir_with_applicability(cx, lhs1, "<slice>", &mut applicability);
+                let slice = Sugg::hir_with_context(cx, lhs1, ctxt, "<slice>", &mut applicability);
 
                 span_lint_and_sugg(
                     cx,
@@ -168,8 +178,8 @@ fn generate_swap_warning<'tcx>(
 }
 
 /// Implementation of the `MANUAL_SWAP` lint.
-fn check_manual_swap<'tcx>(cx: &LateContext<'tcx>, block: &'tcx Block<'tcx>) {
-    if is_in_const_context(cx) {
+fn check_manual_swap<'tcx>(cx: &LateContext<'tcx>, block: &'tcx Block<'tcx>, msrv: Msrv) {
+    if is_in_const_context(cx) && !msrv.meets(cx, msrvs::CONST_MEM_SWAP) {
         return;
     }
 
@@ -190,14 +200,15 @@ fn check_manual_swap<'tcx>(cx: &LateContext<'tcx>, block: &'tcx Block<'tcx>) {
             && rhs2_path.segments.len() == 1
 
             && ident.name == rhs2_path.segments[0].ident.name
-            && eq_expr_value(cx, tmp_init, lhs1)
-            && eq_expr_value(cx, rhs1, lhs2)
 
             && let ctxt = s1.span.ctxt()
             && s2.span.ctxt() == ctxt
             && s3.span.ctxt() == ctxt
             && first.span.ctxt() == ctxt
             && second.span.ctxt() == ctxt
+
+            && eq_expr_value(cx, ctxt, tmp_init, lhs1)
+            && eq_expr_value(cx, ctxt, rhs1, lhs2)
         {
             let span = s1.span.to(s3.span);
             generate_swap_warning(block, cx, lhs1, lhs2, rhs1, rhs2, span, false);
@@ -210,11 +221,12 @@ fn check_suspicious_swap(cx: &LateContext<'_>, block: &Block<'_>) {
     for [first, second] in block.stmts.array_windows() {
         if let Some((lhs0, rhs0)) = parse(first)
             && let Some((lhs1, rhs1)) = parse(second)
-            && first.span.eq_ctxt(second.span)
-			&& !first.span.in_external_macro(cx.sess().source_map())
-            && is_same(cx, lhs0, rhs1)
-            && is_same(cx, lhs1, rhs0)
-			&& !is_same(cx, lhs1, rhs1) // Ignore a = b; a = a (#10421)
+            && let ctxt = first.span.ctxt()
+            && ctxt == second.span.ctxt()
+			&& !ctxt.in_external_macro(cx.sess().source_map())
+            && is_same(cx, ctxt, lhs0, rhs1)
+            && is_same(cx, ctxt, lhs1, rhs0)
+			&& !is_same(cx, ctxt, lhs1, rhs1) // Ignore a = b; a = a (#10421)
             && let Some(lhs_sugg) = match &lhs0 {
                 ExprOrIdent::Expr(expr) => Sugg::hir_opt(cx, expr),
                 ExprOrIdent::Ident(ident) => Some(Sugg::NonParen(ident.as_str().into())),
@@ -242,9 +254,9 @@ fn check_suspicious_swap(cx: &LateContext<'_>, block: &Block<'_>) {
     }
 }
 
-fn is_same(cx: &LateContext<'_>, lhs: ExprOrIdent<'_>, rhs: &Expr<'_>) -> bool {
+fn is_same(cx: &LateContext<'_>, ctxt: SyntaxContext, lhs: ExprOrIdent<'_>, rhs: &Expr<'_>) -> bool {
     match lhs {
-        ExprOrIdent::Expr(expr) => eq_expr_value(cx, expr, rhs),
+        ExprOrIdent::Expr(expr) => eq_expr_value(cx, ctxt, expr, rhs),
         ExprOrIdent::Ident(ident) => {
             if let ExprKind::Path(QPath::Resolved(None, path)) = rhs.kind
                 && let [segment] = &path.segments
@@ -285,10 +297,10 @@ fn check_xor_swap<'tcx>(cx: &LateContext<'tcx>, block: &'tcx Block<'tcx>) {
         if let Some((lhs0, rhs0)) = extract_sides_of_xor_assign(s1, ctxt)
             && let Some((lhs1, rhs1)) = extract_sides_of_xor_assign(s2, ctxt)
             && let Some((lhs2, rhs2)) = extract_sides_of_xor_assign(s3, ctxt)
-            && eq_expr_value(cx, lhs0, rhs1)
-            && eq_expr_value(cx, lhs2, rhs1)
-            && eq_expr_value(cx, lhs1, rhs0)
-            && eq_expr_value(cx, lhs1, rhs2)
+            && eq_expr_value(cx, ctxt, lhs0, rhs1)
+            && eq_expr_value(cx, ctxt, lhs2, rhs1)
+            && eq_expr_value(cx, ctxt, lhs1, rhs0)
+            && eq_expr_value(cx, ctxt, lhs1, rhs2)
             && s2.span.ctxt() == ctxt
             && s3.span.ctxt() == ctxt
         {
@@ -361,7 +373,8 @@ impl<'tcx> IndexBinding<'_, 'tcx> {
                 // - Variable declaration is outside the suggestion span
                 // - Variable is not used as an index or elsewhere later
                 if !self.suggest_span.contains(init.span)
-                    || path_to_local(expr)
+                    || expr
+                        .res_local_id()
                         .is_some_and(|hir_id| !self.suggest_span.contains(self.cx.tcx.hir_span(hir_id)))
                     || !self.is_used_other_than_swapping(first_segment.ident)
                 {
@@ -380,7 +393,7 @@ impl<'tcx> IndexBinding<'_, 'tcx> {
         }
     }
 
-    fn is_used_other_than_swapping(&mut self, idx_ident: Ident) -> bool {
+    fn is_used_other_than_swapping(&self, idx_ident: Ident) -> bool {
         if Self::is_used_slice_indexed(self.swap1_idx, idx_ident)
             || Self::is_used_slice_indexed(self.swap2_idx, idx_ident)
         {
@@ -389,7 +402,7 @@ impl<'tcx> IndexBinding<'_, 'tcx> {
         self.is_used_after_swap(idx_ident)
     }
 
-    fn is_used_after_swap(&mut self, idx_ident: Ident) -> bool {
+    fn is_used_after_swap(&self, idx_ident: Ident) -> bool {
         let mut v = IndexBindingVisitor {
             idx: idx_ident,
             suggest_span: self.suggest_span,

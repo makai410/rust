@@ -13,10 +13,10 @@ extern "C" {
 
 struct Check<T: PointeeSized>(T);
 
-#[rustc_symbol_name]
+#[rustc_dump_symbol_name]
 //~^ ERROR symbol-name(_RMCs
-//~| ERROR demangling(<foreign_types[
-//~| ERROR demangling-alt(<foreign_types::Check<foreign_types::ForeignType>>)
+//~| NOTE demangling(<foreign_types[
+//~| NOTE demangling-alt(<foreign_types::Check<foreign_types::ForeignType>>)
 impl Check<ForeignType> {}
 
 fn main() {}

@@ -1,5 +1,5 @@
 #![warn(clippy::ref_as_ptr)]
-#![allow(clippy::unnecessary_mut_passed, clippy::needless_lifetimes)]
+#![allow(clippy::unnecessary_mut_passed)]
 
 fn f<T>(_: T) {}
 
@@ -86,9 +86,24 @@ fn main() {
     f(&mut std::array::from_fn(|i| i * i) as *mut [usize; 9]);
     //~^ ref_as_ptr
 
+    let x = (10, 20);
+    let _ = &x as *const _;
+    //~^ ref_as_ptr
+    let _ = &x.0 as *const _;
+    //~^ ref_as_ptr
+
+    let x = Box::new(10);
+    let _ = &*x as *const _;
+    //~^ ref_as_ptr
+
     let _ = &String::new() as *const _;
     let _ = &mut String::new() as *mut _;
     const FOO: *const String = &String::new() as *const _;
+
+    // Regression test for #13910.
+    // This should not lint because the suggested replacement fails during
+    // const evaluation.
+    static mut REGRESSION: *mut i32 = &mut [42] as *mut [i32] as *mut i32;
 }
 
 #[clippy::msrv = "1.75"]

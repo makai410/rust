@@ -1,12 +1,8 @@
 [
     (
         Module {
-            id: ModuleId {
-                krate: Crate(
-                    Id(3000),
-                ),
-                block: None,
-                local_id: Idx::<ModuleData>(0),
+            id: ModuleIdLt {
+                [salsa id]: Id(500),
             },
         },
         [
@@ -16,7 +12,7 @@
                     Struct(
                         Struct {
                             id: StructId(
-                                3401,
+                                0601,
                             ),
                         },
                     ),
@@ -24,18 +20,20 @@
                 loc: DeclarationLocation {
                     hir_file_id: FileId(
                         EditionedFileId(
-                            Id(2000),
+                            Id(480),
                         ),
                     ),
                     ptr: SyntaxNodePtr {
                         kind: STRUCT,
                         range: 83..119,
                     },
-                    name_ptr: AstPtr(
-                        SyntaxNodePtr {
-                            kind: NAME,
-                            range: 109..118,
-                        },
+                    name_ptr: Some(
+                        AstPtr(
+                            SyntaxNodePtr {
+                                kind: NAME,
+                                range: 109..118,
+                            },
+                        ),
                     ),
                 },
                 container_name: None,
@@ -50,7 +48,7 @@
                     Struct(
                         Struct {
                             id: StructId(
-                                3400,
+                                0600,
                             ),
                         },
                     ),
@@ -58,18 +56,20 @@
                 loc: DeclarationLocation {
                     hir_file_id: FileId(
                         EditionedFileId(
-                            Id(2000),
+                            Id(480),
                         ),
                     ),
                     ptr: SyntaxNodePtr {
                         kind: STRUCT,
                         range: 0..81,
                     },
-                    name_ptr: AstPtr(
-                        SyntaxNodePtr {
-                            kind: NAME,
-                            range: 74..80,
-                        },
+                    name_ptr: Some(
+                        AstPtr(
+                            SyntaxNodePtr {
+                                kind: NAME,
+                                range: 74..80,
+                            },
+                        ),
                     ),
                 },
                 container_name: None,
@@ -84,7 +84,7 @@
                     Struct(
                         Struct {
                             id: StructId(
-                                3400,
+                                0600,
                             ),
                         },
                     ),
@@ -92,18 +92,20 @@
                 loc: DeclarationLocation {
                     hir_file_id: FileId(
                         EditionedFileId(
-                            Id(2000),
+                            Id(480),
                         ),
                     ),
                     ptr: SyntaxNodePtr {
                         kind: STRUCT,
                         range: 0..81,
                     },
-                    name_ptr: AstPtr(
-                        SyntaxNodePtr {
-                            kind: NAME,
-                            range: 74..80,
-                        },
+                    name_ptr: Some(
+                        AstPtr(
+                            SyntaxNodePtr {
+                                kind: NAME,
+                                range: 74..80,
+                            },
+                        ),
                     ),
                 },
                 container_name: None,
@@ -118,7 +120,7 @@
                     Struct(
                         Struct {
                             id: StructId(
-                                3400,
+                                0600,
                             ),
                         },
                     ),
@@ -126,18 +128,20 @@
                 loc: DeclarationLocation {
                     hir_file_id: FileId(
                         EditionedFileId(
-                            Id(2000),
+                            Id(480),
                         ),
                     ),
                     ptr: SyntaxNodePtr {
                         kind: STRUCT,
                         range: 0..81,
                     },
-                    name_ptr: AstPtr(
-                        SyntaxNodePtr {
-                            kind: NAME,
-                            range: 74..80,
-                        },
+                    name_ptr: Some(
+                        AstPtr(
+                            SyntaxNodePtr {
+                                kind: NAME,
+                                range: 74..80,
+                            },
+                        ),
                     ),
                 },
                 container_name: None,
@@ -152,7 +156,7 @@
                     Struct(
                         Struct {
                             id: StructId(
-                                3400,
+                                0600,
                             ),
                         },
                     ),
@@ -160,18 +164,20 @@
                 loc: DeclarationLocation {
                     hir_file_id: FileId(
                         EditionedFileId(
-                            Id(2000),
+                            Id(480),
                         ),
                     ),
                     ptr: SyntaxNodePtr {
                         kind: STRUCT,
                         range: 0..81,
                     },
-                    name_ptr: AstPtr(
-                        SyntaxNodePtr {
-                            kind: NAME,
-                            range: 74..80,
-                        },
+                    name_ptr: Some(
+                        AstPtr(
+                            SyntaxNodePtr {
+                                kind: NAME,
+                                range: 74..80,
+                            },
+                        ),
                     ),
                 },
                 container_name: None,
@@ -186,7 +192,7 @@
                     Struct(
                         Struct {
                             id: StructId(
-                                3401,
+                                0601,
                             ),
                         },
                     ),
@@ -194,18 +200,20 @@
                 loc: DeclarationLocation {
                     hir_file_id: FileId(
                         EditionedFileId(
-                            Id(2000),
+                            Id(480),
                         ),
                     ),
                     ptr: SyntaxNodePtr {
                         kind: STRUCT,
                         range: 83..119,
                     },
-                    name_ptr: AstPtr(
-                        SyntaxNodePtr {
-                            kind: NAME,
-                            range: 109..118,
-                        },
+                    name_ptr: Some(
+                        AstPtr(
+                            SyntaxNodePtr {
+                                kind: NAME,
+                                range: 109..118,
+                            },
+                        ),
                     ),
                 },
                 container_name: None,
@@ -220,7 +228,7 @@
                     Struct(
                         Struct {
                             id: StructId(
-                                3400,
+                                0600,
                             ),
                         },
                     ),
@@ -228,18 +236,20 @@
                 loc: DeclarationLocation {
                     hir_file_id: FileId(
                         EditionedFileId(
-                            Id(2000),
+                            Id(480),
                         ),
                     ),
                     ptr: SyntaxNodePtr {
                         kind: STRUCT,
                         range: 0..81,
                     },
-                    name_ptr: AstPtr(
-                        SyntaxNodePtr {
-                            kind: NAME,
-                            range: 74..80,
-                        },
+                    name_ptr: Some(
+                        AstPtr(
+                            SyntaxNodePtr {
+                                kind: NAME,
+                                range: 74..80,
+                            },
+                        ),
                     ),
                 },
                 container_name: None,

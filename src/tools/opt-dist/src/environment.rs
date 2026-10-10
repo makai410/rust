@@ -61,6 +61,12 @@ impl Environment {
         self.stage0().join("bin").join(format!("cargo{}", executable_extension()))
     }
 
+    pub fn cargo_stage_2(&self) -> Utf8PathBuf {
+        self.build_artifacts()
+            .join("stage2-tools-bin")
+            .join(format!("cargo{}", executable_extension()))
+    }
+
     pub fn rustc_stage_0(&self) -> Utf8PathBuf {
         self.stage0().join("bin").join(format!("rustc{}", executable_extension()))
     }
@@ -115,6 +121,14 @@ impl Environment {
 
     pub fn stage0(&self) -> Utf8PathBuf {
         self.stage0_root.clone().unwrap_or_else(|| self.build_artifacts().join("stage0"))
+    }
+
+    pub fn llvm_bolt(&self) -> Utf8PathBuf {
+        self.host_llvm_dir().join(format!("bin/llvm-bolt{}", executable_extension()))
+    }
+
+    pub fn merge_fdata(&self) -> Utf8PathBuf {
+        self.host_llvm_dir().join(format!("bin/merge-fdata{}", executable_extension()))
     }
 }
 

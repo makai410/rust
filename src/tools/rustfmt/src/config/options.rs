@@ -95,12 +95,43 @@ pub enum Heuristics {
     Default,
 }
 
+#[config_type]
+/// Heuristic settings for doc comments. Same as `Heuristics`, but `Inherit` will inherit the value
+/// from the top-level configuration.
+pub enum DocCodeHeuristics {
+    /// Inherit from the top-level configuration
+    Inherit,
+    /// Turn off any heuristics
+    Off,
+    /// Turn on max heuristics
+    Max,
+    /// Use scaled values based on the value of `max_width`
+    Default,
+}
+
+impl DocCodeHeuristics {
+    pub fn to_heuristics(self) -> Option<Heuristics> {
+        match self {
+            DocCodeHeuristics::Inherit => None,
+            DocCodeHeuristics::Off => Some(Heuristics::Off),
+            DocCodeHeuristics::Max => Some(Heuristics::Max),
+            DocCodeHeuristics::Default => Some(Heuristics::Default),
+        }
+    }
+}
+
 impl Density {
-    pub fn to_list_tactic(self, len: usize) -> ListTactic {
+    pub fn to_list_tactic(self, style_edition: StyleEdition, len: usize) -> ListTactic {
         match self {
             Density::Compressed => ListTactic::Mixed,
             Density::Tall => ListTactic::HorizontalVertical,
-            Density::Vertical if len == 1 => ListTactic::Horizontal,
+            Density::Vertical if len == 1 => {
+                if style_edition <= StyleEdition::Edition2024 {
+                    ListTactic::Horizontal
+                } else {
+                    ListTactic::HorizontalVertical
+                }
+            }
             Density::Vertical => ListTactic::Vertical,
         }
     }
@@ -144,6 +175,21 @@ pub enum HexLiteralCase {
     Upper,
     /// Ensure all literals use lowercase lettering
     Lower,
+}
+
+/// How to treat trailing zeros in floating-point literals.
+#[config_type]
+pub enum FloatLiteralTrailingZero {
+    /// Leave the literal as-is.
+    Preserve,
+    /// Add a trailing zero to the literal.
+    Always,
+    /// Add a trailing zero by default. If the literal contains an exponent or a suffix, the zero
+    /// and the preceding period are removed.
+    IfNoPostfix,
+    /// Remove the trailing zero. If the literal contains an exponent or a suffix, the preceding
+    /// period is also removed.
+    Never,
 }
 
 #[config_type]
@@ -513,6 +559,11 @@ pub enum StyleEdition {
     #[doc_hint = "2024"]
     /// [Edition 2024]().
     Edition2024,
+    #[value = "2027"]
+    #[doc_hint = "2027"]
+    #[unstable_variant]
+    /// [Edition 2027]().
+    Edition2027,
 }
 
 impl From<StyleEdition> for rustc_span::edition::Edition {
@@ -522,13 +573,24 @@ impl From<StyleEdition> for rustc_span::edition::Edition {
             StyleEdition::Edition2018 => Self::Edition2018,
             StyleEdition::Edition2021 => Self::Edition2021,
             StyleEdition::Edition2024 => Self::Edition2024,
+            // TODO: should update to Edition2027 when it becomes available
+            StyleEdition::Edition2027 => Self::Edition2024,
         }
     }
 }
 
 impl PartialOrd for StyleEdition {
     fn partial_cmp(&self, other: &StyleEdition) -> Option<std::cmp::Ordering> {
-        rustc_span::edition::Edition::partial_cmp(&(*self).into(), &(*other).into())
+        // FIXME(ytmimi): Update `StyleEdition::Edition2027` logic when
+        // `rustc_span::edition::Edition::Edition2027` becomes available in the compiler
+        match (self, other) {
+            (Self::Edition2027, Self::Edition2027) => Some(std::cmp::Ordering::Equal),
+            (_, Self::Edition2027) => Some(std::cmp::Ordering::Less),
+            (Self::Edition2027, _) => Some(std::cmp::Ordering::Greater),
+            (Self::Edition2015 | Self::Edition2018 | Self::Edition2021 | Self::Edition2024, _) => {
+                rustc_span::edition::Edition::partial_cmp(&(*self).into(), &(*other).into())
+            }
+        }
     }
 }
 
@@ -589,6 +651,7 @@ config_option_with_style_edition_default!(
     WrapComments, bool, _ => false;
     FormatCodeInDocComments, bool, _ => false;
     DocCommentCodeBlockWidth, usize, _ => 100;
+    DocUseSmallHeuristics, DocCodeHeuristics, _ => DocCodeHeuristics::Inherit;
     CommentWidth, usize, _ => 80;
     NormalizeComments, bool, _ => false;
     NormalizeDocAttributes, bool, _ => false;
@@ -597,6 +660,8 @@ config_option_with_style_edition_default!(
     FormatMacroBodies, bool, _ => true;
     SkipMacroInvocations, MacroSelectors, _ => MacroSelectors::default();
     HexLiteralCaseConfig, HexLiteralCase, _ => HexLiteralCase::Preserve;
+    FloatLiteralTrailingZeroConfig, FloatLiteralTrailingZero, _ =>
+        FloatLiteralTrailingZero::Preserve;
 
     // Single line expressions and items
     EmptyItemSingleLine, bool, _ => true;
@@ -632,6 +697,7 @@ config_option_with_style_edition_default!(
     EnumDiscrimAlignThreshold, usize, _ => 0;
     MatchArmBlocks, bool, _ => true;
     MatchArmLeadingPipeConfig, MatchArmLeadingPipe, _ => MatchArmLeadingPipe::Never;
+    MatchArmIndent, bool, _ => true;
     ForceMultilineBlocks, bool, _ => false;
     FnArgsLayout, Density, _ => Density::Tall;
     FnParamsLayout, Density, _ => Density::Tall;
@@ -676,3 +742,41 @@ config_option_with_style_edition_default!(
     MakeBackup, bool, _ => false;
     PrintMisformattedFileNames, bool, _ => false;
 );
+
+#[test]
+fn style_edition_comparisons() {
+    // Style Edition 2015
+    assert!(StyleEdition::Edition2015 == StyleEdition::Edition2015);
+    assert!(StyleEdition::Edition2015 < StyleEdition::Edition2018);
+    assert!(StyleEdition::Edition2015 < StyleEdition::Edition2021);
+    assert!(StyleEdition::Edition2015 < StyleEdition::Edition2024);
+    assert!(StyleEdition::Edition2015 < StyleEdition::Edition2027);
+
+    // Style Edition 2018
+    assert!(StyleEdition::Edition2018 > StyleEdition::Edition2015);
+    assert!(StyleEdition::Edition2018 == StyleEdition::Edition2018);
+    assert!(StyleEdition::Edition2018 < StyleEdition::Edition2021);
+    assert!(StyleEdition::Edition2018 < StyleEdition::Edition2024);
+    assert!(StyleEdition::Edition2018 < StyleEdition::Edition2027);
+
+    // Style Edition 2021
+    assert!(StyleEdition::Edition2021 > StyleEdition::Edition2015);
+    assert!(StyleEdition::Edition2021 > StyleEdition::Edition2018);
+    assert!(StyleEdition::Edition2021 == StyleEdition::Edition2021);
+    assert!(StyleEdition::Edition2021 < StyleEdition::Edition2024);
+    assert!(StyleEdition::Edition2021 < StyleEdition::Edition2027);
+
+    // Style Edition 2024
+    assert!(StyleEdition::Edition2024 > StyleEdition::Edition2015);
+    assert!(StyleEdition::Edition2024 > StyleEdition::Edition2018);
+    assert!(StyleEdition::Edition2024 > StyleEdition::Edition2021);
+    assert!(StyleEdition::Edition2024 == StyleEdition::Edition2024);
+    assert!(StyleEdition::Edition2024 < StyleEdition::Edition2027);
+
+    // Style Edition 2024
+    assert!(StyleEdition::Edition2027 > StyleEdition::Edition2015);
+    assert!(StyleEdition::Edition2027 > StyleEdition::Edition2018);
+    assert!(StyleEdition::Edition2027 > StyleEdition::Edition2021);
+    assert!(StyleEdition::Edition2027 > StyleEdition::Edition2024);
+    assert!(StyleEdition::Edition2027 == StyleEdition::Edition2027);
+}

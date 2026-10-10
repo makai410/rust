@@ -1,6 +1,6 @@
 //@ run-rustfix
 
-#![allow(dead_code, path_statements)]
+#![allow(dead_code, path_statements, unused_features)]
 #![deny(unused_attributes, unused_must_use)]
 #![feature(asm_experimental_arch, stmt_expr_attributes, trait_alias)]
 
@@ -65,7 +65,9 @@ extern "Rust" {
     fn foreign_foo() -> i64;
 }
 
-#[must_use] //~ ERROR unused attribute
+#[must_use]
+//~^ ERROR the `must_use` attribute cannot be used on macro calls
+//~| WARN this was previously accepted by the compiler but is being phased out
 global_asm!("");
 
 #[must_use] //~ ERROR attribute cannot be used on

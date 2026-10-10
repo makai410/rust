@@ -12,7 +12,7 @@ struct EvilSend<T>(pub T);
 unsafe impl<T> Send for EvilSend<T> {}
 unsafe impl<T> Sync for EvilSend<T> {}
 
-pub fn main() {
+fn main() {
     // Shared atomic pointer
     let pointer = AtomicPtr::new(null_mut::<usize>());
     let ptr = EvilSend(&pointer as *const AtomicPtr<usize>);
@@ -39,7 +39,7 @@ pub fn main() {
 
             pointer.store(&mut stack_var as *mut _, Ordering::Release);
 
-            sleep(Duration::from_millis(200));
+            sleep(Duration::from_millis(100));
 
             stack_var //~ ERROR: Data race detected between (1) non-atomic write on thread `unnamed-2` and (2) non-atomic read on thread `unnamed-1`
         });
