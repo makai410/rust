@@ -3,17 +3,11 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(assert_matches)]
-#![feature(box_patterns)]
 #![feature(decl_macro)]
-#![feature(if_let_guard)]
+#![feature(deref_patterns)]
+#![feature(iter_order_by)]
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_quote)]
-#![feature(rustdoc_internals)]
 #![feature(try_blocks)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
@@ -39,18 +33,23 @@ mod concat_bytes;
 mod define_opaque;
 mod derive;
 mod deriving;
+mod diagnostics;
 mod edition_panic;
+mod eii;
 mod env;
-mod errors;
 mod format;
 mod format_foreign;
+mod gca;
 mod global_allocator;
 mod iter;
 mod log_syntax;
+mod offload;
 mod pattern_type;
 mod source_util;
 mod test;
+mod test_binder_constraints;
 mod trace_macros;
+mod view_type;
 
 pub mod asm;
 pub mod cmdline_attrs;
@@ -59,8 +58,6 @@ pub mod proc_macro_harness;
 pub mod standard_library_imports;
 pub mod test_harness;
 pub mod util;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
     let mut register = |name, kind| resolver.register_builtin_macro(name, kind);
@@ -90,6 +87,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         file: source_util::expand_file,
         format_args: format::expand_format_args,
         format_args_nl: format::expand_format_args_nl,
+        gca: gca::expand,
         global_asm: asm::expand_global_asm,
         include: source_util::expand_include,
         include_bytes: source_util::expand_include_bytes,
@@ -103,8 +101,10 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         pattern_type: pattern_type::expand,
         std_panic: edition_panic::expand_panic,
         stringify: source_util::expand_stringify,
+        test_binder_constraints: test_binder_constraints::expand,
         trace_macros: trace_macros::expand_trace_macros,
         unreachable: edition_panic::expand_unreachable,
+        view_type: view_type::expand,
         // tidy-alphabetical-end
     }
 
@@ -119,17 +119,22 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         define_opaque: define_opaque::expand,
         derive: derive::Expander { is_const: false },
         derive_const: derive::Expander { is_const: true },
+        eii: eii::eii,
+        eii_declaration: eii::eii_declaration,
+        eii_shared_macro: eii::eii_shared_macro,
         global_allocator: global_allocator::expand,
+        offload_kernel: offload::expand_kernel,
         test: test::expand_test,
         test_case: test::expand_test_case,
+        unsafe_eii: eii::unsafe_eii,
         // tidy-alphabetical-end
     }
 
     register_derive! {
         Clone: clone::expand_deriving_clone,
-        Copy: bounds::expand_deriving_copy,
-        ConstParamTy: bounds::expand_deriving_const_param_ty,
-        UnsizedConstParamTy: bounds::expand_deriving_unsized_const_param_ty,
+        CoerceShared: reborrow::expand_deriving_coerce_shared,
+        Copy: copy::expand_deriving_copy,
+        ConstParamTy: const_param_ty::expand_deriving_const_param_ty,
         Debug: debug::expand_deriving_debug,
         Default: default::expand_deriving_default,
         Eq: eq::expand_deriving_eq,
@@ -138,6 +143,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         PartialEq: partial_eq::expand_deriving_partial_eq,
         PartialOrd: partial_ord::expand_deriving_partial_ord,
         CoercePointee: coerce_pointee::expand_deriving_coerce_pointee,
+        Reborrow: reborrow::expand_deriving_reborrow,
         From: from::expand_deriving_from,
     }
 

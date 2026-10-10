@@ -1,6 +1,7 @@
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_span::bug;
 
 use super::Const;
 use crate::mir;
@@ -8,7 +9,7 @@ use crate::ty::abstract_const::CastKind;
 use crate::ty::{self, Ty, TyCtxt};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-#[derive(HashStable, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable)]
+#[derive(StableHash, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable)]
 pub enum ExprKind {
     Binop(mir::BinOp),
     UnOp(mir::UnOp),
@@ -16,7 +17,7 @@ pub enum ExprKind {
     Cast(CastKind),
 }
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
-#[derive(HashStable, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable)]
+#[derive(StableHash, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable)]
 pub struct Expr<'tcx> {
     pub kind: ExprKind,
     args: ty::GenericArgsRef<'tcx>,

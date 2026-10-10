@@ -21,6 +21,8 @@
 // Tracking Issue: https://github.com/rust-lang/rust/issues/129080
 
 //@ ignore-cross-compile (linker binary needs to run)
+// FIXME: Once GCC backend is fixed, remove this `ignore-backends`.
+//@ ignore-backends: gcc
 
 use run_make_support::{
     bin_name, cwd, diff, is_darwin, is_windows, regex, rfs, run_in_tmpdir, rust_lib_name, rustc,
@@ -199,13 +201,9 @@ fn diff_dir_test(crate_type: CrateType, remap_type: RemapType) {
                     .arg(format!("--remap-path-prefix={}=/b", base_dir.join("test").display()));
             }
             RemapType::Cwd { is_empty } => {
-                // FIXME(Oneirical): Building with crate type set to `bin` AND having -Cdebuginfo=2
-                // (or `-g`, the shorthand form) enabled will cause reproducibility failures
-                // for multiple platforms.
-                // See https://github.com/rust-lang/rust/issues/89911
                 // FIXME(#129117): Windows rlib + `-Cdebuginfo=2` + `-Z remap-cwd-prefix=.` seems
                 // to be unreproducible.
-                if !matches!(crate_type, CrateType::Bin) && !is_windows() {
+                if !is_windows() {
                     compiler1.arg("-Cdebuginfo=2");
                     compiler2.arg("-Cdebuginfo=2");
                 }

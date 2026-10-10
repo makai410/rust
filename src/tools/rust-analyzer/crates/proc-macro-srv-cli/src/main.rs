@@ -1,7 +1,7 @@
 //! A standalone binary for `proc-macro-srv`.
 //! Driver for proc macro server
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![cfg_attr(not(feature = "sysroot-abi"), allow(unused_crate_dependencies))]
+#![cfg_attr(not(feature = "in-rust-tree"), allow(unused_crate_dependencies))]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 #[cfg(feature = "in-rust-tree")]
@@ -9,11 +9,11 @@ extern crate rustc_driver as _;
 
 mod version;
 
-#[cfg(any(feature = "sysroot-abi", rust_analyzer))]
-mod main_loop;
 use clap::{Command, ValueEnum};
-#[cfg(any(feature = "sysroot-abi", rust_analyzer))]
-use main_loop::run;
+use proc_macro_api::ProtocolFormat;
+
+#[cfg(feature = "in-rust-tree")]
+use proc_macro_srv_cli::main_loop::run;
 
 fn main() -> std::io::Result<()> {
     let v = std::env::var("RUST_ANALYZER_INTERNALS_DO_NOT_USE");
@@ -31,8 +31,8 @@ fn main() -> std::io::Result<()> {
             clap::Arg::new("format")
                 .long("format")
                 .action(clap::ArgAction::Set)
-                .default_value("json")
-                .value_parser(clap::builder::EnumValueParser::<ProtocolFormat>::new()),
+                .default_value("json-legacy")
+                .value_parser(clap::builder::EnumValueParser::<ProtocolFormatArg>::new()),
             clap::Arg::new("version")
                 .long("version")
                 .action(clap::ArgAction::SetTrue)
@@ -43,45 +43,63 @@ fn main() -> std::io::Result<()> {
         println!("rust-analyzer-proc-macro-srv {}", version::version());
         return Ok(());
     }
-    let &format =
-        matches.get_one::<ProtocolFormat>("format").expect("format value should always be present");
-    run(format)
+    let &format = matches
+        .get_one::<ProtocolFormatArg>("format")
+        .expect("format value should always be present");
+
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let mut stdout = std::io::stdout();
+
+    run(&mut stdin, &mut stdout, format.into())
 }
 
+/// Wrapper for CLI argument parsing that implements `ValueEnum`.
 #[derive(Copy, Clone)]
-enum ProtocolFormat {
-    Json,
-    #[cfg(feature = "postcard")]
-    Postcard,
+struct ProtocolFormatArg(ProtocolFormat);
+
+impl From<ProtocolFormatArg> for ProtocolFormat {
+    fn from(arg: ProtocolFormatArg) -> Self {
+        arg.0
+    }
 }
 
-impl ValueEnum for ProtocolFormat {
+impl ValueEnum for ProtocolFormatArg {
     fn value_variants<'a>() -> &'a [Self] {
-        &[ProtocolFormat::Json]
+        &[
+            ProtocolFormatArg(ProtocolFormat::JsonLegacy),
+            ProtocolFormatArg(ProtocolFormat::BidirectionalPostcardPrototype),
+        ]
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
-        match self {
-            ProtocolFormat::Json => Some(clap::builder::PossibleValue::new("json")),
-            #[cfg(feature = "postcard")]
-            ProtocolFormat::Postcard => Some(clap::builder::PossibleValue::new("postcard")),
+        match self.0 {
+            ProtocolFormat::JsonLegacy => Some(clap::builder::PossibleValue::new("json-legacy")),
+            ProtocolFormat::BidirectionalPostcardPrototype => {
+                Some(clap::builder::PossibleValue::new("bidirectional-postcard-prototype"))
+            }
         }
     }
+
     fn from_str(input: &str, _ignore_case: bool) -> Result<Self, String> {
         match input {
-            "json" => Ok(ProtocolFormat::Json),
-            #[cfg(feature = "postcard")]
-            "postcard" => Ok(ProtocolFormat::Postcard),
+            "json-legacy" => Ok(ProtocolFormatArg(ProtocolFormat::JsonLegacy)),
+            "bidirectional-postcard-prototype" => {
+                Ok(ProtocolFormatArg(ProtocolFormat::BidirectionalPostcardPrototype))
+            }
             _ => Err(format!("unknown protocol format: {input}")),
         }
     }
 }
 
-#[cfg(not(any(feature = "sysroot-abi", rust_analyzer)))]
-fn run(_: ProtocolFormat) -> std::io::Result<()> {
+#[cfg(not(feature = "in-rust-tree"))]
+fn run(
+    _: &mut std::io::BufReader<std::io::Stdin>,
+    _: &mut std::io::Stdout,
+    _: ProtocolFormat,
+) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "proc-macro-srv-cli needs to be compiled with the `sysroot-abi` feature to function"
+        "proc-macro-srv-cli needs to be compiled with the `in-rust-tree` feature to function"
             .to_owned(),
     ))
 }

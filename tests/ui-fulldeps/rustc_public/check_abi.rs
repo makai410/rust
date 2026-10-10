@@ -6,30 +6,29 @@
 //@ ignore-remote
 
 #![feature(rustc_private)]
-#![feature(assert_matches)]
-#![feature(ascii_char, ascii_char_variants)]
 
-extern crate rustc_hir;
-extern crate rustc_middle;
 extern crate rustc_driver;
+extern crate rustc_hir;
 extern crate rustc_interface;
+extern crate rustc_middle;
 #[macro_use]
 extern crate rustc_public;
 
+use std::assert_matches;
+use std::collections::HashSet;
+use std::convert::TryFrom;
+use std::io::Write;
+use std::ops::ControlFlow;
+
 use rustc_public::abi::{
-    ArgAbi, CallConvention, FieldsShape, IntegerLength, PassMode, Primitive, Scalar, ValueAbi,
-    VariantsShape,
+    ArgAbi, ArgExtension, CallConvention, FieldsShape, IndirectMode, IntegerLength, PassMode,
+    Primitive, Scalar, ValueRepr, VariantsShape,
 };
 use rustc_public::mir::MirVisitor;
 use rustc_public::mir::mono::Instance;
 use rustc_public::target::MachineInfo;
 use rustc_public::ty::{AdtDef, RigidTy, Ty, TyKind};
 use rustc_public::{CrateDef, CrateItem, CrateItems, ItemKind};
-use std::assert_matches::assert_matches;
-use std::collections::HashSet;
-use std::convert::TryFrom;
-use std::io::Write;
-use std::ops::ControlFlow;
 
 const CRATE_NAME: &str = "input";
 
@@ -39,7 +38,7 @@ fn test_stable_mir() -> ControlFlow<()> {
     let items = rustc_public::all_local_items();
 
     // Test fn_abi
-    let target_fn = *get_item(&items, (ItemKind::Fn, "fn_abi")).unwrap();
+    let target_fn = *get_item(&items, (ItemKind::Fn, "input::fn_abi")).unwrap();
     let instance = Instance::try_from(target_fn).unwrap();
     let fn_abi = instance.fn_abi().unwrap();
     assert_eq!(fn_abi.conv, CallConvention::Rust);
@@ -51,11 +50,11 @@ fn test_stable_mir() -> ControlFlow<()> {
     check_result(&fn_abi.ret);
 
     // Test variadic function.
-    let variadic_fn = *get_item(&items, (ItemKind::Fn, "variadic_fn")).unwrap();
+    let variadic_fn = *get_item(&items, (ItemKind::Fn, "input::variadic_fn")).unwrap();
     check_variadic(variadic_fn);
 
     // Extract function pointers.
-    let fn_ptr_holder = *get_item(&items, (ItemKind::Fn, "fn_ptr_holder")).unwrap();
+    let fn_ptr_holder = *get_item(&items, (ItemKind::Fn, "input::fn_ptr_holder")).unwrap();
     let fn_ptr_holder_instance = Instance::try_from(fn_ptr_holder).unwrap();
     let body = fn_ptr_holder_instance.body().unwrap();
     let args = body.arg_locals();
@@ -108,7 +107,18 @@ fn check_ignore(abi: &ArgAbi) {
 /// Check the primitive argument: `primitive: char`.
 fn check_primitive(abi: &ArgAbi) {
     assert!(abi.ty.kind().is_char());
-    assert_matches!(abi.mode, PassMode::Direct(_));
+    let PassMode::Direct(ref attrs) = abi.mode else {
+        panic!("Expected PassMode::Direct for char, got: {:?}", abi.mode);
+    };
+    // A char (32-bit) doesn't need sign/zero extension on most platforms.
+    #[cfg(not(any(target_arch = "loongarch64", target_arch = "riscv64")))]
+    assert_eq!(attrs.arg_extension(), ArgExtension::None);
+    // However, LoongArch64 and RiscV64 ABIs require that 32-bit integers
+    // (signed or unsigned) are sign-extended when passed in registers.
+    #[cfg(any(target_arch = "loongarch64", target_arch = "riscv64"))]
+    assert_eq!(attrs.arg_extension(), ArgExtension::Sext);
+    // Direct arguments are not pointers, so no pointee alignment.
+    assert_eq!(attrs.pointee_align(), None);
     let layout = abi.layout.shape();
     assert!(layout.is_sized());
     assert!(!layout.is_1zst());
@@ -118,7 +128,12 @@ fn check_primitive(abi: &ArgAbi) {
 /// Check the return value: `Result<usize, &str>`.
 fn check_result(abi: &ArgAbi) {
     assert!(abi.ty.kind().is_enum());
-    assert_matches!(abi.mode, PassMode::Indirect { .. });
+    let PassMode::Indirect { ref attrs, address_space: _, mode } = abi.mode else {
+        panic!("Expected PassMode::Indirect for Result, got: {:?}", abi.mode);
+    };
+    // Indirect arguments have a pointee alignment (the pointer must be aligned).
+    assert!(attrs.pointee_align().is_some());
+    assert!(mode == IndirectMode::Pointer);
     let layout = abi.layout.shape();
     assert!(layout.is_sized());
     assert_matches!(layout.fields, FieldsShape::Arbitrary { .. });
@@ -133,7 +148,7 @@ fn check_niche(abi: &ArgAbi) {
     assert!(layout.is_sized());
     assert_eq!(layout.size.bytes(), 1);
 
-    let ValueAbi::Scalar(scalar) = layout.abi else { unreachable!() };
+    let ValueRepr::Scalar(scalar) = layout.value_repr else { unreachable!() };
     assert!(scalar.has_niche(&MachineInfo::target()), "Opps: {:?}", scalar);
 
     let Scalar::Initialized { value, valid_range } = scalar else { unreachable!() };
@@ -187,7 +202,6 @@ fn generate_input(path: &str) -> std::io::Result<()> {
     write!(
         file,
         r#"
-        #![feature(c_variadic)]
         #![allow(unused_variables)]
 
         use std::num::NonZero;

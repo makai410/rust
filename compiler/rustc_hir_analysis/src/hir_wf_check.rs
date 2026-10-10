@@ -1,10 +1,10 @@
 use rustc_hir::def::DefKind;
-use rustc_hir::intravisit::{self, Visitor, VisitorExt};
+use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{self as hir, AmbigArg, ForeignItem, ForeignItemKind};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::traits::{ObligationCause, ObligationCauseCode, WellFormedLoc};
-use rustc_middle::bug;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt, TypingMode, fold_regions};
+use rustc_span::bug;
 use rustc_span::def_id::LocalDefId;
 use rustc_trait_selection::traits::{self, ObligationCtxt};
 use tracing::debug;
@@ -19,7 +19,8 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
 ) -> Option<ObligationCause<'tcx>> {
     let def_id = match loc {
         WellFormedLoc::Ty(def_id) => def_id,
-        WellFormedLoc::Param { function, param_idx: _ } => function,
+        WellFormedLoc::Param { function, .. } => function,
+        WellFormedLoc::HirId(_) | WellFormedLoc::None => return None,
     };
     let hir_id = tcx.local_def_id_to_hir_id(def_id);
 
@@ -51,12 +52,12 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
     struct HirWfCheck<'tcx> {
         tcx: TyCtxt<'tcx>,
         predicate: ty::Predicate<'tcx>,
-        cause: Option<ObligationCause<'tcx>>,
-        cause_depth: usize,
+        cause: Option<ObligationCause<'tcx>> = None,
+        cause_depth: usize = 0,
         icx: ItemCtxt<'tcx>,
         def_id: LocalDefId,
         param_env: ty::ParamEnv<'tcx>,
-        depth: usize,
+        depth: usize = 0,
     }
 
     impl<'tcx> Visitor<'tcx> for HirWfCheck<'tcx> {
@@ -85,7 +86,7 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
             let cause = traits::ObligationCause::new(
                 ty.span,
                 self.def_id,
-                traits::ObligationCauseCode::WellFormed(None),
+                traits::ObligationCauseCode::WellFormed(WellFormedLoc::HirId(ty.hir_id)),
             );
 
             ocx.register_obligation(traits::Obligation::new(
@@ -95,7 +96,7 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
                 ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(tcx_ty.into())),
             ));
 
-            for error in ocx.select_all_or_error() {
+            for error in ocx.evaluate_obligations_error_on_ambiguity() {
                 debug!("Wf-check got error for {:?}: {:?}", ty, error);
                 if error.obligation.predicate == self.predicate {
                     // Save the cause from the greatest depth - this corresponds
@@ -124,16 +125,8 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
         }
     }
 
-    let mut visitor = HirWfCheck {
-        tcx,
-        predicate,
-        cause: None,
-        cause_depth: 0,
-        icx,
-        def_id,
-        param_env: tcx.param_env(def_id.to_def_id()),
-        depth: 0,
-    };
+    let param_env = tcx.param_env(def_id.to_def_id());
+    let mut visitor = HirWfCheck { tcx, predicate, icx, def_id, param_env, .. };
 
     // Get the starting `hir::Ty` using our `WellFormedLoc`.
     // We will walk 'into' this type to try to find
@@ -199,7 +192,7 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
             }
             ref node => bug!("Unexpected node {:?}", node),
         },
-        WellFormedLoc::Param { function: _, param_idx } => {
+        WellFormedLoc::Param { param_idx, .. } => {
             let fn_decl = tcx.hir_fn_decl_by_hir_id(hir_id).unwrap();
             // Get return type
             if param_idx as usize == fn_decl.inputs.len() {
@@ -212,6 +205,7 @@ pub(super) fn diagnostic_hir_wf_check<'tcx>(
                 vec![&fn_decl.inputs[param_idx as usize]]
             }
         }
+        WellFormedLoc::HirId(_) | WellFormedLoc::None => return None,
     };
     for ty in tys {
         visitor.visit_ty_unambig(ty);

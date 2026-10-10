@@ -1,10 +1,10 @@
 error[E0521]: borrowed data escapes outside of function
-  --> $DIR/closure-bounds-static-cant-capture-borrowed.rs:5:5
+  --> $DIR/closure-bounds-static-cant-capture-borrowed.rs:6:5
    |
 LL |   fn foo(x: &()) {
    |          -  - let's call the lifetime of this reference `'1`
    |          |
-   |          `x` is a reference that is only valid in the function body
+   |          `x` is only valid in the function body
 LL | /     bar(|| {
 LL | |
 LL | |
@@ -14,9 +14,15 @@ LL | |     })
    | |      |
    | |______`x` escapes the function body here
    |        argument requires that `'1` must outlive `'static`
+   |
+note: `'static` lifetime requirement from `bar` introduced here
+  --> $DIR/closure-bounds-static-cant-capture-borrowed.rs:2:39
+   |
+LL | fn bar<F>(blk: F) where F: FnOnce() + 'static {
+   |                                       ^^^^^^^ lifetime requirement introduced here
 
 error[E0373]: closure may outlive the current function, but it borrows `x`, which is owned by the current function
-  --> $DIR/closure-bounds-static-cant-capture-borrowed.rs:5:9
+  --> $DIR/closure-bounds-static-cant-capture-borrowed.rs:6:9
    |
 LL |     bar(|| {
    |         ^^ may outlive borrowed value `x`
@@ -25,7 +31,7 @@ LL |         let _ = x;
    |                 - `x` is borrowed here
    |
 note: function requires argument type to outlive `'static`
-  --> $DIR/closure-bounds-static-cant-capture-borrowed.rs:5:5
+  --> $DIR/closure-bounds-static-cant-capture-borrowed.rs:6:5
    |
 LL | /     bar(|| {
 LL | |

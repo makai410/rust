@@ -6,55 +6,65 @@
 //! function parameters.
 
 use std::borrow::Borrow;
-use std::mem;
 use std::sync::Arc;
+use std::{debug_assert_matches, mem};
 
-use itertools::{Itertools, Position};
-use rustc_abi::VariantIdx;
+use itertools::Itertools;
+use rustc_abi::{FIRST_VARIANT, FieldIdx, VariantIdx};
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::{BindingMode, ByRef, LetStmt, LocalSource, Node};
-use rustc_middle::bug;
-use rustc_middle::middle::region;
+use rustc_middle::middle::region::{self, TempLifetime};
 use rustc_middle::mir::*;
 use rustc_middle::thir::{self, *};
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::{self, CanonicalUserTypeAnnotation, Ty, ValTree, ValTreeKind};
 use rustc_pattern_analysis::constructor::RangeEnd;
 use rustc_pattern_analysis::rustc::{DeconstructedPat, RustcPatCtxt};
-use rustc_span::{BytePos, Pos, Span, Symbol, sym};
+use rustc_span::{BytePos, Pos, Span, Symbol, bug, span_bug, sym};
 use tracing::{debug, instrument};
 
 use crate::builder::ForGuard::{self, OutsideGuard, RefWithinGuard};
 use crate::builder::expr::as_place::PlaceBuilder;
+use crate::builder::matches::buckets::PartitionedCandidates;
 use crate::builder::matches::user_ty::ProjectedUserTypesNode;
-use crate::builder::scope::DropKind;
+use crate::builder::scope::LintLevel;
 use crate::builder::{
     BlockAnd, BlockAndExtension, Builder, GuardFrame, GuardFrameLocal, LocalsForNode,
 };
 
 // helper functions, broken out by category:
+mod buckets;
 mod match_pair;
 mod test;
 mod user_ty;
 mod util;
 
-/// Arguments to [`Builder::then_else_break_inner`] that are usually forwarded
+/// Arguments to [`Builder::lower_if_condition`] that are usually forwarded
 /// to recursive invocations.
 #[derive(Clone, Copy)]
-struct ThenElseArgs {
+pub(crate) struct LowerIfCondArgs {
     /// Used as the temp scope for lowering `expr`. If absent (for match guards),
     /// `self.local_scope()` is used.
-    temp_scope_override: Option<region::Scope>,
-    variable_source_info: SourceInfo,
+    pub(crate) temp_scope_override: Option<region::Scope>,
+    pub(crate) variable_source_info: SourceInfo,
     /// Determines how bindings should be handled when lowering `let` expressions.
     ///
-    /// Forwarded to [`Builder::lower_let_expr`] when lowering [`ExprKind::Let`].
-    declare_let_bindings: DeclareLetBindings,
+    /// Forwarded to [`Builder::lower_fallible_let`] when lowering [`ExprKind::Let`].
+    pub(crate) declare_let_bindings: DeclareLetBindings,
 }
 
-/// Should lowering a `let` expression also declare its bindings?
+impl LowerIfCondArgs {
+    /// Returns a copy of `self` with [`DeclareLetBindings::LetNotPermitted`].
+    /// Used when recursing into a sub-condition that does not permit `let` (e.g. `||` or `!`).
+    fn let_not_permitted(self) -> Self {
+        LowerIfCondArgs { declare_let_bindings: DeclareLetBindings::LetNotPermitted, ..self }
+    }
+}
+
+/// Should lowering a `let` also declare its bindings?
 ///
-/// Used by [`Builder::lower_let_expr`] when lowering [`ExprKind::Let`].
+/// Used by [`Builder::lower_fallible_let`].
 #[derive(Clone, Copy)]
 pub(crate) enum DeclareLetBindings {
     /// Yes, declare `let` bindings as normal for `if` conditions.
@@ -81,77 +91,60 @@ pub(crate) enum ScheduleDrops {
 }
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
-    /// Lowers a condition in a way that ensures that variables bound in any let
-    /// expressions are definitely initialized in the if body.
+    /// Lowers the condition for an `if`-expression or similar construct
+    /// (including `&&` and `||` expressions, and match-guard conditions).
     ///
-    /// If `declare_let_bindings` is false then variables created in `let`
-    /// expressions will not be declared. This is for if let guards on arms with
-    /// an or pattern, where the guard is lowered multiple times.
-    pub(crate) fn then_else_break(
-        &mut self,
-        block: BasicBlock,
-        expr_id: ExprId,
-        temp_scope_override: Option<region::Scope>,
-        variable_source_info: SourceInfo,
-        declare_let_bindings: DeclareLetBindings,
-    ) -> BlockAnd<()> {
-        self.then_else_break_inner(
-            block,
-            expr_id,
-            ThenElseArgs { temp_scope_override, variable_source_info, declare_let_bindings },
-        )
-    }
-
-    fn then_else_break_inner(
+    /// Must be called within [`Builder::in_if_then_scope`], which keeps track
+    /// of drop scope and knows where to break to if the condition is false.
+    ///
+    /// Returns the block for the *true* arm of the condition check.
+    /// The *true* and *false* arms are returned by [`Builder::in_if_then_scope`].
+    pub(crate) fn lower_if_condition(
         &mut self,
         block: BasicBlock, // Block that the condition and branch will be lowered into
         expr_id: ExprId,   // Condition expression to lower
-        args: ThenElseArgs,
+        args: LowerIfCondArgs,
     ) -> BlockAnd<()> {
-        let this = self;
+        let this = self; // See "LET_THIS_SELF".
         let expr = &this.thir[expr_id];
         let expr_span = expr.span;
 
         match expr.kind {
             ExprKind::LogicalOp { op: LogicalOp::And, lhs, rhs } => {
-                let lhs_then_block = this.then_else_break_inner(block, lhs, args).into_block();
-                let rhs_then_block =
-                    this.then_else_break_inner(lhs_then_block, rhs, args).into_block();
-                rhs_then_block.unit()
+                // A condition of `lhs && rhs` is fairly straightforward.
+                // We can just lower them in sequence, and break if either is false.
+                let lhs_true_block = this.lower_if_condition(block, lhs, args).into_block();
+                let rhs_true_block =
+                    this.lower_if_condition(lhs_true_block, rhs, args).into_block();
+                rhs_true_block.unit()
             }
             ExprKind::LogicalOp { op: LogicalOp::Or, lhs, rhs } => {
+                // A condition of `lhs || rhs` is more complicated, because we need to
+                // short-circuit if `lhs` is *true*. So an inner condition-scope is needed.
+                // See <https://github.com/rust-lang/rust/pull/111752>.
                 let local_scope = this.local_scope();
-                let (lhs_success_block, failure_block) =
+                let (lhs_true_block, lhs_false_block) =
                     this.in_if_then_scope(local_scope, expr_span, |this| {
-                        this.then_else_break_inner(
-                            block,
-                            lhs,
-                            ThenElseArgs {
-                                declare_let_bindings: DeclareLetBindings::LetNotPermitted,
-                                ..args
-                            },
-                        )
+                        this.lower_if_condition(block, lhs, args.let_not_permitted())
                     });
-                let rhs_success_block = this
-                    .then_else_break_inner(
-                        failure_block,
-                        rhs,
-                        ThenElseArgs {
-                            declare_let_bindings: DeclareLetBindings::LetNotPermitted,
-                            ..args
-                        },
-                    )
+                let rhs_true_block = this
+                    .lower_if_condition(lhs_false_block, rhs, args.let_not_permitted())
                     .into_block();
 
-                // Make the LHS and RHS success arms converge to a common block.
-                // (We can't just make LHS goto RHS, because `rhs_success_block`
+                // Make the LHS-true and RHS-true arms converge to a common block.
+                // (We can't just make LHS goto RHS, because `rhs_true_block`
                 // might contain statements that we don't want on the LHS path.)
                 let success_block = this.cfg.start_new_block();
-                this.cfg.goto(lhs_success_block, args.variable_source_info, success_block);
-                this.cfg.goto(rhs_success_block, args.variable_source_info, success_block);
+                this.cfg.goto(lhs_true_block, args.variable_source_info, success_block);
+                this.cfg.goto(rhs_true_block, args.variable_source_info, success_block);
                 success_block.unit()
             }
             ExprKind::Unary { op: UnOp::Not, arg } => {
+                // For a condition of `!cond`, lower `cond` as its own condition,
+                // then invert the meaning of the true/false blocks.
+                // This avoids an intermediate temporary for negating the condition value.
+                // See <https://github.com/rust-lang/rust/pull/111752>.
+
                 // Improve branch coverage instrumentation by noting conditions
                 // nested within one or more `!` expressions.
                 // (Skipped if branch coverage is not enabled.)
@@ -160,41 +153,34 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
 
                 let local_scope = this.local_scope();
-                let (success_block, failure_block) =
+                let (true_block, false_block) =
                     this.in_if_then_scope(local_scope, expr_span, |this| {
-                        // Help out coverage instrumentation by injecting a dummy statement with
-                        // the original condition's span (including `!`). This fixes #115468.
-                        if this.tcx.sess.instrument_coverage() {
-                            this.cfg.push_coverage_span_marker(block, this.source_info(expr_span));
-                        }
-                        this.then_else_break_inner(
-                            block,
-                            arg,
-                            ThenElseArgs {
-                                declare_let_bindings: DeclareLetBindings::LetNotPermitted,
-                                ..args
-                            },
-                        )
+                        this.lower_if_condition(block, arg, args.let_not_permitted())
                     });
-                this.break_for_else(success_block, args.variable_source_info);
-                failure_block.unit()
+                // Break if the condition was true; proceed if the condition was false.
+                this.break_from_if_then_scope(true_block, args.variable_source_info);
+                false_block.unit()
             }
-            ExprKind::Scope { region_scope, lint_level, value } => {
-                let region_scope = (region_scope, this.source_info(expr_span));
-                this.in_scope(region_scope, lint_level, |this| {
-                    this.then_else_break_inner(block, value, args)
+            ExprKind::Scope { region_scope, hir_id, value } => {
+                let source_info = this.source_info(expr_span);
+                this.in_scope((region_scope, source_info), LintLevel::Explicit(hir_id), |this| {
+                    this.push_coverage_point_for_expr(block, source_info, hir_id);
+                    this.lower_if_condition(block, value, args)
                 })
             }
-            ExprKind::Use { source } => this.then_else_break_inner(block, source, args),
-            ExprKind::Let { expr, ref pat } => this.lower_let_expr(
+            ExprKind::ValueExpr { source } => this.lower_if_condition(block, source, args),
+            ExprKind::Let { ref pat, expr } => this.lower_fallible_let(
                 block,
-                expr,
                 pat,
+                expr,
                 Some(args.variable_source_info.scope),
                 args.variable_source_info.span,
                 args.declare_let_bindings,
             ),
+
             _ => {
+                // The condition is an ordinary boolean-valued expression,
+                // so lower it normally and branch on the result.
                 let mut block = block;
                 let temp_scope = args.temp_scope_override.unwrap_or_else(|| this.local_scope());
                 let mutability = Mutability::Mut;
@@ -213,19 +199,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
                 let operand = Operand::Move(Place::from(place));
 
-                let then_block = this.cfg.start_new_block();
-                let else_block = this.cfg.start_new_block();
-                let term = TerminatorKind::if_(operand, then_block, else_block);
+                let true_block = this.cfg.start_new_block();
+                let false_block = this.cfg.start_new_block();
+                let term = TerminatorKind::if_(operand, true_block, false_block);
 
                 // Record branch coverage info for this condition.
                 // (Does nothing if branch coverage is not enabled.)
-                this.visit_coverage_branch_condition(expr_id, then_block, else_block);
+                this.visit_coverage_branch_condition(expr_id, true_block, false_block);
 
                 let source_info = this.source_info(expr_span);
                 this.cfg.terminate(block, source_info, term);
-                this.break_for_else(else_block, source_info);
+                this.break_from_if_then_scope(false_block, source_info);
 
-                then_block.unit()
+                true_block.unit()
             }
         }
     }
@@ -353,10 +339,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         scrutinee_id: ExprId,
         arms: &[ArmId],
         span: Span,
-        scrutinee_span: Span,
     ) -> BlockAnd<()> {
-        let scrutinee_place =
-            unpack!(block = self.lower_scrutinee(block, scrutinee_id, scrutinee_span));
+        let scrutinee_span = self.thir[scrutinee_id].span;
+        let scrutinee_place = unpack!(block = self.lower_scrutinee(block, scrutinee_id));
 
         let match_start_span = span.shrink_to_lo().to(scrutinee_span);
         let patterns = arms
@@ -374,7 +359,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             &scrutinee_place,
             match_start_span,
             patterns,
-            false,
+            Exhaustive::Yes,
         );
 
         self.lower_match_arms(
@@ -388,15 +373,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     /// Evaluate the scrutinee and add the PlaceMention for it.
-    fn lower_scrutinee(
+    pub(crate) fn lower_scrutinee(
         &mut self,
         mut block: BasicBlock,
         scrutinee_id: ExprId,
-        scrutinee_span: Span,
     ) -> BlockAnd<PlaceBuilder<'tcx>> {
         let scrutinee_place_builder = unpack!(block = self.as_place_builder(block, scrutinee_id));
         if let Some(scrutinee_place) = scrutinee_place_builder.try_to_place(self) {
-            let source_info = self.source_info(scrutinee_span);
+            let source_info = self.source_info(self.thir[scrutinee_id].span);
             self.cfg.push_place_mention(block, source_info, scrutinee_place);
         }
 
@@ -431,7 +415,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let guard_scope = arm
                     .guard
                     .map(|_| region::Scope { data: region::ScopeData::MatchGuard, ..arm.scope });
-                self.in_scope(arm_scope, arm.lint_level, |this| {
+                self.in_scope(arm_scope, LintLevel::Explicit(arm.hir_id), |this| {
                     this.opt_in_scope(guard_scope.map(|scope| (scope, arm_source_info)), |this| {
                         // `if let` guard temps needing deduplicating will be in the guard scope.
                         let old_dedup_scope =
@@ -549,9 +533,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // the drop order for the first sub-branch, we lower sub-branches in reverse (#142163).
             let target_block = self.cfg.start_new_block();
             for (pos, sub_branch) in branch.sub_branches.into_iter().rev().with_position() {
-                debug_assert!(pos != Position::Only);
+                debug_assert!(!pos.is_exactly_one());
                 let schedule_drops =
-                    if pos == Position::Last { ScheduleDrops::Yes } else { ScheduleDrops::No };
+                    if pos.is_last() { ScheduleDrops::Yes } else { ScheduleDrops::No };
                 let binding_end = self.bind_and_guard_matched_candidate(
                     sub_branch,
                     fake_borrow_temps,
@@ -573,12 +557,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         initializer_id: ExprId,
     ) -> BlockAnd<()> {
         match irrefutable_pat.kind {
-            // Optimize the case of `let x = ...` to write directly into `x`
+            // Optimize `let x = ...` and `let x: T = ...` to write directly into `x`,
+            // and then require that `T == typeof(x)` if present.
             PatKind::Binding { mode: BindingMode(ByRef::No, _), var, subpattern: None, .. } => {
                 let place = self.storage_live_binding(
                     block,
                     var,
                     irrefutable_pat.span,
+                    false,
                     OutsideGuard,
                     ScheduleDrops::Yes,
                 );
@@ -588,42 +574,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let source_info = self.source_info(irrefutable_pat.span);
                 self.cfg.push_fake_read(block, source_info, FakeReadCause::ForLet(None), place);
 
-                self.schedule_drop_for_binding(var, irrefutable_pat.span, OutsideGuard);
-                block.unit()
-            }
+                let ascriptions: &[_] =
+                    try { irrefutable_pat.extra.as_deref()?.ascriptions.as_slice() }
+                        .unwrap_or_default();
+                for thir::Ascription { annotation, variance: _ } in ascriptions {
+                    let ty_source_info = self.source_info(annotation.span);
 
-            // Optimize the case of `let x: T = ...` to write directly
-            // into `x` and then require that `T == typeof(x)`.
-            PatKind::AscribeUserType {
-                ref subpattern,
-                ascription: thir::Ascription { ref annotation, variance: _ },
-            } if let PatKind::Binding {
-                mode: BindingMode(ByRef::No, _),
-                var,
-                subpattern: None,
-                ..
-            } = subpattern.kind =>
-            {
-                let place = self.storage_live_binding(
-                    block,
-                    var,
-                    irrefutable_pat.span,
-                    OutsideGuard,
-                    ScheduleDrops::Yes,
-                );
-                block = self.expr_into_dest(place, block, initializer_id).into_block();
-
-                // Inject a fake read, see comments on `FakeReadCause::ForLet`.
-                let pattern_source_info = self.source_info(irrefutable_pat.span);
-                let cause_let = FakeReadCause::ForLet(None);
-                self.cfg.push_fake_read(block, pattern_source_info, cause_let, place);
-
-                let ty_source_info = self.source_info(annotation.span);
-
-                let base = self.canonical_user_type_annotations.push(annotation.clone());
-                self.cfg.push(
-                    block,
-                    Statement::new(
+                    let base = self.canonical_user_type_annotations.push(annotation.clone());
+                    let stmt = Statement::new(
                         ty_source_info,
                         StatementKind::AscribeUserType(
                             Box::new((place, UserTypeProjection { base, projs: Vec::new() })),
@@ -643,17 +601,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             // `<expr>`.
                             ty::Invariant,
                         ),
-                    ),
-                );
+                    );
+                    self.cfg.push(block, stmt);
+                }
 
                 self.schedule_drop_for_binding(var, irrefutable_pat.span, OutsideGuard);
                 block.unit()
             }
 
             _ => {
-                let initializer = &self.thir[initializer_id];
-                let place_builder =
-                    unpack!(block = self.lower_scrutinee(block, initializer_id, initializer.span));
+                let place_builder = unpack!(block = self.lower_scrutinee(block, initializer_id));
                 self.place_into_pattern(block, irrefutable_pat, place_builder, true)
             }
         }
@@ -672,7 +629,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             &initializer,
             irrefutable_pat.span,
             vec![(irrefutable_pat, HasMatchGuard::No)],
-            false,
+            Exhaustive::Yes,
         );
         let [branch] = built_tree.branches.try_into().unwrap();
 
@@ -739,6 +696,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             pattern,
             &ProjectedUserTypesNode::None,
             &mut |this, name, mode, var, span, ty, user_tys| {
+                let saved_scope = this.source_scope;
+                this.set_correct_source_scope_for_arg(var.0, saved_scope, span);
                 let vis_scope = *visibility_scope
                     .get_or_insert_with(|| this.new_source_scope(scope_span, LintLevel::Inherited));
                 let source_info = SourceInfo { span, scope: this.source_scope };
@@ -756,6 +715,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     opt_match_place.map(|(x, y)| (x.cloned(), y)),
                     pattern.span,
                 );
+                this.source_scope = saved_scope;
             },
         );
         if let Some(guard_expr) = guard {
@@ -781,7 +741,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             ExprKind::Scope { value, .. } => {
                 self.declare_guard_bindings(value, scope_span, visibility_scope);
             }
-            ExprKind::Use { source } => {
+            ExprKind::ValueExpr { source } => {
                 self.declare_guard_bindings(source, scope_span, visibility_scope);
             }
             ExprKind::LogicalOp { op: LogicalOp::And, lhs, rhs } => {
@@ -799,6 +759,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         block: BasicBlock,
         var: LocalVarId,
         span: Span,
+        is_shorthand: bool,
         for_guard: ForGuard,
         schedule_drop: ScheduleDrops,
     ) -> Place<'tcx> {
@@ -810,7 +771,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         if let Some(region_scope) = self.region_scope_tree.var_scope(var.0.local_id)
             && matches!(schedule_drop, ScheduleDrops::Yes)
         {
-            self.schedule_drop(span, region_scope, local_id, DropKind::Storage);
+            self.schedule_drop_storage(span, region_scope, local_id);
+        }
+        let local_info = self.local_decls[local_id].local_info.as_mut().unwrap_crate_local();
+        if let LocalInfo::User(BindingForm::Var(var_info)) = &mut **local_info {
+            var_info.introductions.push(VarBindingIntroduction { span, is_shorthand });
         }
         Place::from(local_id)
     }
@@ -823,7 +788,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) {
         let local_id = self.var_local_id(var, for_guard);
         if let Some(region_scope) = self.region_scope_tree.var_scope(var.0.local_id) {
-            self.schedule_drop(span, region_scope, local_id, DropKind::Value);
+            self.schedule_drop_value(span, region_scope, local_id);
         }
     }
 
@@ -866,6 +831,26 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             &ProjectedUserTypesNode<'_>,
         ),
     ) {
+        // Ascriptions correspond to user-written types like `let A::<'a>(_): A<'static> = ...;`.
+        //
+        // Caution: Pushing user types here is load-bearing even for
+        // patterns containing no bindings, to ensure that the type ends
+        // up represented in MIR _somewhere_.
+        let user_tys = match pattern.extra.as_deref() {
+            Some(PatExtra { ascriptions, .. }) if !ascriptions.is_empty() => {
+                let base_user_tys = ascriptions
+                    .iter()
+                    .map(|thir::Ascription { annotation, variance: _ }| {
+                        // Note that the variance doesn't apply here, as we are tracking the effect
+                        // of user types on any bindings contained with subpattern.
+                        self.canonical_user_type_annotations.push(annotation.clone())
+                    })
+                    .collect();
+                &user_tys.push_user_types(base_user_tys)
+            }
+            _ => user_tys,
+        };
+
         // Avoid having to write the full method name at each recursive call.
         let visit_subpat = |this: &mut Self, subpat, user_tys: &_, f: &mut _| {
             this.visit_primary_bindings_special(subpat, user_tys, f)
@@ -903,37 +888,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | PatKind::Never
             | PatKind::Error(_) => {}
 
-            PatKind::Deref { ref subpattern } => {
+            PatKind::Deref { pin: Pinnedness::Pinned, ref subpattern } => {
+                // Project into the `Pin(_)` struct, then deref the inner `&` or `&mut`.
+                visit_subpat(self, subpattern, &user_tys.leaf(FieldIdx::ZERO).deref(), f);
+            }
+            PatKind::Deref { pin: Pinnedness::Not, ref subpattern } => {
                 visit_subpat(self, subpattern, &user_tys.deref(), f);
             }
 
             PatKind::DerefPattern { ref subpattern, .. } => {
                 visit_subpat(self, subpattern, &ProjectedUserTypesNode::None, f);
-            }
-
-            PatKind::AscribeUserType {
-                ref subpattern,
-                ascription: thir::Ascription { ref annotation, variance: _ },
-            } => {
-                // This corresponds to something like
-                //
-                // ```
-                // let A::<'a>(_): A<'static> = ...;
-                // ```
-                //
-                // Note that the variance doesn't apply here, as we are tracking the effect
-                // of `user_ty` on any bindings contained with subpattern.
-
-                // Caution: Pushing this user type here is load-bearing even for
-                // patterns containing no bindings, to ensure that the type ends
-                // up represented in MIR _somewhere_.
-                let base_user_ty = self.canonical_user_type_annotations.push(annotation.clone());
-                let subpattern_user_tys = user_tys.push_user_type(base_user_ty);
-                visit_subpat(self, subpattern, &subpattern_user_tys, f)
-            }
-
-            PatKind::ExpandedConstant { ref subpattern, .. } => {
-                visit_subpat(self, subpattern, user_tys, f)
             }
 
             PatKind::Leaf { ref subpatterns } => {
@@ -959,6 +923,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 for subpattern in pats.iter() {
                     visit_subpat(self, subpattern, user_tys, f);
                 }
+            }
+            PatKind::Guard { ref subpattern, .. } => {
+                visit_subpat(self, subpattern, user_tys, f);
             }
         }
     }
@@ -1012,24 +979,6 @@ struct FlatPat<'tcx> {
     extra_data: PatternExtraData<'tcx>,
 }
 
-impl<'tcx> FlatPat<'tcx> {
-    /// Creates a `FlatPat` containing a simplified [`MatchPairTree`] list/forest
-    /// for the given pattern.
-    fn new(place: PlaceBuilder<'tcx>, pattern: &Pat<'tcx>, cx: &mut Builder<'_, 'tcx>) -> Self {
-        // Recursively build a tree of match pairs for the given pattern.
-        let mut match_pairs = vec![];
-        let mut extra_data = PatternExtraData {
-            span: pattern.span,
-            bindings: Vec::new(),
-            ascriptions: Vec::new(),
-            is_never: pattern.is_never_pattern(),
-        };
-        MatchPairTree::for_pattern(place, pattern, cx, &mut match_pairs, &mut extra_data);
-
-        Self { match_pairs, extra_data }
-    }
-}
-
 /// Candidates are a generalization of (a) top-level match arms, and
 /// (b) sub-branches of or-patterns, allowing the match-lowering process to handle
 /// them both in a mostly-uniform way. For example, the list of candidates passed
@@ -1053,7 +1002,7 @@ struct Candidate<'tcx> {
     /// Key mutations include:
     ///
     /// - When a match pair is fully satisfied by a test, it is removed from the
-    ///   list, and its subpairs are added instead (see [`Builder::sort_candidate`]).
+    ///   list, and its subpairs are added instead (see [`Builder::choose_bucket_for_candidate`]).
     /// - During or-pattern expansion, any leading or-pattern is removed, and is
     ///   converted into subcandidates (see [`Builder::expand_and_match_or_candidates`]).
     /// - After a candidate's subcandidates have been lowered, a copy of any remaining
@@ -1061,7 +1010,7 @@ struct Candidate<'tcx> {
     ///   (see [`Builder::test_remaining_match_pairs_after_or`]).
     ///
     /// Invariants:
-    /// - All or-patterns ([`TestCase::Or`]) have been sorted to the end.
+    /// - All or-patterns ([`MatchPairKind::Or`]) have been sorted to the end.
     match_pairs: Vec<MatchPairTree<'tcx>>,
 
     /// ...and if this is non-empty, one of these subcandidates also has to match...
@@ -1147,12 +1096,15 @@ impl<'tcx> Candidate<'tcx> {
 
     /// Restores the invariant that or-patterns must be sorted to the end.
     fn sort_match_pairs(&mut self) {
-        self.match_pairs.sort_by_key(|pair| matches!(pair.test_case, TestCase::Or { .. }));
+        self.match_pairs.sort_by_key(|pair| matches!(pair.kind, MatchPairKind::Or { .. }));
     }
 
     /// Returns whether the first match pair of this candidate is an or-pattern.
     fn starts_with_or_pattern(&self) -> bool {
-        matches!(&*self.match_pairs, [MatchPairTree { test_case: TestCase::Or { .. }, .. }, ..])
+        matches!(
+            self.match_pairs.first(),
+            Some(MatchPairTree { kind: MatchPairKind::Or { .. }, .. })
+        )
     }
 
     /// Visit the leaf candidates (those with no subcandidates) contained in
@@ -1217,6 +1169,7 @@ struct Binding<'tcx> {
     source: Place<'tcx>,
     var_id: LocalVarId,
     binding_mode: BindingMode,
+    is_shorthand: bool,
 }
 
 /// Indicates that the type of `source` must be a subtype of the
@@ -1235,71 +1188,105 @@ struct Ascription<'tcx> {
 /// and helps [`TestKind::Switch`] and [`TestKind::SwitchInt`] know what target
 /// values to use.
 ///
-/// Created by [`MatchPairTree::for_pattern`], and then inspected primarily by:
+/// Created by [`MatchPairTree`], and then inspected primarily by:
 /// - [`Builder::pick_test_for_match_pair`] (to choose a test)
-/// - [`Builder::sort_candidate`] (to see how the test interacts with a match pair)
+/// - [`Builder::choose_bucket_for_candidate`] (to see how the test interacts with a match pair)
 ///
 /// Note that or-patterns are not tested directly like the other variants.
 /// Instead they participate in or-pattern expansion, where they are transformed into
 /// subcandidates. See [`Builder::expand_and_match_or_candidates`].
 #[derive(Debug, Clone)]
-enum TestCase<'tcx> {
+enum TestableCase<'tcx> {
     Variant { adt_def: ty::AdtDef<'tcx>, variant_index: VariantIdx },
-    Constant { value: ty::Value<'tcx> },
+    Constant { value: ty::Value<'tcx>, kind: PatConstKind },
     Range(Arc<PatRange<'tcx>>),
-    Slice { len: usize, variable_length: bool },
+    Slice { len: u64, op: SliceLenOp },
     Deref { temp: Place<'tcx>, mutability: Mutability },
     Never,
-    Or { pats: Box<[FlatPat<'tcx>]> },
 }
 
-impl<'tcx> TestCase<'tcx> {
+impl<'tcx> TestableCase<'tcx> {
     fn as_range(&self) -> Option<&PatRange<'tcx>> {
         if let Self::Range(v) = self { Some(v.as_ref()) } else { None }
     }
+}
+
+/// Sub-classification of [`TestableCase::Constant`], which helps to avoid
+/// some redundant ad-hoc checks when preparing and lowering tests.
+#[derive(Debug, Clone)]
+enum PatConstKind {
+    /// The primitive `bool` type, which is like an integer but simpler,
+    /// having only two values.
+    Bool,
+    /// Primitive unsigned/signed integer types, plus `char`.
+    /// These types interact nicely with `SwitchInt`.
+    IntOrChar,
+    /// Floating-point primitives, e.g. `f32`, `f64`.
+    /// These types don't support `SwitchInt` and require an equality test,
+    /// but can also interact with range pattern tests.
+    Float,
+    /// Constant string values, tested via string equality.
+    String,
+    /// Any other constant-pattern is usually tested via some kind of equality
+    /// check. Types that might be encountered here include:
+    /// - raw pointers derived from integer values
+    /// - pattern types, e.g. `pattern_type!(u32 is 1..)`
+    Other,
 }
 
 /// Node in a tree of "match pairs", where each pair consists of a place to be
 /// tested, and a test to perform on that place.
 ///
 /// Each node also has a list of subpairs (possibly empty) that must also match,
-/// and a reference to the THIR pattern it represents.
+/// and some additional information from the THIR pattern it represents.
 #[derive(Debug, Clone)]
-pub(crate) struct MatchPairTree<'tcx> {
-    /// This place...
-    ///
-    /// ---
-    /// This can be `None` if it referred to a non-captured place in a closure.
-    ///
-    /// Invariant: Can only be `None` when `test_case` is `Or`.
-    /// Therefore this must be `Some(_)` after or-pattern expansion.
-    place: Option<Place<'tcx>>,
+struct MatchPairTree<'tcx> {
+    kind: MatchPairKind<'tcx>,
 
-    /// ... must pass this test...
-    test_case: TestCase<'tcx>,
-
-    /// ... and these subpairs must match.
-    ///
-    /// ---
-    /// Subpairs typically represent tests that can only be performed after their
-    /// parent has succeeded. For example, the pattern `Some(3)` might have an
-    /// outer match pair that tests for the variant `Some`, and then a subpair
-    /// that tests its field for the value `3`.
-    subpairs: Vec<Self>,
-
-    /// Type field of the pattern this node was created from.
-    pattern_ty: Ty<'tcx>,
-    /// Span field of the pattern this node was created from.
+    /// Span field of the THIR pattern this node was created from.
     pattern_span: Span,
 }
 
-/// See [`Test`] for more.
+#[derive(Debug, Clone)]
+enum MatchPairKind<'tcx> {
+    Or {
+        or_subpats: Box<[FlatPat<'tcx>]>,
+    },
+    Testable {
+        /// Place that will be tested.
+        place: Place<'tcx>,
+        /// Test to perform against the place, and the desired outcome.
+        testable_case: TestableCase<'tcx>,
+
+        /// Further tests that can only be performed after this test has succeeded.
+        /// For example, in the pattern `Some(3)` this node might represent a test
+        /// for the variant `Some`, while a subpair would test its field for the
+        /// value `3`.
+        subpairs: Vec<MatchPairTree<'tcx>>,
+    },
+}
+
+/// A runtime test to perform to determine which candidates match a scrutinee place.
+///
+/// The kind of test to perform is indicated by [`TestKind`].
+#[derive(Debug)]
+pub(crate) struct Test<'tcx> {
+    span: Span,
+    kind: TestKind<'tcx>,
+}
+
+/// The kind of runtime test to perform to determine which candidates match a
+/// scrutinee place. This is the main component of [`Test`].
+///
+/// Some of these variants don't contain the constant value(s) being tested
+/// against, because those values are stored in the corresponding bucketed
+/// candidates instead.
 #[derive(Clone, Debug, PartialEq)]
 enum TestKind<'tcx> {
     /// Test what enum variant a value is.
     ///
     /// The subset of expected variants is not stored here; instead they are
-    /// extracted from the [`TestCase`]s of the candidates participating in the
+    /// extracted from the [`TestableCase`]s of the candidates participating in the
     /// test.
     Switch {
         /// The enum type being tested.
@@ -1309,27 +1296,27 @@ enum TestKind<'tcx> {
     /// Test what value an integer or `char` has.
     ///
     /// The test's target values are not stored here; instead they are extracted
-    /// from the [`TestCase`]s of the candidates participating in the test.
+    /// from the [`TestableCase`]s of the candidates participating in the test.
     SwitchInt,
 
     /// Test whether a `bool` is `true` or `false`.
     If,
 
-    /// Test for equality with value, possibly after an unsizing coercion to
-    /// `cast_ty`,
-    Eq {
+    /// Tests the place against a string constant using string equality.
+    StringEq {
+        /// Constant string value to test against.
+        /// Note that this value has type `str` (not `&str`).
         value: ty::Value<'tcx>,
-        // Integer types are handled by `SwitchInt`, and constants with ADT
-        // types and `&[T]` types are converted back into patterns, so this can
-        // only be `&str` or floats.
-        cast_ty: Ty<'tcx>,
     },
+
+    /// Tests the place against a constant using scalar equality.
+    ScalarEq { value: ty::Value<'tcx> },
 
     /// Test whether the value falls within an inclusive or exclusive range.
     Range(Arc<PatRange<'tcx>>),
 
     /// Test that the length of the slice is `== len` or `>= len`.
-    Len { len: u64, op: BinOp },
+    SliceLen { len: u64, op: SliceLenOp },
 
     /// Call `Deref::deref[_mut]` on the value.
     Deref {
@@ -1342,14 +1329,15 @@ enum TestKind<'tcx> {
     Never,
 }
 
-/// A test to perform to determine which [`Candidate`] matches a value.
-///
-/// [`Test`] is just the test to perform; it does not include the value
-/// to be tested.
-#[derive(Debug)]
-pub(crate) struct Test<'tcx> {
-    span: Span,
-    kind: TestKind<'tcx>,
+/// Indicates the kind of slice-length constraint imposed by a slice pattern,
+/// or its corresponding test.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SliceLenOp {
+    /// The slice pattern can only match a slice with exactly `len` elements.
+    Equal,
+    /// The slice pattern can match a slice with `len` or more elements
+    /// (i.e. it contains a `..` subpattern in the middle).
+    GreaterOrEqual,
 }
 
 /// The branch to be taken after a test.
@@ -1538,6 +1526,14 @@ pub(crate) enum HasMatchGuard {
     No,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exhaustive {
+    /// `let` and `match` are exhaustive.
+    Yes,
+    /// `if let` and `let else` are not exhaustive.
+    No,
+}
+
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// The entrypoint of the matching algorithm. Create the decision tree for the match expression,
     /// starting from `block`.
@@ -1545,9 +1541,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// `patterns` is a list of patterns, one for each arm. The associated boolean indicates whether
     /// the arm has a guard.
     ///
-    /// `refutable` indicates whether the candidate list is refutable (for `if let` and `let else`)
-    /// or not (for `let` and `match`). In the refutable case we return the block to which we branch
-    /// on failure.
+    /// `exhaustive` indicates whether the candidate list is exhaustive (for `if let` and `let else`)
+    /// or not (for `let` and `match`). In the non-exhaustive case we return the block to which we
+    /// branch on failure.
     pub(crate) fn lower_match_tree(
         &mut self,
         block: BasicBlock,
@@ -1555,7 +1551,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         scrutinee_place_builder: &PlaceBuilder<'tcx>,
         match_start_span: Span,
         patterns: Vec<(&Pat<'tcx>, HasMatchGuard)>,
-        refutable: bool,
+        exhaustive: Exhaustive,
     ) -> BuiltMatchTree<'tcx> {
         // Assemble the initial list of candidates. These top-level candidates are 1:1 with the
         // input patterns, but other parts of match lowering also introduce subcandidates (for
@@ -1584,9 +1580,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         // Set up false edges so that the borrow-checker cannot make use of the specific CFG we
         // generated. We falsely branch from each candidate to the one below it to make it as if we
-        // were testing match branches one by one in order. In the refutable case we also want a
+        // were testing match branches one by one in order. In the non-exhaustive case we also want a
         // false edge to the final failure block.
-        let mut next_candidate_start_block = if refutable { Some(otherwise_block) } else { None };
+        let mut next_candidate_start_block = match exhaustive {
+            Exhaustive::Yes => None,
+            Exhaustive::No => Some(otherwise_block),
+        };
         for candidate in candidates.iter_mut().rev() {
             let has_guard = candidate.has_guard;
             candidate.visit_leaves_rev(|leaf_candidate| {
@@ -1620,8 +1619,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             });
         }
 
-        if !refutable {
-            // Match checking ensures `otherwise_block` is actually unreachable in irrefutable
+        if exhaustive == Exhaustive::Yes {
+            // Match checking ensures `otherwise_block` is actually unreachable in exhaustive
             // cases.
             let source_info = self.source_info(scrutinee_span);
 
@@ -1726,9 +1725,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         start_block: BasicBlock,
         candidates: &mut [&mut Candidate<'tcx>],
     ) -> BasicBlock {
-        ensure_sufficient_stack(|| {
-            self.match_candidates_inner(span, scrutinee_span, start_block, candidates)
-        })
+        self.match_candidates_inner(span, scrutinee_span, start_block, candidates)
     }
 
     /// Construct the decision tree for `candidates`. Don't call this, call `match_candidates`
@@ -1930,10 +1927,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         candidate: &mut Candidate<'tcx>,
         match_pair: MatchPairTree<'tcx>,
     ) {
-        let TestCase::Or { pats } = match_pair.test_case else { bug!() };
-        debug!("expanding or-pattern: candidate={:#?}\npats={:#?}", candidate, pats);
+        let MatchPairKind::Or { or_subpats } = match_pair.kind else { bug!() };
+        debug!("expanding or-pattern: candidate={:#?}\nor_subpats={:#?}", candidate, or_subpats);
         candidate.or_span = Some(match_pair.pattern_span);
-        candidate.subcandidates = pats
+        candidate.subcandidates = or_subpats
             .into_iter()
             .map(|flat_pat| Candidate::from_flat_pat(flat_pat, candidate.has_guard))
             .collect();
@@ -2098,7 +2095,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         debug_assert!(
             remaining_match_pairs
                 .iter()
-                .all(|match_pair| matches!(match_pair.test_case, TestCase::Or { .. }))
+                .all(|match_pair| matches!(match_pair.kind, MatchPairKind::Or { .. }))
         );
 
         // Visit each leaf candidate within this subtree, add a copy of the remaining
@@ -2149,91 +2146,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         // Extract the match-pair from the highest priority candidate
         let match_pair = &candidates[0].match_pairs[0];
         let test = self.pick_test_for_match_pair(match_pair);
-        // Unwrap is ok after simplification.
-        let match_place = match_pair.place.unwrap();
+
+        let MatchPairKind::Testable { place: match_place, .. } = match_pair.kind else {
+            bug!("match pair must be testable")
+        };
         debug!(?test, ?match_pair);
 
         (match_place, test)
-    }
-
-    /// Given a test, we partition the input candidates into several buckets.
-    /// If a candidate matches in exactly one of the branches of `test`
-    /// (and no other branches), we put it into the corresponding bucket.
-    /// If it could match in more than one of the branches of `test`, the test
-    /// doesn't usefully apply to it, and we stop partitioning candidates.
-    ///
-    /// Importantly, we also **mutate** the branched candidates to remove match pairs
-    /// that are entailed by the outcome of the test, and add any sub-pairs of the
-    /// removed pairs.
-    ///
-    /// This returns a pair of
-    /// - the candidates that weren't sorted;
-    /// - for each possible outcome of the test, the candidates that match in that outcome.
-    ///
-    /// For example:
-    /// ```
-    /// # let (x, y, z) = (true, true, true);
-    /// match (x, y, z) {
-    ///     (true , _    , true ) => true,  // (0)
-    ///     (false, false, _    ) => false, // (1)
-    ///     (_    , true , _    ) => true,  // (2)
-    ///     (true , _    , false) => false, // (3)
-    /// }
-    /// # ;
-    /// ```
-    ///
-    /// Assume we are testing on `x`. Conceptually, there are 2 overlapping candidate sets:
-    /// - If the outcome is that `x` is true, candidates {0, 2, 3} are possible
-    /// - If the outcome is that `x` is false, candidates {1, 2} are possible
-    ///
-    /// Following our algorithm:
-    /// - Candidate 0 is sorted into outcome `x == true`
-    /// - Candidate 1 is sorted into outcome `x == false`
-    /// - Candidate 2 remains unsorted, because testing `x` has no effect on it
-    /// - Candidate 3 remains unsorted, because a previous candidate (2) was unsorted
-    ///   - This helps preserve the illusion that candidates are tested "in order"
-    ///
-    /// The sorted candidates are mutated to remove entailed match pairs:
-    /// - candidate 0 becomes `[z @ true]` since we know that `x` was `true`;
-    /// - candidate 1 becomes `[y @ false]` since we know that `x` was `false`.
-    fn sort_candidates<'b, 'c>(
-        &mut self,
-        match_place: Place<'tcx>,
-        test: &Test<'tcx>,
-        mut candidates: &'b mut [&'c mut Candidate<'tcx>],
-    ) -> (
-        &'b mut [&'c mut Candidate<'tcx>],
-        FxIndexMap<TestBranch<'tcx>, Vec<&'b mut Candidate<'tcx>>>,
-    ) {
-        // For each of the possible outcomes, collect vector of candidates that apply if the test
-        // has that particular outcome.
-        let mut target_candidates: FxIndexMap<_, Vec<&mut Candidate<'_>>> = Default::default();
-
-        let total_candidate_count = candidates.len();
-
-        // Sort the candidates into the appropriate vector in `target_candidates`. Note that at some
-        // point we may encounter a candidate where the test is not relevant; at that point, we stop
-        // sorting.
-        while let Some(candidate) = candidates.first_mut() {
-            let Some(branch) =
-                self.sort_candidate(match_place, test, candidate, &target_candidates)
-            else {
-                break;
-            };
-            let (candidate, rest) = candidates.split_first_mut().unwrap();
-            target_candidates.entry(branch).or_insert_with(Vec::new).push(candidate);
-            candidates = rest;
-        }
-
-        // At least the first candidate ought to be tested
-        assert!(
-            total_candidate_count > candidates.len(),
-            "{total_candidate_count}, {candidates:#?}"
-        );
-        debug!("tested_candidates: {}", total_candidate_count - candidates.len());
-        debug!("untested_candidates: {}", candidates.len());
-
-        (candidates, target_candidates)
     }
 
     /// This is the most subtle part of the match lowering algorithm. At this point, there are
@@ -2347,8 +2266,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         // For each of the N possible test outcomes, build the vector of candidates that applies if
         // the test has that particular outcome. This also mutates the candidates to remove match
         // pairs that are fully satisfied by the relevant outcome.
-        let (remaining_candidates, target_candidates) =
-            self.sort_candidates(match_place, &test, candidates);
+        let PartitionedCandidates { target_candidates, remaining_candidates } =
+            self.partition_candidates_into_buckets(match_place, &test, candidates);
 
         // The block that we should branch to if none of the `target_candidates` match.
         let remainder_start = self.cfg.start_new_block();
@@ -2390,61 +2309,72 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 // Pat binding - used for `let` and function parameters as well.
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
-    /// Lowers a `let` expression that appears in a suitable context
-    /// (e.g. an `if` condition or match guard).
+    /// Lowers a fallible `let`, which is one of:
+    /// - A let-expression inside an `if` condition or match guard.
+    /// - A let-else statement.
     ///
-    /// Also used for lowering let-else statements, since they have similar
-    /// needs despite not actually using `let` expressions.
+    /// (Strictly speaking, the underlying pattern might actually be infallible.
+    /// What matters here is that it is _allowed_ to be fallible.)
     ///
-    /// Use [`DeclareLetBindings`] to control whether the `let` bindings are
-    /// declared or not.
-    pub(crate) fn lower_let_expr(
+    /// Must be called within a [`Builder::in_if_then_scope`], to indicate where
+    /// to break to if the `let` fails to match.
+    pub(crate) fn lower_fallible_let(
         &mut self,
         mut block: BasicBlock,
-        expr_id: ExprId,
         pat: &Pat<'tcx>,
+        scrutinee_id: ExprId,
         source_scope: Option<SourceScope>,
         scope_span: Span,
+        // Controls whether bindings are declared or not, as requested by the caller.
         declare_let_bindings: DeclareLetBindings,
     ) -> BlockAnd<()> {
-        let expr_span = self.thir[expr_id].span;
-        let scrutinee = unpack!(block = self.lower_scrutinee(block, expr_id, expr_span));
+        let scrutinee_span = self.thir[scrutinee_id].span;
+        let scrutinee_place_builder = unpack!(block = self.lower_scrutinee(block, scrutinee_id));
+
+        // Lower the scrutinee and pattern as though they were desugared to a `match`.
         let built_tree = self.lower_match_tree(
             block,
-            expr_span,
-            &scrutinee,
+            scrutinee_span,
+            &scrutinee_place_builder,
             pat.span,
             vec![(pat, HasMatchGuard::No)],
-            true,
+            Exhaustive::No,
         );
-        let [branch] = built_tree.branches.try_into().unwrap();
+        let [true_branch] = built_tree.branches.try_into().unwrap();
+        let false_block = built_tree.otherwise_block;
 
-        self.break_for_else(built_tree.otherwise_block, self.source_info(expr_span));
+        // If pattern-matching failed, break out of the enclosing if-then scope.
+        self.break_from_if_then_scope(false_block, self.source_info(scrutinee_span));
 
         match declare_let_bindings {
             DeclareLetBindings::Yes => {
-                let expr_place = scrutinee.try_to_place(self);
-                let opt_expr_place = expr_place.as_ref().map(|place| (Some(place), expr_span));
+                let scrutinee_place;
+                let opt_match_place = try {
+                    scrutinee_place = scrutinee_place_builder.try_to_place(self)?;
+                    (Some(&scrutinee_place), scrutinee_span)
+                };
                 self.declare_bindings(
                     source_scope,
                     pat.span.to(scope_span),
                     pat,
                     None,
-                    opt_expr_place,
+                    opt_match_place,
                 );
             }
             DeclareLetBindings::No => {} // Caller is responsible for bindings.
-            DeclareLetBindings::LetNotPermitted => {
-                self.tcx.dcx().span_bug(expr_span, "let expression not expected in this context")
-            }
+            DeclareLetBindings::LetNotPermitted => self
+                .tcx
+                .dcx()
+                .span_bug(scrutinee_span, "let expression not expected in this context"),
         }
 
-        let success = self.bind_pattern(self.source_info(pat.span), branch, &[], expr_span, None);
+        let true_block =
+            self.bind_pattern(self.source_info(pat.span), true_branch, &[], scrutinee_span, None);
 
         // If branch coverage is enabled, record this branch.
-        self.visit_coverage_conditional_let(pat, success, built_tree.otherwise_block);
+        self.visit_coverage_conditional_let(pat, true_block, false_block);
 
-        success.unit()
+        true_block.unit()
     }
 
     /// Initializes each of the bindings from the candidate by
@@ -2507,15 +2437,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
             let mut guard_span = rustc_span::DUMMY_SP;
 
-            let (post_guard_block, otherwise_post_guard_block) =
+            let (guard_true_block, guard_false_block) =
                 self.in_if_then_scope(match_scope, guard_span, |this| {
                     guard_span = this.thir[guard].span;
-                    this.then_else_break(
+                    this.lower_if_condition(
                         block,
                         guard,
-                        None, // Use `self.local_scope()` as the temp scope
-                        this.source_info(arm.span),
-                        DeclareLetBindings::No, // For guards, `let` bindings are declared separately
+                        LowerIfCondArgs {
+                            temp_scope_override: None, // Use `this.local_scope()`.
+                            variable_source_info: this.source_info(arm.span),
+                            // For guards, `let` bindings are declared separately.
+                            declare_let_bindings: DeclareLetBindings::No,
+                        },
                     )
                 });
 
@@ -2533,10 +2466,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
             for &(_, temp, _) in fake_borrows {
                 let cause = FakeReadCause::ForMatchGuard;
-                self.cfg.push_fake_read(post_guard_block, guard_end, cause, Place::from(temp));
+                self.cfg.push_fake_read(guard_true_block, guard_end, cause, Place::from(temp));
             }
 
-            self.cfg.goto(otherwise_post_guard_block, source_info, sub_branch.otherwise_block);
+            self.cfg.goto(guard_false_block, source_info, sub_branch.otherwise_block);
 
             // We want to ensure that the matched candidates are bound
             // after we have confirmed this candidate *and* any
@@ -2573,16 +2506,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             for binding in by_value_bindings.clone() {
                 let local_id = self.var_local_id(binding.var_id, RefWithinGuard);
                 let cause = FakeReadCause::ForGuardBinding;
-                self.cfg.push_fake_read(post_guard_block, guard_end, cause, Place::from(local_id));
+                self.cfg.push_fake_read(guard_true_block, guard_end, cause, Place::from(local_id));
             }
             // Only schedule drops for the last sub-branch we lower.
             self.bind_matched_candidate_for_arm_body(
-                post_guard_block,
+                guard_true_block,
                 schedule_drops,
                 by_value_bindings,
             );
 
-            post_guard_block
+            guard_true_block
         } else {
             // (Here, it is not too early to bind the matched
             // candidate on `block`, because there is no guard result
@@ -2725,6 +2658,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 block,
                 binding.var_id,
                 binding.span,
+                binding.is_shorthand,
                 RefWithinGuard,
                 ScheduleDrops::Yes,
             );
@@ -2735,19 +2669,25 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     let rvalue = Rvalue::Ref(re_erased, BorrowKind::Shared, binding.source);
                     self.cfg.push_assign(block, source_info, ref_for_guard, rvalue);
                 }
-                ByRef::Yes(mutbl) => {
-                    // The arm binding will be by reference, so eagerly create it now. Drops must
-                    // be scheduled to emit `StorageDead` on the guard's failure/break branches.
+                ByRef::Yes(pinnedness, mutbl) => {
+                    // The arm binding will be by reference, so eagerly create it now // be scheduled to emit `StorageDead` on the guard's failure/break branches.
                     let value_for_arm = self.storage_live_binding(
                         block,
                         binding.var_id,
                         binding.span,
+                        binding.is_shorthand,
                         OutsideGuard,
                         ScheduleDrops::Yes,
                     );
 
                     let rvalue =
                         Rvalue::Ref(re_erased, util::ref_pat_borrow_kind(mutbl), binding.source);
+                    let rvalue = match pinnedness {
+                        ty::Pinnedness::Not => rvalue,
+                        ty::Pinnedness::Pinned => {
+                            self.pin_borrowed_local(block, value_for_arm.local, rvalue, source_info)
+                        }
+                    };
                     self.cfg.push_assign(block, source_info, value_for_arm, rvalue);
                     // For the guard binding, take a shared reference to that reference.
                     let rvalue = Rvalue::Ref(re_erased, BorrowKind::Shared, value_for_arm);
@@ -2775,6 +2715,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 block,
                 binding.var_id,
                 binding.span,
+                binding.is_shorthand,
                 OutsideGuard,
                 schedule_drops,
             );
@@ -2782,13 +2723,60 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 self.schedule_drop_for_binding(binding.var_id, binding.span, OutsideGuard);
             }
             let rvalue = match binding.binding_mode.0 {
-                ByRef::No => Rvalue::Use(self.consume_by_copy_or_move(binding.source)),
-                ByRef::Yes(mutbl) => {
-                    Rvalue::Ref(re_erased, util::ref_pat_borrow_kind(mutbl), binding.source)
+                ByRef::No => {
+                    Rvalue::Use(self.consume_by_copy_or_move(binding.source), WithRetag::Yes)
+                }
+                ByRef::Yes(pinnedness, mutbl) => {
+                    let rvalue =
+                        Rvalue::Ref(re_erased, util::ref_pat_borrow_kind(mutbl), binding.source);
+                    match pinnedness {
+                        ty::Pinnedness::Not => rvalue,
+                        ty::Pinnedness::Pinned => {
+                            self.pin_borrowed_local(block, local.local, rvalue, source_info)
+                        }
+                    }
                 }
             };
             self.cfg.push_assign(block, source_info, local, rvalue);
         }
+    }
+
+    /// Given an rvalue `&[mut]borrow` and a local `local`, generate the pinned borrow for it:
+    /// ```ignore (illustrative)
+    /// pinned_temp = &borrow;
+    /// local = Pin { __pointer: move pinned_temp };
+    /// ```
+    fn pin_borrowed_local(
+        &mut self,
+        block: BasicBlock,
+        local: Local,
+        borrow: Rvalue<'tcx>,
+        source_info: SourceInfo,
+    ) -> Rvalue<'tcx> {
+        debug_assert_matches!(borrow, Rvalue::Ref(..));
+
+        let local_ty = self.local_decls[local].ty;
+
+        let pinned_ty = local_ty.pinned_ty().unwrap_or_else(|| {
+            span_bug!(
+                source_info.span,
+                "expect type `Pin` for a pinned binding, found type {:?}",
+                local_ty
+            )
+        });
+        let pinned_temp =
+            Place::from(self.local_decls.push(LocalDecl::new(pinned_ty, source_info.span)));
+        self.cfg.push_assign(block, source_info, pinned_temp, borrow);
+        Rvalue::Aggregate(
+            Box::new(AggregateKind::Adt(
+                self.tcx.require_lang_item(LangItem::Pin, source_info.span),
+                FIRST_VARIANT,
+                self.tcx.mk_args(&[pinned_ty.into()]),
+                None,
+                None,
+            )),
+            std::iter::once(Operand::Move(pinned_temp)).collect(),
+        )
     }
 
     /// Each binding (`ref mut var`/`ref var`/`mut var`/`var`, where the bound
@@ -2827,6 +2815,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     opt_ty_info: None,
                     opt_match_place,
                     pat_span,
+                    introductions: Vec::new(),
                 },
             )))),
         };
@@ -2849,7 +2838,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 user_ty: None,
                 source_info,
                 local_info: ClearCrossCrate::Set(Box::new(LocalInfo::User(
-                    BindingForm::RefForGuard,
+                    BindingForm::RefForGuard(for_arm_body),
                 ))),
             });
             if self.should_emit_debug_info_for_binding(name, var_id) {
@@ -2882,8 +2871,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         for (_, node) in tcx.hir_parent_iter(var_id.0) {
             // FIXME(khuey) at what point is it safe to bail on the iterator?
             // Can we stop at the first non-Pat node?
-            if matches!(node, Node::LetStmt(&LetStmt { source: LocalSource::AssignDesugar(_), .. }))
-            {
+            if matches!(node, Node::LetStmt(&LetStmt { source: LocalSource::AssignDesugar, .. })) {
                 return false;
             }
         }
@@ -2941,11 +2929,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         match pat.ctor() {
             Constructor::Variant(variant_index) => {
-                let ValTreeKind::Branch(box [actual_variant_idx]) = *valtree else {
+                let ValTreeKind::Branch(branch) = *valtree else {
                     bug!("malformed valtree for an enum")
                 };
-
-                let ValTreeKind::Leaf(actual_variant_idx) = ***actual_variant_idx else {
+                if branch.len() != 1 {
+                    bug!("malformed valtree for an enum")
+                };
+                let ValTreeKind::Leaf(actual_variant_idx) = **branch[0].to_value().valtree else {
                     bug!("malformed valtree for an enum")
                 };
 
@@ -2953,7 +2943,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             Constructor::IntRange(int_range) => {
                 let size = pat.ty().primitive_size(self.tcx);
-                let actual_int = valtree.unwrap_leaf().to_bits(size);
+                let actual_int = valtree.to_leaf().to_bits(size);
                 let actual_int = if pat.ty().is_signed() {
                     MaybeInfiniteInt::new_finite_int(actual_int, size.bits())
                 } else {
@@ -2961,33 +2951,33 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 };
                 IntRange::from_singleton(actual_int).is_subrange(int_range)
             }
-            Constructor::Bool(pattern_value) => match valtree.unwrap_leaf().try_to_bool() {
+            Constructor::Bool(pattern_value) => match valtree.to_leaf().try_to_bool() {
                 Ok(actual_value) => *pattern_value == actual_value,
                 Err(()) => bug!("bool value with invalid bits"),
             },
             Constructor::F16Range(l, h, end) => {
-                let actual = valtree.unwrap_leaf().to_f16();
+                let actual = valtree.to_leaf().to_f16();
                 match end {
                     RangeEnd::Included => (*l..=*h).contains(&actual),
                     RangeEnd::Excluded => (*l..*h).contains(&actual),
                 }
             }
             Constructor::F32Range(l, h, end) => {
-                let actual = valtree.unwrap_leaf().to_f32();
+                let actual = valtree.to_leaf().to_f32();
                 match end {
                     RangeEnd::Included => (*l..=*h).contains(&actual),
                     RangeEnd::Excluded => (*l..*h).contains(&actual),
                 }
             }
             Constructor::F64Range(l, h, end) => {
-                let actual = valtree.unwrap_leaf().to_f64();
+                let actual = valtree.to_leaf().to_f64();
                 match end {
                     RangeEnd::Included => (*l..=*h).contains(&actual),
                     RangeEnd::Excluded => (*l..*h).contains(&actual),
                 }
             }
             Constructor::F128Range(l, h, end) => {
-                let actual = valtree.unwrap_leaf().to_f128();
+                let actual = valtree.to_leaf().to_f128();
                 match end {
                     RangeEnd::Included => (*l..=*h).contains(&actual),
                     RangeEnd::Excluded => (*l..*h).contains(&actual),

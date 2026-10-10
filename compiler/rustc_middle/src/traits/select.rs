@@ -4,17 +4,19 @@
 
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
-use rustc_macros::{HashStable, TypeVisitable};
-use rustc_query_system::cache::Cache;
+use rustc_macros::{StableHash, TypeVisitable};
+use rustc_type_ir::solve::AliasBoundKind;
 
 use self::EvaluationResult::*;
 use super::{SelectionError, SelectionResult};
+use crate::traits::cache::WithDepNodeCache;
 use crate::ty;
 
 pub type SelectionCache<'tcx, ENV> =
-    Cache<(ENV, ty::TraitPredicate<'tcx>), SelectionResult<'tcx, SelectionCandidate<'tcx>>>;
+    WithDepNodeCache<(ENV, ty::TraitClause<'tcx>), SelectionResult<'tcx, SelectionCandidate<'tcx>>>;
 
-pub type EvaluationCache<'tcx, ENV> = Cache<(ENV, ty::PolyTraitPredicate<'tcx>), EvaluationResult>;
+pub type EvaluationCache<'tcx, ENV> =
+    WithDepNodeCache<(ENV, ty::PolyTraitClause<'tcx>), EvaluationResult>;
 
 /// The selection process begins by considering all impls, where
 /// clauses, and so forth that might resolve an obligation. Sometimes
@@ -110,14 +112,19 @@ pub enum SelectionCandidate<'tcx> {
     /// Implementation of transmutability trait.
     TransmutabilityCandidate,
 
-    ParamCandidate(ty::PolyTraitPredicate<'tcx>),
+    ParamCandidate(ty::PolyTraitClause<'tcx>),
     ImplCandidate(DefId),
     AutoImplCandidate,
 
     /// This is a trait matching with a projected type as `Self`, and we found
     /// an applicable bound in the trait definition. The `usize` is an index
-    /// into the list returned by `tcx.item_bounds`.
-    ProjectionCandidate(usize),
+    /// into the list returned by `tcx.item_bounds` and the `AliasBoundKind`
+    /// is whether this is candidate from recursion on the self type of a
+    /// projection.
+    ProjectionCandidate {
+        idx: usize,
+        kind: AliasBoundKind,
+    },
 
     /// Implementation of a `Fn`-family trait by one of the anonymous types
     /// generated for an `||` expression.
@@ -171,6 +178,8 @@ pub enum SelectionCandidate<'tcx> {
     BuiltinUnsizeCandidate,
 
     BikeshedGuaranteedNoDropCandidate,
+
+    TryAsDynCandidate,
 }
 
 /// The result of trait evaluation. The order is important
@@ -184,7 +193,7 @@ pub enum SelectionCandidate<'tcx> {
 ///     all the "potential success" candidates can potentially succeed,
 ///     so they are noops when unioned with a definite error, and within
 ///     the categories it's easy to see that the unions are correct.
-#[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, HashStable)]
+#[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, StableHash)]
 pub enum EvaluationResult {
     /// Evaluation successful.
     EvaluatedToOk,
@@ -251,7 +260,7 @@ impl EvaluationResult {
 }
 
 /// Indicates that trait evaluation caused overflow and in which pass.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, HashStable)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, StableHash)]
 pub enum OverflowError {
     Error(ErrorGuaranteed),
     Canonical,

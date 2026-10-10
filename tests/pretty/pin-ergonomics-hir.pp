@@ -2,11 +2,10 @@
 //@ pretty-mode:hir
 //@ pp-exact:pin-ergonomics-hir.pp
 
-#![feature(pin_ergonomics)]
 #![allow(dead_code, incomplete_features)]
-#[attr = MacroUse {arguments: UseAll}]
+#![attr = Feature([pin_ergonomics#0])]
 extern crate std;
-#[prelude_import]
+#[attr = PreludeImport]
 use ::std::prelude::rust_2015::*;
 
 use std::pin::Pin;
@@ -40,5 +39,8 @@ fn bar() {
     foo_const(x);
     foo_const(x);
 }
+
+fn patterns<'a>(&pin mut x: Pin<&'_ mut i32>, &pin const y: Pin<&'a i32>,
+    ref pin mut z: i32, ref pin const w: i32) { }
 
 fn main() { }

@@ -2,6 +2,7 @@ use crate::{
     GenericDefId, ModuleDefId,
     expr_store::pretty::{print_function, print_struct},
     nameres::crate_def_map,
+    signatures::{FunctionSignature, StructSignature},
     test_db::TestDB,
 };
 use expect_test::{Expect, expect};
@@ -24,7 +25,6 @@ fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expe
                 ModuleDefId::ConstId(id) => id.into(),
                 ModuleDefId::StaticId(id) => id.into(),
                 ModuleDefId::TraitId(id) => id.into(),
-                ModuleDefId::TraitAliasId(id) => id.into(),
                 ModuleDefId::TypeAliasId(id) => id.into(),
                 ModuleDefId::EnumVariantId(_) => continue,
                 ModuleDefId::BuiltinType(_) => continue,
@@ -39,19 +39,28 @@ fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expe
         match def {
             GenericDefId::AdtId(adt_id) => match adt_id {
                 crate::AdtId::StructId(struct_id) => {
-                    out += &print_struct(&db, &db.struct_signature(struct_id), Edition::CURRENT);
+                    out += &print_struct(
+                        &db,
+                        struct_id,
+                        StructSignature::of(&db, struct_id),
+                        Edition::CURRENT,
+                    );
                 }
                 crate::AdtId::UnionId(_id) => (),
                 crate::AdtId::EnumId(_id) => (),
             },
             GenericDefId::ConstId(_id) => (),
             GenericDefId::FunctionId(function_id) => {
-                out += &print_function(&db, &db.function_signature(function_id), Edition::CURRENT)
+                out += &print_function(
+                    &db,
+                    function_id,
+                    FunctionSignature::of(&db, function_id),
+                    Edition::CURRENT,
+                )
             }
 
             GenericDefId::ImplId(_id) => (),
             GenericDefId::StaticId(_id) => (),
-            GenericDefId::TraitAliasId(_id) => (),
             GenericDefId::TraitId(_id) => (),
             GenericDefId::TypeAliasId(_id) => (),
         }
@@ -186,6 +195,45 @@ fn allowed3(baz: impl Baz<Assoc = Qux<impl Foo>>) {}
                 Param[0]: Foo,
                 Param[1]: Baz::<Assoc = Qux::<Param[0]>>
              {...}
+        "#]],
+    );
+}
+
+#[test]
+fn type_alias_constrained_lifetime_with_elided_lifetime_args() {
+    lower_and_print(
+        r#"
+type Alias<'a, 'b, T> = &'b T;
+fn f<T>(_: Alias<T>) {}
+"#,
+        expect![[r#"
+            fn f<T>(Alias::<T>) {...}
+        "#]],
+    );
+}
+
+#[test]
+fn regression_21138() {
+    lower_and_print(
+        r#"
+fn foo(v: for<'a> Trait1 + Trait2) {}
+    "#,
+        expect![[r#"
+            fn foo(dyn for<'a> Trait1 + Trait2) {...}
+        "#]],
+    );
+}
+
+#[test]
+fn extern_block_abi() {
+    lower_and_print(
+        r#"
+extern "C" {
+    fn extern_fn();
+}
+    "#,
+        expect![[r#"
+            extern "C" fn extern_fn() {...}
         "#]],
     );
 }

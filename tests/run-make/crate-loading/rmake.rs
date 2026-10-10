@@ -6,14 +6,16 @@
 use run_make_support::{diff, rust_lib_name, rustc};
 
 fn main() {
-    rustc().input("multiple-dep-versions-1.rs").run();
-    rustc().input("multiple-dep-versions-2.rs").extra_filename("2").metadata("2").run();
+    rustc().edition("2015").input("dependency-1.rs").run();
+    rustc().edition("2015").input("dependency-2.rs").extra_filename("2").metadata("2").run();
     rustc()
-        .input("multiple-dep-versions-3.rs")
+        .edition("2015")
+        .input("dep-2-reexport.rs")
         .extern_("dependency", rust_lib_name("dependency2"))
         .run();
 
     let out = rustc()
+        .edition("2015")
         .input("multiple-dep-versions.rs")
         .extern_("dependency", rust_lib_name("dependency"))
         .extern_("dep_2_reexport", rust_lib_name("foo"))

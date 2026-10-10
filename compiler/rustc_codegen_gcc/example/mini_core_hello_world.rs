@@ -1,12 +1,12 @@
 // Adapted from https://github.com/sunfishcode/mir2cranelift/blob/master/rust-examples/nocore-hello-world.rs
 
 #![feature(
-    no_core, unboxed_closures, lang_items, never_type, linkage,
-    extern_types, thread_local
+    no_core, unboxed_closures, lang_items, linkage,
+    extern_types, thread_local, rustc_private
 )]
 #![no_core]
 #![allow(dead_code, internal_features, non_camel_case_types)]
-#![rustfmt_skip]
+#![cfg_attr(rustfmt, rustfmt_skip)]
 
 extern crate mini_core;
 
@@ -90,8 +90,8 @@ fn start<T: Termination + 'static>(
 ) -> isize {
     if argc == 3 {
         unsafe { puts(*argv); }
-        unsafe { puts(*((argv as usize + intrinsics::size_of::<*const u8>()) as *const *const u8)); }
-        unsafe { puts(*((argv as usize + 2 * intrinsics::size_of::<*const u8>()) as *const *const u8)); }
+        unsafe { puts(*((argv as usize + size_of::<*const u8>()) as *const *const u8)); }
+        unsafe { puts(*((argv as usize + 2 * size_of::<*const u8>()) as *const *const u8)); }
     }
 
     main().report();
@@ -154,7 +154,7 @@ fn main() {
     let slice = &[0, 1] as &[i32];
     let slice_ptr = slice as *const [i32] as *const i32;
 
-    let align = intrinsics::align_of::<*const i32>();
+    let align = align_of::<*const i32>();
     assert_eq!(slice_ptr as usize % align, 0);
 
     //return;
@@ -195,11 +195,9 @@ fn main() {
         assert_eq!(intrinsics::size_of_val(a) as u8, 8);
         assert_eq!(intrinsics::size_of_val(&0u32) as u8, 4);
 
-        assert_eq!(intrinsics::align_of::<u16>() as u8, 2);
-        assert_eq!(intrinsics::align_of_val(&a) as u8, intrinsics::align_of::<&str>() as u8);
+        assert_eq!(align_of::<u16>() as u8, 2);
+        assert_eq!(intrinsics::align_of_val(&a) as u8, align_of::<&str>() as u8);
 
-        /*
-         * TODO: re-enable in the next sync.
         let u8_needs_drop = const { intrinsics::needs_drop::<u8>() };
         assert!(!u8_needs_drop);
         let slice_needs_drop = const { intrinsics::needs_drop::<[u8]>() };
@@ -208,7 +206,6 @@ fn main() {
         assert!(noisy_drop);
         let noisy_unsized_drop = const { intrinsics::needs_drop::<NoisyDropUnsized>() };
         assert!(noisy_unsized_drop);
-        */
 
         Unique {
             pointer: 0 as *const &str,
@@ -278,7 +275,7 @@ fn main() {
         }
     }
 
-    // TODO(antoyo): to make this work, support weak linkage.
+    // FIXME(antoyo): to make this work, support weak linkage.
     //unsafe { assert_eq!(ABC as usize, 0); }
 
     &mut (|| Some(0 as *const ())) as &mut dyn FnMut() -> Option<*const ()>;
@@ -441,10 +438,10 @@ pub enum E2<X> {
 #[allow(unreachable_patterns)]
 fn check_niche_behavior () {
     if let E1::V2 { .. } = (E1::V1 { f: true }) {
-        intrinsics::abort();
+        intrinsics::abort_immediate();
     }
 
     if let E2::V1 { .. } = E2::V3::<Infallible> {
-        intrinsics::abort();
+        intrinsics::abort_immediate();
     }
 }

@@ -1,28 +1,25 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::SpanRangeExt;
-use clippy_utils::{SpanlessEq, SpanlessHash, fulfill_or_allowed, is_lint_allowed, path_to_local, search_same};
+use clippy_utils::res::MaybeResPath as _;
+use clippy_utils::source::SpanExt as _;
+use clippy_utils::{SpanlessEq, fulfill_or_allowed, hash_expr, is_lint_allowed, search_same};
 use core::cmp::Ordering;
 use core::{iter, slice};
-use itertools::Itertools;
+use itertools::Itertools as _;
 use rustc_arena::DroplessArena;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{Arm, Expr, HirId, HirIdMap, HirIdMapEntry, HirIdSet, Pat, PatExpr, PatExprKind, PatKind, RangeEnd};
 use rustc_lint::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
-use rustc_lint::{LateContext, LintContext};
-use rustc_middle::ty;
-use rustc_span::{ByteSymbol, ErrorGuaranteed, Span, Symbol};
+use rustc_lint::{LateContext, LintContext as _};
+use rustc_middle::ty::{self, TypeckResults};
+use rustc_span::{ByteSymbol, ErrorGuaranteed, Span, Symbol, SyntaxContext};
 
 use super::MATCH_SAME_ARMS;
 
 #[expect(clippy::too_many_lines)]
 pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
-    let hash = |&(_, arm): &(usize, &Arm<'_>)| -> u64 {
-        let mut h = SpanlessHash::new(cx);
-        h.hash_expr(arm.body);
-        h.finish()
-    };
+    let hash = |&(_, arm): &(_, &Arm<'_>)| hash_expr(cx, arm.body);
 
     let arena = DroplessArena::default();
     let normalized_pats: Vec<_> = arms
@@ -35,9 +32,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
         .iter()
         .enumerate()
         .map(|(i, pat)| {
-            normalized_pats[i + 1..]
-                .iter()
-                .enumerate()
+            (normalized_pats[i + 1..].iter().enumerate())
                 .find_map(|(j, other)| pat.has_overlapping_values(other).then_some(i + 1 + j))
                 .unwrap_or(normalized_pats.len())
         })
@@ -48,16 +43,15 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
         .iter()
         .enumerate()
         .map(|(i, pat)| {
-            normalized_pats[..i]
-                .iter()
-                .enumerate()
-                .rev()
-                .zip(forwards_blocking_idxs[..i].iter().copied().rev())
-                .skip_while(|&(_, forward_block)| forward_block > i)
-                .find_map(|((j, other), forward_block)| {
-                    (forward_block == i || pat.has_overlapping_values(other)).then_some(j)
-                })
-                .unwrap_or(0)
+            iter::zip(
+                normalized_pats[..i].iter().enumerate().rev(),
+                forwards_blocking_idxs[..i].iter().copied().rev(),
+            )
+            .skip_while(|&(_, forward_block)| forward_block > i)
+            .find_map(|((j, other), forward_block)| {
+                (forward_block == i || pat.has_overlapping_values(other)).then_some(j)
+            })
+            .unwrap_or(0)
         })
         .collect();
 
@@ -67,9 +61,12 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
 
         let check_eq_with_pat = |expr_a: &Expr<'_>, expr_b: &Expr<'_>| {
             let mut local_map: HirIdMap<HirId> = HirIdMap::default();
-            let eq_fallback = |a: &Expr<'_>, b: &Expr<'_>| {
-                if let Some(a_id) = path_to_local(a)
-                    && let Some(b_id) = path_to_local(b)
+            let eq_fallback = |a_typeck_results: &TypeckResults<'tcx>,
+                               a: &Expr<'_>,
+                               b_typeck_results: &TypeckResults<'tcx>,
+                               b: &Expr<'_>| {
+                if let Some(a_id) = a.res_local_id()
+                    && let Some(b_id) = b.res_local_id()
                     && let entry = match local_map.entry(a_id) {
                         HirIdMapEntry::Vacant(entry) => entry,
                         // check if using the same bindings as before
@@ -77,7 +74,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                     }
                     // the names technically don't have to match; this makes the lint more conservative
                     && cx.tcx.hir_name(a_id) == cx.tcx.hir_name(b_id)
-                    && cx.typeck_results().expr_ty(a) == cx.typeck_results().expr_ty(b)
+                    && a_typeck_results.expr_ty(a) == b_typeck_results.expr_ty(b)
                     && pat_contains_local(lhs.pat, a_id)
                     && pat_contains_local(rhs.pat, b_id)
                 {
@@ -90,7 +87,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
 
             SpanlessEq::new(cx)
                 .expr_fallback(eq_fallback)
-                .eq_expr(expr_a, expr_b)
+                .eq_expr(SyntaxContext::root(), expr_a, expr_b)
                 // these checks could be removed to allow unused bindings
                 && bindings_eq(lhs.pat, local_map.keys().copied().collect())
                 && bindings_eq(rhs.pat, local_map.values().copied().collect())
@@ -135,7 +132,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                     diag.span_label(last.span, "the wildcard arm");
 
                     let s = if prev.len() > 1 { "s" } else { "" };
-                    diag.multipart_suggestion_verbose(
+                    diag.multipart_suggestion(
                         format!("otherwise remove the non-wildcard arm{s}"),
                         prev.iter()
                             .map(|(_, arm)| (adjusted_arm_span(cx, arm.span), String::new()))
@@ -155,16 +152,16 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                     if let Some(((_, dest), src)) = split
                         && let Some(pat_snippets) = group
                             .iter()
-                            .map(|(_, arm)| arm.pat.span.get_source_text(cx))
+                            .map(|(_, arm)| arm.pat.span.get_text(cx))
                             .collect::<Option<Vec<_>>>()
                     {
-                        let mut suggs = src
+                        let suggs = src
                             .iter()
                             .map(|(_, arm)| (adjusted_arm_span(cx, arm.span), String::new()))
+                            .chain([(dest.pat.span, pat_snippets.iter().join(" | "))])
                             .collect_vec();
 
-                        suggs.push((dest.pat.span, pat_snippets.iter().join(" | ")));
-                        diag.multipart_suggestion_verbose(
+                        diag.multipart_suggestion(
                             "otherwise merge the patterns into a single arm",
                             suggs,
                             Applicability::MaybeIncorrect,
@@ -268,9 +265,8 @@ impl<'a> NormalizedPat<'a> {
             PatKind::Missing => unreachable!(),
             PatKind::Wild | PatKind::Binding(.., None) => Self::Wild,
             PatKind::Binding(.., Some(pat))
-            | PatKind::Box(pat)
             | PatKind::Deref(pat)
-            | PatKind::Ref(pat, _)
+            | PatKind::Ref(pat, _, _)
             | PatKind::Guard(pat, _) => Self::from_pat(cx, arena, pat),
             PatKind::Never => Self::Never,
             PatKind::Struct(ref path, fields, _) => {
@@ -396,10 +392,7 @@ impl<'a> NormalizedPat<'a> {
                 if lpath != rpath {
                     return false;
                 }
-                lpats
-                    .iter()
-                    .zip(rpats.iter())
-                    .all(|(lpat, rpat)| lpat.has_overlapping_values(rpat))
+                iter::zip(lpats, rpats).all(|(lpat, rpat)| lpat.has_overlapping_values(rpat))
             },
             (Self::Path(x), Self::Path(y)) => x == y,
             (Self::LitStr(x), Self::LitStr(y)) => x == y,
@@ -409,7 +402,7 @@ impl<'a> NormalizedPat<'a> {
             (Self::Range(ref x), Self::Range(ref y)) => x.overlaps(y),
             (Self::Range(ref range), Self::LitInt(x)) | (Self::LitInt(x), Self::Range(ref range)) => range.contains(x),
             (Self::Slice(lpats, None), Self::Slice(rpats, None)) => {
-                lpats.len() == rpats.len() && lpats.iter().zip(rpats.iter()).all(|(x, y)| x.has_overlapping_values(y))
+                lpats.len() == rpats.len() && iter::zip(lpats, rpats).all(|(x, y)| x.has_overlapping_values(y))
             },
             (Self::Slice(pats, None), Self::Slice(front, Some(back)))
             | (Self::Slice(front, Some(back)), Self::Slice(pats, None)) => {
@@ -418,16 +411,12 @@ impl<'a> NormalizedPat<'a> {
                 if pats.len() < front.len() + back.len() {
                     return false;
                 }
-                pats[..front.len()]
-                    .iter()
-                    .zip(front.iter())
-                    .chain(pats[pats.len() - back.len()..].iter().zip(back.iter()))
+                iter::zip(&pats[..front.len()], front)
+                    .chain(iter::zip(&pats[pats.len() - back.len()..], back))
                     .all(|(x, y)| x.has_overlapping_values(y))
             },
-            (Self::Slice(lfront, Some(lback)), Self::Slice(rfront, Some(rback))) => lfront
-                .iter()
-                .zip(rfront.iter())
-                .chain(lback.iter().rev().zip(rback.iter().rev()))
+            (Self::Slice(lfront, Some(lback)), Self::Slice(rfront, Some(rback))) => iter::zip(lfront, rfront)
+                .chain(iter::zip(lback.iter().rev(), rback.iter().rev()))
                 .all(|(x, y)| x.has_overlapping_values(y)),
 
             // Enums can mix unit variants with tuple/struct variants. These can never overlap.

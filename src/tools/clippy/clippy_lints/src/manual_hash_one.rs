@@ -1,13 +1,13 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::source::SpanRangeExt;
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _, MaybeTypeckRes as _};
+use clippy_utils::source::SpanExt as _;
+use clippy_utils::sym;
 use clippy_utils::visitors::{is_local_used, local_used_once};
-use clippy_utils::{is_trait_method, path_to_local_id, sym};
 use rustc_errors::Applicability;
 use rustc_hir::{BindingMode, ExprKind, LetStmt, Node, PatKind, StmtKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -46,17 +46,17 @@ declare_clippy_lint! {
     "manual implementations of `BuildHasher::hash_one`"
 }
 
+impl_lint_pass!(ManualHashOne => [MANUAL_HASH_ONE]);
+
 pub struct ManualHashOne {
     msrv: Msrv,
 }
 
 impl ManualHashOne {
     pub fn new(conf: &'static Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
-
-impl_lint_pass!(ManualHashOne => [MANUAL_HASH_ONE]);
 
 impl LateLintPass<'_> for ManualHashOne {
     fn check_local(&mut self, cx: &LateContext<'_>, local: &LetStmt<'_>) {
@@ -81,8 +81,8 @@ impl LateLintPass<'_> for ManualHashOne {
             && !hash_expr.span.from_expansion()
             && let ExprKind::MethodCall(seg, hashed_value, [ref_to_hasher], _) = hash_expr.kind
             && seg.ident.name == sym::hash
-            && is_trait_method(cx, hash_expr, sym::Hash)
-            && path_to_local_id(ref_to_hasher.peel_borrows(), hasher)
+            && cx.ty_based_def(hash_expr).opt_parent(cx).is_diag_item(cx, sym::Hash)
+            && ref_to_hasher.peel_borrows().res_local_id() == Some(hasher)
 
             && let maybe_finish_stmt = stmts.next()
             // There should be no more statements referencing `hasher`
@@ -104,8 +104,8 @@ impl LateLintPass<'_> for ManualHashOne {
                 finish_expr.span,
                 "manual implementation of `BuildHasher::hash_one`",
                 |diag| {
-                    if let Some(build_hasher) = build_hasher.span.get_source_text(cx)
-                        && let Some(hashed_value) = hashed_value.span.get_source_text(cx)
+                    if let Some(build_hasher) = build_hasher.span.get_text(cx)
+                        && let Some(hashed_value) = hashed_value.span.get_text(cx)
                     {
                         diag.multipart_suggestion(
                             "try",

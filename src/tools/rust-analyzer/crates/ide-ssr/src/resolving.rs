@@ -25,13 +25,13 @@ pub(crate) struct ResolvedPattern<'db> {
     pub(crate) placeholders_by_stand_in: FxHashMap<SmolStr, parsing::Placeholder>,
     pub(crate) node: SyntaxNode,
     // Paths in `node` that we've resolved.
-    pub(crate) resolved_paths: FxHashMap<SyntaxNode, ResolvedPath>,
+    pub(crate) resolved_paths: FxHashMap<SyntaxNode, ResolvedPath<'db>>,
     pub(crate) ufcs_function_calls: FxHashMap<SyntaxNode, UfcsCallInfo<'db>>,
     pub(crate) contains_self: bool,
 }
 
-pub(crate) struct ResolvedPath {
-    pub(crate) resolution: hir::PathResolution,
+pub(crate) struct ResolvedPath<'db> {
+    pub(crate) resolution: hir::PathResolution<'db>,
     /// The depth of the ast::Path that was resolved within the pattern.
     pub(crate) depth: u32,
 }
@@ -48,16 +48,20 @@ impl<'db> ResolvedRule<'db> {
         resolution_scope: &ResolutionScope<'db>,
         index: usize,
     ) -> Result<ResolvedRule<'db>, SsrError> {
-        let resolver =
-            Resolver { resolution_scope, placeholders_by_stand_in: rule.placeholders_by_stand_in };
-        let resolved_template = match rule.template {
-            Some(template) => Some(resolver.resolve_pattern_tree(template)?),
-            None => None,
-        };
-        Ok(ResolvedRule {
-            pattern: resolver.resolve_pattern_tree(rule.pattern)?,
-            template: resolved_template,
-            index,
+        hir::attach_db(resolution_scope.scope.db, || {
+            let resolver = Resolver {
+                resolution_scope,
+                placeholders_by_stand_in: rule.placeholders_by_stand_in,
+            };
+            let resolved_template = match rule.template {
+                Some(template) => Some(resolver.resolve_pattern_tree(template)?),
+                None => None,
+            };
+            Ok(ResolvedRule {
+                pattern: resolver.resolve_pattern_tree(rule.pattern)?,
+                template: resolved_template,
+                index,
+            })
         })
     }
 
@@ -116,7 +120,7 @@ impl<'db> Resolver<'_, 'db> {
         &self,
         node: SyntaxNode,
         depth: u32,
-        resolved_paths: &mut FxHashMap<SyntaxNode, ResolvedPath>,
+        resolved_paths: &mut FxHashMap<SyntaxNode, ResolvedPath<'db>>,
     ) -> Result<(), SsrError> {
         use syntax::ast::AstNode;
         if let Some(path) = ast::Path::cast(node.clone()) {
@@ -151,7 +155,7 @@ impl<'db> Resolver<'_, 'db> {
     fn path_contains_placeholder(&self, path: &ast::Path) -> bool {
         if let Some(segment) = path.segment()
             && let Some(name_ref) = segment.name_ref()
-            && self.placeholders_by_stand_in.contains_key(name_ref.text().as_str())
+            && self.placeholders_by_stand_in.contains_key(name_ref.text())
         {
             return true;
         }
@@ -161,7 +165,7 @@ impl<'db> Resolver<'_, 'db> {
         false
     }
 
-    fn ok_to_use_path_resolution(&self, resolution: &hir::PathResolution) -> bool {
+    fn ok_to_use_path_resolution(&self, resolution: &hir::PathResolution<'db>) -> bool {
         match resolution {
             hir::PathResolution::Def(hir::ModuleDef::Function(function))
                 if function.as_assoc_item(self.resolution_scope.scope.db).is_some() =>
@@ -211,7 +215,7 @@ impl<'db> ResolutionScope<'db> {
         self.node.ancestors().find(|node| node.kind() == SyntaxKind::FN)
     }
 
-    fn resolve_path(&self, path: &ast::Path) -> Option<hir::PathResolution> {
+    fn resolve_path(&self, path: &ast::Path) -> Option<hir::PathResolution<'db>> {
         // First try resolving the whole path. This will work for things like
         // `std::collections::HashMap`, but will fail for things like
         // `std::collections::HashMap::new`.
@@ -224,12 +228,10 @@ impl<'db> ResolutionScope<'db> {
         let resolved_qualifier = self.scope.speculative_resolve(&path.qualifier()?)?;
         if let hir::PathResolution::Def(hir::ModuleDef::Adt(adt)) = resolved_qualifier {
             let name = path.segment()?.name_ref()?;
-            let module = self.scope.module();
             adt.ty(self.scope.db).iterate_path_candidates(
                 self.scope.db,
                 &self.scope,
                 &self.scope.visible_traits().0,
-                Some(module),
                 None,
                 |assoc_item| {
                     let item_name = assoc_item.name(self.scope.db)?;

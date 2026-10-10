@@ -7,8 +7,9 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{self, DefLocation, Location, TerminatorKind, traversal};
-use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::{bug, span_bug};
+use rustc_middle::ty;
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf};
+use rustc_span::{bug, span_bug};
 use tracing::debug;
 
 use super::FunctionCx;
@@ -55,7 +56,7 @@ pub(crate) fn non_ssa_locals<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     non_ssa_locals
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum LocalKind {
     ZST,
     /// A local that requires an alloca.
@@ -83,12 +84,11 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> LocalAnalyzer<'a, 'b, 'tcx, Bx>
             LocalKind::Unused => {
                 let ty = fx.monomorphize(decl.ty);
                 let layout = fx.cx.spanned_layout_of(ty, decl.source_info.span);
-                *kind =
-                    if fx.cx.is_backend_immediate(layout) || fx.cx.is_backend_scalar_pair(layout) {
-                        LocalKind::SSA(location)
-                    } else {
-                        LocalKind::Memory
-                    };
+                *kind = if let abi::BackendRepr::Memory { .. } = layout.backend_repr {
+                    LocalKind::Memory
+                } else {
+                    LocalKind::SSA(location)
+                };
             }
             LocalKind::SSA(_) => *kind = LocalKind::Memory,
         }
@@ -150,10 +150,6 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> LocalAnalyzer<'a, 'b, 'tcx, Bx>
                     {
                         layout.for_variant(self.fx.cx, vidx)
                     }
-                    mir::PlaceElem::Subtype(subtype_ty) => {
-                        let subtype_ty = self.fx.monomorphize(subtype_ty);
-                        self.fx.cx.layout_of(subtype_ty)
-                    }
                     _ => {
                         self.locals[place_ref.local] = LocalKind::Memory;
                         return;
@@ -161,7 +157,7 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> LocalAnalyzer<'a, 'b, 'tcx, Bx>
                 }
             }
             debug_assert!(
-                !self.fx.cx.is_backend_ref(layout),
+                layout.is_ssa_standalone(),
                 "Post-projection {place_ref:?} layout should be non-Ref, but it's {layout:?}",
             );
         }
@@ -199,17 +195,24 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> Visitor<'tcx> for LocalAnalyzer
         match context {
             PlaceContext::MutatingUse(MutatingUseContext::Call) => {
                 let call = location.block;
-                let TerminatorKind::Call { target, .. } =
-                    self.fx.mir.basic_blocks[call].terminator().kind
+                let TerminatorKind::Call { target, func, .. } =
+                    &self.fx.mir.basic_blocks[call].terminator().kind
                 else {
                     bug!()
                 };
-                self.define(local, DefLocation::CallReturn { call, target });
+                let tcx = self.fx.cx.tcx();
+                let func_ty = func.ty(&self.fx.mir.local_decls, tcx);
+                if let ty::FnDef(def_id, _args) = *func_ty.kind()
+                    && let Some(intrinsic) = tcx.intrinsic(def_id)
+                    && self.fx.cx.intrinsic_call_expects_place_always(intrinsic.name)
+                {
+                    self.locals[local] = LocalKind::Memory;
+                }
+                self.define(local, DefLocation::CallReturn { call, target: *target });
             }
 
             PlaceContext::NonUse(_)
-            | PlaceContext::NonMutatingUse(NonMutatingUseContext::PlaceMention)
-            | PlaceContext::MutatingUse(MutatingUseContext::Retag) => {}
+            | PlaceContext::NonMutatingUse(NonMutatingUseContext::PlaceMention) => {}
 
             PlaceContext::NonMutatingUse(
                 NonMutatingUseContext::Copy
@@ -233,7 +236,6 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> Visitor<'tcx> for LocalAnalyzer
 
             PlaceContext::MutatingUse(
                 MutatingUseContext::Store
-                | MutatingUseContext::Deinit
                 | MutatingUseContext::SetDiscriminant
                 | MutatingUseContext::AsmOutput
                 | MutatingUseContext::Borrow
@@ -264,6 +266,10 @@ impl<'a, 'b, 'tcx, Bx: BuilderMethods<'b, 'tcx>> Visitor<'tcx> for LocalAnalyzer
             PlaceContext::MutatingUse(MutatingUseContext::Yield) => bug!(),
         }
     }
+
+    fn visit_statement_debuginfo(&mut self, _: &mir::StmtDebugInfo<'tcx>, _: Location) {
+        // Debuginfo does not generate actual code.
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -286,10 +292,14 @@ impl CleanupKind {
 /// MSVC requires unwinding code to be split to a tree of *funclets*, where each funclet can only
 /// branch to itself or to its parent. Luckily, the code we generates matches this pattern.
 /// Recover that structure in an analyze pass.
-pub(crate) fn cleanup_kinds(mir: &mir::Body<'_>) -> IndexVec<mir::BasicBlock, CleanupKind> {
+pub(crate) fn cleanup_kinds(
+    mir: &mir::Body<'_>,
+    nop_landing_pads: &DenseBitSet<mir::BasicBlock>,
+) -> IndexVec<mir::BasicBlock, CleanupKind> {
     fn discover_masters<'tcx>(
         result: &mut IndexSlice<mir::BasicBlock, CleanupKind>,
         mir: &mir::Body<'tcx>,
+        nop_landing_pads: &DenseBitSet<mir::BasicBlock>,
     ) {
         for (bb, data) in mir.basic_blocks.iter_enumerated() {
             match data.terminator().kind {
@@ -308,7 +318,9 @@ pub(crate) fn cleanup_kinds(mir: &mir::Body<'_>) -> IndexVec<mir::BasicBlock, Cl
                 | TerminatorKind::InlineAsm { unwind, .. }
                 | TerminatorKind::Assert { unwind, .. }
                 | TerminatorKind::Drop { unwind, .. } => {
-                    if let mir::UnwindAction::Cleanup(unwind) = unwind {
+                    if let mir::UnwindAction::Cleanup(unwind) = unwind
+                        && !nop_landing_pads.contains(unwind)
+                    {
                         debug!(
                             "cleanup_kinds: {:?}/{:?} registering {:?} as funclet",
                             bb, data, unwind
@@ -389,7 +401,7 @@ pub(crate) fn cleanup_kinds(mir: &mir::Body<'_>) -> IndexVec<mir::BasicBlock, Cl
 
     let mut result = IndexVec::from_elem(CleanupKind::NotCleanup, &mir.basic_blocks);
 
-    discover_masters(&mut result, mir);
+    discover_masters(&mut result, mir, &nop_landing_pads);
     propagate(&mut result, mir);
     debug!("cleanup_kinds: result={:?}", result);
     result

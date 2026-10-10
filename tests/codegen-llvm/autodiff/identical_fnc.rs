@@ -1,4 +1,4 @@
-//@ compile-flags: -Zautodiff=Enable -C opt-level=3  -Clto=fat
+//@ compile-flags: -Zautodiff=Enable -Zautodiff_post_passes=mergefunc,function(mem2reg,instsimplify,simplifycfg) -C opt-level=3  -Clto=fat
 //@ no-prefer-dynamic
 //@ needs-enzyme
 //
@@ -8,7 +8,7 @@
 // merged placeholder function anymore, and compilation would fail. We prevent this by disabling
 // LLVM's merge_function pass before AD. Here we implicetely test that our solution keeps working.
 // We also explicetly test that we keep running merge_function after AD, by checking for two
-// identical function calls in the LLVM-IR, while having two different calls in the Rust code.
+// identical function calls in the LLVM-IR, despite having two different calls in the Rust code.
 #![feature(autodiff)]
 
 use std::autodiff::autodiff_reverse;
@@ -27,14 +27,14 @@ fn square2(x: &f64) -> f64 {
 
 // CHECK:; identical_fnc::main
 // CHECK-NEXT:; Function Attrs:
-// CHECK-NEXT:define internal void @_ZN13identical_fnc4main17h6009e4f751bf9407E()
+// CHECK-NEXT:define internal void
 // CHECK-NEXT:start:
 // CHECK-NOT:br
 // CHECK-NOT:ret
 // CHECK:; call identical_fnc::d_square
-// CHECK-NEXT:call fastcc void @_ZN13identical_fnc8d_square17hcb5768e95528c35fE(double %x.val, ptr noalias noundef align 8 dereferenceable(8) %dx1)
+// CHECK-NEXT:call fastcc void @[[HASH:.+]](ptr {{.*}}, ptr {{.*}})
 // CHECK:; call identical_fnc::d_square
-// CHECK-NEXT:call fastcc void @_ZN13identical_fnc8d_square17hcb5768e95528c35fE(double %x.val, ptr noalias noundef align 8 dereferenceable(8) %dx2)
+// CHECK-NEXT:call fastcc void @[[HASH]](ptr {{.*}}, ptr {{.*}})
 
 fn main() {
     let x = std::hint::black_box(3.0);

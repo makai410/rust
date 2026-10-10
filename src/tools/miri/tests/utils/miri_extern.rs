@@ -23,7 +23,7 @@ extern "Rust" {
     /// considered leaking even if it still exists when the program terminates.
     ///
     /// `ptr` has to point to the beginning of an allocated block.
-    pub fn miri_static_root(ptr: *const u8);
+    pub fn miri_static_root(ptr: *const ());
 
     // Miri-provided extern function to get the amount of frames in the current backtrace.
     // The `flags` argument must be `0`.
@@ -48,15 +48,15 @@ extern "Rust" {
     pub fn miri_resolve_frame_names(
         ptr: *mut (),
         flags: u64,
-        name_buf: *mut u8,
-        filename_buf: *mut u8,
+        name_buf: *mut (),
+        filename_buf: *mut (),
     );
 
     /// Miri-provided extern function to begin unwinding with the given payload.
     ///
     /// This is internal and unstable and should not be used; we give it here
     /// just to be complete.
-    pub fn miri_start_unwind(payload: *mut u8) -> !;
+    pub fn miri_start_unwind(payload: *mut ()) -> !;
 
     /// Miri-provided extern function to get the internal unique identifier for the allocation that a pointer
     /// points to. If this pointer is invalid (not pointing to an allocation), interpretation will abort.
@@ -114,10 +114,15 @@ extern "Rust" {
     ///
     /// This is useful when no fundamental way of allocating memory is
     /// available, e.g. when using `no_std` + `alloc`.
-    pub fn miri_alloc(size: usize, align: usize) -> *mut u8;
+    pub fn miri_alloc(size: usize, align: usize) -> *mut ();
 
     /// Miri-provided extern function to deallocate memory.
-    pub fn miri_dealloc(ptr: *mut u8, size: usize, align: usize);
+    pub fn miri_dealloc(ptr: *mut (), size: usize, align: usize);
+
+    /// Add the allocation that this pointer points to to the "tracked" allocations.
+    /// This is equivalent to `-Zmiri-track-allic-id=<id>`, but also works if the ID is
+    /// only known at runtime.
+    pub fn miri_track_alloc(ptr: *const ());
 
     /// Convert a path from the host Miri runs on to the target Miri interprets.
     /// Performs conversion of path separators as needed.
@@ -147,4 +152,58 @@ extern "Rust" {
     /// "symbolic" alignment checks. Will fail if the pointer is not actually aligned or `align` is
     /// not a power of two. Has no effect when alignment checks are concrete (which is the default).
     pub fn miri_promise_symbolic_alignment(ptr: *const (), align: usize);
+
+    /// Blocks the current execution if the argument is false
+    pub fn miri_genmc_assume(condition: bool);
+
+    /// Miri-provided extern function to spawn a new thread in the interpreter.
+    ///
+    /// Returns the thread id.
+    ///
+    /// This is useful when no fundamental way of spawning threads is available, e.g. when using
+    /// `no_std`.
+    pub fn miri_thread_spawn(t: extern "Rust" fn(*mut ()), data: *mut ()) -> usize;
+
+    /// Miri-provided extern function to join a thread that was spawned by Miri.
+    pub fn miri_thread_join(thread_id: usize) -> bool;
+
+    /// Indicate to Miri that this thread is busy-waiting in a spin loop.
+    ///
+    /// As far as Miri is concerned, this is equivalent to `yield_now`.
+    pub fn miri_spin_loop();
 }
+
+// Stubs so we can run things without Miri.
+#[cfg(not(miri))]
+mod stubs {
+    use std::ffi::CStr;
+    use std::io::Write;
+
+    pub unsafe fn miri_write_to_stdout(bytes: &[u8]) {
+        std::io::stdout().write_all(bytes).unwrap()
+    }
+
+    pub unsafe fn miri_write_to_stderr(bytes: &[u8]) {
+        std::io::stderr().write_all(bytes).unwrap()
+    }
+
+    pub unsafe fn miri_host_to_target_path(
+        path: *const core::ffi::c_char,
+        out: *mut core::ffi::c_char,
+        out_size: usize,
+    ) -> usize {
+        let path = CStr::from_ptr(path);
+        let len = path.count_bytes() + 1;
+        if out_size >= len {
+            out.copy_from(path.as_ptr(), len);
+            0
+        } else {
+            len
+        }
+    }
+
+    pub unsafe fn miri_run_provenance_gc() {}
+}
+
+#[cfg(not(miri))]
+pub use stubs::*;

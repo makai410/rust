@@ -13,17 +13,21 @@
 //! to pass a prebuilt Clippy from the outside when running `cargo clippy`, but that would be
 //! (as usual) a massive undertaking/refactoring.
 
-use build_helper::exit;
-
-use super::compile::{run_cargo, rustc_cargo, std_cargo};
 use super::tool::{SourceType, prepare_tool_cargo};
-use crate::builder::{Builder, ShouldRun};
 use crate::core::build_steps::check::{CompilerForCheck, prepare_compiler_for_check};
-use crate::core::build_steps::compile::std_crates_for_run_make;
-use crate::core::builder;
-use crate::core::builder::{Alias, Kind, RunConfig, Step, StepMetadata, crate_description};
+use crate::core::build_steps::compile::{
+    ArtifactKeepMode, run_cargo, rustc_cargo, std_cargo, std_crates_for_make_run,
+};
+use crate::core::builder::{
+    self, Alias, Builder, CommandLineStep, Kind, RunConfig, ShouldRun, StepMetadata,
+    crate_description,
+};
+use crate::core::compiler::Compiler;
+use crate::core::config::TargetSelection;
+use crate::core::config::flags::Subcommand;
+use crate::core::session::Mode;
 use crate::utils::build_stamp::{self, BuildStamp};
-use crate::{Compiler, Mode, Subcommand, TargetSelection};
+use crate::utils::helpers;
 
 /// Disable the most spammy clippy lints
 const IGNORED_RULES_FOR_STD_AND_RUSTC: &[&str] = &[
@@ -34,7 +38,7 @@ const IGNORED_RULES_FOR_STD_AND_RUSTC: &[&str] = &[
     "too_many_arguments",
     "needless_lifetimes", // people want to keep the lifetimes
     "wrong_self_convention",
-    "approx_constant", // libcore is what defines those
+    "redundant_pattern_matching", // can affect drop order
 ];
 
 fn lint_args(builder: &Builder<'_>, config: &LintConfig, ignored_rules: &[&str]) -> Vec<String> {
@@ -168,16 +172,19 @@ impl Std {
     }
 }
 
-impl Step for Std {
+impl CommandLineStep for Std {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.crate_or_deps("sysroot").path("library")
     }
 
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
+    }
+
     fn make_run(run: RunConfig<'_>) {
-        let crates = std_crates_for_run_make(&run);
+        let crates = std_crates_for_make_run(&run);
         let config = LintConfig::new(run.builder);
         run.builder.ensure(Std::new(run.builder, run.target, config, crates));
     }
@@ -195,11 +202,7 @@ impl Step for Std {
             Kind::Clippy,
         );
 
-        std_cargo(builder, target, &mut cargo);
-
-        for krate in &*self.crates {
-            cargo.arg("-p").arg(krate);
-        }
+        std_cargo(builder, target, &mut cargo, &self.crates);
 
         let _guard = builder.msg(
             Kind::Clippy,
@@ -215,8 +218,7 @@ impl Step for Std {
             lint_args(builder, &self.config, IGNORED_RULES_FOR_STD_AND_RUSTC),
             &build_stamp::libstd_stamp(builder, build_compiler, target),
             vec![],
-            true,
-            false,
+            ArtifactKeepMode::OnlyRmeta,
         );
     }
 
@@ -254,13 +256,16 @@ impl Rustc {
     }
 }
 
-impl Step for Rustc {
+impl CommandLineStep for Rustc {
     type Output = ();
     const IS_HOST: bool = true;
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.crate_or_deps("rustc-main").path("compiler")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -307,8 +312,7 @@ impl Step for Rustc {
             lint_args(builder, &self.config, IGNORED_RULES_FOR_STD_AND_RUSTC),
             &build_stamp::librustc_stamp(builder, build_compiler, target),
             vec![],
-            true,
-            false,
+            ArtifactKeepMode::OnlyRmeta,
         );
     }
 
@@ -337,7 +341,7 @@ impl CodegenGcc {
     }
 }
 
-impl Step for CodegenGcc {
+impl CommandLineStep for CodegenGcc {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -366,21 +370,35 @@ impl Step for CodegenGcc {
         );
         self.build_compiler.configure_cargo(&mut cargo);
 
-        let _guard =
-            builder.msg(Kind::Clippy, "rustc_codegen_gcc", Mode::ToolRustc, build_compiler, target);
+        let _guard = builder.msg(
+            Kind::Clippy,
+            "rustc_codegen_gcc",
+            Mode::ToolRustcPrivate,
+            build_compiler,
+            target,
+        );
 
         let stamp = BuildStamp::new(&builder.cargo_out(build_compiler, Mode::Codegen, target))
             .with_prefix("rustc_codegen_gcc-check");
 
-        run_cargo(
+        let args = lint_args(builder, &self.config, &[]);
+        run_cargo(builder, cargo, args.clone(), &stamp, vec![], ArtifactKeepMode::OnlyRmeta);
+
+        // Same but we disable the features enabled by default.
+        let mut cargo = prepare_tool_cargo(
             builder,
-            cargo,
-            lint_args(builder, &self.config, &[]),
-            &stamp,
-            vec![],
-            true,
-            false,
+            build_compiler,
+            Mode::Codegen,
+            target,
+            Kind::Clippy,
+            "compiler/rustc_codegen_gcc",
+            SourceType::InTree,
+            &[],
         );
+        self.build_compiler.configure_cargo(&mut cargo);
+        println!("Now running clippy on `rustc_codegen_gcc` with `--no-default-features`");
+        cargo.arg("--no-default-features");
+        run_cargo(builder, cargo, args, &stamp, vec![], ArtifactKeepMode::OnlyRmeta);
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
@@ -397,7 +415,7 @@ macro_rules! lint_any {
         $path:expr,
         $readable_name:expr,
         $mode:expr
-        $(,lint_by_default = $lint_by_default:expr)*
+        $(, lint_by_default = $lint_by_default:expr )?
         ;
     )+) => {
         $(
@@ -409,12 +427,15 @@ macro_rules! lint_any {
             config: LintConfig,
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ();
-            const DEFAULT: bool = if false $(|| $lint_by_default)* { true } else { false };
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
                 run.path($path)
+            }
+
+            fn is_default_step(_builder: &Builder<'_>) -> bool {
+                false $( || const { $lint_by_default } )?
             }
 
             fn make_run(run: RunConfig<'_>) {
@@ -459,8 +480,7 @@ macro_rules! lint_any {
                     lint_args(builder, &self.config, &[]),
                     &stamp,
                     vec![],
-                    true,
-                    false,
+                    ArtifactKeepMode::OnlyRmeta
                 );
             }
 
@@ -478,8 +498,8 @@ lint_any!(
     Bootstrap, "src/bootstrap", "bootstrap", Mode::ToolTarget;
     BuildHelper, "src/build_helper", "build_helper", Mode::ToolTarget;
     BuildManifest, "src/tools/build-manifest", "build-manifest", Mode::ToolTarget;
-    CargoMiri, "src/tools/miri/cargo-miri", "cargo-miri", Mode::ToolRustc;
-    Clippy, "src/tools/clippy", "clippy", Mode::ToolRustc;
+    CargoMiri, "src/tools/miri/cargo-miri", "cargo-miri", Mode::ToolRustcPrivate;
+    Clippy, "src/tools/clippy", "clippy", Mode::ToolRustcPrivate;
     CollectLicenseMetadata, "src/tools/collect-license-metadata", "collect-license-metadata", Mode::ToolTarget;
     Compiletest, "src/tools/compiletest", "compiletest", Mode::ToolTarget;
     CoverageDump, "src/tools/coverage-dump", "coverage-dump", Mode::ToolTarget;
@@ -487,14 +507,14 @@ lint_any!(
     Jsondoclint, "src/tools/jsondoclint", "jsondoclint", Mode::ToolTarget;
     LintDocs, "src/tools/lint-docs", "lint-docs", Mode::ToolTarget;
     LlvmBitcodeLinker, "src/tools/llvm-bitcode-linker", "llvm-bitcode-linker", Mode::ToolTarget;
-    Miri, "src/tools/miri", "miri", Mode::ToolRustc;
+    Miri, "src/tools/miri", "miri", Mode::ToolRustcPrivate;
     MiroptTestTools, "src/tools/miropt-test-tools", "miropt-test-tools", Mode::ToolTarget;
     OptDist, "src/tools/opt-dist", "opt-dist", Mode::ToolTarget;
     RemoteTestClient, "src/tools/remote-test-client", "remote-test-client", Mode::ToolTarget;
     RemoteTestServer, "src/tools/remote-test-server", "remote-test-server", Mode::ToolTarget;
-    RustAnalyzer, "src/tools/rust-analyzer", "rust-analyzer", Mode::ToolRustc;
-    Rustdoc, "src/librustdoc", "clippy", Mode::ToolRustc;
-    Rustfmt, "src/tools/rustfmt", "rustfmt", Mode::ToolRustc;
+    RustAnalyzer, "src/tools/rust-analyzer", "rust-analyzer", Mode::ToolRustcPrivate;
+    Rustdoc, "src/librustdoc", "clippy", Mode::ToolRustcPrivate;
+    Rustfmt, "src/tools/rustfmt", "rustfmt", Mode::ToolRustcPrivate;
     RustInstaller, "src/tools/rust-installer", "rust-installer", Mode::ToolTarget;
     Tidy, "src/tools/tidy", "tidy", Mode::ToolTarget;
     TestFloatParse, "src/tools/test-float-parse", "test-float-parse", Mode::ToolStd;
@@ -507,12 +527,15 @@ pub struct CI {
     config: LintConfig,
 }
 
-impl Step for CI {
+impl CommandLineStep for CI {
     type Output = ();
-    const DEFAULT: bool = false;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.alias("ci")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -523,7 +546,7 @@ impl Step for CI {
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         if builder.top_stage != 2 {
             eprintln!("ERROR: `x clippy ci` should always be executed with --stage 2");
-            exit!(1);
+            helpers::exit_process(1);
         }
 
         // We want to check in-tree source using in-tree clippy. However, if we naively did
@@ -549,16 +572,56 @@ impl Step for CI {
             allow: vec!["clippy::all".into()],
             warn: vec![],
             deny: vec![
+                // the entire correctness group should always be enforced.
                 "clippy::correctness".into(),
+                // tidy-alphabetic-start
+                "clippy::approx_constant".into(),
+                "clippy::assign_op_pattern".into(),
+                "clippy::bind_instead_of_map".into(),
+                "clippy::borrow_deref_ref".into(),
                 "clippy::char_lit_as_u8".into(),
+                "clippy::chunks_exact_to_as_chunks".into(),
+                "clippy::declare_interior_mutable_const".into(),
+                "clippy::default_constructed_unit_structs".into(),
+                "clippy::derivable_impls".into(),
+                "clippy::double_must_use".into(),
+                "clippy::excessive_precision".into(),
+                "clippy::explicit_auto_deref".into(),
+                "clippy::filter_map_next".into(),
                 "clippy::four_forward_slashes".into(),
+                "clippy::int_plus_one".into(),
+                "clippy::legacy_numeric_constants".into(),
+                "clippy::let_and_return".into(),
+                "clippy::manual_repeat_n".into(),
+                "clippy::map_clone".into(),
+                "clippy::match_as_ref".into(),
+                "clippy::mem_replace_option_with_none".into(),
+                "clippy::mem_replace_option_with_some".into(),
+                "clippy::needless_as_bytes".into(),
                 "clippy::needless_bool".into(),
                 "clippy::needless_bool_assign".into(),
+                "clippy::needless_borrow".into(),
+                "clippy::needless_raw_string_hashes".into(),
+                "clippy::needless_return".into(),
+                "clippy::neg_cmp_op_on_partial_ord".into(),
                 "clippy::non_minimal_cfg".into(),
+                "clippy::op_ref".into(),
+                "clippy::partialeq_ne_impl".into(),
+                "clippy::partialeq_to_none".into(),
                 "clippy::print_literal".into(),
+                "clippy::ptr_offset_with_cast".into(),
+                "clippy::redundant_closure".into(),
+                "clippy::redundant_slicing".into(),
                 "clippy::same_item_push".into(),
+                "clippy::seek_from_current".into(),
                 "clippy::single_char_add_str".into(),
+                "clippy::single_match".into(),
+                "clippy::to_digit_is_some".into(),
                 "clippy::to_string_in_format_args".into(),
+                "clippy::unconditional_recursion".into(),
+                "clippy::unnecessary_map_or".into(),
+                "clippy::zero_divided_by_zero".into(),
+                // tidy-alphabetic-end
             ],
             forbid: vec![],
         };
@@ -586,6 +649,8 @@ impl Step for CI {
                 "clippy::same_item_push".into(),
                 "clippy::single_char_add_str".into(),
                 "clippy::to_string_in_format_args".into(),
+                "clippy::unconditional_recursion".into(),
+                "clippy::mem_replace_with_default".into(),
             ],
             forbid: vec![],
         };

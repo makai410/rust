@@ -5,7 +5,7 @@
 //   stdout: 1
 //     2
 
-#![feature(no_core)]
+#![feature(no_core, rustc_private)]
 #![no_std]
 #![no_core]
 #![no_main]
@@ -27,12 +27,8 @@ fn one() -> isize {
 
 #[no_mangle]
 extern "C" fn main(argc: i32, _argv: *const *const u8) -> i32 {
-    let test = Test {
-        field: one(),
-    };
-    let two = Two {
-        two: 2,
-    };
+    let test = Test { field: one() };
+    let two = Two { two: 2 };
     unsafe {
         libc::printf(b"%ld\n\0" as *const u8 as *const i8, test.field);
         libc::printf(b"%ld\n\0" as *const u8 as *const i8, two.two);

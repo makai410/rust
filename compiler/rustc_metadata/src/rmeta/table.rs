@@ -1,6 +1,7 @@
 use rustc_hir::def::CtorOf;
 use rustc_index::Idx;
 
+use crate::rmeta::decoder::MetaBlob;
 use crate::rmeta::*;
 
 pub(super) trait IsDefault: Default {
@@ -43,20 +44,12 @@ impl<T> IsDefault for LazyArray<T> {
     }
 }
 
-impl IsDefault for UnusedGenericParams {
-    fn is_default(&self) -> bool {
-        // UnusedGenericParams encodes the *un*usedness as a bitset.
-        // This means that 0 corresponds to all bits used, which is indeed the default.
-        let is_default = self.bits() == 0;
-        debug_assert_eq!(is_default, self.all_used());
-        is_default
-    }
-}
-
 /// Helper trait, for encoding to, and decoding from, a fixed number of bytes.
 /// Used mainly for Lazy positions and lengths.
-/// Unchecked invariant: `Self::default()` should encode as `[0; BYTE_LEN]`,
+///
+/// Invariant: `Self::default()` should encode as `[0; BYTE_LEN]`,
 /// but this has no impact on safety.
+/// In debug builds, this invariant is checked in `[TableBuilder::set]`
 pub(super) trait FixedSizeEncoding: IsDefault {
     /// This should be `[u8; BYTE_LEN]`;
     /// Cannot use an associated `const BYTE_LEN: usize` instead due to const eval limitations.
@@ -110,16 +103,45 @@ macro_rules! fixed_size_enum {
     }
 }
 
-// Workaround; need const traits to construct bitflags in a const
-macro_rules! const_macro_kinds {
-    ($($name:ident),+$(,)?) => (MacroKinds::from_bits_truncate($(MacroKinds::$name.bits())|+))
+macro_rules! defaulted_enum {
+    ($ty:ty { $(($($pat:tt)*))* } $( unreachable { $(($($upat:tt)*))+ } )?) => {
+        impl FixedSizeEncoding for $ty {
+            type ByteArray = [u8; 1];
+
+            #[inline]
+            fn from_bytes(b: &[u8; 1]) -> Self {
+                use $ty::*;
+                let val = match b[0] {
+                    $(${index()} => $($pat)*,)*
+                    _ => panic!("Unexpected {} code: {:?}", stringify!($ty), b[0]),
+                };
+                // Make sure the first entry is always the default value,
+                // and none of the other values are the default value
+                debug_assert_ne!((b[0] != 0), IsDefault::is_default(&val));
+                val
+            }
+
+            #[inline]
+            fn write_to_bytes(self, b: &mut [u8; 1]) {
+                debug_assert!(!IsDefault::is_default(&self));
+                use $ty::*;
+                b[0] = match self {
+                    $($($pat)* => ${index()},)*
+                    $($($($upat)*)|+ => unreachable!(),)?
+                };
+                debug_assert_ne!(b[0], 0);
+            }
+        }
+        impl IsDefault for $ty {
+            fn is_default(&self) -> bool {
+                <$ty as Default>::default() == *self
+            }
+        }
+    }
 }
-const MACRO_KINDS_ATTR_BANG: MacroKinds = const_macro_kinds!(ATTR, BANG);
-const MACRO_KINDS_DERIVE_BANG: MacroKinds = const_macro_kinds!(DERIVE, BANG);
-const MACRO_KINDS_DERIVE_ATTR: MacroKinds = const_macro_kinds!(DERIVE, ATTR);
-const MACRO_KINDS_DERIVE_ATTR_BANG: MacroKinds = const_macro_kinds!(DERIVE, ATTR, BANG);
+
 // Ensure that we get a compilation error if MacroKinds gets extended without updating metadata.
-const _: () = assert!(MACRO_KINDS_DERIVE_ATTR_BANG.is_all());
+const _: () = assert!(MacroKinds::DERIVE_ATTR_BANG.is_all());
 
 fixed_size_enum! {
     DefKind {
@@ -143,7 +165,6 @@ fixed_size_enum! {
         ( Use                                      )
         ( ForeignMod                               )
         ( AnonConst                                )
-        ( InlineConst                              )
         ( OpaqueTy                                 )
         ( Field                                    )
         ( LifetimeParam                            )
@@ -166,24 +187,18 @@ fixed_size_enum! {
         ( Macro(MacroKinds::BANG)                  )
         ( Macro(MacroKinds::ATTR)                  )
         ( Macro(MacroKinds::DERIVE)                )
-        ( Macro(MACRO_KINDS_ATTR_BANG)             )
-        ( Macro(MACRO_KINDS_DERIVE_ATTR)           )
-        ( Macro(MACRO_KINDS_DERIVE_BANG)           )
-        ( Macro(MACRO_KINDS_DERIVE_ATTR_BANG)      )
+        ( Macro(MacroKinds::ATTR_BANG)             )
+        ( Macro(MacroKinds::DERIVE_ATTR)           )
+        ( Macro(MacroKinds::DERIVE_BANG)           )
+        ( Macro(MacroKinds::DERIVE_ATTR_BANG)      )
         ( SyntheticCoroutineBody                   )
+        ( TestBinderConstraints                    )
     } unreachable {
         ( Macro(_)                                 )
     }
 }
 
-fixed_size_enum! {
-    hir::Constness {
-        ( NotConst )
-        ( Const    )
-    }
-}
-
-fixed_size_enum! {
+defaulted_enum! {
     hir::Defaultness {
         ( Final                        )
         ( Default { has_value: false } )
@@ -191,17 +206,25 @@ fixed_size_enum! {
     }
 }
 
-fixed_size_enum! {
-    hir::Safety {
-        ( Unsafe )
-        ( Safe   )
+defaulted_enum! {
+    ty::Asyncness {
+        ( No  )
+        ( Yes )
     }
 }
 
-fixed_size_enum! {
-    ty::Asyncness {
-        ( Yes )
-        ( No  )
+defaulted_enum! {
+    hir::Constness {
+        ( Const { always: false } )
+        ( NotConst )
+        ( Const { always: true } )
+    }
+}
+
+defaulted_enum! {
+    hir::Safety {
+        ( Unsafe )
+        ( Safe   )
     }
 }
 
@@ -218,13 +241,6 @@ fixed_size_enum! {
         ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Block)   )
         ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Fn)      )
         ( Desugared(hir::CoroutineDesugaring::AsyncGen, hir::CoroutineSource::Closure) )
-    }
-}
-
-fixed_size_enum! {
-    ty::AssocItemContainer {
-        ( Trait )
-        ( Impl  )
     }
 }
 
@@ -411,34 +427,43 @@ impl<T> FixedSizeEncoding for Option<LazyArray<T>> {
 }
 
 /// Helper for constructing a table's serialization (also see `Table`).
-pub(super) struct TableBuilder<I: Idx, T: FixedSizeEncoding> {
+pub(super) struct TableBuilder<IdxEncode: Idx, IdxDecode: Idx, T: FixedSizeEncoding> {
     width: usize,
-    blocks: IndexVec<I, T::ByteArray>,
-    _marker: PhantomData<T>,
+    blocks: IndexVec<IdxEncode, T::ByteArray>,
+    _marker: PhantomData<(IdxDecode, T)>,
 }
 
-impl<I: Idx, T: FixedSizeEncoding> Default for TableBuilder<I, T> {
+impl<Ie: Idx, Id: Idx, T: FixedSizeEncoding> Default for TableBuilder<Ie, Id, T> {
     fn default() -> Self {
         TableBuilder { width: 0, blocks: Default::default(), _marker: PhantomData }
     }
 }
 
-impl<I: Idx, const N: usize, T> TableBuilder<I, Option<T>>
+impl<Ie: Idx, Id: Idx, const N: usize, T> TableBuilder<Ie, Id, Option<T>>
 where
     Option<T>: FixedSizeEncoding<ByteArray = [u8; N]>,
 {
-    pub(crate) fn set_some(&mut self, i: I, value: T) {
+    pub(crate) fn set_some(&mut self, i: Ie, value: T) {
         self.set(i, Some(value))
     }
 }
 
-impl<I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]>> TableBuilder<I, T> {
+impl<Ie: Idx, Id: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]>>
+    TableBuilder<Ie, Id, T>
+{
     /// Sets the table value if it is not default.
     /// ATTENTION: For optimization default values are simply ignored by this function, because
     /// right now metadata tables never need to reset non-default values to default. If such need
     /// arises in the future then a new method (e.g. `clear` or `reset`) will need to be introduced
     /// for doing that explicitly.
-    pub(crate) fn set(&mut self, i: I, value: T) {
+    pub(crate) fn set(&mut self, i: Ie, value: T) {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                T::from_bytes(&[0; N]).is_default(),
+                "expected all-zeroes to decode to the default value, as per the invariant of FixedSizeEncoding"
+            );
+        }
         if !value.is_default() {
             // FIXME(eddyb) investigate more compact encodings for sparse tables.
             // On the PR @michaelwoerister mentioned:
@@ -454,7 +479,7 @@ impl<I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]>> TableBui
         }
     }
 
-    pub(crate) fn encode(&self, buf: &mut FileEncoder) -> LazyTable<I, T> {
+    pub(crate) fn encode(&self, buf: &mut FileEncoder<'_>) -> LazyTable<Ie, Id, T> {
         let pos = buf.position();
 
         let width = self.width;
@@ -477,13 +502,17 @@ fn trailing_zeros(x: &[u8]) -> usize {
     x.iter().rev().take_while(|b| **b == 0).count()
 }
 
-impl<I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]> + ParameterizedOverTcx>
-    LazyTable<I, T>
+impl<
+    Ie: Idx,
+    Id: Idx,
+    const N: usize,
+    T: FixedSizeEncoding<ByteArray = [u8; N]> + ParameterizedOverTcx,
+> LazyTable<Ie, Id, T>
 where
     for<'tcx> T::Value<'tcx>: FixedSizeEncoding<ByteArray = [u8; N]>,
 {
     /// Given the metadata, extract out the value at a particular index (if any).
-    pub(super) fn get<'a, 'tcx, M: Metadata<'a, 'tcx>>(&self, metadata: M, i: I) -> T::Value<'tcx> {
+    pub(super) fn get<'a, 'tcx, M: MetaBlob<'a>>(&self, metadata: M, i: Id) -> T::Value<'tcx> {
         // Access past the end of the table returns a Default
         if i.index() >= self.len {
             return Default::default();

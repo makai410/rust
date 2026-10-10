@@ -1,9 +1,7 @@
 //! Reports references in code that the IDE layer cannot resolve.
 use hir::{AnyDiagnostic, Crate, Module, Semantics, db::HirDatabase, sym};
 use ide::{AnalysisHost, RootDatabase, TextRange};
-use ide_db::{
-    EditionedFileId, FxHashSet, LineIndexDatabase as _, base_db::SourceDatabase, defs::NameRefClass,
-};
+use ide_db::{FxHashSet, base_db::SourceDatabase, defs::NameRefClass, line_index};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use parser::SyntaxKind;
 use syntax::{AstNode, WalkEvent, ast};
@@ -13,13 +11,10 @@ use crate::cli::flags;
 
 impl flags::UnresolvedReferences {
     pub fn run(self) -> anyhow::Result<()> {
-        const STACK_SIZE: usize = 1024 * 1024 * 8;
-
         let handle = stdx::thread::Builder::new(
             stdx::thread::ThreadIntent::LatencySensitive,
             "BIG_STACK_THREAD",
         )
-        .stack_size(STACK_SIZE)
         .spawn(|| self.run_())
         .unwrap();
 
@@ -46,6 +41,8 @@ impl flags::UnresolvedReferences {
             load_out_dirs_from_check: !self.disable_build_scripts,
             with_proc_macro_server,
             prefill_caches: false,
+            num_worker_threads: 1,
+            proc_macro_processes: config.proc_macro_num_processes(),
         };
         let (db, vfs, _proc_macro) =
             load_workspace_at(&self.path, &cargo_config, &load_cargo_config, &|_| {})?;
@@ -66,12 +63,16 @@ impl flags::UnresolvedReferences {
             let file_id = module.definition_source_file_id(db).original_file(db);
             let file_id = file_id.file_id(db);
             if !visited_files.contains(&file_id) {
-                let crate_name =
-                    module.krate().display_name(db).as_deref().unwrap_or(&sym::unknown).to_owned();
+                let crate_name = module
+                    .krate(db)
+                    .display_name(db)
+                    .as_deref()
+                    .unwrap_or(&sym::unknown)
+                    .to_owned();
                 let file_path = vfs.file_path(file_id);
                 eprintln!("processing crate: {crate_name}, module: {file_path}",);
 
-                let line_index = db.line_index(file_id);
+                let line_index = line_index(db, file_id);
                 let file_text = db.file_text(file_id);
 
                 for range in find_unresolved_references(db, &sema, file_id, &module) {
@@ -95,7 +96,7 @@ impl flags::UnresolvedReferences {
 
 fn all_modules(db: &dyn HirDatabase) -> Vec<Module> {
     let mut worklist: Vec<_> =
-        Crate::all(db).into_iter().map(|krate| krate.root_module()).collect();
+        Crate::all(db).into_iter().map(|krate| krate.root_module(db)).collect();
     let mut modules = Vec::new();
 
     while let Some(module) = worklist.pop() {
@@ -139,9 +140,7 @@ fn all_unresolved_references(
     sema: &Semantics<'_, RootDatabase>,
     file_id: FileId,
 ) -> Vec<TextRange> {
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(sema.db, file_id));
+    let file_id = sema.attach_first_edition(file_id);
     let file = sema.parse(file_id);
     let root = file.syntax();
 

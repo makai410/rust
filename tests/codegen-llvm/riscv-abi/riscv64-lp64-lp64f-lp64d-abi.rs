@@ -1,11 +1,11 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ compile-flags: --target riscv64gc-unknown-linux-gnu -Copt-level=3 -C no-prepopulate-passes -C panic=abort
 //@ needs-llvm-components: riscv
 
 #![crate_type = "lib"]
 #![no_core]
 #![feature(no_core, lang_items)]
-#![allow(improper_ctypes)]
+#![deny(unfulfilled_lint_expectations, improper_ctypes_definitions)]
 
 extern crate minicore;
 use minicore::*;
@@ -59,6 +59,7 @@ pub extern "C" fn f_fp_scalar_2(x: f64) -> f64 {
 pub struct Empty {}
 
 // CHECK: define void @f_agg_empty_struct()
+#[expect(improper_ctypes_definitions)]
 #[no_mangle]
 pub extern "C" fn f_agg_empty_struct(e: Empty) -> Empty {
     e

@@ -1,9 +1,8 @@
 #![feature(prelude_import)]
 #![no_std]
-//@ needs-enzyme
+//@ only-nightly
 
 #![feature(autodiff)]
-#[macro_use]
 extern crate std;
 #[prelude_import]
 use ::std::prelude::rust_2015::*;
@@ -31,7 +30,7 @@ impl MyTrait for Foo {
     }
     #[rustc_autodiff(Reverse, 1, Const, Active, Active)]
     fn df(&self, x: f64, dret: f64) -> (f64, f64) {
-        ::core::intrinsics::autodiff(Self::f::<>, Self::df::<>,
-            (self, x, dret))
+        ::core::intrinsics::autodiff(Self::f as fn(_: &Self, _: f64) -> f64,
+            Self::df, (self, x, dret))
     }
 }

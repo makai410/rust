@@ -1,5 +1,6 @@
 //@[new] compile-flags: -Znext-solver
 //@ revisions: old new
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@ check-pass
 
 #![feature(const_destruct)]
@@ -15,7 +16,7 @@ impl Drop for Moose {
 
 struct ConstDropper<T>(ManuallyDrop<T>);
 
-impl<T> const Drop for ConstDropper<T> {
+const impl<T> Drop for ConstDropper<T> {
     fn drop(&mut self) {}
 }
 

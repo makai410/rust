@@ -4,24 +4,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 
+use crate::diagnostics::{CheckId, TidyCtx};
 use crate::iter_header::*;
 use crate::walk::*;
 
 // Should be kept in sync with `CompareMode` in `src/tools/compiletest/src/common.rs`,
 // as well as `run`.
-const IGNORES: &[&str] = &[
-    "polonius",
-    "chalk",
-    "split-dwarf",
-    "split-dwarf-single",
-    "next-solver-coherence",
-    "next-solver",
-    "run",
-];
+const IGNORES: &[&str] =
+    &["polonius", "chalk", "split-dwarf", "split-dwarf-single", "next-solver", "run"];
 const EXTENSIONS: &[&str] = &["stdout", "stderr"];
 const SPECIAL_TEST: &str = "tests/ui/command/need-crate-arg-ignore-tidy.x.rs";
 
-pub fn check(tests_path: impl AsRef<Path>, bad: &mut bool) {
+pub fn check(tests_path: &Path, tidy_ctx: TidyCtx) {
+    let check = tidy_ctx
+        .start_check(CheckId::new("tests_revision_unpaired_stdout_stderr").path(tests_path));
+
     // Recurse over subdirectories under `tests/`
     walk_dir(tests_path.as_ref(), filter, &mut |entry| {
         // We are inspecting a folder. Collect the paths to interesting files `.rs`, `.stderr`,
@@ -122,12 +119,11 @@ pub fn check(tests_path: impl AsRef<Path>, bad: &mut bool) {
                 [] | [_] => return,
                 [_, _] if !expected_revisions.is_empty() => {
                     // Found unrevisioned output files for a revisioned test.
-                    tidy_error!(
-                        bad,
+                    check.error(format!(
                         "found unrevisioned output file `{}` for a revisioned test `{}`",
                         sibling.display(),
                         test_path.display(),
-                    );
+                    ));
                 }
                 [_, _] => return,
                 [_, found_revision, .., extension] => {
@@ -138,13 +134,12 @@ pub fn check(tests_path: impl AsRef<Path>, bad: &mut bool) {
                     {
                         // Found some unexpected revision-esque component that is not a known
                         // compare-mode or expected revision.
-                        tidy_error!(
-                            bad,
+                        check.error(format!(
                             "found output file `{}` for unexpected revision `{}` of test `{}`",
                             sibling.display(),
                             found_revision,
                             test_path.display()
-                        );
+                        ));
                     }
                 }
             }

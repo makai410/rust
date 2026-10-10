@@ -1,10 +1,9 @@
 #![warn(clippy::unnecessary_literal_unwrap)]
-#![allow(unreachable_code)]
 #![allow(
-    clippy::unnecessary_lazy_evaluations,
     clippy::diverging_sub_expression,
     clippy::let_unit_value,
-    clippy::no_effect
+    clippy::no_effect,
+    clippy::unnecessary_lazy_evaluations
 )]
 
 fn unwrap_option_some() {
@@ -152,12 +151,4 @@ fn unwrap_unchecked() {
     //~^ unnecessary_literal_unwrap
 }
 
-fn main() {
-    unwrap_option_some();
-    unwrap_option_none();
-    unwrap_result_ok();
-    unwrap_result_err();
-    unwrap_methods_option();
-    unwrap_methods_result();
-    unwrap_unchecked();
-}
+fn main() {}

@@ -1,8 +1,8 @@
 //@ compile-flags: -Copt-level=0 -Cno-prepopulate-passes
-//@ min-llvm-version: 19
 //@ only-64bit
 
 #![crate_type = "lib"]
+#![feature(pattern_types, pattern_type_macro)]
 
 use std::cmp::Ordering;
 use std::num::NonZero;
@@ -71,7 +71,7 @@ fn make_ok_ptr(x: NonNull<u16>) -> Result<NonNull<u16>, usize> {
 fn make_ok_int(x: usize) -> Result<usize, NonNull<u16>> {
     // CHECK-LABEL: { i64, ptr } @make_ok_int(i64 %x)
     // CHECK-NEXT: start:
-    // CHECK-NEXT: %[[NOPROV:.+]] = getelementptr i8, ptr null, i64 %x
+    // CHECK-NEXT: %[[NOPROV:.+]] = inttoptr i64 %x to ptr
     // CHECK-NEXT: %[[R:.+]] = insertvalue { i64, ptr } { i64 0, ptr poison }, ptr %[[NOPROV]], 1
     // CHECK-NEXT: ret { i64, ptr } %[[R]]
     Ok(x)
@@ -124,3 +124,14 @@ fn make_fully_uninhabited_result(v: u32, n: Never) -> Result<(u32, Never), (Neve
 }
 
 enum Never {}
+
+#[repr(transparent)]
+struct NewtypeIndex(std::pat::pattern_type!(u32 is 0..=0xFFFFFF00));
+
+#[no_mangle]
+pub fn make_none_newtype_index() -> Option<NewtypeIndex> {
+    // CHECK-LABEL: @make_none_newtype_index
+    // CHECK-NEXT: start:
+    // CHECK-NEXT: ret i32 -1
+    None
+}

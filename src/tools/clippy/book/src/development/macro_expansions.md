@@ -37,7 +37,7 @@ before emitting suggestions to the end user to avoid false positives.
 
 Several functions are available for working with macros.
 
-### The `Span.from_expansion` method
+### The `Span::from_expansion` method
 
 We could utilize a `span`'s [`from_expansion`] method, which
 detects if the `span` is from a macro expansion / desugaring.
@@ -50,7 +50,7 @@ if expr.span.from_expansion() {
 }
 ```
 
-### `Span.ctxt` method
+### `Span::ctxt` method
 
 The `span`'s context, given by the method [`ctxt`] and returning [SyntaxContext],
 represents if the span is from a macro expansion and, if it is, which
@@ -172,7 +172,8 @@ point the user to the relevant code in case of a compile error.
 However, for Clippy this is inconvenient, because most of the time *we don't* want
 to lint proc macro-generated code and this makes it impossible to tell what is and isn't proc macro code.
 
-> NOTE: this is specifically only an issue when a proc macro explicitly sets the span to that of an **input span**.
+> [!NOTE]
+> this is specifically only an issue when a proc macro explicitly sets the span to that of an **input span**.
 >
 > For example, other common ways of creating `TokenStream`s, such as `"fn foo() {...}".parse::<TokenStream>()`,
 > sets each token's span to `Span::call_site()`, which already marks the span as coming from a proc macro

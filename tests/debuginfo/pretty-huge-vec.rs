@@ -1,17 +1,19 @@
 //@ ignore-windows-gnu: #128981
 //@ ignore-android: FIXME(#10381)
+//@ ignore-ohos: similiar to android
 //@ ignore-aix: FIXME(#137965)
 //@ compile-flags:-g
+//@ ignore-backends: gcc
 
 // === GDB TESTS ===================================================================================
 
-// gdb-command: run
+//@ gdb-command: run
 
-// gdb-command: print vec
-// gdb-check:$1 = Vec(size=1000000000) = {[...]...}
+//@ gdb-command: print vec
+//@ gdb-check:$1 = Vec(size=1000000000) = {[...]...}
 
-// gdb-command: print slice
-// gdb-check:$2 = &[u8](size=1000000000) = {[...]...}
+//@ gdb-command: print slice
+//@ gdb-check:$2 = &[u8](size=1000000000) = {[...]...}
 
 #![allow(unused_variables)]
 

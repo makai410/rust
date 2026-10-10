@@ -1,5 +1,5 @@
-use core::num::bignum::Big32x40;
-use core::num::bignum::tests::Big8x3 as Big;
+use core::num::imp::bignum::Big as BigFull;
+use core::num::imp::bignum::tests::Big8x3 as Big;
 
 #[test]
 #[should_panic]
@@ -168,25 +168,6 @@ fn test_div_rem_small() {
 }
 
 #[test]
-fn test_div_rem() {
-    fn div_rem(n: u64, d: u64) -> (Big, Big) {
-        let mut q = Big::from_small(42);
-        let mut r = Big::from_small(42);
-        Big::from_u64(n).div_rem(&Big::from_u64(d), &mut q, &mut r);
-        (q, r)
-    }
-    assert_eq!(div_rem(1, 1), (Big::from_small(1), Big::from_small(0)));
-    assert_eq!(div_rem(4, 3), (Big::from_small(1), Big::from_small(1)));
-    assert_eq!(div_rem(1, 7), (Big::from_small(0), Big::from_small(1)));
-    assert_eq!(div_rem(45, 9), (Big::from_small(5), Big::from_small(0)));
-    assert_eq!(div_rem(103, 9), (Big::from_small(11), Big::from_small(4)));
-    assert_eq!(div_rem(123456, 77), (Big::from_u64(1603), Big::from_small(25)));
-    assert_eq!(div_rem(0xffff, 1), (Big::from_u64(0xffff), Big::from_small(0)));
-    assert_eq!(div_rem(0xeeee, 0xffff), (Big::from_small(0), Big::from_u64(0xeeee)));
-    assert_eq!(div_rem(2_000_000, 2), (Big::from_u64(1_000_000), Big::from_u64(0)));
-}
-
-#[test]
 fn test_is_zero() {
     assert!(Big::from_small(0).is_zero());
     assert!(!Big::from_small(3).is_zero());
@@ -235,27 +216,27 @@ fn test_bit_length() {
 }
 
 #[test]
-fn test_bit_length_32x40() {
+fn test_bit_length_big() {
     for i in 0..32 * 40 {
         // 010000...000
-        assert_eq!(Big32x40::from_small(1).mul_pow2(i).bit_length(), i + 1);
+        assert_eq!(BigFull::from_small(1).mul_pow2(i).bit_length(), i + 1);
     }
     for i in 1..32 * 40 - 1 {
         // 010000...001
         assert_eq!(
-            Big32x40::from_small(1).mul_pow2(i).add(&Big32x40::from_small(1)).bit_length(),
+            BigFull::from_small(1).mul_pow2(i).add(&BigFull::from_small(1)).bit_length(),
             i + 1
         );
         // 110000...000
-        assert_eq!(Big32x40::from_small(3).mul_pow2(i).bit_length(), i + 2);
+        assert_eq!(BigFull::from_small(3).mul_pow2(i).bit_length(), i + 2);
     }
-    assert_eq!(Big32x40::from_small(0).bit_length(), 0);
-    assert_eq!(Big32x40::from_small(1).bit_length(), 1);
-    assert_eq!(Big32x40::from_small(5).bit_length(), 3);
-    assert_eq!(Big32x40::from_small(0x18).bit_length(), 5);
-    assert_eq!(Big32x40::from_u64(0x4073).bit_length(), 15);
-    assert_eq!(Big32x40::from_u64(0xffffff).bit_length(), 24);
-    assert_eq!(Big32x40::from_u64(0xffffffffffffffff).bit_length(), 64);
+    assert_eq!(BigFull::from_small(0).bit_length(), 0);
+    assert_eq!(BigFull::from_small(1).bit_length(), 1);
+    assert_eq!(BigFull::from_small(5).bit_length(), 3);
+    assert_eq!(BigFull::from_small(0x18).bit_length(), 5);
+    assert_eq!(BigFull::from_u64(0x4073).bit_length(), 15);
+    assert_eq!(BigFull::from_u64(0xffffff).bit_length(), 24);
+    assert_eq!(BigFull::from_u64(0xffffffffffffffff).bit_length(), 64);
 }
 
 #[test]

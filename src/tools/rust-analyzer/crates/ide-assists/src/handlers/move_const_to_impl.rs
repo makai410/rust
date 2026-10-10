@@ -1,8 +1,11 @@
-use hir::{AsAssocItem, AssocItemContainer, FileRange, HasCrate, HasSource};
+use hir::{AsAssocItem, AssocItemContainer, FileRange, HasSource};
 use ide_db::{assists::AssistId, defs::Definition, search::SearchScope};
 use syntax::{
     SyntaxKind,
-    ast::{self, AstNode, edit::IndentLevel, edit_in_place::Indent},
+    ast::{
+        self, AstNode,
+        edit::{AstNodeEdit, IndentLevel},
+    },
 };
 
 use crate::assist_context::{AssistContext, Assists};
@@ -39,7 +42,7 @@ use crate::assist_context::{AssistContext, Assists};
 //     }
 // }
 // ```
-pub(crate) fn move_const_to_impl(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn move_const_to_impl(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let db = ctx.db();
     let const_: ast::Const = ctx.find_node_at_offset()?;
     // Don't show the assist when the cursor is at the const's body.
@@ -70,7 +73,7 @@ pub(crate) fn move_const_to_impl(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
     let ty = impl_.self_ty(db);
     // If there exists another associated item with the same name, skip the assist.
     if ty
-        .iterate_assoc_items(db, ty.krate(db), |assoc| {
+        .iterate_assoc_items(db, |assoc| {
             // Type aliases wouldn't conflict due to different namespaces, but we're only checking
             // the items in inherent impls, so we assume `assoc` is never type alias for the sake
             // of brevity (inherent associated types exist in nightly Rust, but it's *very*
@@ -135,8 +138,8 @@ pub(crate) fn move_const_to_impl(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
             let fixup = if last_const.is_none() { "\n" } else { "" };
             let indent = IndentLevel::from_node(parent_fn.syntax());
 
-            let const_ = const_.clone_for_update();
-            const_.reindent_to(indent);
+            let const_ = const_.reset_indent();
+            let const_ = const_.indent(indent);
             builder.insert(insert_offset, format!("\n{indent}{const_}{fixup}"));
         },
     )

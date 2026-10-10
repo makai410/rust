@@ -5,6 +5,7 @@ tex/*/out
 *.rs.bk
 .vscode
 .helix
+.zed
 *.mm_profdata
 perf.data
 perf.data.old
@@ -12,5 +13,6 @@ flamegraph*.svg
 rustc-ice*.txt
 tests/native-lib/libtestlib.so
 .auto-*
+miri.toml
 
 /genmc/

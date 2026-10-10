@@ -3,8 +3,7 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Func<T> {
+const trait Func<T> {
     type Output;
 
     fn call_once(self, arg: T) -> Self::Output;
@@ -12,7 +11,7 @@ trait Func<T> {
 
 struct Closure;
 
-impl const Func<&usize> for Closure {
+const impl Func<&usize> for Closure {
     type Output = usize;
 
     fn call_once(self, arg: &usize) -> Self::Output {

@@ -1,9 +1,6 @@
-//@ assembly-output: ptx-linker
-//@ compile-flags: --crate-type cdylib -Z unstable-options -Clinker-flavor=llbc
+//@ assembly-output: emit-asm
+//@ compile-flags: --crate-type cdylib
 //@ only-nvptx64
-//@ revisions: LLVM20 LLVM21
-//@ [LLVM21] min-llvm-version: 21
-//@ [LLVM20] max-llvm-major-version: 20
 
 #![feature(abi_ptx)]
 #![no_std]
@@ -12,14 +9,13 @@
 extern crate breakpoint_panic_handler;
 
 // Verify function name doesn't contain unacceaptable characters.
-// CHECK: .func (.param .b32 func_retval0) [[IMPL_FN:[a-zA-Z0-9$_]+square[a-zA-Z0-9$_]+]]
+// CHECK: .func (.param .b32 func_retval0) [[IMPL_FN:[a-zA-Z0-9$_]+square]]
 
 // CHECK-LABEL: .visible .entry top_kernel(
 #[no_mangle]
 pub unsafe extern "ptx-kernel" fn top_kernel(a: *const u32, b: *mut u32) {
     // CHECK:      call.uni (retval0),
-    // LLVM20-NEXT: [[IMPL_FN]]
-    // LLVM21-SAME: [[IMPL_FN]]
+    // CHECK-SAME: [[IMPL_FN]]
     *b = deep::private::MyStruct::new(*a).square();
 }
 

@@ -112,7 +112,7 @@ fn no_lint() {
         Ok(v) => Some(v),
     };
 
-    let _ = match Ok::<_, std::convert::Infallible>(1) {
+    let _ = match Ok::<_, !>(1) {
         Ok(3) => None,
         Ok(v) => Some(v),
     };
@@ -176,4 +176,18 @@ mod issue15051 {
             Err(_) => None,
         }
     }
+}
+
+fn wrongly_unmangled_macros() {
+    macro_rules! test_expr {
+        ($val:expr) => {
+            Ok::<i32, ()>($val)
+        };
+    }
+
+    let _ = match test_expr!(42) {
+        //~^ manual_ok_err
+        Ok(v) => Some(v),
+        Err(_) => None,
+    };
 }

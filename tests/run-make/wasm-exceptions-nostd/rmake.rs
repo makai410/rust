@@ -1,4 +1,4 @@
-//@ only-wasm32-bare
+//@ only-wasm32-unknown-unknown
 
 use std::path::Path;
 
@@ -10,7 +10,6 @@ fn main() {
         .input(Path::new("src").join("lib.rs"))
         .target("wasm32-unknown-unknown")
         .panic("unwind")
-        .arg("-Cllvm-args=-wasm-enable-eh")
         .arg("-Ctarget-feature=+exception-handling")
         .run();
 

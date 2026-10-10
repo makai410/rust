@@ -1,11 +1,10 @@
 //@no-rustfix: overlapping suggestions
-#![allow(
-    unused,
+#![warn(clippy::nonminimal_bool)]
+#![expect(
     clippy::diverging_sub_expression,
-    clippy::needless_if,
+    clippy::needless_ifs,
     clippy::redundant_pattern_matching
 )]
-#![warn(clippy::nonminimal_bool)]
 #![allow(clippy::useless_vec)]
 
 fn main() {
@@ -67,6 +66,7 @@ fn issue3847(a: u32, b: u32) -> bool {
         return false;
     }
     true
+    //~^^^^ needless_bool
 }
 
 fn issue4548() {
@@ -182,13 +182,11 @@ fn issue_5794() {
     if !b == true {}
     //~^ nonminimal_bool
     //~| bool_comparison
-    //~| bool_comparison
     if !b != true {}
     //~^ nonminimal_bool
     //~| bool_comparison
     if true == !b {}
     //~^ nonminimal_bool
-    //~| bool_comparison
     //~| bool_comparison
     if true != !b {}
     //~^ nonminimal_bool

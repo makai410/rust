@@ -11,24 +11,23 @@
 
 fn main() {
     let foo2 = {extern crate crate_a2 as a; a::Foo};
-        //~^ NOTE one type comes from crate `crate_a2` used here, which is renamed locally to `a`
-        //~| NOTE one trait comes from crate `crate_a2` used here, which is renamed locally to `a`
     let bar2 = {extern crate crate_a2 as a; a::bar()};
     {
         extern crate crate_a1 as a;
-        //~^ NOTE one type comes from crate `crate_a1` used here, which is renamed locally to `a`
-        //~| NOTE one trait comes from crate `crate_a1` used here, which is renamed locally to `a`
         a::try_foo(foo2);
         //~^ ERROR mismatched types
-        //~| NOTE expected `main::a::Foo`, found a different `main::a::Foo`
+        //~| NOTE expected `crate_a1::Foo`, found `crate_a2::Foo`
         //~| NOTE arguments to this function are incorrect
-        //~| NOTE two types coming from two different crates are different types even if they look the same
+        //~| NOTE `crate_a2::Foo` and `crate_a1::Foo` have similar names, but are actually distinct types
+        //~| NOTE `crate_a2::Foo` is defined in crate `crate_a2`
+        //~| NOTE `crate_a1::Foo` is defined in crate `crate_a1`
         //~| NOTE function defined here
         a::try_bar(bar2);
         //~^ ERROR mismatched types
-        //~| NOTE expected trait `main::a::Bar`, found a different trait `main::a::Bar`
+        //~| NOTE expected trait `crate_a1::Bar`, found trait `crate_a2::Bar`
         //~| NOTE arguments to this function are incorrect
-        //~| NOTE two types coming from two different crates are different types even if they look the same
+        //~| NOTE expected struct `Box<(dyn crate_a1::Bar + 'static)>`
+        //~| NOTE    found struct `Box<dyn crate_a2::Bar>`
         //~| NOTE function defined here
     }
 }

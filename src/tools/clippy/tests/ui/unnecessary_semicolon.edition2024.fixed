@@ -4,7 +4,7 @@
 
 #![warn(clippy::unnecessary_semicolon)]
 #![feature(postfix_match)]
-#![allow(clippy::single_match)]
+#![expect(clippy::single_match)]
 
 fn no_lint(mut x: u32) -> Option<u32> {
     Some(())?;
@@ -62,4 +62,13 @@ fn issue14100() -> bool {
     // Removing the `;` would make the block type be `()` instead of `!`, and this could no longer be
     // cast into the `bool` function return type.
     if return true {};
+}
+
+fn issue15426(x: u32) {
+    // removing the `;` would turn the stmt into an expr, but attrs aren't allowed on exprs
+    #[rustfmt::skip]
+    match x {
+        0b00 => {}  0b01 => {}
+        0b11 => {}  _    => {}
+    };
 }

@@ -1,12 +1,18 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ assembly-output: emit-asm
-// ignore-tidy-linelength
+// ignore-tidy-file-linelength
+//@ revisions: aarch64_be_unknown_hermit
+//@ [aarch64_be_unknown_hermit] compile-flags: --target aarch64_be-unknown-hermit
+//@ [aarch64_be_unknown_hermit] needs-llvm-components: aarch64
 //@ revisions: aarch64_be_unknown_linux_gnu
 //@ [aarch64_be_unknown_linux_gnu] compile-flags: --target aarch64_be-unknown-linux-gnu
 //@ [aarch64_be_unknown_linux_gnu] needs-llvm-components: aarch64
 //@ revisions: aarch64_be_unknown_linux_gnu_ilp32
 //@ [aarch64_be_unknown_linux_gnu_ilp32] compile-flags: --target aarch64_be-unknown-linux-gnu_ilp32
 //@ [aarch64_be_unknown_linux_gnu_ilp32] needs-llvm-components: aarch64
+//@ revisions: aarch64_be_unknown_linux_musl
+//@ [aarch64_be_unknown_linux_musl] compile-flags: --target aarch64_be-unknown-linux-musl
+//@ [aarch64_be_unknown_linux_musl] needs-llvm-components: aarch64
 //@ revisions: aarch64_be_unknown_netbsd
 //@ [aarch64_be_unknown_netbsd] compile-flags: --target aarch64_be-unknown-netbsd
 //@ [aarch64_be_unknown_netbsd] needs-llvm-components: aarch64
@@ -22,18 +28,30 @@
 //@ revisions: aarch64_nintendo_switch_freestanding
 //@ [aarch64_nintendo_switch_freestanding] compile-flags: --target aarch64-nintendo-switch-freestanding
 //@ [aarch64_nintendo_switch_freestanding] needs-llvm-components: aarch64
+//@ revisions: aarch64_oe_linux_gnu
+//@ [aarch64_oe_linux_gnu] compile-flags: --target aarch64-oe-linux-gnu
+//@ [aarch64_oe_linux_gnu] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_freebsd
 //@ [aarch64_unknown_freebsd] compile-flags: --target aarch64-unknown-freebsd
 //@ [aarch64_unknown_freebsd] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_fuchsia
 //@ [aarch64_unknown_fuchsia] compile-flags: --target aarch64-unknown-fuchsia
 //@ [aarch64_unknown_fuchsia] needs-llvm-components: aarch64
+//@ revisions: aarch64_unknown_helenos
+//@ [aarch64_unknown_helenos] compile-flags: --target aarch64-unknown-helenos
+//@ [aarch64_unknown_helenos] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_hermit
 //@ [aarch64_unknown_hermit] compile-flags: --target aarch64-unknown-hermit
 //@ [aarch64_unknown_hermit] needs-llvm-components: aarch64
+//@ revisions: aarch64_unknown_hyperlight
+//@ [aarch64_unknown_hyperlight] compile-flags: --target aarch64-unknown-hyperlight
+//@ [aarch64_unknown_hyperlight] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_illumos
 //@ [aarch64_unknown_illumos] compile-flags: --target aarch64-unknown-illumos
 //@ [aarch64_unknown_illumos] needs-llvm-components: aarch64
+//@ revisions: aarch64_unknown_l4re_uclibc
+//@ [aarch64_unknown_l4re_uclibc] compile-flags: --target aarch64-unknown-l4re-uclibc
+//@ [aarch64_unknown_l4re_uclibc] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_linux_gnu
 //@ [aarch64_unknown_linux_gnu] compile-flags: --target aarch64-unknown-linux-gnu
 //@ [aarch64_unknown_linux_gnu] needs-llvm-components: aarch64
@@ -46,6 +64,12 @@
 //@ revisions: aarch64_unknown_linux_ohos
 //@ [aarch64_unknown_linux_ohos] compile-flags: --target aarch64-unknown-linux-ohos
 //@ [aarch64_unknown_linux_ohos] needs-llvm-components: aarch64
+//@ revisions: aarch64_unknown_linux_pauthtest
+//@ [aarch64_unknown_linux_pauthtest] compile-flags: --target aarch64-unknown-linux-pauthtest
+//@ [aarch64_unknown_linux_pauthtest] needs-llvm-components: aarch64
+//@ revisions: aarch64_unknown_managarm_mlibc
+//@ [aarch64_unknown_managarm_mlibc] compile-flags: --target aarch64-unknown-managarm-mlibc
+//@ [aarch64_unknown_managarm_mlibc] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_netbsd
 //@ [aarch64_unknown_netbsd] compile-flags: --target aarch64-unknown-netbsd
 //@ [aarch64_unknown_netbsd] needs-llvm-components: aarch64
@@ -55,6 +79,12 @@
 //@ revisions: aarch64_unknown_none_softfloat
 //@ [aarch64_unknown_none_softfloat] compile-flags: --target aarch64-unknown-none-softfloat
 //@ [aarch64_unknown_none_softfloat] needs-llvm-components: aarch64
+//@ revisions: aarch64v8r_unknown_none
+//@ [aarch64v8r_unknown_none] compile-flags: --target aarch64v8r-unknown-none
+//@ [aarch64v8r_unknown_none] needs-llvm-components: aarch64
+//@ revisions: aarch64v8r_unknown_none_softfloat
+//@ [aarch64v8r_unknown_none_softfloat] compile-flags: --target aarch64v8r-unknown-none-softfloat
+//@ [aarch64v8r_unknown_none_softfloat] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_nto_qnx700
 //@ [aarch64_unknown_nto_qnx700] compile-flags: --target aarch64-unknown-nto-qnx700
 //@ [aarch64_unknown_nto_qnx700] needs-llvm-components: aarch64
@@ -64,9 +94,9 @@
 //@ revisions: aarch64_unknown_nto_qnx710_iosock
 //@ [aarch64_unknown_nto_qnx710_iosock] compile-flags: --target aarch64-unknown-nto-qnx710_iosock
 //@ [aarch64_unknown_nto_qnx710_iosock] needs-llvm-components: aarch64
-//@ revisions: aarch64_unknown_nto_qnx800
-//@ [aarch64_unknown_nto_qnx800] compile-flags: --target aarch64-unknown-nto-qnx800
-//@ [aarch64_unknown_nto_qnx800] needs-llvm-components: aarch64
+//@ revisions: aarch64_unknown_qnx
+//@ [aarch64_unknown_qnx] compile-flags: --target aarch64-unknown-qnx
+//@ [aarch64_unknown_qnx] needs-llvm-components: aarch64
 //@ revisions: aarch64_unknown_openbsd
 //@ [aarch64_unknown_openbsd] compile-flags: --target aarch64-unknown-openbsd
 //@ [aarch64_unknown_openbsd] needs-llvm-components: aarch64
@@ -127,6 +157,12 @@
 //@ revisions: armv5te_unknown_linux_uclibceabi
 //@ [armv5te_unknown_linux_uclibceabi] compile-flags: --target armv5te-unknown-linux-uclibceabi
 //@ [armv5te_unknown_linux_uclibceabi] needs-llvm-components: arm
+//@ revisions: armv6_none_eabi
+//@ [armv6_none_eabi] compile-flags: --target armv6-none-eabi
+//@ [armv6_none_eabi] needs-llvm-components: arm
+//@ revisions: armv6_none_eabihf
+//@ [armv6_none_eabihf] compile-flags: --target armv6-none-eabihf
+//@ [armv6_none_eabihf] needs-llvm-components: arm
 //@ revisions: armv6_unknown_freebsd
 //@ [armv6_unknown_freebsd] compile-flags: --target armv6-unknown-freebsd
 //@ [armv6_unknown_freebsd] needs-llvm-components: arm
@@ -139,6 +175,9 @@
 //@ revisions: armv7_linux_androideabi
 //@ [armv7_linux_androideabi] compile-flags: --target armv7-linux-androideabi
 //@ [armv7_linux_androideabi] needs-llvm-components: arm
+//@ revisions: armv7_oe_linux_gnueabihf
+//@ [armv7_oe_linux_gnueabihf] compile-flags: --target armv7-oe-linux-gnueabihf
+//@ [armv7_oe_linux_gnueabihf] needs-llvm-components: arm
 //@ revisions: armv7_rtems_eabihf
 //@ [armv7_rtems_eabihf] compile-flags: --target armv7-rtems-eabihf
 //@ [armv7_rtems_eabihf] needs-llvm-components: arm
@@ -196,9 +235,9 @@
 //@ revisions: armv7a_nuttx_eabihf
 //@ [armv7a_nuttx_eabihf] compile-flags: --target armv7a-nuttx-eabihf
 //@ [armv7a_nuttx_eabihf] needs-llvm-components: arm
-//@ revisions: armv7a_vex_v5
-//@ [armv7a_vex_v5] compile-flags: --target armv7a-vex-v5
-//@ [armv7a_vex_v5] needs-llvm-components: arm
+//@ revisions: thumbv7a_vex_v5
+//@ [thumbv7a_vex_v5] compile-flags: --target thumbv7a-vex-v5
+//@ [thumbv7a_vex_v5] needs-llvm-components: arm
 //@ revisions: armv7r_none_eabi
 //@ [armv7r_none_eabi] compile-flags: --target armv7r-none-eabi
 //@ [armv7r_none_eabi] needs-llvm-components: arm
@@ -223,6 +262,9 @@
 //@ revisions: hexagon_unknown_none_elf
 //@ [hexagon_unknown_none_elf] compile-flags: --target hexagon-unknown-none-elf
 //@ [hexagon_unknown_none_elf] needs-llvm-components: hexagon
+//@ revisions: hexagon_unknown_qurt
+//@ [hexagon_unknown_qurt] compile-flags: --target hexagon-unknown-qurt
+//@ [hexagon_unknown_qurt] needs-llvm-components: hexagon
 //@ revisions: i686_pc_nto_qnx700
 //@ [i686_pc_nto_qnx700] compile-flags: --target i686-pc-nto-qnx700
 //@ [i686_pc_nto_qnx700] needs-llvm-components: x86
@@ -241,12 +283,18 @@
 //@ revisions: i686_linux_android
 //@ [i686_linux_android] compile-flags: --target i686-linux-android
 //@ [i686_linux_android] needs-llvm-components: x86
+//@ revisions: i686_oe_linux_gnu
+//@ [i686_oe_linux_gnu] compile-flags: --target i686-oe-linux-gnu
+//@ [i686_oe_linux_gnu] needs-llvm-components: x86
 //@ revisions: i686_unknown_freebsd
 //@ [i686_unknown_freebsd] compile-flags: --target i686-unknown-freebsd
 //@ [i686_unknown_freebsd] needs-llvm-components: x86
 //@ revisions: i686_unknown_haiku
 //@ [i686_unknown_haiku] compile-flags: --target i686-unknown-haiku
 //@ [i686_unknown_haiku] needs-llvm-components: x86
+//@ revisions: i686_unknown_helenos
+//@ [i686_unknown_helenos] compile-flags: --target i686-unknown-helenos
+//@ [i686_unknown_helenos] needs-llvm-components: x86
 //@ revisions: i686_unknown_hurd_gnu
 //@ [i686_unknown_hurd_gnu] compile-flags: --target i686-unknown-hurd-gnu
 //@ [i686_unknown_hurd_gnu] needs-llvm-components: x86
@@ -358,12 +406,18 @@
 //@ revisions: msp430_none_elf
 //@ [msp430_none_elf] compile-flags: --target msp430-none-elf
 //@ [msp430_none_elf] needs-llvm-components: msp430
+//@ revisions: powerpc64_sony_ps3
+//@ [powerpc64_sony_ps3] compile-flags: --target powerpc64-sony-ps3
+//@ [powerpc64_sony_ps3] needs-llvm-components: powerpc
 //@ revisions: powerpc64_unknown_freebsd
 //@ [powerpc64_unknown_freebsd] compile-flags: --target powerpc64-unknown-freebsd
 //@ [powerpc64_unknown_freebsd] needs-llvm-components: powerpc
 //@ revisions: powerpc64_unknown_linux_gnu
 //@ [powerpc64_unknown_linux_gnu] compile-flags: --target powerpc64-unknown-linux-gnu
 //@ [powerpc64_unknown_linux_gnu] needs-llvm-components: powerpc
+//@ revisions: powerpc64_unknown_linux_gnuelfv2
+//@ [powerpc64_unknown_linux_gnuelfv2] compile-flags: --target powerpc64-unknown-linux-gnuelfv2
+//@ [powerpc64_unknown_linux_gnuelfv2] needs-llvm-components: powerpc
 //@ revisions: powerpc64_unknown_linux_musl
 //@ [powerpc64_unknown_linux_musl] compile-flags: --target powerpc64-unknown-linux-musl
 //@ [powerpc64_unknown_linux_musl] needs-llvm-components: powerpc
@@ -385,6 +439,9 @@
 //@ revisions: powerpc_unknown_freebsd
 //@ [powerpc_unknown_freebsd] compile-flags: --target powerpc-unknown-freebsd
 //@ [powerpc_unknown_freebsd] needs-llvm-components: powerpc
+//@ revisions: powerpc_unknown_helenos
+//@ [powerpc_unknown_helenos] compile-flags: --target powerpc-unknown-helenos
+//@ [powerpc_unknown_helenos] needs-llvm-components: powerpc
 //@ revisions: powerpc_unknown_linux_gnu
 //@ [powerpc_unknown_linux_gnu] compile-flags: --target powerpc-unknown-linux-gnu
 //@ [powerpc_unknown_linux_gnu] needs-llvm-components: powerpc
@@ -460,9 +517,15 @@
 //@ revisions: riscv32imc_unknown_none_elf
 //@ [riscv32imc_unknown_none_elf] compile-flags: --target riscv32imc-unknown-none-elf
 //@ [riscv32imc_unknown_none_elf] needs-llvm-components: riscv
+//@ revisions: riscv32imfc_unknown_none_elf
+//@ [riscv32imfc_unknown_none_elf] compile-flags: --target riscv32imfc-unknown-none-elf
+//@ [riscv32imfc_unknown_none_elf] needs-llvm-components: riscv
 //@ revisions: riscv64_linux_android
 //@ [riscv64_linux_android] compile-flags: --target riscv64-linux-android
 //@ [riscv64_linux_android] needs-llvm-components: riscv
+//@ revisions: riscv64_oe_linux_gnu
+//@ [riscv64_oe_linux_gnu] compile-flags: --target riscv64-oe-linux-gnu
+//@ [riscv64_oe_linux_gnu] needs-llvm-components: riscv
 //@ revisions: riscv64_wrs_vxworks
 //@ [riscv64_wrs_vxworks] compile-flags: --target riscv64-wrs-vxworks
 //@ [riscv64_wrs_vxworks] needs-llvm-components: riscv
@@ -478,9 +541,15 @@
 //@ revisions: riscv64gc_unknown_linux_gnu
 //@ [riscv64gc_unknown_linux_gnu] compile-flags: --target riscv64gc-unknown-linux-gnu
 //@ [riscv64gc_unknown_linux_gnu] needs-llvm-components: riscv
+//@ revisions: riscv64a23_unknown_linux_gnu
+//@ [riscv64a23_unknown_linux_gnu] compile-flags: --target riscv64a23-unknown-linux-gnu
+//@ [riscv64a23_unknown_linux_gnu] needs-llvm-components: riscv
 //@ revisions: riscv64gc_unknown_linux_musl
 //@ [riscv64gc_unknown_linux_musl] compile-flags: --target riscv64gc-unknown-linux-musl
 //@ [riscv64gc_unknown_linux_musl] needs-llvm-components: riscv
+//@ revisions: riscv64gc_unknown_managarm_mlibc
+//@ [riscv64gc_unknown_managarm_mlibc] compile-flags: --target riscv64gc-unknown-managarm-mlibc
+//@ [riscv64gc_unknown_managarm_mlibc] needs-llvm-components: riscv
 //@ revisions: riscv64gc_unknown_netbsd
 //@ [riscv64gc_unknown_netbsd] compile-flags: --target riscv64gc-unknown-netbsd
 //@ [riscv64gc_unknown_netbsd] needs-llvm-components: riscv
@@ -490,6 +559,12 @@
 //@ revisions: riscv64gc_unknown_openbsd
 //@ [riscv64gc_unknown_openbsd] compile-flags: --target riscv64gc-unknown-openbsd
 //@ [riscv64gc_unknown_openbsd] needs-llvm-components: riscv
+//@ revisions: riscv64gc_unknown_redox
+//@ [riscv64gc_unknown_redox] compile-flags: --target riscv64gc-unknown-redox
+//@ [riscv64gc_unknown_redox] needs-llvm-components: riscv
+//@ revisions: riscv64im_unknown_none_elf
+//@ [riscv64im_unknown_none_elf] compile-flags: --target riscv64im-unknown-none-elf
+//@ [riscv64im_unknown_none_elf] needs-llvm-components: riscv
 //@ revisions: riscv64imac_unknown_none_elf
 //@ [riscv64imac_unknown_none_elf] compile-flags: --target riscv64imac-unknown-none-elf
 //@ [riscv64imac_unknown_none_elf] needs-llvm-components: riscv
@@ -499,6 +574,12 @@
 //@ revisions: s390x_unknown_linux_musl
 //@ [s390x_unknown_linux_musl] compile-flags: --target s390x-unknown-linux-musl
 //@ [s390x_unknown_linux_musl] needs-llvm-components: systemz
+//@ revisions: s390x_unknown_none_softfloat
+//@ [s390x_unknown_none_softfloat] compile-flags: --target s390x-unknown-none-softfloat
+//@ [s390x_unknown_none_softfloat] needs-llvm-components: systemz
+//@ revisions: sparc64_unknown_helenos
+//@ [sparc64_unknown_helenos] compile-flags: --target sparc64-unknown-helenos
+//@ [sparc64_unknown_helenos] needs-llvm-components: sparc
 //@ revisions: sparc64_unknown_linux_gnu
 //@ [sparc64_unknown_linux_gnu] compile-flags: --target sparc64-unknown-linux-gnu
 //@ [sparc64_unknown_linux_gnu] needs-llvm-components: sparc
@@ -523,6 +604,24 @@
 //@ revisions: thumbv5te_none_eabi
 //@ [thumbv5te_none_eabi] compile-flags: --target thumbv5te-none-eabi
 //@ [thumbv5te_none_eabi] needs-llvm-components: arm
+//@ revisions: thumbv6_none_eabi
+//@ [thumbv6_none_eabi] compile-flags: --target thumbv6-none-eabi
+//@ [thumbv6_none_eabi] needs-llvm-components: arm
+//@ revisions: thumbv7a_none_eabi
+//@ [thumbv7a_none_eabi] compile-flags: --target thumbv7a-none-eabi
+//@ [thumbv7a_none_eabi] needs-llvm-components: arm
+//@ revisions: thumbv7a_none_eabihf
+//@ [thumbv7a_none_eabihf] compile-flags: --target thumbv7a-none-eabihf
+//@ [thumbv7a_none_eabihf] needs-llvm-components: arm
+//@ revisions: thumbv7r_none_eabi
+//@ [thumbv7r_none_eabi] compile-flags: --target thumbv7r-none-eabi
+//@ [thumbv7r_none_eabi] needs-llvm-components: arm
+//@ revisions: thumbv7r_none_eabihf
+//@ [thumbv7r_none_eabihf] compile-flags: --target thumbv7r-none-eabihf
+//@ [thumbv7r_none_eabihf] needs-llvm-components: arm
+//@ revisions: thumbv8r_none_eabihf
+//@ [thumbv8r_none_eabihf] compile-flags: --target thumbv8r-none-eabihf
+//@ [thumbv8r_none_eabihf] needs-llvm-components: arm
 //@ revisions: thumbv6m_none_eabi
 //@ [thumbv6m_none_eabi] compile-flags: --target thumbv6m-none-eabi
 //@ [thumbv6m_none_eabi] needs-llvm-components: arm
@@ -571,6 +670,9 @@
 //@ revisions: wasm32_wasip2
 //@ [wasm32_wasip2] compile-flags: --target wasm32-wasip2
 //@ [wasm32_wasip2] needs-llvm-components: webassembly
+//@ revisions: wasm32_wasip3
+//@ [wasm32_wasip3] compile-flags: --target wasm32-wasip3
+//@ [wasm32_wasip3] needs-llvm-components: webassembly
 //@ revisions: wasm32_wali_linux_musl
 //@ [wasm32_wali_linux_musl] compile-flags: --target wasm32-wali-linux-musl
 //@ [wasm32_wali_linux_musl] needs-llvm-components: webassembly
@@ -586,15 +688,18 @@
 //@ revisions: x86_64_lynx_lynxos178
 //@ [x86_64_lynx_lynxos178] compile-flags: --target x86_64-lynx-lynxos178
 //@ [x86_64_lynx_lynxos178] needs-llvm-components: x86
+//@ revisions: x86_64_oe_linux_gnu
+//@ [x86_64_oe_linux_gnu] compile-flags: --target x86_64-oe-linux-gnu
+//@ [x86_64_oe_linux_gnu] needs-llvm-components: x86
 //@ revisions: x86_64_pc_nto_qnx710
 //@ [x86_64_pc_nto_qnx710] compile-flags: --target x86_64-pc-nto-qnx710
 //@ [x86_64_pc_nto_qnx710] needs-llvm-components: x86
 //@ revisions: x86_64_pc_nto_qnx710_iosock
 //@ [x86_64_pc_nto_qnx710_iosock] compile-flags: --target x86_64-pc-nto-qnx710_iosock
 //@ [x86_64_pc_nto_qnx710_iosock] needs-llvm-components: x86
-//@ revisions: x86_64_pc_nto_qnx800
-//@ [x86_64_pc_nto_qnx800] compile-flags: --target x86_64-pc-nto-qnx800
-//@ [x86_64_pc_nto_qnx800] needs-llvm-components: x86
+//@ revisions: x86_64_pc_qnx
+//@ [x86_64_pc_qnx] compile-flags: --target x86_64-pc-qnx
+//@ [x86_64_pc_qnx] needs-llvm-components: x86
 //@ revisions: x86_64_pc_solaris
 //@ [x86_64_pc_solaris] compile-flags: --target x86_64-pc-solaris
 //@ [x86_64_pc_solaris] needs-llvm-components: x86
@@ -613,12 +718,18 @@
 //@ revisions: x86_64_unknown_haiku
 //@ [x86_64_unknown_haiku] compile-flags: --target x86_64-unknown-haiku
 //@ [x86_64_unknown_haiku] needs-llvm-components: x86
+//@ revisions: x86_64_unknown_helenos
+//@ [x86_64_unknown_helenos] compile-flags: --target x86_64-unknown-helenos
+//@ [x86_64_unknown_helenos] needs-llvm-components: x86
 //@ revisions: x86_64_unknown_hurd_gnu
 //@ [x86_64_unknown_hurd_gnu] compile-flags: --target x86_64-unknown-hurd-gnu
 //@ [x86_64_unknown_hurd_gnu] needs-llvm-components: x86
 //@ revisions: x86_64_unknown_hermit
 //@ [x86_64_unknown_hermit] compile-flags: --target x86_64-unknown-hermit
 //@ [x86_64_unknown_hermit] needs-llvm-components: x86
+//@ revisions: x86_64_unknown_hyperlight
+//@ [x86_64_unknown_hyperlight] compile-flags: --target x86_64-unknown-hyperlight
+//@ [x86_64_unknown_hyperlight] needs-llvm-components: x86
 //@ revisions: x86_64_unknown_illumos
 //@ [x86_64_unknown_illumos] compile-flags: --target x86_64-unknown-illumos
 //@ [x86_64_unknown_illumos] needs-llvm-components: x86
@@ -631,6 +742,15 @@
 //@ revisions: x86_64_unknown_linux_gnux32
 //@ [x86_64_unknown_linux_gnux32] compile-flags: --target x86_64-unknown-linux-gnux32
 //@ [x86_64_unknown_linux_gnux32] needs-llvm-components: x86
+//@ revisions: x86_64_unknown_linux_gnuasan
+//@ [x86_64_unknown_linux_gnuasan] compile-flags: --target x86_64-unknown-linux-gnuasan
+//@ [x86_64_unknown_linux_gnuasan] needs-llvm-components: x86
+//@ revisions: x86_64_unknown_linux_gnumsan
+//@ [x86_64_unknown_linux_gnumsan] compile-flags: --target x86_64-unknown-linux-gnumsan
+//@ [x86_64_unknown_linux_gnumsan] needs-llvm-components: x86
+//@ revisions: x86_64_unknown_linux_gnutsan
+//@ [x86_64_unknown_linux_gnutsan] compile-flags: --target x86_64-unknown-linux-gnutsan
+//@ [x86_64_unknown_linux_gnutsan] needs-llvm-components: x86
 //@ revisions: x86_64_unknown_linux_musl
 //@ [x86_64_unknown_linux_musl] compile-flags: --target x86_64-unknown-linux-musl
 //@ [x86_64_unknown_linux_musl] needs-llvm-components: x86
@@ -640,6 +760,12 @@
 //@ revisions: x86_64_unknown_linux_none
 //@ [x86_64_unknown_linux_none] compile-flags: --target x86_64-unknown-linux-none
 //@ [x86_64_unknown_linux_none] needs-llvm-components: x86
+//@ revisions: x86_64_unknown_managarm_mlibc
+//@ [x86_64_unknown_managarm_mlibc] compile-flags: --target x86_64-unknown-managarm-mlibc
+//@ [x86_64_unknown_managarm_mlibc] needs-llvm-components: x86
+//@ revisions: x86_64_unknown_motor
+//@ [x86_64_unknown_motor] compile-flags: --target x86_64-unknown-motor
+//@ [x86_64_unknown_motor] needs-llvm-components: x86
 //@ revisions: x86_64_unknown_netbsd
 //@ [x86_64_unknown_netbsd] compile-flags: --target x86_64-unknown-netbsd
 //@ [x86_64_unknown_netbsd] needs-llvm-components: x86
@@ -700,27 +826,25 @@
 //@ revisions: riscv64gc_unknown_nuttx_elf
 //@ [riscv64gc_unknown_nuttx_elf] compile-flags: --target riscv64gc-unknown-nuttx-elf
 //@ [riscv64gc_unknown_nuttx_elf] needs-llvm-components: riscv
-// FIXME: disabled since it requires a custom LLVM until the upstream LLVM adds support for the target (https://github.com/espressif/llvm-project/issues/4)
-/*
-    revisions: xtensa_esp32_none_elf
-    [xtensa_esp32_none_elf] compile-flags: --target xtensa-esp32-none-elf
-    [xtensa_esp32_none_elf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32_espidf
-    [xtensa_esp32_espidf] compile-flags: --target xtensa-esp32s2-espidf
-    [xtensa_esp32_espidf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32s2_none_elf
-    [xtensa_esp32s2_none_elf] compile-flags: --target xtensa-esp32s2-none-elf
-    [xtensa_esp32s2_none_elf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32s2_espidf
-    [xtensa_esp32s2_espidf] compile-flags: --target xtensa-esp32s2-espidf
-    [xtensa_esp32s2_espidf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32s3_none_elf
-    [xtensa_esp32s3_none_elf] compile-flags: --target xtensa-esp32s3-none-elf
-    [xtensa_esp32s3_none_elf] needs-llvm-components: xtensa
-    revisions: xtensa_esp32s3_espidf
-    [xtensa_esp32s3_espidf] compile-flags: --target xtensa-esp32s3-espidf
-    [xtensa_esp32s3_espidf] needs-llvm-components: xtensa
-*/
+//@ revisions: xtensa_esp32_none_elf
+//@ [xtensa_esp32_none_elf] compile-flags: --target xtensa-esp32-none-elf
+//@ [xtensa_esp32_none_elf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32_espidf
+//@ [xtensa_esp32_espidf] compile-flags: --target xtensa-esp32s2-espidf
+//@ [xtensa_esp32_espidf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32s2_none_elf
+//@ [xtensa_esp32s2_none_elf] compile-flags: --target xtensa-esp32s2-none-elf
+//@ [xtensa_esp32s2_none_elf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32s2_espidf
+//@ [xtensa_esp32s2_espidf] compile-flags: --target xtensa-esp32s2-espidf
+//@ [xtensa_esp32s2_espidf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32s3_none_elf
+//@ [xtensa_esp32s3_none_elf] compile-flags: --target xtensa-esp32s3-none-elf
+//@ [xtensa_esp32s3_none_elf] needs-llvm-components: xtensa
+//@ revisions: xtensa_esp32s3_espidf
+//@ [xtensa_esp32s3_espidf] compile-flags: --target xtensa-esp32s3-espidf
+//@ [xtensa_esp32s3_espidf] needs-llvm-components: xtensa
+
 // Sanity-check that each target can produce assembly code.
 
 #![feature(no_core, lang_items)]

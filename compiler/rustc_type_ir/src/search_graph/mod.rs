@@ -18,12 +18,13 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::iter;
 use std::marker::PhantomData;
+use std::ops::Sub;
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash};
 use rustc_type_ir::data_structures::HashMap;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, trace};
 
 mod stack;
 use stack::{Stack, StackDepth, StackEntry};
@@ -40,6 +41,7 @@ pub use global_cache::GlobalCache;
 pub trait Cx: Copy {
     type Input: Debug + Eq + Hash + Copy;
     type Result: Debug + Eq + Hash + Copy;
+    type AmbiguityKind: Debug + Eq + Hash + Copy;
 
     type DepNodeIndex;
     type Tracked<T: Debug + Clone>: Debug;
@@ -53,7 +55,7 @@ pub trait Cx: Copy {
 
     fn with_global_cache<R>(self, f: impl FnOnce(&mut GlobalCache<Self>) -> R) -> R;
 
-    fn evaluation_is_concurrent(&self) -> bool;
+    fn assert_evaluation_is_concurrent(&self);
 }
 
 pub trait Delegate: Sized {
@@ -86,28 +88,21 @@ pub trait Delegate: Sized {
         kind: PathKind,
         input: <Self::Cx as Cx>::Input,
     ) -> <Self::Cx as Cx>::Result;
-    fn is_initial_provisional_result(
-        cx: Self::Cx,
-        kind: PathKind,
-        input: <Self::Cx as Cx>::Input,
-        result: <Self::Cx as Cx>::Result,
-    ) -> bool;
-    fn on_stack_overflow(
-        cx: Self::Cx,
-        input: <Self::Cx as Cx>::Input,
-        inspect: &mut Self::ProofTreeBuilder,
-    ) -> <Self::Cx as Cx>::Result;
-    fn on_fixpoint_overflow(
+    fn is_initial_provisional_result(result: <Self::Cx as Cx>::Result) -> Option<PathKind>;
+    fn stack_overflow_result(
         cx: Self::Cx,
         input: <Self::Cx as Cx>::Input,
     ) -> <Self::Cx as Cx>::Result;
 
-    fn is_ambiguous_result(result: <Self::Cx as Cx>::Result) -> bool;
-    fn propagate_ambiguity(
+    const FIXPOINT_OVERFLOW_AMBIGUITY_KIND: <Self::Cx as Cx>::AmbiguityKind;
+    fn fixpoint_overflow_result(
         cx: Self::Cx,
-        for_input: <Self::Cx as Cx>::Input,
-        from_result: <Self::Cx as Cx>::Result,
+        input: <Self::Cx as Cx>::Input,
     ) -> <Self::Cx as Cx>::Result;
+
+    fn is_ambiguous_result(
+        result: <Self::Cx as Cx>::Result,
+    ) -> Option<<Self::Cx as Cx>::AmbiguityKind>;
 
     fn compute_goal(
         search_graph: &mut SearchGraph<Self>,
@@ -121,10 +116,7 @@ pub trait Delegate: Sized {
 /// result. In the case we return an initial provisional result depending
 /// on the kind of cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Decodable_NoContext, Encodable_NoContext, HashStable_NoContext)
-)]
+#[cfg_attr(feature = "nightly", derive(Decodable_NoContext, Encodable_NoContext, StableHash))]
 pub enum PathKind {
     /// A path consisting of only inductive/unproductive steps. Their initial
     /// provisional result is `Err(NoSolution)`. We currently treat them as
@@ -219,6 +211,27 @@ impl HeadUsages {
         let HeadUsages { inductive, unknown, coinductive, forced_ambiguity } = self;
         inductive == 0 && unknown == 0 && coinductive == 0 && forced_ambiguity == 0
     }
+
+    fn is_single(self, path_kind: PathKind) -> bool {
+        match path_kind {
+            PathKind::Inductive => matches!(
+                self,
+                HeadUsages { inductive: _, unknown: 0, coinductive: 0, forced_ambiguity: 0 },
+            ),
+            PathKind::Unknown => matches!(
+                self,
+                HeadUsages { inductive: 0, unknown: _, coinductive: 0, forced_ambiguity: 0 },
+            ),
+            PathKind::Coinductive => matches!(
+                self,
+                HeadUsages { inductive: 0, unknown: 0, coinductive: _, forced_ambiguity: 0 },
+            ),
+            PathKind::ForcedAmbiguity => matches!(
+                self,
+                HeadUsages { inductive: 0, unknown: 0, coinductive: 0, forced_ambiguity: _ },
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -229,6 +242,8 @@ impl CandidateHeadUsages {
     pub fn merge_usages(&mut self, other: CandidateHeadUsages) {
         if let Some(other_usages) = other.usages {
             if let Some(ref mut self_usages) = self.usages {
+                // Each head is merged independently, so the final usage counts are the same
+                // regardless of hash iteration order.
                 #[allow(rustc::potential_query_instability)]
                 for (head_index, head) in other_usages.into_iter() {
                     let HeadUsages { inductive, unknown, coinductive, forced_ambiguity } = head;
@@ -245,8 +260,30 @@ impl CandidateHeadUsages {
     }
 }
 
+/// Whether evaluating a given goal should be done with a lower available depth from
+/// its parent goal.
+///
+/// Normally, it should be `Yes`, but among rustc's predicate goals, `normalizes-to`
+/// goals are exceptions. They act like functions that used for normalizing associated
+/// terms while evaluating projection goals with fully unconstrained expected term.
+/// We don't want to lower the available depths for those function-like goals, otherwise
+/// we will encounter recursion limit overflows more often.
 #[derive(Debug, Clone, Copy)]
+pub enum LowerAvailableDepth {
+    Yes,
+    No,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct AvailableDepth(usize);
+
+impl Sub<RequiredDepth> for AvailableDepth {
+    type Output = AvailableDepth;
+    fn sub(self, rhs: RequiredDepth) -> AvailableDepth {
+        AvailableDepth(self.0.checked_sub(rhs.0).unwrap())
+    }
+}
+
 impl AvailableDepth {
     /// Returns the remaining depth allowed for nested goals.
     ///
@@ -257,8 +294,16 @@ impl AvailableDepth {
     fn allowed_depth_for_nested<D: Delegate>(
         root_depth: AvailableDepth,
         stack: &Stack<D::Cx>,
+        lower_available_depth: LowerAvailableDepth,
     ) -> Option<AvailableDepth> {
         if let Some(last) = stack.last() {
+            match lower_available_depth {
+                LowerAvailableDepth::Yes => {}
+                LowerAvailableDepth::No => {
+                    return Some(last.available_depth);
+                }
+            }
+
             if last.available_depth.0 == 0 {
                 return None;
             }
@@ -275,10 +320,13 @@ impl AvailableDepth {
 
     /// Whether we're allowed to use a global cache entry which required
     /// the given depth.
-    fn cache_entry_is_applicable(self, additional_depth: usize) -> bool {
-        self.0 >= additional_depth
+    fn cache_entry_is_applicable(self, required_depth: RequiredDepth) -> bool {
+        self.0 >= required_depth.0
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequiredDepth(pub usize);
 
 #[derive(Clone, Copy, Debug)]
 struct CycleHead {
@@ -483,13 +531,30 @@ impl<X: Cx> NestedGoals<X> {
     /// to all nested goals of that nested goal are also inductive. Otherwise the paths are
     /// the same as for the child.
     fn extend_from_child(&mut self, step_kind: PathKind, nested_goals: &NestedGoals<X>) {
-        #[allow(rustc::potential_query_instability)]
-        for (input, paths_to_nested) in nested_goals.iter() {
-            let paths_to_nested = paths_to_nested.extend_with(step_kind);
-            self.insert(input, paths_to_nested);
+        if nested_goals.is_empty() {
+            return;
+        }
+
+        // Each nested goal is updated independently, so traversal order cannot
+        // affect the result.
+        #[expect(rustc::potential_query_instability)]
+        if self.is_empty() {
+            // Manually avoid HashMap lookups for every input if there aren't
+            // any preexisting entries.
+            self.nested_goals.clone_from(&nested_goals.nested_goals);
+            for paths_to_nested in self.nested_goals.values_mut() {
+                *paths_to_nested = paths_to_nested.extend_with(step_kind);
+            }
+        } else {
+            for (input, paths_to_nested) in nested_goals.iter() {
+                let paths_to_nested = paths_to_nested.extend_with(step_kind);
+                self.insert(input, paths_to_nested);
+            }
         }
     }
 
+    // This helper intentionally exposes unstable hash iteration so each caller must opt in
+    // locally and justify why its traversal is order-insensitive.
     #[cfg_attr(feature = "nightly", rustc_lint_query_instability)]
     #[allow(rustc::potential_query_instability)]
     fn iter(&self) -> impl Iterator<Item = (X::Input, PathsToNested)> + '_ {
@@ -529,7 +594,7 @@ struct ProvisionalCacheEntry<X: Cx> {
 #[derive_where(Debug; X: Cx)]
 struct EvaluationResult<X: Cx> {
     encountered_overflow: bool,
-    required_depth: usize,
+    required_depth: RequiredDepth,
     heads: CycleHeads,
     nested_goals: NestedGoals<X>,
     result: X::Result,
@@ -545,7 +610,7 @@ impl<X: Cx> EvaluationResult<X> {
             encountered_overflow,
             // Unlike `encountered_overflow`, we share `heads`, `required_depth`,
             // and `nested_goals` between evaluations.
-            required_depth: final_entry.required_depth,
+            required_depth: final_entry.required_depth(),
             heads: final_entry.heads,
             nested_goals: final_entry.nested_goals,
             // We only care about the final result.
@@ -576,8 +641,8 @@ pub struct SearchGraph<D: Delegate<Cx = X>, X: Cx = <D as Delegate>::Cx> {
 /// don't need to track the nested goals used while computing a provisional
 /// cache entry.
 enum UpdateParentGoalCtxt<'a, X: Cx> {
-    Ordinary(&'a NestedGoals<X>),
-    CycleOnStack(X::Input),
+    Ordinary { nested_goals: &'a NestedGoals<X> },
+    CycleOnStack { head: X::Input },
     ProvisionalCacheHit,
 }
 
@@ -598,14 +663,15 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
     fn update_parent_goal(
         stack: &mut Stack<X>,
         step_kind_from_parent: PathKind,
-        required_depth_for_nested: usize,
         heads: impl Iterator<Item = (StackDepth, CycleHead)>,
         encountered_overflow: bool,
         context: UpdateParentGoalCtxt<'_, X>,
+        min_reachable_available_depth: AvailableDepth,
     ) {
         if let Some((parent_index, parent)) = stack.last_mut_with_index() {
-            parent.required_depth = parent.required_depth.max(required_depth_for_nested + 1);
             parent.encountered_overflow |= encountered_overflow;
+            parent.min_reached_available_depth =
+                parent.min_reached_available_depth.min(min_reachable_available_depth);
 
             for (head_index, head) in heads {
                 if let Some(candidate_usages) = &mut parent.candidate_usages {
@@ -629,11 +695,11 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
                 }
             }
             let parent_depends_on_cycle = match context {
-                UpdateParentGoalCtxt::Ordinary(nested_goals) => {
+                UpdateParentGoalCtxt::Ordinary { nested_goals } => {
                     parent.nested_goals.extend_from_child(step_kind_from_parent, nested_goals);
                     !nested_goals.is_empty()
                 }
-                UpdateParentGoalCtxt::CycleOnStack(head) => {
+                UpdateParentGoalCtxt::CycleOnStack { head } => {
                     // We lookup provisional cache entries before detecting cycles.
                     // We therefore can't use a global cache entry if it contains a cycle
                     // whose head is in the provisional cache.
@@ -692,15 +758,42 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
     pub fn ignore_candidate_head_usages(&mut self, usages: CandidateHeadUsages) {
         if let Some(usages) = usages.usages {
             let (entry_index, entry) = self.stack.last_mut_with_index().unwrap();
+            // Ignoring usages only mutates the state for the current `head_index`, so the
+            // resulting per-head state is unchanged by iteration order.
             #[allow(rustc::potential_query_instability)]
             for (head_index, usages) in usages.into_iter() {
                 if head_index == entry_index {
-                    entry.usages.unwrap().ignore_usages(usages);
+                    entry.usages.as_mut().unwrap().ignore_usages(usages);
                 } else {
                     entry.heads.ignore_usages(head_index, usages);
                 }
             }
         }
+    }
+
+    pub fn evaluate_root_goal_for_proof_tree(
+        cx: X,
+        root_depth: usize,
+        input: X::Input,
+        inspect: &mut D::ProofTreeBuilder,
+    ) -> (X::Result, RequiredDepth) {
+        let mut this = SearchGraph::<D>::new(root_depth);
+        let available_depth = AvailableDepth(root_depth);
+        let step_kind_from_parent = PathKind::Inductive; // is never used
+        this.stack.push(StackEntry {
+            input,
+            step_kind_from_parent,
+            available_depth,
+            min_reached_available_depth: available_depth,
+            provisional_result: None,
+            heads: Default::default(),
+            encountered_overflow: false,
+            usages: None,
+            candidate_usages: None,
+            nested_goals: Default::default(),
+        });
+        let evaluation_result = this.evaluate_goal_in_task(cx, input, inspect);
+        (evaluation_result.result, evaluation_result.required_depth)
     }
 
     /// Probably the most involved method of the whole solver.
@@ -713,12 +806,15 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         cx: X,
         input: X::Input,
         step_kind_from_parent: PathKind,
+        lower_available_depth: LowerAvailableDepth,
         inspect: &mut D::ProofTreeBuilder,
     ) -> X::Result {
-        let Some(available_depth) =
-            AvailableDepth::allowed_depth_for_nested::<D>(self.root_depth, &self.stack)
-        else {
-            return self.handle_overflow(cx, input, inspect);
+        let Some(available_depth) = AvailableDepth::allowed_depth_for_nested::<D>(
+            self.root_depth,
+            &self.stack,
+            lower_available_depth,
+        ) else {
+            return self.handle_overflow(cx, input);
         };
 
         // We check the provisional cache before checking the global cache. This simplifies
@@ -729,7 +825,9 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         // - A
         //     - BA cycle
         //     - CB :x:
-        if let Some(result) = self.lookup_provisional_cache(input, step_kind_from_parent) {
+        if let Some(result) =
+            self.lookup_provisional_cache(input, step_kind_from_parent, available_depth)
+        {
             return result;
         }
 
@@ -757,7 +855,9 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         // avoid iterating over the stack in case a goal has already been computed.
         // This may not have an actual performance impact and we could reorder them
         // as it may reduce the number of `nested_goals` we need to track.
-        if let Some(result) = self.check_cycle_on_stack(cx, input, step_kind_from_parent) {
+        if let Some(result) =
+            self.check_cycle_on_stack(cx, input, step_kind_from_parent, available_depth)
+        {
             debug_assert!(validate_cache.is_none(), "global cache and cycle on stack: {input:?}");
             return result;
         }
@@ -768,7 +868,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             step_kind_from_parent,
             available_depth,
             provisional_result: None,
-            required_depth: 0,
+            min_reached_available_depth: available_depth,
             heads: Default::default(),
             encountered_overflow: false,
             usages: None,
@@ -790,10 +890,10 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         Self::update_parent_goal(
             &mut self.stack,
             step_kind_from_parent,
-            evaluation_result.required_depth,
             evaluation_result.heads.iter(),
             evaluation_result.encountered_overflow,
-            UpdateParentGoalCtxt::Ordinary(&evaluation_result.nested_goals),
+            UpdateParentGoalCtxt::Ordinary { nested_goals: &evaluation_result.nested_goals },
+            available_depth - evaluation_result.required_depth,
         );
         let result = evaluation_result.result;
 
@@ -803,7 +903,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             if let Some((_scope, expected)) = validate_cache {
                 // Do not try to move a goal into the cache again if we're testing
                 // the global cache.
-                assert_eq!(expected, evaluation_result.result, "input={input:?}");
+                assert_eq!(expected, result, "input={input:?}");
             } else if D::inspect_is_noop(inspect) {
                 self.insert_global_cache(cx, input, evaluation_result, dep_node)
             }
@@ -833,12 +933,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         result
     }
 
-    fn handle_overflow(
-        &mut self,
-        cx: X,
-        input: X::Input,
-        inspect: &mut D::ProofTreeBuilder,
-    ) -> X::Result {
+    fn handle_overflow(&mut self, cx: X, input: X::Input) -> X::Result {
         if let Some(last) = self.stack.last_mut() {
             last.encountered_overflow = true;
             // If computing a goal `B` depends on another goal `A` and
@@ -853,7 +948,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         }
 
         debug!("encountered stack overflow");
-        D::on_stack_overflow(cx, input, inspect)
+        D::stack_overflow_result(cx, input)
     }
 
     /// When reevaluating a goal with a changed provisional result, all provisional cache entry
@@ -863,6 +958,8 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
     /// don't depend on its value.
     fn clear_dependent_provisional_results_for_rerun(&mut self) {
         let rerun_index = self.stack.next_index();
+        // Each cached entry is filtered independently based on whether it depends on
+        // `rerun_index`, so bucket traversal order does not matter.
         #[allow(rustc::potential_query_instability)]
         self.provisional_cache.retain(|_, entries| {
             entries.retain(|entry| {
@@ -872,7 +969,29 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             !entries.is_empty()
         });
     }
+}
 
+/// We need to rebase provisional cache entries when popping one of their cycle
+/// heads from the stack. This may not necessarily mean that we've actually
+/// reached a fixpoint for that cycle head, which impacts the way we rebase
+/// provisional cache entries.
+#[derive_where(Debug; X: Cx)]
+enum RebaseReason<X: Cx> {
+    NoCycleUsages,
+    Ambiguity(X::AmbiguityKind),
+    /// We've actually reached a fixpoint.
+    ///
+    /// This either happens in the first evaluation step for the cycle head.
+    /// In this case the used provisional result depends on the cycle `PathKind`.
+    /// We store this path kind to check whether the provisional cache entry
+    /// we're rebasing relied on the same cycles.
+    ///
+    /// In later iterations cycles always return `stack_entry.provisional_result`
+    /// so we no longer depend on the `PathKind`. We store `None` in that case.
+    ReachedFixpoint(Option<PathKind>),
+}
+
+impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
     /// A necessary optimization to handle complex solver cycles. A provisional cache entry
     /// relies on a set of cycle heads and the path towards these heads. When popping a cycle
     /// head from the stack after we've finished computing it, we can't be sure that the
@@ -890,12 +1009,15 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
     /// cache entries to also be ambiguous. This causes some undesirable ambiguity for nested
     /// goals whose result doesn't actually depend on this cycle head, but that's acceptable
     /// to me.
+    #[instrument(level = "trace", skip(self))]
     fn rebase_provisional_cache_entries(
         &mut self,
         stack_entry: &StackEntry<X>,
-        mut mutate_result: impl FnMut(X::Input, X::Result) -> X::Result,
+        rebase_reason: RebaseReason<X>,
     ) {
         let popped_head_index = self.stack.next_index();
+        // Rebasing decisions depend only on each provisional entry and the current stack state,
+        // so traversing the cache in hash order cannot change the final cache contents.
         #[allow(rustc::potential_query_instability)]
         self.provisional_cache.retain(|&input, entries| {
             entries.retain_mut(|entry| {
@@ -908,6 +1030,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
                 let popped_head = if heads.highest_cycle_head_index() == popped_head_index {
                     heads.remove_highest_cycle_head()
                 } else {
+                    debug_assert!(heads.highest_cycle_head_index() < popped_head_index);
                     return true;
                 };
 
@@ -961,9 +1084,34 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
                         let eph = ep.extend_with_paths(ph);
                         heads.insert(head_index, eph, head.usages);
                     }
+
+                    // The provisional cache entry does depend on the provisional result
+                    // of the popped cycle head. In case we didn't actually reach a fixpoint,
+                    // we must not keep potentially incorrect provisional cache entries around.
+                    match rebase_reason {
+                        // If the cycle head does not actually depend on itself, then
+                        // the provisional result used by the provisional cache entry
+                        // is not actually equal to the final provisional result. We
+                        // need to discard the provisional cache entry in this case.
+                        RebaseReason::NoCycleUsages => return false,
+                        // If we avoid rerunning a goal due to ambiguity, we only keep provisional
+                        // results which depend on that cycle head if these are already ambiguous
+                        // themselves.
+                        RebaseReason::Ambiguity(kind) => {
+                            if !D::is_ambiguous_result(*result).is_some_and(|k| k == kind) {
+                                return false;
+                            }
+                        }
+                        RebaseReason::ReachedFixpoint(None) => {}
+                        RebaseReason::ReachedFixpoint(Some(path_kind)) => {
+                            if !popped_head.usages.is_single(path_kind) {
+                                return false;
+                            }
+                        }
+                    };
                 }
 
-                let Some(head_index) = heads.opt_highest_cycle_head_index() else {
+                let Some(new_highest_head_index) = heads.opt_highest_cycle_head_index() else {
                     return false;
                 };
 
@@ -972,11 +1120,11 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
                 *path_from_head = path_from_head.extend(Self::cycle_path_kind(
                     &self.stack,
                     stack_entry.step_kind_from_parent,
-                    head_index,
+                    new_highest_head_index,
                 ));
-                // Mutate the result of the provisional cache entry in case we did
-                // not reach a fixpoint.
-                *result = mutate_result(input, *result);
+
+                trace!(?input, ?entry, "rebased provisional cache entry");
+
                 true
             });
             !entries.is_empty()
@@ -987,6 +1135,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         &mut self,
         input: X::Input,
         step_kind_from_parent: PathKind,
+        available_depth: AvailableDepth,
     ) -> Option<X::Result> {
         if !D::ENABLE_PROVISIONAL_CACHE {
             return None;
@@ -1022,10 +1171,10 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
                 Self::update_parent_goal(
                     &mut self.stack,
                     step_kind_from_parent,
-                    0,
                     heads.iter(),
                     encountered_overflow,
                     UpdateParentGoalCtxt::ProvisionalCacheHit,
+                    available_depth,
                 );
                 debug!(?head_index, ?path_from_head, "provisional cache hit");
                 return Some(result);
@@ -1058,6 +1207,8 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
 
         // The global cache entry is also invalid if there's a provisional cache entry
         // would apply for any of its nested goals.
+        // Any matching provisional entry rejects the candidate,
+        // so iteration order only affects when we return `false`, not the final answer.
         #[allow(rustc::potential_query_instability)]
         for (input, path_from_global_entry) in nested_goals.iter() {
             let Some(entries) = self.provisional_cache.get(&input) else {
@@ -1143,10 +1294,10 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             Self::update_parent_goal(
                 &mut self.stack,
                 step_kind_from_parent,
-                required_depth,
                 heads,
                 encountered_overflow,
-                UpdateParentGoalCtxt::Ordinary(nested_goals),
+                UpdateParentGoalCtxt::Ordinary { nested_goals },
+                available_depth - required_depth,
             );
 
             debug!(?required_depth, "global cache hit");
@@ -1159,6 +1310,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         cx: X,
         input: X::Input,
         step_kind_from_parent: PathKind,
+        available_depth: AvailableDepth,
     ) -> Option<X::Result> {
         let head_index = self.stack.find(input)?;
         // We have a nested goal which directly relies on a goal deeper in the stack.
@@ -1175,10 +1327,10 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
         Self::update_parent_goal(
             &mut self.stack,
             step_kind_from_parent,
-            0,
             iter::once((head_index, head)),
             false,
-            UpdateParentGoalCtxt::CycleOnStack(input),
+            UpdateParentGoalCtxt::CycleOnStack { head: input },
+            available_depth,
         );
 
         // Return the provisional result or, if we're in the first iteration,
@@ -1191,35 +1343,22 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
     }
 
     /// Whether we've reached a fixpoint when evaluating a cycle head.
+    #[instrument(level = "trace", skip(self, stack_entry), ret)]
     fn reached_fixpoint(
         &mut self,
-        cx: X,
         stack_entry: &StackEntry<X>,
         usages: HeadUsages,
         result: X::Result,
-    ) -> bool {
+    ) -> Result<Option<PathKind>, ()> {
         let provisional_result = stack_entry.provisional_result;
-        if usages.is_empty() {
-            true
-        } else if let Some(provisional_result) = provisional_result {
-            provisional_result == result
+        if let Some(provisional_result) = provisional_result {
+            if provisional_result == result { Ok(None) } else { Err(()) }
+        } else if let Some(path_kind) = D::is_initial_provisional_result(result)
+            .filter(|&path_kind| usages.is_single(path_kind))
+        {
+            Ok(Some(path_kind))
         } else {
-            let check = |k| D::is_initial_provisional_result(cx, k, stack_entry.input, result);
-            match usages {
-                HeadUsages { inductive: _, unknown: 0, coinductive: 0, forced_ambiguity: 0 } => {
-                    check(PathKind::Inductive)
-                }
-                HeadUsages { inductive: 0, unknown: _, coinductive: 0, forced_ambiguity: 0 } => {
-                    check(PathKind::Unknown)
-                }
-                HeadUsages { inductive: 0, unknown: 0, coinductive: _, forced_ambiguity: 0 } => {
-                    check(PathKind::Coinductive)
-                }
-                HeadUsages { inductive: 0, unknown: 0, coinductive: 0, forced_ambiguity: _ } => {
-                    check(PathKind::ForcedAmbiguity)
-                }
-                _ => false,
-            }
+            Err(())
         }
     }
 
@@ -1246,7 +1385,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             encountered_overflow |= stack_entry.encountered_overflow;
             debug_assert_eq!(stack_entry.input, input);
 
-            // If the current goal is not the root of a cycle, we are done.
+            // If the current goal is not a cycle head, we are done.
             //
             // There are no provisional cache entries which depend on this goal.
             let Some(usages) = stack_entry.usages else {
@@ -1262,10 +1401,16 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             //
             // Check whether we reached a fixpoint, either because the final result
             // is equal to the provisional result of the previous iteration, or because
-            // this was only the root of either coinductive or inductive cycles, and the
+            // this was only the head of either coinductive or inductive cycles, and the
             // final result is equal to the initial response for that case.
-            if self.reached_fixpoint(cx, &stack_entry, usages, result) {
-                self.rebase_provisional_cache_entries(&stack_entry, |_, result| result);
+            if let Ok(fixpoint) = self.reached_fixpoint(&stack_entry, usages, result) {
+                self.rebase_provisional_cache_entries(
+                    &stack_entry,
+                    RebaseReason::ReachedFixpoint(fixpoint),
+                );
+                return EvaluationResult::finalize(stack_entry, encountered_overflow, result);
+            } else if usages.is_empty() {
+                self.rebase_provisional_cache_entries(&stack_entry, RebaseReason::NoCycleUsages);
                 return EvaluationResult::finalize(stack_entry, encountered_overflow, result);
             }
 
@@ -1274,17 +1419,15 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             // response in the next iteration in this case. These changes would
             // likely either be caused by incompleteness or can change the maybe
             // cause from ambiguity to overflow. Returning ambiguity always
-            // preserves soundness and completeness even if the goal is be known
-            // to succeed or fail.
+            // preserves soundness and completeness even if the goal could
+            // otherwise succeed or fail.
             //
             // This prevents exponential blowup affecting multiple major crates.
             // As we only get to this branch if we haven't yet reached a fixpoint,
             // we also taint all provisional cache entries which depend on the
             // current goal.
-            if D::is_ambiguous_result(result) {
-                self.rebase_provisional_cache_entries(&stack_entry, |input, _| {
-                    D::propagate_ambiguity(cx, input, result)
-                });
+            if let Some(kind) = D::is_ambiguous_result(result) {
+                self.rebase_provisional_cache_entries(&stack_entry, RebaseReason::Ambiguity(kind));
                 return EvaluationResult::finalize(stack_entry, encountered_overflow, result);
             };
 
@@ -1293,15 +1436,17 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             i += 1;
             if i >= D::FIXPOINT_STEP_LIMIT {
                 debug!("canonical cycle overflow");
-                let result = D::on_fixpoint_overflow(cx, input);
-                self.rebase_provisional_cache_entries(&stack_entry, |input, _| {
-                    D::on_fixpoint_overflow(cx, input)
-                });
+                let result = D::fixpoint_overflow_result(cx, input);
+                self.rebase_provisional_cache_entries(
+                    &stack_entry,
+                    RebaseReason::Ambiguity(D::FIXPOINT_OVERFLOW_AMBIGUITY_KIND),
+                );
                 return EvaluationResult::finalize(stack_entry, encountered_overflow, result);
             }
 
             // Clear all provisional cache entries which depend on a previous provisional
-            // result of this goal and rerun.
+            // result of this goal and rerun. This does not remove goals which accessed this
+            // goal without depending on its result.
             self.clear_dependent_provisional_results_for_rerun();
 
             debug!(?result, "fixpoint changed provisional results");
@@ -1312,7 +1457,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
                 provisional_result: Some(result),
                 // We can keep these goals from previous iterations as they are only
                 // ever read after finalizing this evaluation.
-                required_depth: stack_entry.required_depth,
+                min_reached_available_depth: stack_entry.min_reached_available_depth,
                 heads: stack_entry.heads,
                 nested_goals: stack_entry.nested_goals,
                 // We reset these two fields when rerunning this goal. We could
@@ -1321,7 +1466,12 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
                 // similar to the previous iterations when reevaluating, it's better
                 // for caching if the reevaluation also starts out with `false`.
                 encountered_overflow: false,
-                usages: None,
+                // We keep provisional cache entries around if they used this goal
+                // without depending on its result.
+                //
+                // We still need to drop or rebase these cache entries once we've
+                // finished evaluating this goal.
+                usages: Some(HeadUsages::default()),
                 candidate_usages: None,
             });
         }

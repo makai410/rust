@@ -1,14 +1,13 @@
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::source::snippet;
-use hir::def::{DefKind, Res};
+use rustc_attr_ir::find_attr;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
-use rustc_hir::attrs::AttributeKind;
-use rustc_hir::{self as hir, AmbigArg, find_attr};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_session::impl_lint_pass;
-use rustc_span::Span;
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::{self as hir, AmbigArg, UseTree};
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
 use rustc_span::edition::Edition;
+use rustc_span::{OrdSpan, Span};
 use std::collections::BTreeMap;
 
 declare_clippy_lint! {
@@ -44,6 +43,8 @@ declare_clippy_lint! {
     "#[macro_use] is no longer needed"
 }
 
+impl_lint_pass!(MacroUseImports => [MACRO_USE_IMPORTS]);
+
 /// `MacroRefData` includes the name of the macro.
 #[derive(Debug, Clone)]
 pub struct MacroRefData {
@@ -65,8 +66,6 @@ pub struct MacroUseImports {
     collected: FxHashSet<Span>,
     mac_refs: Vec<MacroRefData>,
 }
-
-impl_lint_pass!(MacroUseImports => [MACRO_USE_IMPORTS]);
 
 impl MacroUseImports {
     fn push_unique_macro(&mut self, cx: &LateContext<'_>, span: Span) {
@@ -97,11 +96,11 @@ impl MacroUseImports {
 impl LateLintPass<'_> for MacroUseImports {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &hir::Item<'_>) {
         if cx.sess().opts.edition >= Edition::Edition2018
-            && let hir::ItemKind::Use(path, _kind) = &item.kind
+            && let hir::ItemKind::Use(UseTree { prefix, .. }) = &item.kind
             && let hir_id = item.hir_id()
             && let attrs = cx.tcx.hir_attrs(hir_id)
-            && let Some(mac_attr_span) = find_attr!(attrs, AttributeKind::MacroUse {span, ..} => *span)
-            && let Some(Res::Def(DefKind::Mod, id)) = path.res.type_ns
+            && let Some(mac_attr_span) = find_attr!(attrs, MacroUse {span, ..} => *span)
+            && let Some(Res::Def(DefKind::Mod, id)) = prefix.res.type_ns
             && !id.is_local()
         {
             for kid in cx.tcx.module_children(id) {
@@ -152,7 +151,7 @@ impl LateLintPass<'_> for MacroUseImports {
                         if !check_dup.contains(&(*item).to_string()) {
                             used.entry((
                                 (*root).to_string(),
-                                span,
+                                OrdSpan(*span),
                                 hir_id.local_id,
                                 cx.tcx.def_path_hash(hir_id.owner.def_id.into()),
                             ))
@@ -176,7 +175,7 @@ impl LateLintPass<'_> for MacroUseImports {
                                 .collect::<Vec<_>>();
                             used.entry((
                                 (*root).to_string(),
-                                span,
+                                OrdSpan(*span),
                                 hir_id.local_id,
                                 cx.tcx.def_path_hash(hir_id.owner.def_id.into()),
                             ))
@@ -188,7 +187,7 @@ impl LateLintPass<'_> for MacroUseImports {
                             let rest = rest.to_vec();
                             used.entry((
                                 (*root).to_string(),
-                                span,
+                                OrdSpan(*span),
                                 hir_id.local_id,
                                 cx.tcx.def_path_hash(hir_id.owner.def_id.into()),
                             ))
@@ -216,11 +215,11 @@ impl LateLintPass<'_> for MacroUseImports {
                     cx,
                     MACRO_USE_IMPORTS,
                     *hir_id,
-                    *span,
+                    span.0,
                     "`macro_use` attributes are no longer needed in the Rust 2018 edition",
                     |diag| {
                         diag.span_suggestion(
-                            *span,
+                            span.0,
                             "remove the attribute and import the macro directly, try",
                             format!("use {import};"),
                             Applicability::MaybeIncorrect,

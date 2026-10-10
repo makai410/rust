@@ -1,8 +1,7 @@
 //@aux-build:proc_macro_derive.rs
-
-#![allow(unused, clippy::duplicated_attributes)]
 #![warn(clippy::useless_attribute)]
-#![warn(unreachable_pub)]
+#![deny(unreachable_pub)]
+#![expect(clippy::duplicated_attributes)]
 #![feature(rustc_private)]
 
 #![allow(dead_code)]
@@ -41,6 +40,10 @@ mod foo {
 }
 #[allow(deprecated)]
 pub use foo::Bar;
+
+// don't lint on exported_private_dependencies for `use` items
+#[allow(exported_private_dependencies)]
+use {};
 
 // This should not trigger the lint. There's lint level definitions inside the external derive
 // that would trigger the useless_attribute lint.
@@ -92,9 +95,7 @@ mod module {
 #[allow(unused_braces)]
 use module::{Struct};
 
-fn main() {
-    test_indented_attr();
-}
+fn main() {}
 
 // Regression test for https://github.com/rust-lang/rust-clippy/issues/4467
 #[allow(dead_code)]
@@ -153,8 +154,18 @@ pub mod redundant_imports_issue {
         () => {};
     }
 
-    #[expect(redundant_imports)]
+    #[expect(unused_imports)]
     pub(crate) use empty;
 
     empty!();
+}
+
+pub mod issue15636 {
+    pub mod f {
+        #[deprecated(since = "TBD")]
+        pub mod deprec {}
+    }
+
+    #[allow(deprecated_in_future)]
+    pub use f::deprec;
 }

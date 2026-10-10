@@ -7,7 +7,6 @@
 //@ edition: 2021
 
 #![feature(rustc_private)]
-#![feature(assert_matches)]
 
 extern crate rustc_middle;
 
@@ -27,7 +26,7 @@ fn test_item_kind() -> ControlFlow<()> {
     assert_eq!(items.len(), 4);
     // Constructor item.
     for item in items {
-        let expected_kind = match item.name().as_str() {
+        let expected_kind = match item.trimmed_name().as_str() {
             "Dummy" => ItemKind::Ctor(CtorKind::Fn),
             "dummy" => ItemKind::Fn,
             "unit" => ItemKind::Fn,

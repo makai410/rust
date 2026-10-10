@@ -1,6 +1,7 @@
 #![allow(clippy::needless_question_mark, rustc::internal)]
 
 mod commands;
+mod config;
 mod coverage;
 mod util;
 
@@ -78,9 +79,13 @@ pub enum Command {
         /// Build the program with the dependencies declared in `tests/deps/Cargo.toml`.
         #[arg(long)]
         dep: bool,
-        /// Show build progress.
+        /// Compile and run the program natively instead of via Miri. Implies `--dep`.
+        /// All flags are passed to rustc; there is currently no way to pass flags to the program.
+        #[arg(long)]
+        native: bool,
+        /// Hide build progress.
         #[arg(long, short)]
-        verbose: bool,
+        quiet: bool,
         /// The cross-interpretation target.
         #[arg(long)]
         target: Option<String>,
@@ -133,11 +138,18 @@ pub enum Command {
         /// List of benchmarks to run (default: run all benchmarks).
         benches: Vec<String>,
     },
-    /// Update and activate the rustup toolchain 'miri'.
+    /// Update and activate the rustup toolchain 'miri' (or whatever name is configured in
+    /// `miri.toml`).
     ///
     /// The `rust-version` file is used to determine the commit that will be intsalled.
     /// `rustup-toolchain-install-master` must be installed for this to work.
     Toolchain {
+        /// Overwrite the name the toolchain will have in `rustup`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Overwrite the commit to install.
+        #[arg(long)]
+        commit: Option<String>,
         /// Flags that are passed through to `rustup-toolchain-install-master`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         flags: Vec<String>,
@@ -157,8 +169,8 @@ impl Command {
             | Self::Build { flags, .. }
             | Self::Check { flags, .. }
             | Self::Doc { flags, .. }
-            | Self::Fmt { flags }
-            | Self::Toolchain { flags }
+            | Self::Fmt { flags, .. }
+            | Self::Toolchain { flags, .. }
             | Self::Clippy { flags, .. }
             | Self::Run { flags, .. }
             | Self::Test { flags, .. } => {
@@ -193,6 +205,10 @@ fn main() -> Result<()> {
     let args = Cli::parse_from(miri_args);
     let mut command = args.command;
     command.add_remainder(remainder)?;
-    command.exec()?;
-    Ok(())
+
+    // Parse config file.
+    let config = config::Config::load()?;
+
+    // Run the thing.
+    command.exec(&config)
 }

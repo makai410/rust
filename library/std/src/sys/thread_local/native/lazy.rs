@@ -27,9 +27,11 @@ enum State<D> {
 }
 
 #[allow(missing_debug_implementations)]
+#[repr(C)]
 pub struct Storage<T, D> {
-    state: Cell<State<D>>,
+    // This field must be first, for correctness of `#[rustc_align_static]`
     value: UnsafeCell<MaybeUninit<T>>,
+    state: Cell<State<D>>,
 }
 
 impl<T, D> Storage<T, D>
@@ -93,7 +95,7 @@ where
             // as we've already registered the destructor.
             State::Alive => unsafe { old_value.assume_init_drop() },
 
-            State::Destroyed(_) => unreachable!(),
+            State::Destroyed(_) => rtabort!("unreachable"),
         }
 
         self.value.get().cast()

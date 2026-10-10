@@ -11,7 +11,7 @@ LL - fn frob() -> impl Fn<P, Output = T> + '_ {}
 LL + fn frob() -> impl Fn<P, Output = T> + 'static {}
    |
 
-error[E0412]: cannot find type `P` in this scope
+error[E0425]: cannot find type `P` in this scope
   --> $DIR/opaque-used-in-extraneous-argument.rs:5:22
    |
 LL | fn frob() -> impl Fn<P, Output = T> + '_ {}
@@ -22,7 +22,7 @@ help: you might be missing a type parameter
 LL | fn frob<P>() -> impl Fn<P, Output = T> + '_ {}
    |        +++
 
-error[E0412]: cannot find type `T` in this scope
+error[E0425]: cannot find type `T` in this scope
   --> $DIR/opaque-used-in-extraneous-argument.rs:5:34
    |
 LL | fn frob() -> impl Fn<P, Output = T> + '_ {}
@@ -37,22 +37,32 @@ error[E0658]: the precise format of `Fn`-family traits' type parameters is subje
   --> $DIR/opaque-used-in-extraneous-argument.rs:5:19
    |
 LL | fn frob() -> impl Fn<P, Output = T> + '_ {}
-   |                   ^^^^^^^^^^^^^^^^^ help: use parenthetical notation instead: `Fn(P) -> T`
+   |                   ^^^^^^^^^^^^^^^^^
    |
    = note: see issue #29625 <https://github.com/rust-lang/rust/issues/29625> for more information
    = help: add `#![feature(unboxed_closures)]` to the crate attributes to enable
    = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+help: use parenthetical notation instead
+   |
+LL - fn frob() -> impl Fn<P, Output = T> + '_ {}
+LL + fn frob() -> impl Fn(P) -> T + '_ {}
+   |
 
 error[E0658]: the precise format of `Fn`-family traits' type parameters is subject to change
   --> $DIR/opaque-used-in-extraneous-argument.rs:5:19
    |
 LL | fn frob() -> impl Fn<P, Output = T> + '_ {}
-   |                   ^^^^^^^^^^^^^^^^^ help: use parenthetical notation instead: `Fn(P) -> T`
+   |                   ^^^^^^^^^^^^^^^^^
    |
    = note: see issue #29625 <https://github.com/rust-lang/rust/issues/29625> for more information
    = help: add `#![feature(unboxed_closures)]` to the crate attributes to enable
    = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
    = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+help: use parenthetical notation instead
+   |
+LL - fn frob() -> impl Fn<P, Output = T> + '_ {}
+LL + fn frob() -> impl Fn(P) -> T + '_ {}
+   |
 
 error[E0061]: this function takes 0 arguments but 1 argument was supplied
   --> $DIR/opaque-used-in-extraneous-argument.rs:17:20
@@ -90,5 +100,5 @@ LL +     open_parent()
 
 error: aborting due to 7 previous errors
 
-Some errors have detailed explanations: E0061, E0106, E0412, E0658.
+Some errors have detailed explanations: E0061, E0106, E0425, E0658.
 For more information about an error, try `rustc --explain E0061`.

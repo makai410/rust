@@ -33,6 +33,9 @@ pub fn where_bound_predicate_to_string(where_bound_predicate: &ast::WhereBoundPr
     State::new().where_bound_predicate_to_string(where_bound_predicate)
 }
 
+/// # Panics
+///
+/// Panics if `pat.kind` is `PatKind::Missing`.
 pub fn pat_to_string(pat: &ast::Pat) -> String {
     State::new().pat_to_string(pat)
 }
@@ -75,6 +78,14 @@ pub fn path_segment_to_string(p: &ast::PathSegment) -> String {
 
 pub fn vis_to_string(v: &ast::Visibility) -> String {
     State::new().vis_to_string(v)
+}
+
+pub fn impl_restriction_to_string(r: &ast::ImplRestriction) -> String {
+    State::new().impl_restriction_to_string(r)
+}
+
+pub fn mut_restriction_to_string(r: &ast::MutRestriction) -> String {
+    State::new().mut_restriction_to_string(r)
 }
 
 pub fn meta_list_item_to_string(li: &ast::MetaItemInner) -> String {

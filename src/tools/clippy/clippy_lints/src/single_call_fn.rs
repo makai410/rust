@@ -5,8 +5,7 @@ use rustc_data_structures::fx::{FxIndexMap, IndexEntry};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::{Expr, ExprKind, HirId, Node};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, impl_lint_pass};
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -58,6 +57,7 @@ declare_clippy_lint! {
     restriction,
     "checks for functions that are only used once"
 }
+
 impl_lint_pass!(SingleCallFn => [SINGLE_CALL_FN]);
 
 #[derive(Debug, Clone)]

@@ -1,10 +1,10 @@
 //@ check-pass
 
-#![feature(min_generic_const_args)]
+#![feature(gca_min_const_items, gca_macroless_args)]
 #![allow(incomplete_features)]
 
 pub trait Tr<X> {
-    #[type_const]
+    #[rustc_always_gca]
     const SIZE: usize;
 }
 

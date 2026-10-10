@@ -1,4 +1,5 @@
 //@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 
 // Check that `[const]` item bounds only hold if the where clauses on the
@@ -8,8 +9,7 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Trait {
+const trait Trait {
     type Assoc<U>: [const] Trait
     where
         U: [const] Other;
@@ -17,8 +17,7 @@ trait Trait {
     fn func();
 }
 
-#[const_trait]
-trait Other {}
+const trait Other {}
 
 const fn fails<T: [const] Trait, U: Other>() {
     T::Assoc::<U>::func();

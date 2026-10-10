@@ -1,5 +1,5 @@
 #[cfg(feature = "nightly")]
-use crate::{BackendRepr, FieldsShape, Primitive, Size, TyAbiInterface, TyAndLayout, Variants};
+use crate::{BackendRepr, FieldsShape, Size, TyAbiInterface, TyAndLayout, Variants};
 
 mod reg;
 
@@ -35,6 +35,7 @@ impl HomogeneousAggregate {
     /// Try to combine two `HomogeneousAggregate`s, e.g. from two fields in
     /// the same `struct`. Only succeeds if only one of them has any data,
     /// or both units are identical.
+    #[cfg(feature = "nightly")]
     fn merge(self, other: HomogeneousAggregate) -> Result<HomogeneousAggregate, Heterogeneous> {
         match (self, other) {
             (x, HomogeneousAggregate::NoData) | (HomogeneousAggregate::NoData, x) => Ok(x),
@@ -57,9 +58,14 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
     ///
     /// Note: We generally ignore 1-ZST fields when computing this value (see #56877).
     ///
+    /// Note: The fields of a union are merged as if it were a struct, so the result does not
+    /// distinguish the two. `powerpc64::is_or_contains_union` in `rustc_target` walks the layout
+    /// again to do that, mirroring the array handling here.
+    ///
     /// This is public so that it can be used in unit tests, but
     /// should generally only be relevant to the ABI details of
     /// specific targets.
+    #[tracing::instrument(skip(cx), level = "debug")]
     pub fn homogeneous_aggregate<C>(&self, cx: &C) -> Result<HomogeneousAggregate, Heterogeneous>
     where
         Ty: TyAbiInterface<'a, C> + Copy,
@@ -67,22 +73,24 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
         match self.backend_repr {
             // The primitive for this algorithm.
             BackendRepr::Scalar(scalar) => {
-                let kind = match scalar.primitive() {
-                    Primitive::Int(..) | Primitive::Pointer(_) => RegKind::Integer,
-                    Primitive::Float(_) => RegKind::Float,
-                };
+                let kind = RegKind::from_primitive(scalar.primitive());
                 Ok(HomogeneousAggregate::Homogeneous(Reg { kind, size: self.size }))
             }
 
-            BackendRepr::SimdVector { .. } => {
+            BackendRepr::SimdVector { element, count: _ } => {
                 assert!(!self.is_zst());
+
                 Ok(HomogeneousAggregate::Homogeneous(Reg {
-                    kind: RegKind::Vector,
+                    kind: RegKind::Vector { hint_vector_elem: element.primitive() },
                     size: self.size,
                 }))
             }
 
-            BackendRepr::ScalarPair(..) | BackendRepr::Memory { sized: true } => {
+            BackendRepr::SimdScalableVector { .. } => {
+                unreachable!("`homogeneous_aggregate` should not be called for scalable vectors")
+            }
+
+            BackendRepr::ScalarPair { .. } | BackendRepr::Memory { sized: true } => {
                 // Helper for computing `homogeneous_aggregate`, allowing a custom
                 // starting offset (used below for handling variants).
                 let from_fields_at =

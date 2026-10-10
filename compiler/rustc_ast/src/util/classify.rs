@@ -101,13 +101,17 @@ pub fn expr_requires_semi_to_be_stmt(e: &ast::Expr) -> bool {
 pub fn leading_labeled_expr(mut expr: &ast::Expr) -> bool {
     loop {
         match &expr.kind {
-            Block(_, label) | ForLoop { label, .. } | Loop(_, label, _) | While(_, _, label) => {
+            Block(_, label)
+            | ForLoop(ast::ForLoop { label, .. })
+            | Loop(_, label, _)
+            | While(_, _, label) => {
                 return label.is_some();
             }
 
             Assign(e, _, _)
             | AssignOp(_, e, _)
             | Await(e, _)
+            | Move(e, _)
             | Use(e, _)
             | Binary(_, e, _)
             | Call(e, _)
@@ -154,6 +158,7 @@ pub fn leading_labeled_expr(mut expr: &ast::Expr) -> bool {
             | Yeet(..)
             | Yield(..)
             | UnsafeBinderCast(..)
+            | GcaMacro(..)
             | Err(..)
             | Dummy => return false,
         }
@@ -183,6 +188,7 @@ pub fn expr_trailing_brace(mut expr: &ast::Expr) -> Option<TrailingBrace<'_>> {
             | Ret(Some(e))
             | Unary(_, e)
             | Yeet(Some(e))
+            | Move(e, _)
             | Become(e) => {
                 expr = e;
             }
@@ -238,6 +244,7 @@ pub fn expr_trailing_brace(mut expr: &ast::Expr) -> Option<TrailingBrace<'_>> {
             | Try(_)
             | Yeet(None)
             | UnsafeBinderCast(..)
+            | GcaMacro(..)
             | Err(_)
             | Dummy => {
                 break None;
@@ -255,10 +262,10 @@ fn type_trailing_braced_mac_call(mut ty: &ast::Ty) -> Option<&ast::MacCall> {
                 break (mac.args.delim == Delimiter::Brace).then_some(mac);
             }
 
-            ast::TyKind::Ptr(mut_ty)
-            | ast::TyKind::Ref(_, mut_ty)
-            | ast::TyKind::PinnedRef(_, mut_ty) => {
-                ty = &mut_ty.ty;
+            ast::TyKind::Ptr(inner_ty, _)
+            | ast::TyKind::Ref(_, inner_ty, _)
+            | ast::TyKind::PinnedRef(_, inner_ty, _) => {
+                ty = inner_ty;
             }
 
             ast::TyKind::UnsafeBinder(binder) => {
@@ -294,11 +301,13 @@ fn type_trailing_braced_mac_call(mut ty: &ast::Ty) -> Option<&ast::MacCall> {
             | ast::TyKind::Never
             | ast::TyKind::Tup(..)
             | ast::TyKind::Paren(..)
-            | ast::TyKind::Typeof(..)
             | ast::TyKind::Infer
             | ast::TyKind::ImplicitSelf
             | ast::TyKind::CVarArgs
             | ast::TyKind::Pat(..)
+            | ast::TyKind::FieldOf(..)
+            | ast::TyKind::View(..)
+            | ast::TyKind::GcaMacro(..)
             | ast::TyKind::Dummy
             | ast::TyKind::Err(..) => break None,
         }

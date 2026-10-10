@@ -1,26 +1,28 @@
 //@ check-pass
 //@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 
 // Demonstrates what's needed to make use of `?` in const contexts.
 
 #![crate_type = "lib"]
 #![feature(try_trait_v2)]
+#![feature(try_trait_v2_residual)]
 #![feature(const_trait_impl)]
 #![feature(const_try)]
 
-use std::ops::{ControlFlow, FromResidual, Try};
+use std::ops::{ControlFlow, FromResidual, Residual, Try};
 
 struct TryMe;
 struct Error;
 
-impl const FromResidual<Error> for TryMe {
+const impl FromResidual<Error> for TryMe {
     fn from_residual(residual: Error) -> Self {
         TryMe
     }
 }
 
-impl const Try for TryMe {
+const impl Try for TryMe {
     type Output = ();
     type Residual = Error;
     fn from_output(output: Self::Output) -> Self {
@@ -29,6 +31,10 @@ impl const Try for TryMe {
     fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
         ControlFlow::Break(Error)
     }
+}
+
+impl Residual<()> for Error {
+    type TryType = TryMe;
 }
 
 const fn t() -> TryMe {

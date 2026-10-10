@@ -2,7 +2,7 @@
 use stdarch_test::assert_instr;
 
 #[cfg(target_arch = "riscv32")]
-unsafe extern "unadjusted" {
+unsafe extern "llvm-intrinsic" {
     #[link_name = "llvm.riscv.orc.b.i32"]
     fn _orc_b_32(rs: i32) -> i32;
 
@@ -17,7 +17,7 @@ unsafe extern "unadjusted" {
 }
 
 #[cfg(target_arch = "riscv64")]
-unsafe extern "unadjusted" {
+unsafe extern "llvm-intrinsic" {
     #[link_name = "llvm.riscv.orc.b.i64"]
     fn _orc_b_64(rs1: i64) -> i64;
 
@@ -68,7 +68,7 @@ pub fn orc_b(rs: usize) -> usize {
 ///
 /// Section: 2.11
 #[unstable(feature = "riscv_ext_intrinsics", issue = "114544")]
-#[target_feature(enable = "zbc")]
+#[target_feature(enable = "zbkc")]
 #[cfg_attr(test, assert_instr(clmul))]
 #[inline]
 pub fn clmul(rs1: usize, rs2: usize) -> usize {
@@ -93,7 +93,7 @@ pub fn clmul(rs1: usize, rs2: usize) -> usize {
 ///
 /// Section: 2.12
 #[unstable(feature = "riscv_ext_intrinsics", issue = "114544")]
-#[target_feature(enable = "zbc")]
+#[target_feature(enable = "zbkc")]
 #[cfg_attr(test, assert_instr(clmulh))]
 #[inline]
 pub fn clmulh(rs1: usize, rs2: usize) -> usize {

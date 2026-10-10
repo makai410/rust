@@ -1,14 +1,21 @@
-//@ only-x86_64
+//@ add-minicore
+//@ compile-flags: --target=x86_64-unknown-linux-gnu
+//@ needs-llvm-components: x86
+//@ normalize-stderr: "and \d+ more" -> "and X more"
 
 #![warn(unused_attributes)]
+#![feature(no_core)]
+#![no_core]
+
+use minicore::*;
 
 #[target_feature(enable = "sse2")]
 //~^ ERROR attribute cannot be used on
-extern crate alloc;
+extern crate minicore;
 
 #[target_feature(enable = "sse2")]
 //~^ ERROR attribute cannot be used on
-use alloc::alloc::alloc;
+use minicore::mem::transmute;
 
 #[target_feature(enable = "sse2")]
 //~^ ERROR attribute cannot be used on
@@ -25,7 +32,7 @@ extern "Rust" {}
 //~| NOTE expected this to be of the form `enable = "..."`
 #[target_feature(disable = "baz")]
 //~^ ERROR malformed `target_feature` attribute
-//~| NOTE expected this to be of the form `enable = "..."`
+//~| NOTE the only valid argument here is `enable`
 unsafe fn foo() {}
 
 #[target_feature(enable = "sse2")]
@@ -61,6 +68,7 @@ trait Baz {}
 
 #[inline(always)]
 //~^ ERROR: cannot use `#[inline(always)]`
+//~| NOTE: See this issue for full discussion: https://github.com/rust-lang/rust/issues/145574
 #[target_feature(enable = "sse2")]
 unsafe fn test() {}
 
@@ -110,3 +118,13 @@ fn main() {
 //~^ ERROR `+sse2` is not valid for this target
 //~| NOTE `+sse2` is not valid for this target
 unsafe fn hey() {}
+
+#[target_feature(enable = "sse5")]
+//~^ ERROR `sse5` is not valid for this target
+//~| NOTE `sse5` is not valid for this target
+unsafe fn typo_sse() {}
+
+#[target_feature(enable = "avx512")]
+//~^ ERROR `avx512` is not valid for this target
+//~| NOTE `avx512` is not valid for this target
+unsafe fn typo_avx512() {}

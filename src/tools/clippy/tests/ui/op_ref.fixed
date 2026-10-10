@@ -1,5 +1,5 @@
-#![allow(unused_variables, clippy::disallowed_names)]
 #![warn(clippy::op_ref)]
+#![expect(clippy::disallowed_names)]
 use std::collections::HashSet;
 use std::ops::{BitAnd, Mul};
 
@@ -111,7 +111,7 @@ mod issue_2597 {
     }
 }
 
-#[allow(clippy::needless_if)]
+#[allow(clippy::needless_ifs)]
 fn issue15063() {
     use std::ops::BitAnd;
 

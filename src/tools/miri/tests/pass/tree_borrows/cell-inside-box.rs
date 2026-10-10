@@ -1,12 +1,13 @@
+//@revisions: tree tree_implicit_writes
+//@[tree_implicit_writes]compile-flags: -Zmiri-tree-borrows-implicit-writes
 //@compile-flags: -Zmiri-tree-borrows
-#![feature(box_as_ptr)]
 #[path = "../../utils/mod.rs"]
 #[macro_use]
 mod utils;
 
 use std::cell::UnsafeCell;
 
-pub fn main() {
+fn main() {
     let cell = UnsafeCell::new(42);
     let box1 = Box::new(cell);
 
@@ -20,7 +21,7 @@ pub fn main() {
         name!(ptr2);
 
         // We perform a write through `x`.
-        // Because `ptr1` is ReservedIM, a child write will make it transition to Active.
+        // Because `ptr1` is ReservedIM, a child write will make it transition to Unique.
         // Because `ptr2` is ReservedIM, a foreign write doesn't have any effect on it.
         let x = (*ptr1).get();
         *x = 1;

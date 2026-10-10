@@ -1,8 +1,8 @@
 use super::ITER_KV_MAP;
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::MaybeDef as _;
+use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
 use clippy_utils::{pat_is_wild, sym};
 use rustc_hir::{Body, Expr, ExprKind, PatKind};
 use rustc_lint::LateContext;
@@ -21,6 +21,7 @@ pub(super) fn check<'tcx>(
     recv: &'tcx Expr<'tcx>,  // hashmap
     m_arg: &'tcx Expr<'tcx>, // |(_, v)| v
     msrv: Msrv,
+    method_name: Symbol,
 ) {
     if map_type == sym::into_iter && !msrv.meets(cx, msrvs::INTO_KEYS) {
         return;
@@ -38,7 +39,7 @@ pub(super) fn check<'tcx>(
             _ => return,
         }
         && let ty = cx.typeck_results().expr_ty_adjusted(recv).peel_refs()
-        && (is_type_diagnostic_item(cx, ty, sym::HashMap) || is_type_diagnostic_item(cx, ty, sym::BTreeMap))
+        && matches!(ty.opt_diag_name(cx), Some(sym::HashMap | sym::BTreeMap))
     {
         let mut applicability = rustc_errors::Applicability::MachineApplicable;
         let recv_snippet = snippet_with_applicability(cx, recv.span, "map", &mut applicability);
@@ -47,17 +48,25 @@ pub(super) fn check<'tcx>(
         if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = body_expr.kind
             && let [local_ident] = path.segments
             && local_ident.ident.name == bound_ident.name
+            && [sym::map, sym::flat_map].contains(&method_name)
         {
+            let identity_map_equivalent = match method_name {
+                sym::map => "",
+                sym::flat_map => ".flatten()",
+                _ => unreachable!(),
+            };
             span_lint_and_sugg(
                 cx,
                 ITER_KV_MAP,
                 expr.span,
                 format!("iterating on a map's {replacement_kind}s"),
                 "try",
-                format!("{recv_snippet}.{into_prefix}{replacement_kind}s()"),
+                format!("{recv_snippet}.{into_prefix}{replacement_kind}s(){identity_map_equivalent}"),
                 applicability,
             );
         } else {
+            let (body_snippet, _) =
+                snippet_with_context(cx, body_expr.span, expr.span.ctxt(), "..", &mut applicability);
             span_lint_and_sugg(
                 cx,
                 ITER_KV_MAP,
@@ -65,9 +74,8 @@ pub(super) fn check<'tcx>(
                 format!("iterating on a map's {replacement_kind}s"),
                 "try",
                 format!(
-                    "{recv_snippet}.{into_prefix}{replacement_kind}s().map(|{}{bound_ident}| {})",
+                    "{recv_snippet}.{into_prefix}{replacement_kind}s().{method_name}(|{}{bound_ident}| {body_snippet})",
                     annotation.prefix_str(),
-                    snippet_with_applicability(cx, body_expr.span, "/* body */", &mut applicability)
                 ),
                 applicability,
             );

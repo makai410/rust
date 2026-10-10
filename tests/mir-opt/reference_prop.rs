@@ -30,7 +30,7 @@ fn reference_propagation<'a, T: Copy>(single: &'a T, mut multiple: &'a T) {
         // CHECK: [[a2:_.*]] = const 7_usize;
         // CHECK: [[b:_.*]] = &[[a]];
         // CHECK: [[btmp:_.*]] = &[[a2]];
-        // CHECK: [[b]] = move [[btmp]];
+        // CHECK: [[b]] = copy [[btmp]];
         // CHECK: [[c:_.*]] = copy (*[[b]]);
 
         let a = 5_usize;
@@ -122,7 +122,7 @@ fn reference_propagation<'a, T: Copy>(single: &'a T, mut multiple: &'a T) {
         // CHECK: bb7: {
         // CHECK: [[a:_.*]] = &(*_2);
         // CHECK: [[tmp:_.*]] = &(*_1);
-        // CHECK: _2 = move [[tmp]];
+        // CHECK: _2 = copy [[tmp]];
         // CHECK: [[b:_.*]] = copy (*[[a]]);
 
         let a = &*multiple;
@@ -186,7 +186,7 @@ fn reference_propagation_mut<'a, T: Copy>(single: &'a mut T, mut multiple: &'a m
         // CHECK: [[a2:_.*]] = const 7_usize;
         // CHECK: [[b:_.*]] = &mut [[a]];
         // CHECK: [[btmp:_.*]] = &mut [[a2]];
-        // CHECK: [[b]] = move [[btmp]];
+        // CHECK: [[b]] = copy [[btmp]];
         // CHECK: [[c:_.*]] = copy (*[[b]]);
 
         let mut a = 5_usize;
@@ -247,9 +247,9 @@ fn reference_propagation_mut<'a, T: Copy>(single: &'a mut T, mut multiple: &'a m
         // CHECK: [[a:_.*]] = const 7_usize;
         // CHECK: [[b1:_.*]] = &mut [[a]];
         // CHECK: [[c:_.*]] = copy (*[[b1]]);
-        // CHECK: [[b2:_.*]] = move [[b1]];
+        // CHECK: [[b2:_.*]] = copy [[b1]];
         // CHECK: [[c2:_.*]] = copy (*[[b2]]);
-        // CHECK: [[b3:_.*]] = move [[b2]];
+        // CHECK: [[b3:_.*]] = copy [[b2]];
 
         let mut a = 7_usize;
         let b1 = &mut a;
@@ -278,7 +278,7 @@ fn reference_propagation_mut<'a, T: Copy>(single: &'a mut T, mut multiple: &'a m
         // CHECK: bb7: {
         // CHECK: [[a:_.*]] = &mut (*_2);
         // CHECK: [[tmp:_.*]] = &mut (*_1);
-        // CHECK: _2 = move [[tmp]];
+        // CHECK: _2 = copy [[tmp]];
         // CHECK: [[b:_.*]] = copy (*[[a]]);
 
         let a = &mut *multiple;
@@ -343,7 +343,7 @@ fn reference_propagation_const_ptr<T: Copy>(single: *const T, mut multiple: *con
         // CHECK: [[a2:_.*]] = const 7_usize;
         // CHECK: [[b:_.*]] = &raw const [[a]];
         // CHECK: [[btmp:_.*]] = &raw const [[a2]];
-        // CHECK: [[b]] = move [[btmp]];
+        // CHECK: [[b]] = copy [[btmp]];
         // CHECK: [[c:_.*]] = copy (*[[b]]);
 
         let a = 5_usize;
@@ -435,7 +435,7 @@ fn reference_propagation_const_ptr<T: Copy>(single: *const T, mut multiple: *con
         // CHECK: bb7: {
         // CHECK: [[a:_.*]] = &raw const (*_2);
         // CHECK: [[tmp:_.*]] = &raw const (*_1);
-        // CHECK: _2 = move [[tmp]];
+        // CHECK: _2 = copy [[tmp]];
         // CHECK: [[b:_.*]] = copy (*[[a]]);
 
         let a = &raw const *multiple;
@@ -514,7 +514,7 @@ fn reference_propagation_mut_ptr<T: Copy>(single: *mut T, mut multiple: *mut T) 
         // CHECK: [[a2:_.*]] = const 7_usize;
         // CHECK: [[b:_.*]] = &raw mut [[a]];
         // CHECK: [[btmp:_.*]] = &raw mut [[a2]];
-        // CHECK: [[b]] = move [[btmp]];
+        // CHECK: [[b]] = copy [[btmp]];
         // CHECK: [[c:_.*]] = copy (*[[b]]);
 
         let mut a = 5_usize;
@@ -606,7 +606,7 @@ fn reference_propagation_mut_ptr<T: Copy>(single: *mut T, mut multiple: *mut T) 
         // CHECK: bb7: {
         // CHECK: [[a:_.*]] = &raw mut (*_2);
         // CHECK: [[tmp:_.*]] = &raw mut (*_1);
-        // CHECK: _2 = move [[tmp]];
+        // CHECK: _2 = copy [[tmp]];
         // CHECK: [[b:_.*]] = copy (*[[a]]);
 
         let a = &raw mut *multiple;
@@ -776,6 +776,36 @@ fn maybe_dead(m: bool) {
     }
 }
 
+#[custom_mir(dialect = "runtime", phase = "post-cleanup")]
+fn maybe_dead_field_reborrow(m: bool) -> i32 {
+    // CHECK-LABEL: fn maybe_dead_field_reborrow(
+    // CHECK: [[r:_.*]] = &mut {{_.*}};
+    // CHECK: ((*[[r]]).0: i32) = const 1_i32;
+
+    use std::intrinsics::mir::*;
+    mir! {
+        let x: (i32, i32);
+        let r: &mut (i32, i32);
+        let r2: &mut i32;
+        {
+            StorageLive(x);
+            x = (0, 0);
+            r = &mut x;
+            (*r).0 = 1;
+            r2 = &mut (*r).0;
+            match m { true => bb1, _ => bb2 }
+        }
+        bb1 = {
+            StorageDead(x);
+            Goto(bb2)
+        }
+        bb2 = {
+            RET = *r2;
+            Return()
+        }
+    }
+}
+
 fn mut_raw_then_mut_shr() -> (i32, i32) {
     // CHECK-LABEL: fn mut_raw_then_mut_shr(
     // CHECK-NOT: (*{{_.*}})
@@ -875,6 +905,7 @@ fn main() {
     multiple_storage();
     dominate_storage();
     maybe_dead(true);
+    maybe_dead_field_reborrow(true);
     mut_raw_then_mut_shr();
     unique_with_copies();
     debuginfo();
@@ -889,6 +920,7 @@ fn main() {
 // EMIT_MIR reference_prop.multiple_storage.ReferencePropagation.diff
 // EMIT_MIR reference_prop.dominate_storage.ReferencePropagation.diff
 // EMIT_MIR reference_prop.maybe_dead.ReferencePropagation.diff
+// EMIT_MIR reference_prop.maybe_dead_field_reborrow.ReferencePropagation.diff
 // EMIT_MIR reference_prop.mut_raw_then_mut_shr.ReferencePropagation.diff
 // EMIT_MIR reference_prop.unique_with_copies.ReferencePropagation.diff
 // EMIT_MIR reference_prop.debuginfo.ReferencePropagation.diff

@@ -176,7 +176,24 @@ pub fn vec_option_i32(n: usize) -> Vec<Option<i32>> {
     vec![None; n]
 }
 
-// Ensure that __rust_alloc_zeroed gets the right attributes for LLVM to optimize it away.
-// CHECK: declare noalias noundef ptr @{{.*}}__rust_alloc_zeroed(i64 noundef, i64 allocalign noundef) unnamed_addr [[RUST_ALLOC_ZEROED_ATTRS:#[0-9]+]]
+// CHECK-LABEL: @vec_array
+#[no_mangle]
+pub fn vec_array(n: usize) -> Vec<[u32; 1_000_000]> {
+    // CHECK-NOT: call {{.*}}alloc::vec::from_elem
+    // CHECK-NOT: call {{.*}}reserve
+    // CHECK-NOT: call {{.*}}__rust_alloc(
 
-// CHECK-DAG: attributes [[RUST_ALLOC_ZEROED_ATTRS]] = { {{.*}} allockind("alloc,zeroed,aligned") allocsize(0) uwtable "alloc-family"="__rust_alloc" {{.*}} }
+    // CHECK: call {{.*}}__rust_alloc_zeroed(
+
+    // CHECK-NOT: call {{.*}}alloc::vec::from_elem
+    // CHECK-NOT: call {{.*}}reserve
+    // CHECK-NOT: call {{.*}}__rust_alloc(
+
+    // CHECK: ret void
+    vec![[0; 1_000_000]; 3]
+}
+
+// Ensure that __rust_alloc_zeroed gets the right attributes for LLVM to optimize it away.
+// CHECK: declare noalias noundef ptr @{{.*}}__rust_alloc_zeroed(i64 noundef, i64 allocalign noundef range(i64 1, -9223372036854775807)) unnamed_addr [[RUST_ALLOC_ZEROED_ATTRS:#[0-9]+]]
+
+// CHECK-DAG: attributes [[RUST_ALLOC_ZEROED_ATTRS]] = { {{.*}} allockind("alloc,zeroed,aligned") allocsize(0) {{(uwtable )?}}"alloc-family"="__rust_alloc" {{.*}} }

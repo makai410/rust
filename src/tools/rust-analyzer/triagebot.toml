@@ -24,7 +24,5 @@ labels = ["has-merge-commits", "S-waiting-on-author"]
 [transfer]
 
 # Canonicalize issue numbers to avoid closing the wrong issue when upstreaming this subtree
-[canonicalize-issue-links]
-
-# Prevents mentions in commits to avoid users being spammed
-[no-mentions]
+[issue-links]
+check-commits = "uncanonicalized"

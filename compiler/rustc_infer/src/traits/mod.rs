@@ -20,7 +20,7 @@ use rustc_middle::ty::{self, Ty, TyCtxt, Upcast};
 use rustc_span::Span;
 use thin_vec::ThinVec;
 
-pub use self::engine::{FromSolverError, ScrubbedTraitError, TraitEngine};
+pub use self::engine::{FromSolverError, ScrubbedTraitError, TraitEngine, TraitErrors};
 pub(crate) use self::project::UndoLog;
 pub use self::project::{
     MismatchedProjectionTypes, Normalized, NormalizedTerm, ProjectionCache, ProjectionCacheEntry,
@@ -37,6 +37,8 @@ use crate::infer::InferCtxt;
 #[derive(Clone, TypeFoldable, TypeVisitable)]
 pub struct Obligation<'tcx, T> {
     /// The reason we have to prove this thing.
+    /// FIXME: we shouldn't ignore the cause but instead change the affected visitors
+    /// to only visit predicates manually.
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
     pub cause: ObligationCause<'tcx>,
@@ -85,8 +87,8 @@ impl<T: Hash> Hash for Obligation<'_, T> {
 }
 
 pub type PredicateObligation<'tcx> = Obligation<'tcx, ty::Predicate<'tcx>>;
-pub type TraitObligation<'tcx> = Obligation<'tcx, ty::TraitPredicate<'tcx>>;
-pub type PolyTraitObligation<'tcx> = Obligation<'tcx, ty::PolyTraitPredicate<'tcx>>;
+pub type TraitObligation<'tcx> = Obligation<'tcx, ty::TraitClause<'tcx>>;
+pub type PolyTraitObligation<'tcx> = Obligation<'tcx, ty::PolyTraitClause<'tcx>>;
 
 pub type PredicateObligations<'tcx> = ThinVec<PredicateObligation<'tcx>>;
 
@@ -156,11 +158,11 @@ impl<'tcx, O> Obligation<'tcx, O> {
     pub fn misc(
         tcx: TyCtxt<'tcx>,
         span: Span,
-        body_id: LocalDefId,
+        body_def_id: LocalDefId,
         param_env: ty::ParamEnv<'tcx>,
         trait_ref: impl Upcast<TyCtxt<'tcx>, O>,
     ) -> Obligation<'tcx, O> {
-        Obligation::new(tcx, ObligationCause::misc(span, body_id), param_env, trait_ref)
+        Obligation::new(tcx, ObligationCause::misc(span, body_def_id), param_env, trait_ref)
     }
 
     pub fn with<P>(
@@ -173,7 +175,7 @@ impl<'tcx, O> Obligation<'tcx, O> {
 }
 
 impl<'tcx> PolyTraitObligation<'tcx> {
-    pub fn polarity(&self) -> ty::PredicatePolarity {
+    pub fn polarity(&self) -> ty::ClausePolarity {
         self.predicate.skip_binder().polarity
     }
 

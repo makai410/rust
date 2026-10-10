@@ -3,13 +3,13 @@
 // completely accurate (some things might be counted twice, others missed).
 
 use rustc_ast::visit::BoundKind;
-use rustc_ast::{self as ast, NodeId, visit as ast_visit};
+use rustc_ast::{self as ast, AttrVec, NodeId, visit as ast_visit};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::thousands::usize_with_underscores;
 use rustc_hir::{self as hir, AmbigArg, HirId, intravisit as hir_visit};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
-use rustc_span::def_id::LocalDefId;
+use rustc_span::def_id::{LocalDefId, LocalModId};
 
 struct NodeStats {
     count: usize,
@@ -265,7 +265,8 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
                 Union,
                 Trait,
                 TraitAlias,
-                Impl
+                Impl,
+                TestBinderConstraints
             ]
         );
         hir_visit::walk_item(self, i)
@@ -276,7 +277,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
         hir_visit::walk_body(self, b);
     }
 
-    fn visit_mod(&mut self, m: &'v hir::Mod<'v>, _s: Span, _n: HirId) {
+    fn visit_mod(&mut self, m: &'v hir::Mod<'v>, _s: Span, _id: LocalModId) {
         self.record("Mod", None, m);
         hir_visit::walk_mod(self, m)
     }
@@ -324,7 +325,6 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
                 Or,
                 Never,
                 Tuple,
-                Box,
                 Deref,
                 Ref,
                 Expr,
@@ -408,9 +408,10 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
                 OpaqueDef,
                 TraitAscription,
                 TraitObject,
-                Typeof,
                 Infer,
                 Pat,
+                FieldOf,
+                View,
                 Err
             ]
         );
@@ -430,7 +431,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     fn visit_where_predicate(&mut self, p: &'v hir::WherePredicate<'v>) {
         record_variants!(
             (self, p, p.kind, Some(p.hir_id), hir, WherePredicate, WherePredicateKind),
-            [BoundPredicate, RegionPredicate, EqPredicate]
+            [BoundPredicate, RegionPredicate]
         );
         hir_visit::walk_where_predicate(self, p)
     }
@@ -447,16 +448,24 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
         hir_visit::walk_fn(self, fk, fd, b, id)
     }
 
-    fn visit_use(&mut self, p: &'v hir::UsePath<'v>, _hir_id: HirId) {
+    fn visit_use(&mut self, tree: &'v hir::UseTree<'v>, _hir_id: HirId, _def_id: LocalDefId) {
         // This is `visit_use`, but the type is `Path` so record it that way.
-        self.record("Path", None, p);
+        self.record("Path", None, tree);
         // Don't call `hir_visit::walk_use(self, p, hir_id)`: it calls
         // `visit_path` up to three times, once for each namespace result in
         // `p.res`, by building temporary `Path`s that are not part of the real
         // HIR, which causes `p` to be double- or triple-counted. Instead just
         // walk the path internals (i.e. the segments) directly.
-        let hir::Path { span: _, res: _, segments } = *p;
+        let hir::Path { span: _, res: _, segments } = *tree.prefix;
         ast_visit::walk_list!(self, visit_path_segment, segments);
+        match tree.kind {
+            hir::UseKind::Single(_) | hir::UseKind::Glob => {}
+            hir::UseKind::Nested { items } => {
+                for (tree, id, def_id) in items {
+                    self.visit_use(tree, *id, *def_id);
+                }
+            }
+        }
     }
 
     fn visit_trait_item(&mut self, ti: &'v hir::TraitItem<'v>) {
@@ -546,7 +555,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
         hir_visit::walk_assoc_item_constraint(self, constraint)
     }
 
-    fn visit_attribute(&mut self, attr: &'v hir::Attribute) {
+    fn visit_attribute(&mut self, attr: &'v rustc_attr_ir::Attribute) {
         self.record("Attribute", None, attr);
     }
 
@@ -573,6 +582,7 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
                 Use,
                 Static,
                 Const,
+                ConstBlock,
                 Fn,
                 Mod,
                 ForeignMod,
@@ -587,7 +597,8 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
                 MacCall,
                 MacroDef,
                 Delegation,
-                DelegationMac
+                DelegationMac,
+                TestBinderConstraints
             ]
         );
         ast_visit::walk_item(self, i)
@@ -633,7 +644,6 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
                 Or,
                 Path,
                 Tuple,
-                Box,
                 Deref,
                 Ref,
                 Expr,
@@ -656,10 +666,10 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
             (self, e, e.kind, None, ast, Expr, ExprKind),
             [
                 Array, ConstBlock, Call, MethodCall, Tup, Binary, Unary, Lit, Cast, Type, Let,
-                If, While, ForLoop, Loop, Match, Closure, Block, Await, Use, TryBlock, Assign,
+                If, While, ForLoop, Loop, Match, Closure, Block, Await, Move, Use, TryBlock, Assign,
                 AssignOp, Field, Index, Range, Underscore, Path, AddrOf, Break, Continue, Ret,
                 InlineAsm, FormatArgs, OffsetOf, MacCall, Struct, Repeat, Paren, Try, Yield, Yeet,
-                Become, IncludedBytes, Gen, UnsafeBinderCast, Err, Dummy
+                Become, IncludedBytes, Gen, UnsafeBinderCast, GcaMacro, Err, Dummy
             ]
         );
         ast_visit::walk_expr(self, e)
@@ -683,11 +693,13 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
                 TraitObject,
                 ImplTrait,
                 Paren,
-                Typeof,
                 Infer,
                 ImplicitSelf,
                 MacCall,
                 CVarArgs,
+                FieldOf,
+                View,
+                GcaMacro,
                 Dummy,
                 Err
             ]
@@ -704,12 +716,12 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     fn visit_where_predicate(&mut self, p: &'v ast::WherePredicate) {
         record_variants!(
             (self, p, &p.kind, None, ast, WherePredicate, WherePredicateKind),
-            [BoundPredicate, RegionPredicate, EqPredicate]
+            [BoundPredicate, RegionPredicate]
         );
         ast_visit::walk_where_predicate(self, p)
     }
 
-    fn visit_fn(&mut self, fk: ast_visit::FnKind<'v>, _: Span, _: NodeId) {
+    fn visit_fn(&mut self, fk: ast_visit::FnKind<'v>, _: &AttrVec, _: Span, _: NodeId) {
         self.record("FnDecl", None, fk.decl());
         ast_visit::walk_fn(self, fk)
     }
@@ -769,7 +781,7 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     fn visit_attribute(&mut self, attr: &'v ast::Attribute) {
         record_variants!(
             (self, attr, attr.kind, None, ast, Attribute, AttrKind),
-            [Normal, DocComment]
+            [Normal, Synthetic, DocComment]
         );
         ast_visit::walk_attribute(self, attr)
     }

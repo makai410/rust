@@ -4,19 +4,20 @@
 
 use rustc_abi::Size;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_middle::bug;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
+use rustc_span::bug;
 
+use crate::PassPolicy;
 use crate::patch::MirPatch;
 
 pub(super) struct UnreachablePropagation;
 
 impl crate::MirPass<'_> for UnreachablePropagation {
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
         // Enable only under -Zmir-opt-level=2 as this can make programs less debuggable.
-        sess.mir_opt_level() >= 2
+        PassPolicy::optional(ctx.mir_opt_level() >= 2)
     }
 
     fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -29,13 +30,15 @@ impl crate::MirPass<'_> for UnreachablePropagation {
                 TerminatorKind::Unreachable => true,
                 // This will unconditionally run into an unreachable and is therefore unreachable
                 // as well.
-                TerminatorKind::Goto { target } if unreachable_blocks.contains(target) => {
+                TerminatorKind::Goto { target, .. } if unreachable_blocks.contains(target) => {
                     patch.patch_terminator(bb, TerminatorKind::Unreachable);
                     true
                 }
                 // Try to remove unreachable targets from the switch.
                 TerminatorKind::SwitchInt { .. } => {
-                    remove_successors_from_switch(tcx, bb, &unreachable_blocks, body, &mut patch)
+                    remove_successors_from_switch(tcx, bb, body, &mut patch, |bb| {
+                        unreachable_blocks.contains(&bb)
+                    })
                 }
                 _ => false,
             };
@@ -53,26 +56,20 @@ impl crate::MirPass<'_> for UnreachablePropagation {
             body.basic_blocks_mut()[bb].statements.clear();
         }
     }
-
-    fn is_required(&self) -> bool {
-        false
-    }
 }
 
 /// Return whether the current terminator is fully unreachable.
-fn remove_successors_from_switch<'tcx>(
+pub(crate) fn remove_successors_from_switch<'tcx>(
     tcx: TyCtxt<'tcx>,
     bb: BasicBlock,
-    unreachable_blocks: &FxHashSet<BasicBlock>,
     body: &Body<'tcx>,
     patch: &mut MirPatch<'tcx>,
+    is_unreachable_block: impl Fn(BasicBlock) -> bool,
 ) -> bool {
     let terminator = body.basic_blocks[bb].terminator();
     let TerminatorKind::SwitchInt { discr, targets } = &terminator.kind else { bug!() };
     let source_info = terminator.source_info;
     let location = body.terminator_loc(bb);
-
-    let is_unreachable = |bb| unreachable_blocks.contains(&bb);
 
     // If there are multiple targets, we want to keep information about reachability for codegen.
     // For example (see tests/codegen-llvm/match-optimizes-away.rs)
@@ -116,10 +113,10 @@ fn remove_successors_from_switch<'tcx>(
     };
 
     let otherwise = targets.otherwise();
-    let otherwise_unreachable = is_unreachable(otherwise);
+    let otherwise_unreachable = is_unreachable_block(otherwise);
 
     let reachable_iter = targets.iter().filter(|&(value, bb)| {
-        let is_unreachable = is_unreachable(bb);
+        let is_unreachable = is_unreachable_block(bb);
         // We remove this target from the switch, so record the inequality using `Assume`.
         if is_unreachable && !otherwise_unreachable {
             add_assumption(BinOp::Ne, value);
@@ -135,12 +132,12 @@ fn remove_successors_from_switch<'tcx>(
     let terminator = match (num_targets, otherwise_unreachable) {
         // If all targets are unreachable, we can be unreachable as well.
         (1, true) => TerminatorKind::Unreachable,
-        (1, false) => TerminatorKind::Goto { target: otherwise },
+        (1, false) => TerminatorKind::goto(otherwise),
         (2, true) => {
             // All targets are unreachable except one. Record the equality, and make it a goto.
             let (value, target) = new_targets.iter().next().unwrap();
             add_assumption(BinOp::Eq, value);
-            TerminatorKind::Goto { target }
+            TerminatorKind::goto(target)
         }
         _ if num_targets == targets.all_targets().len() => {
             // Nothing has changed.

@@ -5,14 +5,14 @@ use rustc_abi::{Align, AlignFromBytesError};
 
 use super::crt_objects::CrtObjects;
 use super::{
-    BinaryFormat, CodeModel, DebuginfoKind, FloatAbi, FramePointer, LinkArgsCli,
+    Arch, BinaryFormat, CfgAbi, CodeModel, DebuginfoKind, Env, FloatAbi, FramePointer, LinkArgsCli,
     LinkSelfContainedComponents, LinkSelfContainedDefault, LinkerFlavorCli, LldFlavor,
-    MergeFunctions, PanicStrategy, RelocModel, RelroLevel, RustcAbi, SanitizerSet,
+    MergeFunctions, Os, PanicStrategy, RelocModel, RelroLevel, RustcAbi, SanitizerSet,
     SmallDataThresholdSupport, SplitDebuginfo, StackProbeType, StaticCow, SymbolVisibility, Target,
     TargetKind, TargetOptions, TargetWarnings, TlsModel,
 };
 use crate::json::{Json, ToJson};
-use crate::spec::AbiMap;
+use crate::spec::{AbiMap, LlvmAbi};
 
 impl Target {
     /// Loads a target descriptor from a JSON object.
@@ -25,10 +25,7 @@ impl Target {
         let mut base = Target {
             llvm_target: json.llvm_target,
             metadata: Default::default(),
-            pointer_width: json
-                .target_pointer_width
-                .parse()
-                .map_err(|err| format!("invalid target-pointer-width: {err}"))?,
+            pointer_width: json.target_pointer_width,
             data_layout: json.data_layout,
             arch: json.arch,
             options: Default::default(),
@@ -45,11 +42,7 @@ impl Target {
         }
 
         let alignment_error = |field_name: &str, error: AlignFromBytesError| -> String {
-            let msg = match error {
-                AlignFromBytesError::NotPowerOfTwo(_) => "not a power of 2 number of bytes",
-                AlignFromBytesError::TooLarge(_) => "too large",
-            };
-            format!("`{}` bits is not a valid value for {field_name}: {msg}", error.align() * 8)
+            format!("invalid value for {field_name}: {error}")
         };
 
         macro_rules! forward {
@@ -76,7 +69,9 @@ impl Target {
         forward_opt!(c_enum_min_bits); // if None, matches c_int_width
         forward!(os);
         forward!(env);
-        forward!(abi);
+        if let Some(abi) = json.abi {
+            base.cfg_abi = abi;
+        }
         forward!(vendor);
         forward_opt!(linker);
         forward!(linker_flavor_json);
@@ -121,6 +116,8 @@ impl Target {
         forward!(asm_args);
         forward!(cpu);
         forward!(need_explicit_cpu);
+        forward!(requires_consistent_cpu);
+        forward!(unsupported_cpus);
         forward!(features);
         forward!(dynamic_linking);
         forward_opt!(direct_access_external_data);
@@ -150,13 +147,13 @@ impl Target {
         forward!(is_like_darwin);
         forward!(is_like_solaris);
         forward!(is_like_windows);
+        forward!(is_like_gpu);
         forward!(is_like_msvc);
         forward!(is_like_wasm);
         forward!(is_like_android);
         forward!(is_like_vexos);
         forward!(binary_format);
         forward!(default_dwarf_version);
-        forward!(allows_weak_linkage);
         forward!(has_rpath);
         forward!(no_default_libraries);
         forward!(position_independent_executables);
@@ -165,6 +162,7 @@ impl Target {
         forward!(relro_level);
         forward!(archive_format);
         forward!(allow_asm);
+        forward!(static_initializer_must_be_acyclic);
         forward!(main_needs_argc_argv);
         forward!(has_thread_local);
         forward!(obj_is_bitcode);
@@ -217,10 +215,16 @@ impl Target {
                 supported_sanitizers.into_iter().fold(SanitizerSet::empty(), |a, b| a | b);
         }
 
+        if let Some(default_sanitizers) = json.default_sanitizers {
+            base.default_sanitizers =
+                default_sanitizers.into_iter().fold(SanitizerSet::empty(), |a, b| a | b);
+        }
+
         forward!(generate_arange_section);
         forward!(supports_stack_protector);
         forward!(small_data_threshold_support);
         forward!(entry_name);
+        forward!(supports_fentry);
         forward!(supports_xray);
 
         // we're going to run `update_from_cli`, but that won't change the target's AbiMap
@@ -245,23 +249,22 @@ impl ToJson for Target {
         target.update_to_cli();
 
         macro_rules! target_val {
-            ($attr:ident) => {{
-                let name = (stringify!($attr)).replace("_", "-");
-                d.insert(name, target.$attr.to_json());
+            ($attr:ident) => {
+                target_val!($attr, (stringify!($attr)).replace("_", "-"))
+            };
+            ($attr:ident, $json_name:expr) => {{
+                let name = $json_name;
+                d.insert(name.to_string(), target.$attr.to_json());
             }};
         }
 
         macro_rules! target_option_val {
-            ($attr:ident) => {{
-                let name = (stringify!($attr)).replace("_", "-");
-                if default.$attr != target.$attr {
-                    d.insert(name, target.$attr.to_json());
-                }
-            }};
+            ($attr:ident) => {{ target_option_val!($attr, (stringify!($attr)).replace("_", "-")) }};
             ($attr:ident, $json_name:expr) => {{
                 let name = $json_name;
+                #[allow(rustc::bad_opt_access)]
                 if default.$attr != target.$attr {
-                    d.insert(name.into(), target.$attr.to_json());
+                    d.insert(name.to_string(), target.$attr.to_json());
                 }
             }};
             (link_args - $attr:ident, $json_name:expr) => {{
@@ -290,7 +293,7 @@ impl ToJson for Target {
 
         target_val!(llvm_target);
         target_val!(metadata);
-        d.insert("target-pointer-width".to_string(), self.pointer_width.to_string().to_json());
+        target_val!(pointer_width, "target-pointer-width");
         target_val!(arch);
         target_val!(data_layout);
 
@@ -298,7 +301,7 @@ impl ToJson for Target {
         target_option_val!(c_int_width, "target-c-int-width");
         target_option_val!(os);
         target_option_val!(env);
-        target_option_val!(abi);
+        target_option_val!(cfg_abi, "abi");
         target_option_val!(vendor);
         target_option_val!(linker);
         target_option_val!(linker_flavor_json, "linker-flavor");
@@ -319,6 +322,8 @@ impl ToJson for Target {
         target_option_val!(asm_args);
         target_option_val!(cpu);
         target_option_val!(need_explicit_cpu);
+        target_option_val!(requires_consistent_cpu);
+        target_option_val!(unsupported_cpus);
         target_option_val!(features);
         target_option_val!(dynamic_linking);
         target_option_val!(direct_access_external_data);
@@ -342,13 +347,13 @@ impl ToJson for Target {
         target_option_val!(is_like_darwin);
         target_option_val!(is_like_solaris);
         target_option_val!(is_like_windows);
+        target_option_val!(is_like_gpu);
         target_option_val!(is_like_msvc);
         target_option_val!(is_like_wasm);
         target_option_val!(is_like_android);
         target_option_val!(is_like_vexos);
         target_option_val!(binary_format);
         target_option_val!(default_dwarf_version);
-        target_option_val!(allows_weak_linkage);
         target_option_val!(has_rpath);
         target_option_val!(no_default_libraries);
         target_option_val!(position_independent_executables);
@@ -357,6 +362,7 @@ impl ToJson for Target {
         target_option_val!(relro_level);
         target_option_val!(archive_format);
         target_option_val!(allow_asm);
+        target_option_val!(static_initializer_must_be_acyclic);
         target_option_val!(main_needs_argc_argv);
         target_option_val!(has_thread_local);
         target_option_val!(obj_is_bitcode);
@@ -397,12 +403,14 @@ impl ToJson for Target {
         target_option_val!(split_debuginfo);
         target_option_val!(supported_split_debuginfo);
         target_option_val!(supported_sanitizers);
+        target_option_val!(default_sanitizers);
         target_option_val!(c_enum_min_bits);
         target_option_val!(generate_arange_section);
         target_option_val!(supports_stack_protector);
         target_option_val!(small_data_threshold_support);
         target_option_val!(entry_name);
         target_option_val!(entry_abi);
+        target_option_val!(supports_fentry);
         target_option_val!(supports_xray);
 
         // Serializing `-Clink-self-contained` needs a dynamic key to support the
@@ -413,12 +421,12 @@ impl ToJson for Target {
     }
 }
 
-#[derive(serde_derive::Deserialize)]
+#[derive(serde_derive::Deserialize, schemars::JsonSchema)]
 struct LinkSelfContainedComponentsWrapper {
     components: Vec<LinkSelfContainedComponents>,
 }
 
-#[derive(serde_derive::Deserialize)]
+#[derive(serde_derive::Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 enum TargetFamiliesJson {
     Array(StaticCow<[StaticCow<str>]>),
@@ -434,6 +442,17 @@ impl FromStr for EndianWrapper {
     }
 }
 crate::json::serde_deserialize_from_str!(EndianWrapper);
+impl schemars::JsonSchema for EndianWrapper {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Endian".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema! ({
+            "type": "string",
+            "enum": ["big", "little"]
+        })
+    }
+}
 
 /// `ExternAbi` is in `rustc_abi`, which doesn't have access to the macro and serde.
 struct ExternAbiWrapper(rustc_abi::ExternAbi);
@@ -446,8 +465,21 @@ impl FromStr for ExternAbiWrapper {
     }
 }
 crate::json::serde_deserialize_from_str!(ExternAbiWrapper);
+impl schemars::JsonSchema for ExternAbiWrapper {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ExternAbi".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let all =
+            rustc_abi::ExternAbi::ALL_VARIANTS.iter().map(|abi| abi.as_str()).collect::<Vec<_>>();
+        schemars::json_schema! ({
+            "type": "string",
+            "enum": all,
+        })
+    }
+}
 
-#[derive(serde_derive::Deserialize)]
+#[derive(serde_derive::Deserialize, schemars::JsonSchema)]
 struct TargetSpecJsonMetadata {
     description: Option<StaticCow<str>>,
     tier: Option<u64>,
@@ -455,7 +487,7 @@ struct TargetSpecJsonMetadata {
     std: Option<bool>,
 }
 
-#[derive(serde_derive::Deserialize)]
+#[derive(serde_derive::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 // Ensure that all unexpected fields get turned into errors.
 // This helps users stay up to date when the schema changes instead of silently
@@ -463,9 +495,9 @@ struct TargetSpecJsonMetadata {
 #[serde(deny_unknown_fields)]
 struct TargetSpecJson {
     llvm_target: StaticCow<str>,
-    target_pointer_width: String,
+    target_pointer_width: u16,
     data_layout: StaticCow<str>,
-    arch: StaticCow<str>,
+    arch: Arch,
 
     metadata: Option<TargetSpecJsonMetadata>,
 
@@ -475,9 +507,9 @@ struct TargetSpecJson {
     #[serde(rename = "target-c-int-width")]
     c_int_width: Option<u16>,
     c_enum_min_bits: Option<u64>,
-    os: Option<StaticCow<str>>,
-    env: Option<StaticCow<str>>,
-    abi: Option<StaticCow<str>>,
+    os: Option<Os>,
+    env: Option<Env>,
+    abi: Option<CfgAbi>,
     vendor: Option<StaticCow<str>>,
     linker: Option<StaticCow<str>>,
     #[serde(rename = "linker-flavor")]
@@ -513,6 +545,8 @@ struct TargetSpecJson {
     asm_args: Option<StaticCow<[StaticCow<str>]>>,
     cpu: Option<StaticCow<str>>,
     need_explicit_cpu: Option<bool>,
+    requires_consistent_cpu: Option<bool>,
+    unsupported_cpus: Option<StaticCow<[StaticCow<str>]>>,
     features: Option<StaticCow<str>>,
     dynamic_linking: Option<bool>,
     direct_access_external_data: Option<bool>,
@@ -535,13 +569,13 @@ struct TargetSpecJson {
     is_like_darwin: Option<bool>,
     is_like_solaris: Option<bool>,
     is_like_windows: Option<bool>,
+    is_like_gpu: Option<bool>,
     is_like_msvc: Option<bool>,
     is_like_wasm: Option<bool>,
     is_like_android: Option<bool>,
     is_like_vexos: Option<bool>,
     binary_format: Option<BinaryFormat>,
     default_dwarf_version: Option<u32>,
-    allows_weak_linkage: Option<bool>,
     has_rpath: Option<bool>,
     no_default_libraries: Option<bool>,
     position_independent_executables: Option<bool>,
@@ -550,6 +584,7 @@ struct TargetSpecJson {
     relro_level: Option<RelroLevel>,
     archive_format: Option<StaticCow<str>>,
     allow_asm: Option<bool>,
+    static_initializer_must_be_acyclic: Option<bool>,
     main_needs_argc_argv: Option<bool>,
     has_thread_local: Option<bool>,
     obj_is_bitcode: Option<bool>,
@@ -579,7 +614,7 @@ struct TargetSpecJson {
     #[serde(rename = "target-mcount")]
     mcount: Option<StaticCow<str>>,
     llvm_mcount_intrinsic: Option<StaticCow<str>>,
-    llvm_abiname: Option<StaticCow<str>>,
+    llvm_abiname: Option<LlvmAbi>,
     llvm_floatabi: Option<FloatAbi>,
     rustc_abi: Option<RustcAbi>,
     relax_elf_relocations: Option<bool>,
@@ -591,10 +626,16 @@ struct TargetSpecJson {
     split_debuginfo: Option<SplitDebuginfo>,
     supported_split_debuginfo: Option<StaticCow<[SplitDebuginfo]>>,
     supported_sanitizers: Option<Vec<SanitizerSet>>,
+    default_sanitizers: Option<Vec<SanitizerSet>>,
     generate_arange_section: Option<bool>,
     supports_stack_protector: Option<bool>,
     small_data_threshold_support: Option<SmallDataThresholdSupport>,
     entry_name: Option<StaticCow<str>>,
+    supports_fentry: Option<bool>,
     supports_xray: Option<bool>,
     entry_abi: Option<ExternAbiWrapper>,
+}
+
+pub fn json_schema() -> schemars::Schema {
+    schemars::schema_for!(TargetSpecJson)
 }

@@ -1,9 +1,9 @@
-use rustc_hir::def_id::DefId;
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_infer::infer::canonical::QueryRegionConstraint;
 use rustc_infer::infer::canonical::query_response::make_query_region_constraints;
-use rustc_infer::infer::resolve::OpportunisticRegionResolver;
 use rustc_infer::traits::{Obligation, ObligationCause};
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeVisitableExt, fold_regions};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, fold_regions};
+use rustc_span::def_id::DefId;
 use rustc_trait_selection::traits::{ObligationCtxt, with_replaced_escaping_bound_vars};
 
 /// Return the set of types that should be taken into account when checking
@@ -37,20 +37,30 @@ pub(crate) fn coroutine_hidden_types<'tcx>(
 
     let assumptions = compute_assumptions(tcx, def_id, bound_tys);
 
-    ty::EarlyBinder::bind(ty::Binder::bind_with_vars(
-        ty::CoroutineWitnessTypes { types: bound_tys, assumptions },
-        tcx.mk_bound_variable_kinds(&vars),
-    ))
+    ty::EarlyBinder::bind(
+        tcx,
+        ty::Binder::bind_with_vars(
+            ty::CoroutineWitnessTypes { types: bound_tys, assumptions },
+            tcx.mk_bound_variable_kinds(&vars),
+        ),
+    )
 }
 
+// FIXME: The assumptions are only used in the old solver when `-Zhigher-ranked-assumptions`
+// is true. `-Zhigher-ranked-assumptions` is superseded by `assumptions-on-binders`.
+// We can remove this function soon.
 fn compute_assumptions<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     bound_tys: &'tcx ty::List<Ty<'tcx>>,
-) -> &'tcx ty::List<ty::ArgOutlivesPredicate<'tcx>> {
-    let infcx = tcx.infer_ctxt().build(ty::TypingMode::Analysis {
-        defining_opaque_types_and_generators: ty::List::empty(),
-    });
+) -> &'tcx ty::List<ty::ArgOutlivesClause<'tcx>> {
+    if !tcx.sess.opts.unstable_opts.higher_ranked_assumptions {
+        return &ty::List::empty();
+    }
+
+    let infcx = tcx
+        .infer_ctxt()
+        .build(ty::TypingMode::Typeck { defining_opaque_types_and_generators: ty::List::empty() });
     with_replaced_escaping_bound_vars(&infcx, &mut vec![None], bound_tys, |bound_tys| {
         let param_env = tcx.param_env(def_id);
         let ocx = ObligationCtxt::new(&infcx);
@@ -63,24 +73,25 @@ fn compute_assumptions<'tcx>(
                 ty::ClauseKind::WellFormed(ty.into()),
             )
         }));
-        let _errors = ocx.select_all_or_error();
+        let _errors = ocx.evaluate_obligations_error_on_ambiguity();
 
         let region_obligations = infcx.take_registered_region_obligations();
         let region_assumptions = infcx.take_registered_region_assumptions();
         let region_constraints = infcx.take_and_reset_region_constraints();
 
-        let outlives = make_query_region_constraints(
-            region_obligations,
-            &region_constraints,
-            region_assumptions,
-        )
-        .outlives
-        .fold_with(&mut OpportunisticRegionResolver::new(&infcx));
+        let constraints = infcx.deeply_resolve_via_unification_table(
+            make_query_region_constraints(
+                region_obligations,
+                &region_constraints,
+                region_assumptions,
+            )
+            .constraints,
+        );
 
         tcx.mk_outlives_from_iter(
-            outlives
+            constraints
                 .into_iter()
-                .map(|(o, _)| o)
+                .flat_map(|QueryRegionConstraint { constraint, .. }| constraint.iter_outlives())
                 // FIXME(higher_ranked_auto): We probably should deeply resolve these before
                 // filtering out infers which only correspond to unconstrained infer regions
                 // which we can sometimes get.

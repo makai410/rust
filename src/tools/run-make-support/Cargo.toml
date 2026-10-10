@@ -11,17 +11,20 @@ edition = "2024"
 
 # tidy-alphabetical-start
 bstr = "1.12"
-gimli = "0.32"
+gimli = "0.34"
 libc = "0.2"
-object = "0.37"
+object = { version = "0.39.1", features = ["wasm"] }
 regex = "1.11"
 serde_json = "1.0"
 similar = "2.7"
-wasmparser = { version = "0.236", default-features = false, features = ["std", "features", "validate"] }
+tempfile = "3"
+wasmparser = { version = "0.247", default-features = false, features = ["std", "features", "validate"] }
 # tidy-alphabetical-end
 
 # Shared with bootstrap and compiletest
 build_helper = { path = "../../build_helper" }
+# Shared with rustdoc
+rustdoc-json-types = { path = "../../rustdoc-json-types" }
 
 [lib]
 crate-type = ["lib", "dylib"]

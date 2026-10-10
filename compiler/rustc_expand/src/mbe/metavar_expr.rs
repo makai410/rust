@@ -1,22 +1,24 @@
-use rustc_ast::token::{self, Delimiter, IdentIsRaw, Lit, Token, TokenKind};
+use rustc_ast::token::{self, Delimiter, IdentKind, Lit, Token, TokenKind};
 use rustc_ast::tokenstream::{TokenStream, TokenStreamIter, TokenTree};
 use rustc_ast::{LitIntType, LitKind};
 use rustc_ast_pretty::pprust;
 use rustc_errors::{Applicability, PResult};
 use rustc_macros::{Decodable, Encodable};
 use rustc_session::parse::ParseSess;
-use rustc_span::{Ident, Span, Symbol};
+use rustc_span::{Ident, Span, Symbol, sym};
 
-use crate::errors;
+use crate::diagnostics;
 
-pub(crate) const RAW_IDENT_ERR: &str = "`${concat(..)}` currently does not support raw identifiers";
 pub(crate) const UNSUPPORTED_CONCAT_ELEM_ERR: &str = "expected identifier or string literal";
 
 /// A meta-variable expression, for expansions based on properties of meta-variables.
 #[derive(Debug, PartialEq, Encodable, Decodable)]
 pub(crate) enum MetaVarExpr {
-    /// Unification of two or more identifiers.
-    Concat(Box<[MetaVarExprConcatElem]>),
+    /// Unification of two or more identifiers/literals/metavariables into an identifier.
+    ConcatIdent(Box<[MetaVarExprConcatElem]>),
+
+    /// Unification of two or more identifiers/literals/metavariables into a string literal.
+    ConcatStr(Box<[MetaVarExprConcatElem]>),
 
     /// The number of repetitions of an identifier.
     Count(Ident, usize),
@@ -51,15 +53,18 @@ impl MetaVarExpr {
                 Some(tt) => (Some(tt.span()), None),
                 None => (None, Some(ident.span.shrink_to_hi())),
             };
-            let err =
-                errors::MveMissingParen { ident_span: ident.span, unexpected_span, insert_span };
+            let err = diagnostics::MveMissingParen {
+                ident_span: ident.span,
+                unexpected_span,
+                insert_span,
+            };
             return Err(psess.dcx().create_err(err));
         };
 
         // Ensure there are no trailing tokens in the braces, e.g. `${foo() extra}`
         if iter.peek().is_some() {
             let span = iter_span(&iter).expect("checked is_some above");
-            let err = errors::MveExtraTokens {
+            let err = diagnostics::MveExtraTokens {
                 span,
                 ident_span: ident.span,
                 extra_count: iter.count(),
@@ -69,17 +74,22 @@ impl MetaVarExpr {
         }
 
         let mut iter = args.iter();
-        let rslt = match ident.as_str() {
-            "concat" => parse_concat(&mut iter, psess, outer_span, ident.span)?,
-            "count" => parse_count(&mut iter, psess, ident.span)?,
-            "ignore" => {
+        let rslt = match ident.name {
+            sym::concat => {
+                MetaVarExpr::ConcatIdent(parse_concat(&mut iter, psess, outer_span, ident.span)?)
+            }
+            sym::concat_str => {
+                MetaVarExpr::ConcatStr(parse_concat(&mut iter, psess, outer_span, ident.span)?)
+            }
+            sym::count => parse_count(&mut iter, psess, ident.span)?,
+            sym::ignore => {
                 eat_dollar(&mut iter, psess, ident.span)?;
                 MetaVarExpr::Ignore(parse_ident(&mut iter, psess, ident.span)?)
             }
-            "index" => MetaVarExpr::Index(parse_depth(&mut iter, psess, ident.span)?),
-            "len" => MetaVarExpr::Len(parse_depth(&mut iter, psess, ident.span)?),
+            sym::index => MetaVarExpr::Index(parse_depth(&mut iter, psess, ident.span)?),
+            sym::len => MetaVarExpr::Len(parse_depth(&mut iter, psess, ident.span)?),
             _ => {
-                let err = errors::MveUnrecognizedExpr {
+                let err = diagnostics::MveUnrecognizedExpr {
                     span: ident.span,
                     valid_expr_list: "`count`, `ignore`, `index`, `len`, and `concat`",
                 };
@@ -92,7 +102,7 @@ impl MetaVarExpr {
 
     pub(crate) fn for_each_metavar<A>(&self, mut aux: A, mut cb: impl FnMut(A, &Ident) -> A) -> A {
         match self {
-            MetaVarExpr::Concat(elems) => {
+            MetaVarExpr::ConcatIdent(elems) | MetaVarExpr::ConcatStr(elems) => {
                 for elem in elems {
                     if let MetaVarExprConcatElem::Var(ident) = elem {
                         aux = cb(aux, ident)
@@ -119,18 +129,17 @@ fn check_trailing_tokens<'psess>(
     }
 
     // `None` for max indicates the arg count must be exact, `Some` indicates a range is accepted.
-    let (min_or_exact_args, max_args) = match ident.as_str() {
-        "concat" => panic!("concat takes unlimited tokens but didn't eat them all"),
-        "ignore" => (1, None),
+    let (min_or_exact_args, max_args) = match ident.name {
+        sym::concat => panic!("concat takes unlimited tokens but didn't eat them all"),
+        sym::ignore => (1, None),
         // 1 or 2 args
-        "count" => (1, Some(2)),
+        sym::count => (1, Some(2)),
         // 0 or 1 arg
-        "index" => (0, Some(1)),
-        "len" => (0, Some(1)),
+        sym::index | sym::len => (0, Some(1)),
         other => unreachable!("unknown MVEs should be rejected earlier (got `{other}`)"),
     };
 
-    let err = errors::MveExtraTokens {
+    let err = diagnostics::MveExtraTokens {
         span: iter_span(iter).expect("checked is_none above"),
         ident_span: ident.span,
         extra_count: iter.count(),
@@ -173,7 +182,7 @@ fn parse_concat<'psess>(
     psess: &'psess ParseSess,
     outer_span: Span,
     expr_ident_span: Span,
-) -> PResult<'psess, MetaVarExpr> {
+) -> PResult<'psess, Box<[MetaVarExprConcatElem]>> {
     let mut result = Vec::new();
     loop {
         let is_var = try_eat_dollar(iter);
@@ -187,6 +196,10 @@ fn parse_concat<'psess>(
         } else {
             match parse_ident_from_token(psess, token) {
                 Err(err) => {
+                    // FIXME: Canceling this error means we emit a worse message when encountering
+                    //        raw identifiers (`r#ident`). However, we also don't want to forward
+                    //        (the current version of) this error as is since we also want to
+                    //        mentioning string literals as a valid token kind.
                     err.cancel();
                     return Err(psess
                         .dcx()
@@ -208,7 +221,7 @@ fn parse_concat<'psess>(
             .dcx()
             .struct_span_err(expr_ident_span, "`concat` must have at least two elements"));
     }
-    Ok(MetaVarExpr::Concat(result.into()))
+    Ok(result.into())
 }
 
 /// Parse a meta-variable `count` expression: `count(ident[, depth])`
@@ -270,17 +283,15 @@ fn parse_ident_from_token<'psess>(
     psess: &'psess ParseSess,
     token: &Token,
 ) -> PResult<'psess, Ident> {
-    if let Some((elem, is_raw)) = token.ident() {
-        if let IdentIsRaw::Yes = is_raw {
-            return Err(psess.dcx().struct_span_err(elem.span, RAW_IDENT_ERR));
-        }
+    if let Some((elem, kind)) = token.ident() {
+        validate_ident_kind(psess.dcx(), kind, elem.span)?;
         return Ok(elem);
     }
     let token_str = pprust::token_to_string(token);
     let mut err = psess
         .dcx()
         .struct_span_err(token.span, format!("expected identifier, found `{token_str}`"));
-    err.span_suggestion(
+    err.span_suggestion_short(
         token.span,
         format!("try removing `{token_str}`"),
         "",
@@ -336,4 +347,17 @@ fn eat_dollar<'psess>(
         span,
         "meta-variables within meta-variable expressions must be referenced using a dollar sign",
     ))
+}
+
+pub(crate) fn validate_ident_kind<'a>(
+    dcx: rustc_errors::DiagCtxtHandle<'a>,
+    kind: IdentKind,
+    span: Span,
+) -> PResult<'a, ()> {
+    let kind = match kind {
+        IdentKind::Normal => return Ok(()),
+        IdentKind::Raw => "raw identifiers",
+        IdentKind::ForcedKeyword => "forced keywords",
+    };
+    Err(dcx.struct_span_err(span, format!("`${{concat(..)}}` currently does not support {kind}")))
 }

@@ -1,87 +1,224 @@
 //! Checks the licenses of third-party dependencies.
 
-use std::collections::{HashMap, HashSet};
-use std::fs::{File, read_dir};
-use std::io::Write;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::{Display, Formatter};
+use std::fs::{self, read_dir};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{io, thread};
 
-use build_helper::ci::CiEnv;
 use cargo_metadata::semver::Version;
 use cargo_metadata::{Metadata, Package, PackageId};
 
-#[path = "../../../bootstrap/src/utils/proc_macro_deps.rs"]
-mod proc_macro_deps;
+use crate::diagnostics::{RunningCheck, TidyCtx};
+
+#[derive(Clone, Copy)]
+struct ListLocation {
+    path: &'static str,
+    line: u32,
+}
+
+impl Display for ListLocation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.path, self.line)
+    }
+}
+
+/// Creates a [`ListLocation`] for the current location (with an additional offset to the actual list start);
+macro_rules! location {
+    (+ $offset:literal) => {
+        ListLocation { path: file!(), line: line!() + $offset }
+    };
+}
 
 /// These are licenses that are allowed for all crates, including the runtime,
 /// rustc, tools, etc.
 #[rustfmt::skip]
 const LICENSES: &[&str] = &[
     // tidy-alphabetical-start
-    "(MIT OR Apache-2.0) AND Unicode-3.0",                 // unicode_ident (1.0.14)
-    "(MIT OR Apache-2.0) AND Unicode-DFS-2016",            // unicode_ident (1.0.12)
+    "(MIT OR Apache-2.0) AND MIT",
     "0BSD OR MIT OR Apache-2.0",                           // adler2 license
-    "0BSD",
     "Apache-2.0 / MIT",
     "Apache-2.0 OR ISC OR MIT",
     "Apache-2.0 OR MIT",
     "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT", // wasi license
-    "Apache-2.0",
     "Apache-2.0/MIT",
     "BSD-2-Clause OR Apache-2.0 OR MIT",                   // zerocopy
+    "BSD-2-Clause OR MIT OR Apache-2.0",
+    "BSD-3-Clause/MIT",
+    "CC0-1.0 OR MIT-0 OR Apache-2.0",
     "ISC",
     "MIT / Apache-2.0",
     "MIT AND (MIT OR Apache-2.0)",
     "MIT AND Apache-2.0 WITH LLVM-exception AND (MIT OR Apache-2.0)", // compiler-builtins
-    "MIT OR Apache-2.0 OR LGPL-2.1-or-later",              // r-efi, r-efi-alloc
+    "MIT OR Apache-2.0 OR BSD-1-Clause",
+    "MIT OR Apache-2.0 OR LGPL-2.1-or-later",              // r-efi, r-efi-alloc; LGPL is not acceptable, but we use it under MIT OR Apache-2.0
     "MIT OR Apache-2.0 OR Zlib",                           // tinyvec_macros
     "MIT OR Apache-2.0",
     "MIT OR Zlib OR Apache-2.0",                           // miniz_oxide
     "MIT",
     "MIT/Apache-2.0",
-    "Unicode-3.0",                                         // icu4x
-    "Unicode-DFS-2016",                                    // tinystr
     "Unlicense OR MIT",
     "Unlicense/MIT",
+    "Zlib",                                                // foldhash (FIXME: see PERMITTED_STDLIB_DEPENDENCIES)
+    // tidy-alphabetical-end
+];
+
+/// These are licenses that are allowed for rustc, tools, etc. But not for the runtime!
+#[rustfmt::skip]
+const LICENSES_TOOLS: &[&str] = &[
+    // tidy-alphabetical-start
+    "(Apache-2.0 OR MIT) AND BSD-3-Clause",
+    "(MIT OR Apache-2.0) AND Unicode-3.0",                 // unicode_ident (1.0.14)
+    "(MIT OR Apache-2.0) AND Unicode-DFS-2016",            // unicode_ident (1.0.12)
+    "0BSD",
+    "Apache-2.0 AND ISC",
+    "Apache-2.0 OR BSL-1.0",  // BSL is not acceptable, but we use it under Apache-2.0
+    "Apache-2.0 OR GPL-2.0-only",
+    "Apache-2.0 WITH LLVM-exception",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception",
+    "CC0-1.0",
+    "Unicode-3.0",                                         // icu4x
+    "Unicode-DFS-2016",                                    // tinystr
     "Zlib OR Apache-2.0 OR MIT",                           // tinyvec
+    "Zlib",
     // tidy-alphabetical-end
 ];
 
 type ExceptionList = &'static [(&'static str, &'static str)];
 
+#[derive(Clone, Copy)]
+pub(crate) struct WorkspaceInfo<'a> {
+    /// Path to the directory containing the workspace root Cargo.toml file.
+    pub(crate) path: &'a str,
+    /// The list of license exceptions.
+    pub(crate) exceptions: ExceptionList,
+    /// The list of dependencies that are allowed. If None, any crate with an
+    /// acceptable license is allowed.
+    allowed_deps: Option<PermittedDeps<'a>>,
+    /// Submodules required for the workspace
+    pub(crate) submodules: &'a [&'a str],
+}
+
+#[derive(Clone, Copy)]
+struct PermittedDeps<'a> {
+    /// A list of crates for which dependencies need to be explicitly allowed
+    /// or None to check the entire workspace.
+    roots: Option<&'a [&'a str]>,
+    /// The list of allowed dependencies.
+    deps: &'a [&'a str],
+    /// The source code location of the allowed dependencies list.
+    deps_loc: ListLocation,
+}
+
+impl<'a> PermittedDeps<'a> {
+    const fn new(
+        roots: Option<&'a [&'a str]>,
+        deps: &'a [&'a str],
+        deps_loc: ListLocation,
+    ) -> Self {
+        Self { roots, deps, deps_loc }
+    }
+}
+
+const WORKSPACE_LOCATION: ListLocation = location!(+4);
+
 /// The workspaces to check for licensing and optionally permitted dependencies.
-///
-/// Each entry consists of a tuple with the following elements:
-///
-/// * The path to the workspace root Cargo.toml file.
-/// * The list of license exceptions.
-/// * Optionally a tuple of:
-///     * A list of crates for which dependencies need to be explicitly allowed.
-///     * The list of allowed dependencies.
-/// * Submodules required for the workspace.
 // FIXME auto detect all cargo workspaces
-pub(crate) const WORKSPACES: &[(&str, ExceptionList, Option<(&[&str], &[&str])>, &[&str])] = &[
+pub(crate) const WORKSPACES: &[WorkspaceInfo<'static>] = &[
     // The root workspace has to be first for check_rustfix to work.
-    (".", EXCEPTIONS, Some((&["rustc-main"], PERMITTED_RUSTC_DEPENDENCIES)), &[]),
-    ("library", EXCEPTIONS_STDLIB, Some((&["sysroot"], PERMITTED_STDLIB_DEPENDENCIES)), &[]),
-    // Outside of the alphabetical section because rustfmt formats it using multiple lines.
-    (
-        "compiler/rustc_codegen_cranelift",
-        EXCEPTIONS_CRANELIFT,
-        Some((&["rustc_codegen_cranelift"], PERMITTED_CRANELIFT_DEPENDENCIES)),
-        &[],
-    ),
-    // tidy-alphabetical-start
-    ("compiler/rustc_codegen_gcc", EXCEPTIONS_GCC, None, &[]),
-    ("src/bootstrap", EXCEPTIONS_BOOTSTRAP, None, &[]),
-    ("src/tools/cargo", EXCEPTIONS_CARGO, None, &["src/tools/cargo"]),
-    //("src/tools/miri/test-cargo-miri", &[], None), // FIXME uncomment once all deps are vendored
-    //("src/tools/miri/test_dependencies", &[], None), // FIXME uncomment once all deps are vendored
-    ("src/tools/rust-analyzer", EXCEPTIONS_RUST_ANALYZER, None, &[]),
-    ("src/tools/rustbook", EXCEPTIONS_RUSTBOOK, None, &["src/doc/book", "src/doc/reference"]),
-    ("src/tools/rustc-perf", EXCEPTIONS_RUSTC_PERF, None, &["src/tools/rustc-perf"]),
-    ("src/tools/test-float-parse", EXCEPTIONS, None, &[]),
-    ("tests/run-make/uefi-qemu/uefi_qemu_test", EXCEPTIONS_UEFI_QEMU_TEST, None, &[]),
-    // tidy-alphabetical-end
+    WorkspaceInfo {
+        path: ".",
+        exceptions: EXCEPTIONS,
+        allowed_deps: Some(PermittedDeps::new(
+            Some(&["rustc-main"]),
+            PERMITTED_RUSTC_DEPENDENCIES,
+            PERMITTED_RUSTC_DEPS_LOCATION,
+        )),
+        submodules: &[],
+    },
+    WorkspaceInfo {
+        path: "library",
+        exceptions: EXCEPTIONS_STDLIB,
+        allowed_deps: Some(PermittedDeps::new(
+            None,
+            PERMITTED_STDLIB_DEPENDENCIES,
+            PERMITTED_STDLIB_DEPS_LOCATION,
+        )),
+        submodules: &[],
+    },
+    WorkspaceInfo {
+        path: "library/stdarch",
+        exceptions: EXCEPTIONS_STDARCH,
+        allowed_deps: None,
+        submodules: &[],
+    },
+    WorkspaceInfo {
+        path: "compiler/rustc_codegen_cranelift",
+        exceptions: EXCEPTIONS_CRANELIFT,
+        allowed_deps: Some(PermittedDeps::new(
+            None,
+            PERMITTED_CRANELIFT_DEPENDENCIES,
+            PERMITTED_CRANELIFT_DEPS_LOCATION,
+        )),
+        submodules: &[],
+    },
+    WorkspaceInfo {
+        path: "compiler/rustc_codegen_gcc",
+        exceptions: EXCEPTIONS_GCC,
+        allowed_deps: None,
+        submodules: &[],
+    },
+    WorkspaceInfo {
+        path: "src/bootstrap",
+        exceptions: EXCEPTIONS_BOOTSTRAP,
+        allowed_deps: None,
+        submodules: &[],
+    },
+    WorkspaceInfo {
+        path: "src/tools/cargo",
+        exceptions: EXCEPTIONS_CARGO,
+        allowed_deps: None,
+        submodules: &["src/tools/cargo"],
+    },
+    // FIXME uncomment once all deps are vendored
+    //  WorkspaceInfo {
+    //      path: "src/tools/miri/test-cargo-miri",
+    //      crates_and_deps: None
+    //      submodules: &[],
+    //  },
+    // WorkspaceInfo {
+    //      path: "src/tools/miri/test_dependencies",
+    //      crates_and_deps: None,
+    //      submodules: &[],
+    //  }
+    WorkspaceInfo {
+        path: "src/tools/rust-analyzer",
+        exceptions: EXCEPTIONS_RUST_ANALYZER,
+        allowed_deps: None,
+        submodules: &[],
+    },
+    WorkspaceInfo {
+        path: "src/tools/rustbook",
+        exceptions: EXCEPTIONS_RUSTBOOK,
+        allowed_deps: None,
+        submodules: &["src/doc/book", "src/doc/reference"],
+    },
+    WorkspaceInfo {
+        path: "src/tools/rustc-perf",
+        exceptions: EXCEPTIONS_RUSTC_PERF,
+        allowed_deps: None,
+        submodules: &["src/tools/rustc-perf"],
+    },
+    WorkspaceInfo {
+        path: "tests/run-make-cargo/uefi-qemu/uefi_qemu_test",
+        exceptions: EXCEPTIONS_UEFI_QEMU_TEST,
+        allowed_deps: None,
+        submodules: &[],
+    },
 ];
 
 /// These are exceptions to Rust's permissive licensing policy, and
@@ -91,19 +228,8 @@ pub(crate) const WORKSPACES: &[(&str, ExceptionList, Option<(&[&str], &[&str])>,
 #[rustfmt::skip]
 const EXCEPTIONS: ExceptionList = &[
     // tidy-alphabetical-start
-    ("ar_archive_writer", "Apache-2.0 WITH LLVM-exception"), // rustc
-    ("arrayref", "BSD-2-Clause"),                            // rustc
-    ("blake3", "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"),  // rustc
     ("colored", "MPL-2.0"),                                  // rustfmt
-    ("constant_time_eq", "CC0-1.0 OR MIT-0 OR Apache-2.0"),  // rustc
-    ("dissimilar", "Apache-2.0"),                            // rustdoc, rustc_lexer (few tests) via expect-test, (dev deps)
-    ("fluent-langneg", "Apache-2.0"),                        // rustc (fluent translations)
-    ("foldhash", "Zlib"),                                    // rustc
     ("option-ext", "MPL-2.0"),                               // cargo-miri (via `directories`)
-    ("rustc_apfloat", "Apache-2.0 WITH LLVM-exception"),     // rustc (license is the same as LLVM uses)
-    ("ryu", "Apache-2.0 OR BSL-1.0"), // BSL is not acceptble, but we use it under Apache-2.0                       // cargo/... (because of serde)
-    ("self_cell", "Apache-2.0"),                             // rustc (fluent translations)
-    ("wasi-preview1-component-adapter-provider", "Apache-2.0 WITH LLVM-exception"), // rustc
     // tidy-alphabetical-end
 ];
 
@@ -120,96 +246,51 @@ const EXCEPTIONS_STDLIB: ExceptionList = &[
 
 const EXCEPTIONS_CARGO: ExceptionList = &[
     // tidy-alphabetical-start
-    ("arrayref", "BSD-2-Clause"),
     ("bitmaps", "MPL-2.0+"),
-    ("blake3", "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"),
-    ("ciborium", "Apache-2.0"),
-    ("ciborium-io", "Apache-2.0"),
-    ("ciborium-ll", "Apache-2.0"),
-    ("constant_time_eq", "CC0-1.0 OR MIT-0 OR Apache-2.0"),
-    ("dunce", "CC0-1.0 OR MIT-0 OR Apache-2.0"),
-    ("encoding_rs", "(Apache-2.0 OR MIT) AND BSD-3-Clause"),
-    ("fiat-crypto", "MIT OR Apache-2.0 OR BSD-1-Clause"),
-    ("foldhash", "Zlib"),
     ("im-rc", "MPL-2.0+"),
-    ("libz-rs-sys", "Zlib"),
-    ("normalize-line-endings", "Apache-2.0"),
-    ("openssl", "Apache-2.0"),
-    ("ring", "Apache-2.0 AND ISC"),
-    ("ryu", "Apache-2.0 OR BSL-1.0"), // BSL is not acceptble, but we use it under Apache-2.0
-    ("similar", "Apache-2.0"),
     ("sized-chunks", "MPL-2.0+"),
-    ("subtle", "BSD-3-Clause"),
-    ("supports-hyperlinks", "Apache-2.0"),
-    ("unicode-bom", "Apache-2.0"),
-    ("zlib-rs", "Zlib"),
     // tidy-alphabetical-end
 ];
 
 const EXCEPTIONS_RUST_ANALYZER: ExceptionList = &[
     // tidy-alphabetical-start
-    ("dissimilar", "Apache-2.0"),
-    ("foldhash", "Zlib"),
-    ("notify", "CC0-1.0"),
     ("option-ext", "MPL-2.0"),
-    ("pulldown-cmark-to-cmark", "Apache-2.0"),
-    ("rustc_apfloat", "Apache-2.0 WITH LLVM-exception"),
-    ("ryu", "Apache-2.0 OR BSL-1.0"), // BSL is not acceptble, but we use it under Apache-2.0
-    ("scip", "Apache-2.0"),
     // tidy-alphabetical-end
 ];
 
 const EXCEPTIONS_RUSTC_PERF: ExceptionList = &[
     // tidy-alphabetical-start
-    ("alloc-no-stdlib", "BSD-3-Clause"),
-    ("alloc-stdlib", "BSD-3-Clause"),
-    ("brotli", "BSD-3-Clause/MIT"),
-    ("brotli-decompressor", "BSD-3-Clause/MIT"),
-    ("encoding_rs", "(Apache-2.0 OR MIT) AND BSD-3-Clause"),
+    ("aws-lc-rs", "ISC AND (Apache-2.0 OR ISC)"),
+    (
+        "aws-lc-sys",
+        "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)",
+    ),
+    ("brotli", "BSD-3-Clause AND MIT"),
+    ("fast-srgb8", "MIT OR Apache-2.0 OR CC0-1.0"),
     ("inferno", "CDDL-1.0"),
     ("option-ext", "MPL-2.0"),
-    ("ryu", "Apache-2.0 OR BSL-1.0"),
-    ("snap", "BSD-3-Clause"),
-    ("subtle", "BSD-3-Clause"),
+    ("wasite", "Apache-2.0 OR BSL-1.0 OR MIT"),
+    ("webpki-root-certs", "CDLA-Permissive-2.0"),
+    ("whoami", "Apache-2.0 OR BSL-1.0 OR MIT"),
     // tidy-alphabetical-end
 ];
 
 const EXCEPTIONS_RUSTBOOK: ExceptionList = &[
     // tidy-alphabetical-start
-    ("cssparser", "MPL-2.0"),
-    ("cssparser-macros", "MPL-2.0"),
-    ("dtoa-short", "MPL-2.0"),
-    ("mdbook", "MPL-2.0"),
-    ("ryu", "Apache-2.0 OR BSL-1.0"),
+    ("font-awesome-as-a-crate", "CC-BY-4.0 AND MIT"),
+    ("mdbook-core", "MPL-2.0"),
+    ("mdbook-driver", "MPL-2.0"),
+    ("mdbook-html", "MPL-2.0"),
+    ("mdbook-markdown", "MPL-2.0"),
+    ("mdbook-preprocessor", "MPL-2.0"),
+    ("mdbook-renderer", "MPL-2.0"),
+    ("mdbook-summary", "MPL-2.0"),
     // tidy-alphabetical-end
 ];
 
-const EXCEPTIONS_CRANELIFT: ExceptionList = &[
-    // tidy-alphabetical-start
-    ("cranelift-assembler-x64", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-assembler-x64-meta", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-bforest", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-bitset", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-codegen", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-codegen-meta", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-codegen-shared", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-control", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-entity", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-frontend", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-isle", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-jit", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-module", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-native", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-object", "Apache-2.0 WITH LLVM-exception"),
-    ("cranelift-srcgen", "Apache-2.0 WITH LLVM-exception"),
-    ("foldhash", "Zlib"),
-    ("mach2", "BSD-2-Clause OR MIT OR Apache-2.0"),
-    ("regalloc2", "Apache-2.0 WITH LLVM-exception"),
-    ("target-lexicon", "Apache-2.0 WITH LLVM-exception"),
-    ("wasmtime-jit-icache-coherence", "Apache-2.0 WITH LLVM-exception"),
-    ("wasmtime-math", "Apache-2.0 WITH LLVM-exception"),
-    // tidy-alphabetical-end
-];
+const EXCEPTIONS_STDARCH: ExceptionList = &[];
+
+const EXCEPTIONS_CRANELIFT: ExceptionList = &[];
 
 const EXCEPTIONS_GCC: ExceptionList = &[
     // tidy-alphabetical-start
@@ -218,15 +299,11 @@ const EXCEPTIONS_GCC: ExceptionList = &[
     // tidy-alphabetical-end
 ];
 
-const EXCEPTIONS_BOOTSTRAP: ExceptionList = &[
-    ("ryu", "Apache-2.0 OR BSL-1.0"), // through serde. BSL is not acceptble, but we use it under Apache-2.0
-];
+const EXCEPTIONS_BOOTSTRAP: ExceptionList = &[];
 
-const EXCEPTIONS_UEFI_QEMU_TEST: ExceptionList = &[
-    ("r-efi", "MIT OR Apache-2.0 OR LGPL-2.1-or-later"), // LGPL is not acceptable, but we use it under MIT OR Apache-2.0
-];
+const EXCEPTIONS_UEFI_QEMU_TEST: ExceptionList = &[];
 
-const PERMITTED_DEPS_LOCATION: &str = concat!(file!(), ":", line!());
+const PERMITTED_RUSTC_DEPS_LOCATION: ListLocation = location!(+6);
 
 /// Crates rustc is allowed to depend on. Avoid adding to the list if possible.
 ///
@@ -238,18 +315,23 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "aho-corasick",
     "allocator-api2", // FIXME: only appears in Cargo.lock due to https://github.com/rust-lang/cargo/issues/10801
     "annotate-snippets",
+    "anstream",
     "anstyle",
+    "anstyle-parse",
+    "anstyle-query",
+    "anstyle-wincon",
     "ar_archive_writer",
     "arrayref",
     "arrayvec",
-    "autocfg",
     "bitflags",
     "blake3",
     "block-buffer",
+    "block2",
     "bstr",
     "cc",
     "cfg-if",
     "cfg_aliases",
+    "colorchoice",
     "constant_time_eq",
     "cpufeatures",
     "crc32fast",
@@ -265,16 +347,18 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "derive-where",
     "derive_setters",
     "digest",
+    "dispatch2",
     "displaydoc",
     "dissimilar",
+    "dyn-clone",
     "either",
     "elsa",
     "ena",
     "equivalent",
     "errno",
     "expect-test",
-    "fallible-iterator", // dependency of `thorin`
     "fastrand",
+    "find-msvc-tools",
     "flate2",
     "fluent-bundle",
     "fluent-langneg",
@@ -288,24 +372,24 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "gsgdt",
     "hashbrown",
     "icu_list",
-    "icu_list_data",
-    "icu_locid",
-    "icu_locid_transform",
-    "icu_locid_transform_data",
+    "icu_locale_core",
+    "icu_locale_fallback",
+    "icu_locale_fallback_data",
     "icu_provider",
-    "icu_provider_adapters",
-    "icu_provider_macros",
     "ident_case",
     "indexmap",
     "intl-memoizer",
     "intl_pluralrules",
+    "is_terminal_polyfill",
     "itertools",
     "itoa",
     "jiff",
     "jiff-static",
+    "jiff-tzdb",
+    "jiff-tzdb-platform",
     "jobserver",
     "lazy_static",
-    "leb128",
+    "leb128fmt",
     "libc",
     "libloading",
     "linux-raw-sys",
@@ -320,10 +404,12 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "miniz_oxide",
     "nix",
     "nu-ansi-term",
+    "objc2",
+    "objc2-encode",
     "object",
     "odht",
     "once_cell",
-    "overload",
+    "once_cell_polyfill",
     "parking_lot",
     "parking_lot_core",
     "pathdiff",
@@ -332,10 +418,10 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "polonius-engine",
     "portable-atomic", // dependency for platforms doesn't support `AtomicU64` in std
     "portable-atomic-util",
+    "potential_utf",
     "ppv-lite86",
     "proc-macro-hack",
     "proc-macro2",
-    "psm",
     "pulldown-cmark",
     "pulldown-cmark-escape",
     "punycode",
@@ -347,6 +433,8 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "rand_xorshift", // dependency for doc-tests in rustc_thread_pool
     "rand_xoshiro",
     "redox_syscall",
+    "ref-cast",
+    "ref-cast-impl",
     "regex",
     "regex-automata",
     "regex-syntax",
@@ -358,27 +446,30 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "rustix",
     "ruzstd", // via object in thorin-dwp
     "ryu",
+    "schemars",
+    "schemars_derive",
     "scoped-tls",
     "scopeguard",
     "self_cell",
     "semver",
     "serde",
+    "serde_core",
     "serde_derive",
+    "serde_derive_internals",
     "serde_json",
     "serde_path_to_error",
     "sha1",
     "sha2",
     "sharded-slab",
     "shlex",
+    "simd-adler32",
     "smallvec",
     "stable_deref_trait",
-    "stacker",
     "static_assertions",
     "strsim",
     "syn",
     "synstructure",
     "tempfile",
-    "termcolor",
     "termize",
     "thin-vec",
     "thiserror",
@@ -393,6 +484,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "tracing-attributes",
     "tracing-core",
     "tracing-log",
+    "tracing-serde",
     "tracing-subscriber",
     "tracing-tree",
     "twox-hash",
@@ -409,16 +501,12 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "unicode-script",
     "unicode-security",
     "unicode-width",
-    "unicode-xid",
+    "utf8parse",
     "valuable",
     "version_check",
     "wasi",
     "wasm-encoder",
     "wasmparser",
-    "winapi",
-    "winapi-i686-pc-windows-gnu",
-    "winapi-util",
-    "winapi-x86_64-pc-windows-gnu",
     "windows",
     "windows-collections",
     "windows-core",
@@ -430,16 +518,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "windows-result",
     "windows-strings",
     "windows-sys",
-    "windows-targets",
     "windows-threading",
-    "windows_aarch64_gnullvm",
-    "windows_aarch64_msvc",
-    "windows_i686_gnu",
-    "windows_i686_gnullvm",
-    "windows_i686_msvc",
-    "windows_x86_64_gnu",
-    "windows_x86_64_gnullvm",
-    "windows_x86_64_msvc",
     "wit-bindgen-rt@0.39.0", // pinned to a specific version due to using a binary blob: <https://github.com/rust-lang/rust/pull/136395#issuecomment-2692769062>
     "writeable",
     "yoke",
@@ -448,10 +527,14 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "zerocopy-derive",
     "zerofrom",
     "zerofrom-derive",
+    "zerotrie",
     "zerovec",
     "zerovec-derive",
+    "zlib-rs",
     // tidy-alphabetical-end
 ];
+
+const PERMITTED_STDLIB_DEPS_LOCATION: ListLocation = location!(+2);
 
 const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     // tidy-alphabetical-start
@@ -461,6 +544,8 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     "cfg-if",
     "compiler_builtins",
     "dlmalloc",
+    "find-msvc-tools", // via cc
+    "foldhash", // FIXME: only appears in Cargo.lock due to https://github.com/rust-lang/cargo/issues/10801
     "fortanix-sgx-abi",
     "getopts",
     "gimli",
@@ -469,6 +554,7 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     "libc",
     "memchr",
     "miniz_oxide",
+    "moto-rt",
     "object",
     "r-efi",
     "r-efi-alloc",
@@ -478,21 +564,18 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     "rustc-demangle",
     "rustc-literal-escaper",
     "shlex",
-    "unicode-width",
     "unwinding",
-    "wasi",
-    "windows-sys",
-    "windows-targets",
-    "windows_aarch64_gnullvm",
-    "windows_aarch64_msvc",
-    "windows_i686_gnu",
-    "windows_i686_gnullvm",
-    "windows_i686_msvc",
-    "windows_x86_64_gnu",
-    "windows_x86_64_gnullvm",
-    "windows_x86_64_msvc",
+    "vex-sdk",
+    "wasip1",
+    "wasip2",
+    "wasip3",
+    "windows-link",
+    "windows-sys@0.61.100", // Enforce the usage of our dummy windows-sys patch. Keep version in sync.
+    "wit-bindgen",
     // tidy-alphabetical-end
 ];
+
+const PERMITTED_CRANELIFT_DEPS_LOCATION: ListLocation = location!(+2);
 
 const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
     // tidy-alphabetical-start
@@ -520,10 +603,11 @@ const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
     "cranelift-srcgen",
     "crc32fast",
     "equivalent",
-    "fallible-iterator",
+    "fnv",
     "foldhash",
     "gimli",
     "hashbrown",
+    "heck",
     "indexmap",
     "libc",
     "libloading",
@@ -531,6 +615,7 @@ const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
     "log",
     "mach2",
     "memchr",
+    "memmap2",
     "object",
     "proc-macro2",
     "quote",
@@ -538,14 +623,16 @@ const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
     "region",
     "rustc-hash",
     "serde",
+    "serde_core",
     "serde_derive",
     "smallvec",
     "stable_deref_trait",
     "syn",
     "target-lexicon",
     "unicode-ident",
-    "wasmtime-jit-icache-coherence",
-    "wasmtime-math",
+    "wasmtime-internal-core",
+    "wasmtime-internal-jit-icache-coherence",
+    "windows-link",
     "windows-sys",
     "windows-targets",
     "windows_aarch64_gnullvm",
@@ -563,46 +650,85 @@ const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
 ///
 /// `root` is path to the directory with the root `Cargo.toml` (for the workspace). `cargo` is path
 /// to the cargo executable.
-pub fn check(root: &Path, cargo: &Path, bless: bool, bad: &mut bool) {
-    let mut checked_runtime_licenses = false;
+pub fn check(root: &Path, cargo: &Path, sem: &'_ crate::Semaphore, tidy_ctx: TidyCtx) {
+    let mut check = tidy_ctx.start_check("deps");
+    let bless = tidy_ctx.is_bless_enabled();
+    let is_ci = tidy_ctx.is_running_on_ci();
 
-    check_proc_macro_dep_list(root, cargo, bless, bad);
+    let checked_runtime_licenses = AtomicBool::new(false);
 
-    for &(workspace, exceptions, permitted_deps, submodules) in WORKSPACES {
-        if has_missing_submodule(root, submodules) {
-            continue;
+    check_proc_macro_dep_list(root, cargo, bless, &mut check);
+
+    thread::scope(|s| {
+        for (i, WorkspaceInfo { path, exceptions, allowed_deps: crates_and_deps, submodules }) in
+            WORKSPACES.iter().enumerate()
+        {
+            let check = &check;
+            let checked_runtime_licenses = &checked_runtime_licenses;
+            // starting deps::check already consumed one semaphore permit, with concurrency == 1
+            // this would deadlock if we tried to get one here for the first thread, so
+            // we only do it for additional threads beyond the first one.
+            let guard = if i > 0 { Some(sem.acquire()) } else { None };
+            s.spawn(move || {
+                if has_missing_submodule(root, submodules, is_ci) {
+                    return;
+                }
+
+                if !root.join(path).join("Cargo.lock").exists() {
+                    check.error(format!("the `{path}` workspace doesn't have a Cargo.lock"));
+                    return;
+                }
+
+                let mut cmd = cargo_metadata::MetadataCommand::new();
+                cmd.cargo_path(cargo)
+                    .manifest_path(root.join(path).join("Cargo.toml"))
+                    .features(cargo_metadata::CargoOpt::AllFeatures)
+                    .other_options(vec!["--locked".to_owned()]);
+                let metadata = t!(cmd.exec());
+
+                // Check for packages which have been moved into a different workspace and not updated
+                let absolute_root =
+                    if *path == "." { root.to_path_buf() } else { t!(std::path::absolute(root.join(path))) };
+                let absolute_root_real = t!(std::path::absolute(&metadata.workspace_root));
+                if absolute_root_real != absolute_root {
+                    check.error(format!("{path} is part of another workspace ({} != {}), remove from `WORKSPACES` ({WORKSPACE_LOCATION})", absolute_root.display(), absolute_root_real.display()));
+                }
+                check_license_exceptions(&metadata, path, exceptions, &check);
+                if let Some(PermittedDeps { roots, deps: permitted_deps, deps_loc }) = crates_and_deps {
+                    let descr = roots.map_or(path, |roots| roots.get(0).unwrap_or(&path));
+                    check_permitted_dependencies(
+                        &metadata,
+                        descr,
+                        permitted_deps,
+                        *roots,
+                        *deps_loc,
+                        &check,
+                    );
+                }
+
+
+                if *path == "library" {
+                    check_runtime_license_exceptions(&metadata, &check);
+                    check_runtime_no_duplicate_dependencies(&metadata, &check);
+                    check_runtime_no_proc_macros(&metadata, &check);
+                    checked_runtime_licenses.store(true, Ordering::Relaxed);
+                }
+
+                let _guard = guard;
+            });
         }
-
-        if !root.join(workspace).join("Cargo.lock").exists() {
-            tidy_error!(bad, "the `{workspace}` workspace doesn't have a Cargo.lock");
-            continue;
-        }
-
-        let mut cmd = cargo_metadata::MetadataCommand::new();
-        cmd.cargo_path(cargo)
-            .manifest_path(root.join(workspace).join("Cargo.toml"))
-            .features(cargo_metadata::CargoOpt::AllFeatures)
-            .other_options(vec!["--locked".to_owned()]);
-        let metadata = t!(cmd.exec());
-
-        check_license_exceptions(&metadata, workspace, exceptions, bad);
-        if let Some((crates, permitted_deps)) = permitted_deps {
-            check_permitted_dependencies(&metadata, workspace, permitted_deps, crates, bad);
-        }
-
-        if workspace == "library" {
-            check_runtime_license_exceptions(&metadata, bad);
-            checked_runtime_licenses = true;
-        }
-    }
+    });
 
     // Sanity check to ensure we don't accidentally remove the workspace containing the runtime
     // crates.
-    assert!(checked_runtime_licenses);
+    assert!(checked_runtime_licenses.load(Ordering::Relaxed));
 }
 
 /// Ensure the list of proc-macro crate transitive dependencies is up to date
-fn check_proc_macro_dep_list(root: &Path, cargo: &Path, bless: bool, bad: &mut bool) {
+fn check_proc_macro_dep_list(root: &Path, cargo: &Path, bless: bool, check: &mut RunningCheck) {
+    if std::env::var("RUSTC").is_err() {
+        panic!("tidy must be run under bootstrap (./x test tidy), not as a standalone command");
+    }
     let mut cmd = cargo_metadata::MetadataCommand::new();
     cmd.cargo_path(cargo)
         .manifest_path(root.join("Cargo.toml"))
@@ -617,54 +743,66 @@ fn check_proc_macro_dep_list(root: &Path, cargo: &Path, bless: bool, bad: &mut b
     }
     // Remove the proc-macro crates themselves
     proc_macro_deps.retain(|pkg| !is_proc_macro_pkg(&metadata[pkg]));
+    // Sort and deduplicate the crate names.
+    // Cargo package names may contain `-`, but will normalize these to `_` before passing to rustc.
+    // As bootstrap parses the `--crate-name` flag, use the name of the actual lib target which has
+    // been normalized.
+    let proc_macro_deps = proc_macro_deps
+        .into_iter()
+        .filter_map(|dep| {
+            metadata[dep].targets.iter().find_map(|target| target.is_lib().then_some(&target.name))
+        })
+        .collect::<BTreeSet<_>>();
 
-    let proc_macro_deps: HashSet<_> =
-        proc_macro_deps.into_iter().map(|dep| metadata[dep].name.as_ref()).collect();
-    let expected = proc_macro_deps::CRATES.iter().copied().collect::<HashSet<_>>();
+    let expected = {
+        use std::fmt::Write;
 
-    let needs_blessing = proc_macro_deps.difference(&expected).next().is_some()
-        || expected.difference(&proc_macro_deps).next().is_some();
-
-    if needs_blessing && bless {
-        let mut proc_macro_deps: Vec<_> = proc_macro_deps.into_iter().collect();
-        proc_macro_deps.sort();
-        let mut file = File::create(root.join("src/bootstrap/src/utils/proc_macro_deps.rs"))
-            .expect("`proc_macro_deps` should exist");
-        writeln!(
-            &mut file,
-            "/// Do not update manually - use `./x.py test tidy --bless`
+        const HEADER: &str = "\
+/// Do not update manually - use `./x.py test tidy --bless`
 /// Holds all direct and indirect dependencies of proc-macro crates in tree.
 /// See <https://github.com/rust-lang/rust/issues/134863>
 pub static CRATES: &[&str] = &[
-    // tidy-alphabetical-start"
-        )
-        .unwrap();
-        for dep in proc_macro_deps {
-            writeln!(&mut file, "    {dep:?},").unwrap();
-        }
-        writeln!(
-            &mut file,
-            "    // tidy-alphabetical-end
-];"
-        )
-        .unwrap();
-    } else {
-        let old_bad = *bad;
+    // tidy-alphabetical-start
+";
+        const FOOTER: &str = "    // tidy-alphabetical-end
+];
+";
 
-        for missing in proc_macro_deps.difference(&expected) {
-            tidy_error!(
-                bad,
-                "proc-macro crate dependency `{missing}` is not registered in `src/bootstrap/src/utils/proc_macro_deps.rs`",
-            );
+        let mut buf = String::with_capacity(4096);
+        buf.push_str(HEADER);
+        for dep in proc_macro_deps {
+            writeln!(buf, "    {dep:?},").unwrap();
         }
-        for extra in expected.difference(&proc_macro_deps) {
-            tidy_error!(
-                bad,
-                "`{extra}` is registered in `src/bootstrap/src/utils/proc_macro_deps.rs`, but is not a proc-macro crate dependency",
-            );
+        buf.push_str(FOOTER);
+        buf
+    };
+
+    const PROC_MACRO_DEPS_RS: &str = "src/bootstrap/src/utils/proc_macro_deps.rs";
+    let proc_macro_deps_rs_path = &root.join(PROC_MACRO_DEPS_RS);
+    let actual = match fs::read_to_string(proc_macro_deps_rs_path) {
+        Ok(actual) => actual,
+        Err(e) => {
+            if e.kind() == io::ErrorKind::NotFound {
+                check.error(format!(
+                    "`{PROC_MACRO_DEPS_RS}` not found; has it been moved or renamed?"
+                ));
+            } else {
+                check.error(format!("`{PROC_MACRO_DEPS_RS}` could not be read: {e:?}"));
+            }
+            return;
         }
-        if *bad != old_bad {
-            eprintln!("Run `./x.py test tidy --bless` to regenerate the list");
+    };
+
+    if actual != expected {
+        if bless {
+            fs::write(proc_macro_deps_rs_path, &expected).unwrap();
+        } else {
+            let diff = similar::TextDiff::from_lines(&actual, &expected);
+            let mut unified = diff.unified_diff();
+            unified.header(PROC_MACRO_DEPS_RS, "(expected)");
+
+            check.error(format!("`{PROC_MACRO_DEPS_RS}` is not up-to-date:\n{unified}"));
+            check.message("Run `./x.py test tidy --bless` to regenerate the list");
         }
     }
 }
@@ -672,8 +810,8 @@ pub static CRATES: &[&str] = &[
 /// Used to skip a check if a submodule is not checked out, and not in a CI environment.
 ///
 /// This helps prevent enforcing developers to fetch submodules for tidy.
-pub fn has_missing_submodule(root: &Path, submodules: &[&str]) -> bool {
-    !CiEnv::is_ci()
+pub fn has_missing_submodule(root: &Path, submodules: &[&str], is_ci: bool) -> bool {
+    !is_ci
         && submodules.iter().any(|submodule| {
             let path = root.join(submodule);
             !path.exists()
@@ -686,7 +824,7 @@ pub fn has_missing_submodule(root: &Path, submodules: &[&str]) -> bool {
 ///
 /// Unlike for tools we don't allow exceptions to the `LICENSES` list for the runtime with the sole
 /// exception of `fortanix-sgx-abi` which is only used on x86_64-fortanix-unknown-sgx.
-fn check_runtime_license_exceptions(metadata: &Metadata, bad: &mut bool) {
+fn check_runtime_license_exceptions(metadata: &Metadata, check: &RunningCheck) {
     for pkg in &metadata.packages {
         if pkg.source.is_none() {
             // No need to check local packages.
@@ -695,7 +833,8 @@ fn check_runtime_license_exceptions(metadata: &Metadata, bad: &mut bool) {
         let license = match &pkg.license {
             Some(license) => license,
             None => {
-                tidy_error!(bad, "dependency `{}` does not define a license expression", pkg.id);
+                check
+                    .error(format!("dependency `{}` does not define a license expression", pkg.id));
                 continue;
             }
         };
@@ -708,7 +847,7 @@ fn check_runtime_license_exceptions(metadata: &Metadata, bad: &mut bool) {
                 continue;
             }
 
-            tidy_error!(bad, "invalid license `{}` in `{}`", license, pkg.id);
+            check.error(format!("invalid license `{}` in `{}`", license, pkg.id));
         }
     }
 }
@@ -720,40 +859,40 @@ fn check_license_exceptions(
     metadata: &Metadata,
     workspace: &str,
     exceptions: &[(&str, &str)],
-    bad: &mut bool,
+    check: &RunningCheck,
 ) {
     // Validate the EXCEPTIONS list hasn't changed.
     for (name, license) in exceptions {
         // Check that the package actually exists.
         if !metadata.packages.iter().any(|p| *p.name == *name) {
-            tidy_error!(
-                bad,
-                "could not find exception package `{}` in workspace `{workspace}`\n\
+            check.error(format!(
+                "could not find exception package `{name}` in workspace `{workspace}`\n\
                 Remove from EXCEPTIONS list if it is no longer used.",
-                name
-            );
+            ));
         }
         // Check that the license hasn't changed.
         for pkg in metadata.packages.iter().filter(|p| *p.name == *name) {
             match &pkg.license {
                 None => {
-                    tidy_error!(
-                        bad,
+                    check.error(format!(
                         "dependency exception `{}` in workspace `{workspace}` does not declare a license expression",
                         pkg.id
-                    );
+                    ));
                 }
                 Some(pkg_license) => {
                     if pkg_license.as_str() != *license {
-                        println!(
-                            "dependency exception `{name}` license in workspace `{workspace}` has changed"
-                        );
-                        println!("    previously `{license}` now `{pkg_license}`");
-                        println!("    update EXCEPTIONS for the new license");
-                        *bad = true;
+                        check.error(format!(r#"dependency exception `{name}` license in workspace `{workspace}` has changed
+    previously `{license}` now `{pkg_license}`
+    update EXCEPTIONS for the new license
+"#));
                     }
                 }
             }
+        }
+        if LICENSES.contains(license) || LICENSES_TOOLS.contains(license) {
+            check.error(format!(
+                "dependency exception `{name}` is not necessary. `{license}` is an allowed license"
+            ));
         }
     }
 
@@ -771,21 +910,47 @@ fn check_license_exceptions(
         let license = match &pkg.license {
             Some(license) => license,
             None => {
-                tidy_error!(
-                    bad,
+                check.error(format!(
                     "dependency `{}` in workspace `{workspace}` does not define a license expression",
                     pkg.id
-                );
+                ));
                 continue;
             }
         };
-        if !LICENSES.contains(&license.as_str()) {
-            tidy_error!(
-                bad,
+        if !LICENSES.contains(&license.as_str()) && !LICENSES_TOOLS.contains(&license.as_str()) {
+            check.error(format!(
                 "invalid license `{}` for package `{}` in workspace `{workspace}`",
-                license,
-                pkg.id
-            );
+                license, pkg.id
+            ));
+        }
+    }
+}
+
+fn check_runtime_no_duplicate_dependencies(metadata: &Metadata, check: &RunningCheck) {
+    let mut seen_pkgs = HashSet::new();
+    for pkg in &metadata.packages {
+        if pkg.source.is_none() {
+            continue;
+        }
+
+        if !seen_pkgs.insert(&*pkg.name) {
+            check.error(format!(
+                "duplicate package `{}` is not allowed for the standard library",
+                pkg.name
+            ));
+        }
+    }
+}
+
+fn check_runtime_no_proc_macros(metadata: &Metadata, check: &RunningCheck) {
+    for pkg in &metadata.packages {
+        if pkg.targets.iter().any(|target| target.is_proc_macro()) {
+            check.error(format!(
+                "proc macro `{}` is not allowed as standard library dependency.\n\
+                Using proc macros in the standard library would break cross-compilation \
+                as proc-macros don't get shipped for the host tuple.",
+                pkg.name
+            ));
         }
     }
 }
@@ -798,14 +963,21 @@ fn check_permitted_dependencies(
     metadata: &Metadata,
     descr: &str,
     permitted_dependencies: &[&'static str],
-    restricted_dependency_crates: &[&'static str],
-    bad: &mut bool,
+    restricted_dependency_crates: Option<&[&'static str]>,
+    permitted_location: ListLocation,
+    check: &RunningCheck,
 ) {
     let mut has_permitted_dep_error = false;
     let mut deps = HashSet::new();
-    for to_check in restricted_dependency_crates {
-        let to_check = pkg_from_name(metadata, to_check);
-        deps_of(metadata, &to_check.id, &mut deps);
+    if let Some(restricted_dependency_crates) = restricted_dependency_crates {
+        for to_check in restricted_dependency_crates {
+            let to_check = pkg_from_name(metadata, to_check);
+            deps_of(metadata, &to_check.id, &mut deps);
+        }
+    } else {
+        for to_check in &metadata.packages {
+            deps_of(metadata, &to_check.id, &mut deps);
+        }
     }
 
     // Check that the PERMITTED_DEPENDENCIES does not have unused entries.
@@ -821,11 +993,10 @@ fn check_permitted_dependencies(
             }
         }
         if !deps.iter().any(|dep_id| compare(pkg_from_id(metadata, dep_id), permitted)) {
-            tidy_error!(
-                bad,
+            check.error(format!(
                 "could not find allowed package `{permitted}`\n\
                 Remove from PERMITTED_DEPENDENCIES list if it is no longer used.",
-            );
+            ));
             has_permitted_dep_error = true;
         }
     }
@@ -852,14 +1023,14 @@ fn check_permitted_dependencies(
                 false
             };
             if !is_eq {
-                tidy_error!(bad, "Dependency for {descr} not explicitly permitted: {}", dep.id);
+                check.error(format!("Dependency for {descr} not explicitly permitted: {}", dep.id));
                 has_permitted_dep_error = true;
             }
         }
     }
 
     if has_permitted_dep_error {
-        eprintln!("Go to `{PERMITTED_DEPS_LOCATION}` for the list.");
+        eprintln!("Go to `{}:{}` for the list.", permitted_location.path, permitted_location.line);
     }
 }
 
