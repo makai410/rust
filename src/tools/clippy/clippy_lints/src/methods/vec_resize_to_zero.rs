@@ -1,12 +1,11 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::MaybeDef as _;
 use rustc_ast::LitKind;
 use rustc_data_structures::packed::Pu128;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
-use rustc_span::source_map::Spanned;
-use rustc_span::{Span, sym};
+use rustc_span::{Span, Spanned, sym};
 
 use super::VEC_RESIZE_TO_ZERO;
 
@@ -19,7 +18,12 @@ pub(super) fn check<'tcx>(
 ) {
     if let Some(method_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
         && let Some(impl_id) = cx.tcx.impl_of_assoc(method_id)
-        && is_type_diagnostic_item(cx, cx.tcx.type_of(impl_id).instantiate_identity(), sym::Vec)
+        && cx
+            .tcx
+            .type_of(impl_id)
+            .instantiate_identity()
+            .skip_norm_wip()
+            .is_diag_item(cx, sym::Vec)
         && let ExprKind::Lit(Spanned {
             node: LitKind::Int(Pu128(0), _),
             ..

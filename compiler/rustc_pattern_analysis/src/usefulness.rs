@@ -169,7 +169,7 @@
 //! on pattern-tuples.
 //!
 //! Let `pt_1, .., pt_n` and `qt` be length-m tuples of patterns for the same type `(T_1, .., T_m)`.
-//! We compute `usefulness(tp_1, .., tp_n, tq)` as follows:
+//! We compute `usefulness(pt_1, .., pt_n, qt)` as follows:
 //!
 //! - Base case: `m == 0`.
 //!     The pattern-tuples are all empty, i.e. they're all `()`. Thus `tq` is useful iff there are
@@ -710,8 +710,6 @@
 
 use std::fmt;
 
-#[cfg(feature = "rustc")]
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::DenseBitSet;
 use smallvec::{SmallVec, smallvec};
@@ -721,10 +719,6 @@ use self::PlaceValidity::*;
 use crate::constructor::{Constructor, ConstructorSet, IntRange};
 use crate::pat::{DeconstructedPat, PatId, PatOrWild, WitnessPat};
 use crate::{MatchArm, PatCx, PrivateUninhabitedField, checks};
-#[cfg(not(feature = "rustc"))]
-pub fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
-    f()
-}
 
 /// A pattern is a "branch" if it is the immediate child of an or-pattern, or if it is the whole
 /// pattern of a match arm. These are the patterns that can be meaningfully considered "redundant",
@@ -824,7 +818,7 @@ struct PlaceCtxt<'a, Cx: PatCx> {
 impl<'a, Cx: PatCx> Copy for PlaceCtxt<'a, Cx> {}
 impl<'a, Cx: PatCx> Clone for PlaceCtxt<'a, Cx> {
     fn clone(&self) -> Self {
-        Self { cx: self.cx, ty: self.ty }
+        *self
     }
 }
 
@@ -1752,9 +1746,7 @@ fn compute_exhaustiveness_and_usefulness<'a, 'p, Cx: PatCx>(
             || missing_ctors.is_empty()
             || mcx.tycx.exhaustive_witnesses();
         let mut spec_matrix = matrix.specialize_constructor(pcx, &ctor, ctor_is_relevant)?;
-        let mut witnesses = ensure_sufficient_stack(|| {
-            compute_exhaustiveness_and_usefulness(mcx, &mut spec_matrix)
-        })?;
+        let mut witnesses = compute_exhaustiveness_and_usefulness(mcx, &mut spec_matrix)?;
 
         // Transform witnesses for `spec_matrix` into witnesses for `matrix`.
         witnesses.apply_constructor(pcx, &missing_ctors, &ctor);

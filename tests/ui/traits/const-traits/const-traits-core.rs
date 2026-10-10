@@ -1,6 +1,13 @@
-//@ run-pass
+//@ check-pass
 #![feature(
-    const_trait_impl, const_default, ptr_alignment_type, ascii_char, f16, f128, sync_unsafe_cell,
+    const_clone,
+    const_default,
+    const_trait_impl,
+    ptr_alignment_type,
+    ascii_char,
+    f16,
+    f128,
+    sync_unsafe_cell,
 )]
 #![allow(dead_code)]
 // core::default
@@ -29,8 +36,8 @@ const PHANTOM: std::marker::PhantomData<()> = Default::default();
 const OPT: Option<i32> = Default::default();
 // core::iter::sources::empty
 const EMPTY: std::iter::Empty<()> = Default::default();
-// core::ptr::alignment
-const ALIGNMENT: std::ptr::Alignment = Default::default();
+// core::mem::alignment
+const ALIGNMENT: std::mem::Alignment = Default::default();
 // core::slice
 const SLICE: &[()] = Default::default();
 const MUT_SLICE: &mut [()] = Default::default();
@@ -42,5 +49,9 @@ const CELL: std::cell::Cell<()> = Default::default();
 const REF_CELL: std::cell::RefCell<()> = Default::default();
 const UNSAFE_CELL: std::cell::UnsafeCell<()> = Default::default();
 const SYNC_UNSAFE_CELL: std::cell::SyncUnsafeCell<()> = Default::default();
+
+// `Clone` for tuples
+const BUILTIN_CLONE: () = ().clone();
+const BUILTIN_CLONE_2: (u32, i32) = (42, 100).clone();
 
 fn main() {}

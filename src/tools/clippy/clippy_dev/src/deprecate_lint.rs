@@ -1,4 +1,5 @@
-use crate::update_lints::{DeprecatedLint, Lint, find_lint_decls, generate_lint_files, read_deprecated_lints};
+use crate::parse::{DeprecatedLint, Lint, ParseCx, RenamedLint};
+use crate::update_lints::generate_lint_files;
 use crate::utils::{UpdateMode, Version};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -13,21 +14,20 @@ use std::{fs, io};
 /// # Panics
 ///
 /// If a file path could not read from or written to
-pub fn deprecate(clippy_version: Version, name: &str, reason: &str) {
-    if let Some((prefix, _)) = name.split_once("::") {
-        panic!("`{name}` should not contain the `{prefix}` prefix");
-    }
-
-    let mut lints = find_lint_decls();
-    let (mut deprecated_lints, renamed_lints) = read_deprecated_lints();
+pub fn deprecate<'cx>(cx: ParseCx<'cx>, clippy_version: Version, name: &'cx str, reason: &'cx str) {
+    let mut lints = cx.find_lint_decls();
+    let (mut deprecated_lints, renamed_lints) = cx.read_deprecated_lints();
 
     let Some(lint) = lints.iter().find(|l| l.name == name) else {
         eprintln!("error: failed to find lint `{name}`");
         return;
     };
 
-    let prefixed_name = String::from_iter(["clippy::", name]);
-    match deprecated_lints.binary_search_by(|x| x.name.cmp(&prefixed_name)) {
+    let prefixed_name = cx.str_buf.with(|buf| {
+        buf.extend(["clippy::", name]);
+        cx.arena.alloc_str(buf)
+    });
+    match deprecated_lints.binary_search_by(|x| x.name.cmp(prefixed_name)) {
         Ok(_) => {
             println!("`{name}` is already deprecated");
             return;
@@ -36,8 +36,8 @@ pub fn deprecate(clippy_version: Version, name: &str, reason: &str) {
             idx,
             DeprecatedLint {
                 name: prefixed_name,
-                reason: reason.into(),
-                version: clippy_version.rust_display().to_string(),
+                reason,
+                version: cx.str_buf.alloc_display(cx.arena, clippy_version.rust_display()),
             },
         ),
     }
@@ -55,14 +55,66 @@ pub fn deprecate(clippy_version: Version, name: &str, reason: &str) {
     if remove_lint_declaration(name, &mod_path, &mut lints).unwrap_or(false) {
         generate_lint_files(UpdateMode::Change, &lints, &deprecated_lints, &renamed_lints);
         println!("info: `{name}` has successfully been deprecated");
-        println!("note: you must run `cargo uitest` to update the test results");
+        println!("note: you must run `cargo uibless` to update the test results");
     } else {
         eprintln!("error: lint not found");
     }
 }
 
-fn remove_lint_declaration(name: &str, path: &Path, lints: &mut Vec<Lint>) -> io::Result<bool> {
-    fn remove_lint(name: &str, lints: &mut Vec<Lint>) {
+pub fn uplift<'cx, 'env: 'cx>(cx: ParseCx<'cx>, clippy_version: Version, old_name: &'env str, new_name: &'env str) {
+    let mut lints = cx.find_lint_decls();
+    let (deprecated_lints, mut renamed_lints) = cx.read_deprecated_lints();
+
+    let Some(lint) = lints.iter().find(|l| l.name == old_name) else {
+        eprintln!("error: failed to find lint `{old_name}`");
+        return;
+    };
+
+    let old_name_prefixed = cx.str_buf.with(|buf| {
+        buf.extend(["clippy::", old_name]);
+        cx.arena.alloc_str(buf)
+    });
+    for lint in &mut renamed_lints {
+        if lint.new_name == old_name_prefixed {
+            lint.new_name = new_name;
+        }
+    }
+    match renamed_lints.binary_search_by(|x| x.old_name.cmp(old_name_prefixed)) {
+        Ok(_) => {
+            println!("`{old_name}` is already deprecated");
+            return;
+        },
+        Err(idx) => renamed_lints.insert(
+            idx,
+            RenamedLint {
+                old_name: old_name_prefixed,
+                new_name,
+                version: cx.str_buf.alloc_display(cx.arena, clippy_version.rust_display()),
+            },
+        ),
+    }
+
+    let mod_path = {
+        let mut mod_path = PathBuf::from(format!("clippy_lints/src/{}", lint.module));
+        if mod_path.is_dir() {
+            mod_path = mod_path.join("mod");
+        }
+
+        mod_path.set_extension("rs");
+        mod_path
+    };
+
+    if remove_lint_declaration(old_name, &mod_path, &mut lints).unwrap_or(false) {
+        generate_lint_files(UpdateMode::Change, &lints, &deprecated_lints, &renamed_lints);
+        println!("info: `{old_name}` has successfully been uplifted");
+        println!("note: you must run `cargo uibless` to update the test results");
+    } else {
+        eprintln!("error: lint not found");
+    }
+}
+
+fn remove_lint_declaration(name: &str, path: &Path, lints: &mut Vec<Lint<'_>>) -> io::Result<bool> {
+    fn remove_lint(name: &str, lints: &mut Vec<Lint<'_>>) {
         lints.iter().position(|l| l.name == name).map(|pos| lints.remove(pos));
     }
 
@@ -135,14 +187,14 @@ fn remove_lint_declaration(name: &str, path: &Path, lints: &mut Vec<Lint>) -> io
             );
 
             assert!(
-                content[lint.declaration_range.clone()].contains(&name.to_uppercase()),
+                content[lint.declaration_range].contains(&name.to_uppercase()),
                 "error: `{}` does not contain lint `{}`'s declaration",
                 path.display(),
                 lint.name
             );
 
             // Remove lint declaration (declare_clippy_lint!)
-            content.replace_range(lint.declaration_range.clone(), "");
+            content.replace_range(lint.declaration_range, "");
 
             // Remove the module declaration (mod xyz;)
             let mod_decl = format!("\nmod {name};");

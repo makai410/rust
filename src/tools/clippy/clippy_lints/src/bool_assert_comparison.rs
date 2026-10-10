@@ -1,14 +1,14 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::macros::{find_assert_eq_args, root_macro_call_first_node};
+use clippy_utils::source::walk_span_to_context;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::sym;
 use clippy_utils::ty::{implements_trait, is_copy};
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, Lit};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::ty::{self, Ty};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, declare_lint_pass};
+use rustc_middle::ty::{self, Ty, Unnormalized};
 use rustc_span::symbol::Ident;
 
 declare_clippy_lint! {
@@ -62,8 +62,10 @@ fn is_impl_not_trait_with_bool_out<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -
             )
         })
         .is_some_and(|assoc_item| {
-            let proj = Ty::new_projection(cx.tcx, assoc_item.def_id, cx.tcx.mk_args_trait(ty, []));
-            let nty = cx.tcx.normalize_erasing_regions(cx.typing_env(), proj);
+            let proj = Ty::new_projection(cx.tcx, ty::IsRigid::No, assoc_item.def_id, cx.tcx.mk_args_trait(ty, []));
+            let nty = cx
+                .tcx
+                .normalize_erasing_regions(cx.typing_env(), Unnormalized::new_wip(proj));
 
             nty.is_bool()
         })
@@ -130,22 +132,24 @@ impl<'tcx> LateLintPass<'tcx> for BoolAssertComparison {
 
                 let mut suggestions = vec![(name_span, non_eq_mac.to_string()), (lit_span, String::new())];
 
-                if let Some(sugg) = Sugg::hir_opt(cx, non_lit_expr) {
-                    let sugg = if bool_value ^ eq_macro {
-                        !sugg.maybe_paren()
-                    } else if ty::Bool == *non_lit_ty.kind() {
-                        sugg
-                    } else {
-                        !!sugg.maybe_paren()
-                    };
-                    suggestions.push((non_lit_expr.span, sugg.to_string()));
+                let mut applicability = Applicability::MachineApplicable;
+                let sugg = Sugg::hir_with_context(cx, non_lit_expr, macro_call.span.ctxt(), "..", &mut applicability);
+                let sugg = if bool_value ^ eq_macro {
+                    !sugg.maybe_paren()
+                } else if ty::Bool == *non_lit_ty.kind() {
+                    sugg
+                } else {
+                    !!sugg.maybe_paren()
+                };
+                let non_lit_expr_span =
+                    walk_span_to_context(non_lit_expr.span, macro_call.span.ctxt()).unwrap_or(non_lit_expr.span);
+                suggestions.push((non_lit_expr_span, sugg.to_string()));
 
-                    diag.multipart_suggestion(
-                        format!("replace it with `{non_eq_mac}!(..)`"),
-                        suggestions,
-                        Applicability::MachineApplicable,
-                    );
-                }
+                diag.multipart_suggestion(
+                    format!("replace it with `{non_eq_mac}!(..)`"),
+                    suggestions,
+                    applicability,
+                );
             },
         );
     }

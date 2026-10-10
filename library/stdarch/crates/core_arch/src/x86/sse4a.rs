@@ -6,7 +6,7 @@ use crate::core_arch::{simd::*, x86::*};
 use stdarch_test::assert_instr;
 
 #[allow(improper_ctypes)]
-unsafe extern "C" {
+unsafe extern "llvm-intrinsic" {
     #[link_name = "llvm.x86.sse4a.extrq"]
     fn extrq(x: i64x2, y: i8x16) -> i64x2;
     #[link_name = "llvm.x86.sse4a.extrqi"]
@@ -15,10 +15,6 @@ unsafe extern "C" {
     fn insertq(x: i64x2, y: i64x2) -> i64x2;
     #[link_name = "llvm.x86.sse4a.insertqi"]
     fn insertqi(x: i64x2, y: i64x2, len: u8, idx: u8) -> i64x2;
-    #[link_name = "llvm.x86.sse4a.movnt.sd"]
-    fn movntsd(x: *mut f64, y: __m128d);
-    #[link_name = "llvm.x86.sse4a.movnt.ss"]
-    fn movntss(x: *mut f32, y: __m128);
 }
 
 /// Extracts the bit range specified by `y` from the lower 64 bits of `x`.
@@ -32,6 +28,11 @@ unsafe extern "C" {
 ///
 /// If `length == 0 && index > 0` or `length + index > 64` the result is
 /// undefined.
+///
+/// The extracted bits are saved in the least-significant bit positions of the lower
+/// quadword of the destination; the remaining bits in the lower quadword of the
+/// destination register are cleared to 0. The upper quadword of the destination
+/// register is undefined.
 #[inline]
 #[target_feature(enable = "sse4a")]
 #[cfg_attr(test, assert_instr(extrq))]
@@ -47,7 +48,10 @@ pub fn _mm_extract_si64(x: __m128i, y: __m128i) -> __m128i {
 /// and index are both zero, bits `[63:0]` of parameter `x` are extracted. It is a compile-time error
 /// for `len + idx` to be greater than 64 or for `len` to be zero and `idx` to be non-zero.
 ///
-/// Returns a 128-bit integer vector whose lower 64 bits contain the extracted bits.
+/// The extracted bits are saved in the least-significant bit positions of the lower
+/// quadword of the destination; the remaining bits in the lower quadword of the
+/// destination register are cleared to 0. The upper quadword of the destination
+/// register is undefined.
 #[inline]
 #[target_feature(enable = "sse4a")]
 #[cfg_attr(test, assert_instr(extrq, LEN = 5, IDX = 5))]
@@ -70,6 +74,8 @@ pub fn _mm_extracti_si64<const LEN: i32, const IDX: i32>(x: __m128i) -> __m128i 
 ///
 /// If the `length` is zero it is interpreted as `64`. If `index + length > 64`
 /// or `index > 0 && length == 0` the result is undefined.
+///
+/// The upper 64 bits of the destination are undefined.
 #[inline]
 #[target_feature(enable = "sse4a")]
 #[cfg_attr(test, assert_instr(insertq))]
@@ -84,6 +90,8 @@ pub fn _mm_insert_si64(x: __m128i, y: __m128i) -> __m128i {
 /// `idx` specifies the index of the LSB. `len` specifies the number of bits to insert. If length and index
 /// are both zero, bits `[63:0]` of parameter `x` are replaced with bits `[63:0]` of parameter `y`. It is a
 /// compile-time error for `len + idx` to be greater than 64 or for `len` to be zero and `idx` to be non-zero.
+///
+/// The upper 64 bits of the destination are undefined.
 #[inline]
 #[target_feature(enable = "sse4a")]
 #[cfg_attr(test, assert_instr(insertq, LEN = 5, IDX = 5))]
@@ -114,7 +122,13 @@ pub fn _mm_inserti_si64<const LEN: i32, const IDX: i32>(x: __m128i, y: __m128i) 
 #[cfg_attr(test, assert_instr(movntsd))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
 pub unsafe fn _mm_stream_sd(p: *mut f64, a: __m128d) {
-    movntsd(p, a);
+    // see #1541, we should use inline asm to be sure, because LangRef isn't clear enough
+    crate::arch::asm!(
+        vps!("movntsd",  ",{a}"),
+        p = in(reg) p,
+        a = in(xmm_reg) a,
+        options(nostack, preserves_flags),
+    );
 }
 
 /// Non-temporal store of `a.0` into `p`.
@@ -134,7 +148,13 @@ pub unsafe fn _mm_stream_sd(p: *mut f64, a: __m128d) {
 #[cfg_attr(test, assert_instr(movntss))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
 pub unsafe fn _mm_stream_ss(p: *mut f32, a: __m128) {
-    movntss(p, a);
+    // see #1541, we should use inline asm to be sure, because LangRef isn't clear enough
+    crate::arch::asm!(
+        vps!("movntss",  ",{a}"),
+        p = in(reg) p,
+        a = in(xmm_reg) a,
+        options(nostack, preserves_flags),
+    );
 }
 
 #[cfg(test)]
@@ -142,8 +162,13 @@ mod tests {
     use crate::core_arch::x86::*;
     use stdarch_test::simd_test;
 
+    // Normally this requires SSE2, but for tests it does not matter whether we use the instruction.
+    fn _mm_cvtsi128_si64(a: __m128i) -> i64 {
+        unsafe { simd_extract!(a.as_i64x2(), 0) }
+    }
+
     #[simd_test(enable = "sse4a")]
-    unsafe fn test_mm_extract_si64() {
+    fn test_mm_extract_si64() {
         let b = 0b0110_0000_0000_i64;
         //        ^^^^ bit range extracted
         let x = _mm_setr_epi64x(b, 0);
@@ -152,19 +177,27 @@ mod tests {
         let y = _mm_setr_epi64x(v, 0);
         let e = _mm_setr_epi64x(0b0110_i64, 0);
         let r = _mm_extract_si64(x, y);
-        assert_eq_m128i(r, e);
+
+        // The upper quadword of the destination register is undefined.
+        let r = _mm_cvtsi128_si64(r);
+        let e = _mm_cvtsi128_si64(e);
+        assert_eq!(r, e);
     }
 
     #[simd_test(enable = "sse4a")]
-    unsafe fn test_mm_extracti_si64() {
+    fn test_mm_extracti_si64() {
         let a = _mm_setr_epi64x(0x0123456789abcdef, 0);
         let r = _mm_extracti_si64::<8, 8>(a);
         let e = _mm_setr_epi64x(0xcd, 0);
-        assert_eq_m128i(r, e);
+
+        // The upper quadword of the destination register is undefined.
+        let r = _mm_cvtsi128_si64(r);
+        let e = _mm_cvtsi128_si64(e);
+        assert_eq!(r, e);
     }
 
     #[simd_test(enable = "sse4a")]
-    unsafe fn test_mm_insert_si64() {
+    fn test_mm_insert_si64() {
         let i = 0b0110_i64;
         //        ^^^^ bit range inserted
         let z = 0b1010_1010_1010i64;
@@ -177,16 +210,24 @@ mod tests {
         //        ^idx: 2^3 = 8 ^length = 2^2 = 4
         let y = _mm_setr_epi64x(i, v);
         let r = _mm_insert_si64(x, y);
-        assert_eq_m128i(r, expected);
+
+        // The upper quadword of the destination register is undefined.
+        let r = _mm_cvtsi128_si64(r);
+        let expected = _mm_cvtsi128_si64(expected);
+        assert_eq!(r, expected);
     }
 
     #[simd_test(enable = "sse4a")]
-    unsafe fn test_mm_inserti_si64() {
+    fn test_mm_inserti_si64() {
         let a = _mm_setr_epi64x(0x0123456789abcdef, 0);
         let b = _mm_setr_epi64x(0x0011223344556677, 0);
         let r = _mm_inserti_si64::<8, 8>(a, b);
         let e = _mm_setr_epi64x(0x0123456789ab77ef, 0);
-        assert_eq_m128i(r, e);
+
+        // The upper quadword of the destination register is undefined.
+        let r = _mm_cvtsi128_si64(r);
+        let e = _mm_cvtsi128_si64(e);
+        assert_eq!(r, e);
     }
 
     #[repr(align(16))]
@@ -198,7 +239,7 @@ mod tests {
     // Miri cannot support this until it is clear how it fits in the Rust memory model
     // (non-temporal store)
     #[cfg_attr(miri, ignore)]
-    unsafe fn test_mm_stream_sd() {
+    fn test_mm_stream_sd() {
         let mut mem = MemoryF64 {
             data: [1.0_f64, 2.0],
         };
@@ -208,7 +249,10 @@ mod tests {
 
             let x = _mm_setr_pd(3.0, 4.0);
 
-            _mm_stream_sd(d, x);
+            unsafe {
+                _mm_stream_sd(d, x);
+            }
+            _mm_sfence();
         }
         assert_eq!(mem.data[0], 3.0);
         assert_eq!(mem.data[1], 2.0);
@@ -223,7 +267,7 @@ mod tests {
     // Miri cannot support this until it is clear how it fits in the Rust memory model
     // (non-temporal store)
     #[cfg_attr(miri, ignore)]
-    unsafe fn test_mm_stream_ss() {
+    fn test_mm_stream_ss() {
         let mut mem = MemoryF32 {
             data: [1.0_f32, 2.0, 3.0, 4.0],
         };
@@ -233,7 +277,10 @@ mod tests {
 
             let x = _mm_setr_ps(5.0, 6.0, 7.0, 8.0);
 
-            _mm_stream_ss(d, x);
+            unsafe {
+                _mm_stream_ss(d, x);
+            }
+            _mm_sfence();
         }
         assert_eq!(mem.data[0], 5.0);
         assert_eq!(mem.data[1], 2.0);

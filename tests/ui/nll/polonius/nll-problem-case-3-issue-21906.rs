@@ -8,6 +8,7 @@
 //@ ignore-compare-mode-polonius (explicit revisions)
 //@ revisions: nll polonius legacy
 //@ [nll] known-bug: #21906
+//@ [nll] compile-flags: -Z polonius=off
 //@ [polonius] check-pass
 //@ [polonius] compile-flags: -Z polonius=next
 //@ [legacy] check-pass
@@ -26,6 +27,26 @@ fn from_the_rfc<'r, K: Hash + Eq + Copy, V: Default>(
             map.insert(key, V::default());
             map.get_mut(&key).unwrap()
         }
+    }
+}
+
+// A variant that's similar to the RFC example above, but using the entry API, and requested in
+// https://internals.rust-lang.org/t/get-mut-map-back-from-entry-api/24003
+fn get_priority_mut_entry<'a, K, V>(
+    map: &'a mut HashMap<K, V>,
+    key1: K,
+    key2: K,
+) -> Option<&'a mut V>
+where
+    K: Eq + Hash,
+{
+    use std::collections::hash_map::Entry;
+    match map.entry(key1) {
+        Entry::Occupied(occupied) => Some(occupied.into_mut()),
+        Entry::Vacant(_vacant) => match map.entry(key2) {
+            Entry::Occupied(occupied2) => Some(occupied2.into_mut()),
+            Entry::Vacant(_) => None,
+        },
     }
 }
 

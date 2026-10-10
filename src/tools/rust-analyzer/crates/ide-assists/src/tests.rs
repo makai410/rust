@@ -1,7 +1,7 @@
 mod generated;
 
 use expect_test::expect;
-use hir::Semantics;
+use hir::{Semantics, db::HirDatabase, setup_tracing};
 use ide_db::{
     EditionedFileId, FileRange, RootDatabase, SnippetCap,
     assists::ExprFillDefaultMode,
@@ -16,7 +16,7 @@ use test_utils::{assert_eq_text, extract_offset};
 
 use crate::{
     Assist, AssistConfig, AssistContext, AssistKind, AssistResolveStrategy, Assists, SingleResolve,
-    assists, handlers::Handler,
+    handlers::Handler,
 };
 
 pub(crate) const TEST_CONFIG: AssistConfig = AssistConfig {
@@ -34,10 +34,10 @@ pub(crate) const TEST_CONFIG: AssistConfig = AssistConfig {
     prefer_absolute: false,
     assist_emit_must_use: false,
     term_search_fuel: 400,
-    term_search_borrowck: true,
     code_action_grouping: true,
     expr_fill_default: ExprFillDefaultMode::Todo,
     prefer_self_ty: false,
+    show_rename_conflicts: true,
 };
 
 pub(crate) const TEST_CONFIG_NO_GROUPING: AssistConfig = AssistConfig {
@@ -55,10 +55,10 @@ pub(crate) const TEST_CONFIG_NO_GROUPING: AssistConfig = AssistConfig {
     prefer_absolute: false,
     assist_emit_must_use: false,
     term_search_fuel: 400,
-    term_search_borrowck: true,
     code_action_grouping: false,
     expr_fill_default: ExprFillDefaultMode::Todo,
     prefer_self_ty: false,
+    show_rename_conflicts: true,
 };
 
 pub(crate) const TEST_CONFIG_NO_SNIPPET_CAP: AssistConfig = AssistConfig {
@@ -76,10 +76,10 @@ pub(crate) const TEST_CONFIG_NO_SNIPPET_CAP: AssistConfig = AssistConfig {
     prefer_absolute: false,
     assist_emit_must_use: false,
     term_search_fuel: 400,
-    term_search_borrowck: true,
     code_action_grouping: true,
     expr_fill_default: ExprFillDefaultMode::Todo,
     prefer_self_ty: false,
+    show_rename_conflicts: true,
 };
 
 pub(crate) const TEST_CONFIG_IMPORT_ONE: AssistConfig = AssistConfig {
@@ -97,11 +97,23 @@ pub(crate) const TEST_CONFIG_IMPORT_ONE: AssistConfig = AssistConfig {
     prefer_absolute: false,
     assist_emit_must_use: false,
     term_search_fuel: 400,
-    term_search_borrowck: true,
     code_action_grouping: true,
     expr_fill_default: ExprFillDefaultMode::Todo,
     prefer_self_ty: false,
+    show_rename_conflicts: true,
 };
+
+fn assists(
+    db: &RootDatabase,
+    config: &AssistConfig,
+    resolve: AssistResolveStrategy,
+    range: ide_db::FileRange,
+) -> Vec<Assist> {
+    hir::attach_db(db, || {
+        HirDatabase::zalsa_register_downcaster(db);
+        crate::assists(db, config, resolve, range)
+    })
+}
 
 pub(crate) fn with_single_file(text: &str) -> (RootDatabase, EditionedFileId) {
     RootDatabase::with_single_file(text)
@@ -168,6 +180,7 @@ pub(crate) fn check_assist_import_one(
 
 // There is no way to choose what assist within a group you want to test against,
 // so this is here to allow you choose.
+#[track_caller]
 pub(crate) fn check_assist_by_label(
     assist: Handler,
     #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
@@ -188,6 +201,15 @@ pub(crate) fn check_assist_target(
     target: &str,
 ) {
     check(assist, ra_fixture, ExpectedResult::Target(target), None);
+}
+
+#[track_caller]
+pub(crate) fn check_assist_with_label(
+    assist: Handler,
+    #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    label: &str,
+) {
+    check(assist, ra_fixture, ExpectedResult::Label(label), None);
 }
 
 #[track_caller]
@@ -290,6 +312,7 @@ enum ExpectedResult<'a> {
     Unresolved,
     After(&'a str),
     Target(&'a str),
+    Label(&'a str),
 }
 
 #[track_caller]
@@ -305,22 +328,28 @@ fn check_with_config(
     expected: ExpectedResult<'_>,
     assist_label: Option<&str>,
 ) {
+    let _tracing = setup_tracing();
     let (mut db, file_with_caret_id, range_or_offset) = RootDatabase::with_range_or_offset(before);
     db.enable_proc_attr_macros();
+    let sema = Semantics::new(&db);
+    let file_with_caret_id = sema
+        .attach_first_edition_opt(file_with_caret_id.file_id(&db))
+        .unwrap_or(file_with_caret_id);
     let text_without_caret = db.file_text(file_with_caret_id.file_id(&db)).text(&db).to_string();
 
     let frange = hir::FileRange { file_id: file_with_caret_id, range: range_or_offset.into() };
 
-    let sema = Semantics::new(&db);
     let ctx = AssistContext::new(sema, &config, frange);
     let resolve = match expected {
-        ExpectedResult::Unresolved => AssistResolveStrategy::None,
+        ExpectedResult::Unresolved | ExpectedResult::Label(_) => AssistResolveStrategy::None,
         _ => AssistResolveStrategy::All,
     };
     let mut acc = Assists::new(&ctx, resolve);
-    handler(&mut acc, &ctx);
+    hir::attach_db(&db, || {
+        HirDatabase::zalsa_register_downcaster(&db);
+        handler(&mut acc, &ctx);
+    });
     let mut res = acc.finish();
-
     let assist = match assist_label {
         Some(label) => res.into_iter().find(|resolved| resolved.label == label),
         None if res.is_empty() => None,
@@ -380,6 +409,9 @@ fn check_with_config(
             let range = assist.target;
             assert_eq_text!(&text_without_caret[range], target);
         }
+        (Some(assist), ExpectedResult::Label(label)) => {
+            assert_eq!(assist.label.to_string(), label);
+        }
         (Some(assist), ExpectedResult::Unresolved) => assert!(
             assist.source_change.is_none(),
             "unresolved assist should not contain source changes"
@@ -387,7 +419,10 @@ fn check_with_config(
         (Some(_), ExpectedResult::NotApplicable) => panic!("assist should not be applicable!"),
         (
             None,
-            ExpectedResult::After(_) | ExpectedResult::Target(_) | ExpectedResult::Unresolved,
+            ExpectedResult::After(_)
+            | ExpectedResult::Target(_)
+            | ExpectedResult::Label(_)
+            | ExpectedResult::Unresolved,
         ) => {
             panic!("code action is not applicable")
         }
@@ -453,9 +488,38 @@ pub fn test_some_range(a: int) -> bool {
     let expected = labels(&assists);
 
     expect![[r#"
-        Convert integer base
         Extract into...
         Replace if let with match
+        Convert to guarded return
+    "#]]
+    .assert_eq(&expected);
+}
+
+#[test]
+fn assist_order_term_search_unknown_type() {
+    let (db, frange) = RootDatabase::with_range(
+        r#"
+//- minicore: todo, unimplemented
+fn foo(_: u32) -> i32 { 2 }
+fn main() {
+    let unknown;
+    let _: i32 = $0todo!()$0;
+}
+"#,
+    );
+
+    let assists = assists(
+        &db,
+        &TEST_CONFIG,
+        AssistResolveStrategy::None,
+        FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
+    );
+    let expected = labels(&assists);
+
+    expect![[r#"
+        Inline macro
+        Extract into...
+        Extract Module
     "#]]
     .assert_eq(&expected);
 }
@@ -486,9 +550,9 @@ pub fn test_some_range(a: int) -> bool {
         let expected = labels(&assists);
 
         expect![[r#"
-            Convert integer base
             Extract into...
             Replace if let with match
+            Convert to guarded return
         "#]]
         .assert_eq(&expected);
     }

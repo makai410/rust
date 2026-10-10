@@ -1,12 +1,13 @@
+use std::cmp;
 use std::fmt::Write;
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir as hir;
 use rustc_hir::HirId;
 use rustc_hir::def_id::LocalDefId;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_span::def_id::LocalDefIdMap;
-use rustc_span::{Ident, Span, Symbol};
+use rustc_span::{Ident, Span, Symbol, bug};
 
 use super::TyCtxt;
 use crate::hir::place::{
@@ -17,9 +18,9 @@ use crate::{mir, ty};
 
 /// Captures are represented using fields inside a structure.
 /// This represents accessing self in the closure structure
-pub const CAPTURE_STRUCT_LOCAL: mir::Local = mir::Local::from_u32(1);
+pub const CAPTURE_STRUCT_LOCAL: mir::Local = mir::Local::arg(0);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, HashStable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, StableHash)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub struct UpvarPath {
     pub hir_id: HirId,
@@ -28,7 +29,7 @@ pub struct UpvarPath {
 /// Upvars do not get their own `NodeId`. Instead, we use the pair of
 /// the original var ID (that is, the root variable that is referenced
 /// by the upvar) and the ID of the closure expression.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, TyEncodable, TyDecodable, HashStable)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, TyEncodable, TyDecodable, StableHash)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub struct UpvarId {
     pub var_path: UpvarPath,
@@ -43,19 +44,35 @@ impl UpvarId {
 
 /// Information describing the capture of an upvar. This is computed
 /// during `typeck`, specifically by `regionck`.
-#[derive(Eq, PartialEq, Clone, Debug, Copy, TyEncodable, TyDecodable, HashStable, Hash)]
+#[derive(Eq, PartialEq, Clone, Debug, Copy, TyEncodable, TyDecodable, StableHash, Hash)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub enum UpvarCapture {
-    /// Upvar is captured by value. This is always true when the
-    /// closure is labeled `move`, but can also be true in other cases
-    /// depending on inference.
-    ByValue,
+    /// Upvar is captured by reference.
+    ByRef(BorrowKind),
 
     /// Upvar is captured by use. This is true when the closure is labeled `use`.
     ByUse,
 
-    /// Upvar is captured by reference.
-    ByRef(BorrowKind),
+    /// Upvar is captured by value. This is always true when the
+    /// closure is labeled `move`, but can also be true in other cases
+    /// depending on inference.
+    ByValue,
+}
+
+// Used in rustc_hir_typeck::upvar::determine_capture_info
+impl PartialOrd for UpvarCapture {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        match (self, other) {
+            (Self::ByValue, Self::ByValue) | (Self::ByUse, Self::ByUse) => {
+                Some(cmp::Ordering::Equal)
+            }
+            (Self::ByValue | Self::ByUse, Self::ByRef(_)) => Some(cmp::Ordering::Greater),
+            (Self::ByRef(_), Self::ByValue | Self::ByUse) => Some(cmp::Ordering::Less),
+            (Self::ByRef(left), Self::ByRef(right)) => Some(left.cmp(&right)),
+            (Self::ByUse, Self::ByValue) | (Self::ByValue, Self::ByUse) => None,
+        }
+    }
 }
 
 /// Given the closure DefId this map provides a map of root variables to minimum
@@ -74,7 +91,7 @@ pub type RootVariableMinCaptureList<'tcx> = FxIndexMap<HirId, MinCaptureList<'tc
 pub type MinCaptureList<'tcx> = Vec<CapturedPlace<'tcx>>;
 
 /// A composite describing a `Place` that is captured by a closure.
-#[derive(Eq, PartialEq, Clone, Debug, TyEncodable, TyDecodable, HashStable, Hash)]
+#[derive(Eq, PartialEq, Clone, Debug, TyEncodable, TyDecodable, StableHash, Hash)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub struct CapturedPlace<'tcx> {
     /// Name and span where the binding happens.
@@ -191,7 +208,7 @@ impl<'tcx> CapturedPlace<'tcx> {
     }
 }
 
-#[derive(Copy, Clone, Debug, HashStable)]
+#[derive(Copy, Clone, Debug, StableHash)]
 pub struct ClosureTypeInfo<'tcx> {
     user_provided_sig: ty::CanonicalPolyFnSig<'tcx>,
     captures: &'tcx ty::List<&'tcx ty::CapturedPlace<'tcx>>,
@@ -255,7 +272,7 @@ pub fn is_ancestor_or_same_capture(
 /// Part of `MinCaptureInformationMap`; describes the capture kind (&, &mut, move)
 /// for a particular capture as well as identifying the part of the source code
 /// that triggered this capture to occur.
-#[derive(Eq, PartialEq, Clone, Debug, Copy, TyEncodable, TyDecodable, HashStable, Hash)]
+#[derive(Eq, PartialEq, Clone, Debug, Copy, TyEncodable, TyDecodable, StableHash, Hash)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub struct CaptureInfo {
     /// Expr Id pointing to use that resulted in selecting the current capture kind
@@ -327,6 +344,11 @@ pub fn place_to_string_for_capture<'tcx>(tcx: TyCtxt<'tcx>, place: &HirPlace<'tc
                     )
                 }
             },
+            HirProjectionKind::UnwrapUnsafeBinder => {
+                curr_string = format!("unwrap_binder!({curr_string})");
+            }
+            // Just change the type to the hidden type, so we can actually project.
+            HirProjectionKind::OpaqueCast => {}
             proj => bug!("{:?} unexpected because it isn't captured", proj),
         }
     }
@@ -334,8 +356,21 @@ pub fn place_to_string_for_capture<'tcx>(tcx: TyCtxt<'tcx>, place: &HirPlace<'tc
     curr_string
 }
 
-#[derive(Eq, Clone, PartialEq, Debug, TyEncodable, TyDecodable, Copy, HashStable, Hash)]
-#[derive(TypeFoldable, TypeVisitable)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd, // Order of variants is load-bearing
+    Ord,
+    TyEncodable,
+    TyDecodable,
+    StableHash,
+    TypeFoldable,
+    TypeVisitable
+)]
 pub enum BorrowKind {
     /// Data must be immutable and is aliasable.
     Immutable,

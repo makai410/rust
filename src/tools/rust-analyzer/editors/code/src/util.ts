@@ -22,6 +22,10 @@ class Log {
         log: true,
     });
 
+    show(): void {
+        this.output.show(true);
+    }
+
     trace(...messages: [unknown, ...unknown[]]): void {
         this.output.trace(this.stringify(messages));
     }
@@ -40,7 +44,7 @@ class Log {
 
     error(...messages: [unknown, ...unknown[]]): void {
         this.output.error(this.stringify(messages));
-        this.output.show(true);
+        this.show();
     }
 
     private stringify(messages: unknown[]): string {
@@ -327,4 +331,29 @@ export function normalizeDriveLetter(path: string, isWindowsOS: boolean = isWind
     }
 
     return path;
+}
+
+export const RUST_TOOLCHAIN_FILES = ["rust-toolchain.toml", "rust-toolchain"] as const;
+
+export async function findRustToolchainFiles(): Promise<vscode.Uri[]> {
+    const found: vscode.Uri[] = [];
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders) {
+        return found;
+    }
+
+    for (const folder of workspaceFolders) {
+        for (const filename of RUST_TOOLCHAIN_FILES) {
+            const toolchainUri = vscode.Uri.joinPath(folder.uri, filename);
+            try {
+                await vscode.workspace.fs.stat(toolchainUri);
+                found.push(toolchainUri);
+                // Only add the first toolchain file found per workspace folder
+                break;
+            } catch {
+                // File doesn't exist, continue
+            }
+        }
+    }
+    return found;
 }

@@ -5,9 +5,8 @@ use clippy_utils::paths::PathNS;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefIdMap;
 use rustc_hir::{Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::impl_lint_pass;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -61,6 +60,8 @@ declare_clippy_lint! {
     "use of a disallowed method call"
 }
 
+impl_lint_pass!(DisallowedMethods => [DISALLOWED_METHODS]);
+
 pub struct DisallowedMethods {
     disallowed: DefIdMap<(&'static str, &'static DisallowedPath)>,
 }
@@ -84,10 +85,14 @@ impl DisallowedMethods {
     }
 }
 
-impl_lint_pass!(DisallowedMethods => [DISALLOWED_METHODS]);
-
 impl<'tcx> LateLintPass<'tcx> for DisallowedMethods {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
+        if self.disallowed.is_empty() {
+            return;
+        }
+        if expr.span.desugaring_kind().is_some() {
+            return;
+        }
         let (id, span) = match &expr.kind {
             ExprKind::Path(path) if let Res::Def(_, id) = cx.qpath_res(path, expr.hir_id) => (id, expr.span),
             ExprKind::MethodCall(name, ..) if let Some(id) = cx.typeck_results().type_dependent_def_id(expr.hir_id) => {

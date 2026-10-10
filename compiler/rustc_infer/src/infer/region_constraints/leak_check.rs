@@ -2,8 +2,8 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::graph::scc::Sccs;
 use rustc_data_structures::graph::vec_graph::VecGraph;
 use rustc_index::Idx;
-use rustc_middle::span_bug;
 use rustc_middle::ty::error::TypeError;
+use rustc_span::span_bug;
 use tracing::{debug, instrument};
 
 use super::*;
@@ -105,7 +105,7 @@ struct LeakCheck<'a, 'tcx> {
     // is repurposed to store some placeholder `P` such that the weaker
     // condition `S: P` must hold. (This is true if `S: S1` transitively and `S1
     // = P`.)
-    scc_placeholders: IndexVec<LeakCheckScc, Option<ty::PlaceholderRegion>>,
+    scc_placeholders: IndexVec<LeakCheckScc, Option<ty::PlaceholderRegion<'tcx>>>,
 
     // For each SCC S, track the minimum universe that flows into it. Note that
     // this is both the minimum of the universes for every region that is a
@@ -258,15 +258,15 @@ impl<'a, 'tcx> LeakCheck<'a, 'tcx> {
 
     fn placeholder_error(
         &self,
-        placeholder1: ty::PlaceholderRegion,
-        placeholder2: ty::PlaceholderRegion,
+        placeholder1: ty::PlaceholderRegion<'tcx>,
+        placeholder2: ty::PlaceholderRegion<'tcx>,
     ) -> TypeError<'tcx> {
         self.error(placeholder1, ty::Region::new_placeholder(self.tcx, placeholder2))
     }
 
     fn error(
         &self,
-        placeholder: ty::PlaceholderRegion,
+        placeholder: ty::PlaceholderRegion<'tcx>,
         other_region: ty::Region<'tcx>,
     ) -> TypeError<'tcx> {
         debug!("error: placeholder={:?}, other_region={:?}", placeholder, other_region);
@@ -392,8 +392,15 @@ impl<'tcx> MiniGraph<'tcx> {
             {
                 match undo_entry {
                     &AddConstraint(i) => {
-                        let c = region_constraints.data().constraints[i].0;
-                        each_edge(c.sub, c.sup);
+                        region_constraints.data().constraints[i].0.iter_outlives().for_each(
+                            |Constraint { kind: _, sub, sup, visible_for_leak_check }| {
+                                match visible_for_leak_check {
+                                    ty::VisibleForLeakCheck::Yes => each_edge(sub, sup),
+                                    ty::VisibleForLeakCheck::No => {}
+                                    ty::VisibleForLeakCheck::Unreachable => unreachable!(),
+                                }
+                            },
+                        );
                     }
                     &AddVerify(i) => span_bug!(
                         region_constraints.data().verifys[i].origin.span(),
@@ -403,7 +410,18 @@ impl<'tcx> MiniGraph<'tcx> {
                 }
             }
         } else {
-            region_constraints.data().constraints.iter().for_each(|(c, _)| each_edge(c.sub, c.sup))
+            region_constraints
+                .data()
+                .constraints
+                .iter()
+                .flat_map(|(c, _)| c.iter_outlives())
+                .for_each(|Constraint { kind: _, sub, sup, visible_for_leak_check }| {
+                    match visible_for_leak_check {
+                        ty::VisibleForLeakCheck::Yes => each_edge(sub, sup),
+                        ty::VisibleForLeakCheck::No => {}
+                        ty::VisibleForLeakCheck::Unreachable => unreachable!(),
+                    }
+                })
         }
     }
 

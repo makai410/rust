@@ -8,18 +8,22 @@
 
 use std::ops::ControlFlow;
 
-use hir::LangItem;
 use hir::def_id::DefId;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_hir::{self as hir, CoroutineDesugaring, CoroutineKind};
-use rustc_infer::traits::{Obligation, PolyTraitObligation, SelectionError};
+use rustc_infer::traits::{Obligation, PolyTraitObligation, PredicateObligation, SelectionError};
 use rustc_middle::ty::fast_reject::DeepRejectCtxt;
-use rustc_middle::ty::{self, SizedTraitKind, Ty, TypeVisitableExt, TypingMode, elaborate};
-use rustc_middle::{bug, span_bug};
+use rustc_middle::ty::{
+    self, ExistentialPredicate, FieldInfo, SizedTraitKind, TraitRef, Ty, TypeVisitableExt,
+    elaborate,
+};
+use rustc_span::{DUMMY_SP, bug, span_bug};
 use tracing::{debug, instrument, trace};
 
 use super::SelectionCandidate::*;
 use super::{SelectionCandidateSet, SelectionContext, TraitObligationStack};
+use crate::traits::query::evaluate_obligation::InferCtxtExt;
 use crate::traits::util;
 
 impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
@@ -33,7 +37,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             param_env: obligation.param_env,
             cause: obligation.cause.clone(),
             recursion_depth: obligation.recursion_depth,
-            predicate: self.infcx.resolve_vars_if_possible(obligation.predicate),
+            predicate: self.infcx.deeply_resolve_ignoring_regions(obligation.predicate),
         };
 
         if obligation.predicate.skip_binder().self_ty().is_ty_var() {
@@ -53,7 +57,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         let mut candidates = SelectionCandidateSet { vec: Vec::new(), ambiguous: false };
 
         // Negative trait predicates have different rules than positive trait predicates.
-        if obligation.polarity() == ty::PredicatePolarity::Negative {
+        if obligation.polarity() == ty::ClausePolarity::Negative {
             self.assemble_candidates_for_trait_alias(obligation, &mut candidates);
             self.assemble_candidates_from_impls(obligation, &mut candidates);
             self.assemble_candidates_from_caller_bounds(stack, &mut candidates)?;
@@ -67,7 +71,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
             let lang_item = tcx.as_lang_item(def_id);
             match lang_item {
-                Some(LangItem::Copy | LangItem::Clone) => {
+                Some(LangItem::Copy | LangItem::Clone | LangItem::TrivialClone) => {
                     debug!(obligation_self_ty = ?obligation.predicate.skip_binder().self_ty());
 
                     // User-defined copy impls are permitted, but only for
@@ -128,6 +132,12 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                         &mut candidates,
                     );
                 }
+                Some(LangItem::TryAsDyn) => {
+                    self.assemble_candidates_for_try_as_dyn(obligation, &mut candidates);
+                }
+                Some(LangItem::Field) => {
+                    self.assemble_candidates_for_field_trait(obligation, &mut candidates);
+                }
                 _ => {
                     // We re-match here for traits that can have both builtin impls and user written impls.
                     // After the builtin impls we need to also add user written impls, which we do not want to
@@ -187,7 +197,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // quickly check if the self-type is a projection at all.
         match obligation.predicate.skip_binder().trait_ref.self_ty().kind() {
             // Excluding IATs and type aliases here as they don't have meaningful item bounds.
-            ty::Alias(ty::Projection | ty::Opaque, _) => {}
+            ty::Alias(_, ty::AliasTy { kind: ty::Projection { .. } | ty::Opaque { .. }, .. }) => {}
             ty::Infer(ty::TyVar(_)) => {
                 span_bug!(
                     obligation.cause.span,
@@ -198,7 +208,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         }
 
         self.infcx.probe(|_| {
-            let poly_trait_predicate = self.infcx.resolve_vars_if_possible(obligation.predicate);
+            let poly_trait_predicate =
+                self.infcx.deeply_resolve_ignoring_regions(obligation.predicate);
             let placeholder_trait_predicate =
                 self.infcx.enter_forall_and_leak_universe(poly_trait_predicate);
 
@@ -208,7 +219,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             let mut distinct_normalized_bounds = FxHashSet::default();
             let _ = self.for_each_item_bound::<!>(
                 placeholder_trait_predicate.self_ty(),
-                |selcx, bound, idx| {
+                |selcx, bound, idx, alias_bound_kind| {
                     let Some(bound) = bound.as_trait_clause() else {
                         return ControlFlow::Continue(());
                     };
@@ -230,12 +241,16 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                             bound.map_bound(|pred| pred.trait_ref),
                         ) {
                             Ok(None) => {
-                                candidates.vec.push(ProjectionCandidate(idx));
+                                candidates
+                                    .vec
+                                    .push(ProjectionCandidate { idx, kind: alias_bound_kind });
                             }
                             Ok(Some(normalized_trait))
                                 if distinct_normalized_bounds.insert(normalized_trait) =>
                             {
-                                candidates.vec.push(ProjectionCandidate(idx));
+                                candidates
+                                    .vec
+                                    .push(ProjectionCandidate { idx, kind: alias_bound_kind });
                             }
                             _ => {}
                         }
@@ -265,8 +280,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             .obligation
             .param_env
             .caller_bounds()
-            .iter()
-            .filter_map(|p| p.as_trait_clause())
+            .filter_map(|c| c.as_trait_clause())
             // Micro-optimization: filter out predicates with different polarities.
             .filter(|p| p.polarity() == stack.obligation.predicate.polarity());
 
@@ -308,7 +322,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             // `async`/`gen` constructs get lowered to a special kind of coroutine that
             // should *not* `impl Coroutine`.
             ty::Coroutine(did, ..) if self.tcx().is_general_coroutine(*did) => {
-                debug!(?self_ty, ?obligation, "assemble_coroutine_candidates",);
+                debug!(?self_ty, ?obligation, "assemble_coroutine_candidates");
 
                 candidates.vec.push(CoroutineCandidate);
             }
@@ -330,7 +344,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             // async constructs get lowered to a special kind of coroutine that
             // should directly `impl Future`.
             if self.tcx().coroutine_is_async(*did) {
-                debug!(?self_ty, ?obligation, "assemble_future_candidates",);
+                debug!(?self_ty, ?obligation, "assemble_future_candidates");
 
                 candidates.vec.push(FutureCandidate);
             }
@@ -348,7 +362,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         if let ty::Coroutine(did, ..) = self_ty.kind()
             && self.tcx().coroutine_is_gen(*did)
         {
-            debug!(?self_ty, ?obligation, "assemble_iterator_candidates",);
+            debug!(?self_ty, ?obligation, "assemble_iterator_candidates");
 
             candidates.vec.push(IteratorCandidate);
         }
@@ -374,7 +388,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             // gen constructs get lowered to a special kind of coroutine that
             // should directly `impl AsyncIterator`.
             if self.tcx().coroutine_is_async_gen(did) {
-                debug!(?self_ty, ?obligation, "assemble_iterator_candidates",);
+                debug!(?self_ty, ?obligation, "assemble_iterator_candidates");
 
                 // Can only confirm this candidate if we have constrained
                 // the `Yield` type to at least `Poll<Option<?0>>`..
@@ -600,7 +614,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 // Before we create the generic parameters and everything, first
                 // consider a "quick reject". This avoids creating more types
                 // and so forth that we need to.
-                let impl_trait_header = self.tcx().impl_trait_header(impl_def_id).unwrap();
+                let impl_trait_header = self.tcx().impl_trait_header(impl_def_id);
                 if !drcx
                     .args_may_unify(obligation_args, impl_trait_header.trait_ref.skip_binder().args)
                 {
@@ -650,8 +664,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             return false;
         };
 
-        for &(predicate, _) in self.tcx().predicates_of(impl_def_id).predicates {
-            let ty::ClauseKind::Trait(pred) = predicate.kind().skip_binder() else { continue };
+        for &(clause, _) in self.tcx().clauses_of(impl_def_id).clauses {
+            let ty::ClauseKind::Trait(pred) = clause.kind().skip_binder() else { continue };
             if fn_ptr_trait != pred.trait_ref.def_id {
                 continue;
             }
@@ -669,7 +683,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
                 // These may potentially implement `FnPtr`
                 ty::Placeholder(..)
-                | ty::Dynamic(_, _, _)
+                | ty::Dynamic(_, _)
                 | ty::Alias(_, _)
                 | ty::Infer(_)
                 | ty::Param(..)
@@ -773,7 +787,13 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     }
                 }
                 ty::Param(..)
-                | ty::Alias(ty::Projection | ty::Inherent | ty::Free, ..)
+                | ty::Alias(
+                    _,
+                    ty::AliasTy {
+                        kind: ty::Projection { .. } | ty::Inherent { .. } | ty::Free { .. },
+                        ..
+                    },
+                )
                 | ty::Placeholder(..)
                 | ty::Bound(..) => {
                     // In these cases, we don't know what the actual
@@ -824,8 +844,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     );
                 }
 
-                ty::Alias(ty::Opaque, alias) => {
-                    if candidates.vec.iter().any(|c| matches!(c, ProjectionCandidate(_))) {
+                ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, .. }) => {
+                    debug_assert!(!self.typing_mode().is_coherence(), "old solver coherence");
+
+                    if candidates.vec.iter().any(|c| matches!(c, ProjectionCandidate { .. })) {
                         // We do not generate an auto impl candidate for `impl Trait`s which already
                         // reference our auto trait.
                         //
@@ -835,11 +857,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                         //
                         // Note that this is only sound as projection candidates of opaque types
                         // are always applicable for auto traits.
-                    } else if let TypingMode::Coherence = self.infcx.typing_mode() {
-                        // We do not emit auto trait candidates for opaque types in coherence.
-                        // Doing so can result in weird dependency cycles.
-                        candidates.ambiguous = true;
-                    } else if self.infcx.can_define_opaque_ty(alias.def_id) {
+                    } else if self.infcx.can_define_opaque_ty(def_id) {
                         // We do not emit auto trait candidates for opaque types in their defining scope, as
                         // we need to know the hidden type first, which we can't reliably know within the defining
                         // scope.
@@ -900,12 +918,15 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             "assemble_candidates_from_object_ty",
         );
 
-        if !self.tcx().trait_def(obligation.predicate.def_id()).implement_via_object {
+        if self.tcx().is_sizedness_trait(obligation.predicate.def_id()) {
+            // `dyn MetaSized` is valid, but should get its `MetaSized` impl from
+            // being `dyn` (SizedCandidate), not from the object candidate.
             return;
         }
 
         self.infcx.probe(|_snapshot| {
-            let poly_trait_predicate = self.infcx.resolve_vars_if_possible(obligation.predicate);
+            let poly_trait_predicate =
+                self.infcx.deeply_resolve_ignoring_regions(obligation.predicate);
             self.infcx.enter_forall(poly_trait_predicate, |placeholder_trait_predicate| {
                 let self_ty = placeholder_trait_predicate.self_ty();
                 let principal_trait_ref = match self_ty.kind() {
@@ -991,7 +1012,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         match (source.kind(), target.kind()) {
             // Trait+Kx+'a -> Trait+Ky+'b (upcasts).
-            (&ty::Dynamic(a_data, a_region, ty::Dyn), &ty::Dynamic(b_data, b_region, ty::Dyn)) => {
+            (&ty::Dynamic(a_data, a_region), &ty::Dynamic(b_data, b_region)) => {
                 // Upcast coercions permit several things:
                 //
                 // 1. Dropping auto traits, e.g., `Foo + Send` to `Foo`
@@ -1011,10 +1032,14 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     // supertraits.
                     let a_auto_traits: FxIndexSet<DefId> = a_data
                         .auto_traits()
-                        .chain(principal_def_id_a.into_iter().flat_map(|principal_def_id| {
-                            elaborate::supertrait_def_ids(self.tcx(), principal_def_id)
-                                .filter(|def_id| self.tcx().trait_is_auto(*def_id))
-                        }))
+                        .chain(
+                            principal_def_id_a
+                                .map(|principal_def_id| {
+                                    elaborate::supertrait_def_ids(self.tcx(), principal_def_id)
+                                        .filter(|def_id| self.tcx().trait_is_auto(*def_id))
+                                })
+                                .into_flat_iter(),
+                        )
                         .collect();
                     let auto_traits_compatible = b_data
                         .auto_traits()
@@ -1036,7 +1061,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                             if upcast_trait_ref.def_id() == target_trait_did
                                 && let Ok(nested) = self.match_upcast_principal(
                                     obligation,
-                                    upcast_trait_ref,
+                                    ty::Unnormalized::new_wip(upcast_trait_ref),
                                     a_data,
                                     b_data,
                                     a_region,
@@ -1054,7 +1079,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
 
             // `T` -> `Trait`
-            (_, &ty::Dynamic(_, _, ty::Dyn)) => {
+            (_, &ty::Dynamic(_, _)) => {
                 candidates.vec.push(BuiltinUnsizeCandidate);
             }
 
@@ -1327,7 +1352,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             | ty::Pat(_, _)
             | ty::FnPtr(..)
             | ty::UnsafeBinder(_)
-            | ty::Dynamic(_, _, _)
+            | ty::Dynamic(_, _)
             | ty::Closure(..)
             | ty::CoroutineClosure(..)
             | ty::Coroutine(_, _)
@@ -1347,7 +1372,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         obligation: &PolyTraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
     ) {
-        let self_ty = self.infcx.resolve_vars_if_possible(obligation.self_ty());
+        let self_ty = self.infcx.deeply_resolve_ignoring_regions(obligation.self_ty());
 
         match self_ty.skip_binder().kind() {
             ty::FnPtr(..) => candidates.vec.push(BuiltinCandidate),
@@ -1431,6 +1456,85 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
                 candidates.ambiguous = true;
             }
+        }
+    }
+
+    fn assemble_candidates_for_try_as_dyn(
+        &mut self,
+        obligation: &PolyTraitObligation<'tcx>,
+        candidates: &mut SelectionCandidateSet<'tcx>,
+    ) {
+        match *obligation.predicate.self_ty().skip_binder().kind() {
+            ty::Dynamic(bounds, _lifetime) => {
+                for bound in bounds {
+                    match bound.skip_binder() {
+                        ExistentialPredicate::Trait(_) => {}
+                        // FIXME(try_as_dyn): check what kind of projections we can allow
+                        ExistentialPredicate::Projection(_) => return,
+                        // Auto traits do not affect lifetimes outside of specialization,
+                        // which is disabled in reflection.
+                        ExistentialPredicate::AutoTrait(_) => {}
+                    }
+                }
+                candidates.vec.push(TryAsDynCandidate);
+            }
+
+            ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
+                candidates.ambiguous = true;
+            }
+
+            _ => {}
+        }
+    }
+
+    fn assemble_candidates_for_field_trait(
+        &mut self,
+        obligation: &PolyTraitObligation<'tcx>,
+        candidates: &mut SelectionCandidateSet<'tcx>,
+    ) {
+        // FIXME(field_projections): We should not use `evaluate_obligation` in
+        // the trait solver. Doing so means we don't track overflow and cycles properly
+        // encountering query cycles instead.
+        if let ty::Adt(def, args) = obligation.predicate.self_ty().skip_binder().kind()
+            && let Some(FieldInfo { base, ty, .. }) =
+                def.field_representing_type_info(self.tcx(), args)
+            // NOTE: these bounds have to be kept in sync with the definition of the `Field` trait
+            // in `library/core/src/field.rs` as well as the new trait solver `fn
+            // consider_builtin_field_candidate` in
+            // `compiler/rustc_next_trait_solver/src/solve/trait_goals.rs`.
+            && match self.infcx.evaluate_obligation(&PredicateObligation::new(
+                self.tcx(),
+                obligation.cause.clone(),
+                obligation.param_env,
+                TraitRef::new(
+                    self.tcx(),
+                    self.tcx().require_lang_item(LangItem::Sized, DUMMY_SP),
+                    [base],
+                ),
+            )) {
+                Ok(res) if res.must_apply_modulo_regions() => true,
+                _ => false,
+            }
+            && match self.infcx.evaluate_obligation(&PredicateObligation::new(
+                self.tcx(),
+                obligation.cause.clone(),
+                obligation.param_env,
+                TraitRef::new(
+                    self.tcx(),
+                    self.tcx().require_lang_item(LangItem::Sized, DUMMY_SP),
+                    [ty],
+                ),
+            )) {
+                Ok(res) if res.must_apply_modulo_regions() => true,
+                _ => false,
+            }
+            && match base.kind() {
+                ty::Adt(def, _) => def.is_struct() && !def.repr().packed(),
+                ty::Tuple(..) => true,
+                _ => false,
+            }
+        {
+            candidates.vec.push(BuiltinCandidate);
         }
     }
 }

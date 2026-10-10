@@ -3,11 +3,15 @@
 
 use std::fmt;
 
-use salsa::Durability;
+use rustc_hash::FxHashSet;
+use salsa::{Durability, Setter as _};
 use triomphe::Arc;
 use vfs::FileId;
 
-use crate::{CrateGraphBuilder, CratesIdMap, RootQueryDb, SourceRoot, SourceRootId};
+use crate::{
+    CrateGraphBuilder, CratesIdMap, LibraryRoots, LocalRoots, SourceDatabase, SourceRoot,
+    SourceRootId,
+};
 
 /// Encapsulate a bunch of raw `.set` calls on the database.
 #[derive(Default)]
@@ -46,11 +50,18 @@ impl FileChange {
         self.crate_graph = Some(graph);
     }
 
-    pub fn apply(self, db: &mut dyn RootQueryDb) -> Option<CratesIdMap> {
+    pub fn apply(self, db: &mut dyn SourceDatabase) -> Option<CratesIdMap> {
         let _p = tracing::info_span!("FileChange::apply").entered();
         if let Some(roots) = self.roots {
+            let mut local_roots = FxHashSet::default();
+            let mut library_roots = FxHashSet::default();
             for (idx, root) in roots.into_iter().enumerate() {
                 let root_id = SourceRootId(idx as u32);
+                if root.is_library {
+                    library_roots.insert(root_id);
+                } else {
+                    local_roots.insert(root_id);
+                }
                 let durability = source_root_durability(&root);
                 for file_id in root.iter() {
                     db.set_file_source_root_with_durability(file_id, root_id, durability);
@@ -58,6 +69,8 @@ impl FileChange {
 
                 db.set_source_root_with_durability(root_id, Arc::new(root), durability);
             }
+            LocalRoots::get(db).set_roots(db).to(local_roots);
+            LibraryRoots::get(db).set_roots(db).to(library_roots);
         }
 
         for (file_id, text) in self.files_changed {

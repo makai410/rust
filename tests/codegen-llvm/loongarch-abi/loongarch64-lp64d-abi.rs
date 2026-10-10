@@ -1,4 +1,4 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ compile-flags: -Copt-level=3 -C no-prepopulate-passes --target loongarch64-unknown-linux-gnu
 //@ needs-llvm-components: loongarch
 
@@ -256,11 +256,11 @@ pub struct IntDoubleInt {
     c: i32,
 }
 
-// CHECK: define void @f_int_double_int_s_arg(ptr{{( dead_on_return)?}} noalias{{( nocapture)?}} noundef align 8{{( captures\(none\))?}} dereferenceable(24) %a)
+// CHECK: define void @f_int_double_int_s_arg(ptr{{( dead_on_return)?}} noalias nofree noundef align 8{{( captures\(address\))?}}{{( dead_on_return)?}} dereferenceable(24) %a)
 #[no_mangle]
 pub extern "C" fn f_int_double_int_s_arg(a: IntDoubleInt) {}
 
-// CHECK: define void @f_ret_int_double_int_s(ptr{{( dead_on_unwind)?}} noalias{{( nocapture)?}} noundef{{( writable)?}} sret([24 x i8]) align 8{{( captures\(none\))?}} dereferenceable(24) %_0)
+// CHECK: define void @f_ret_int_double_int_s(ptr{{( dead_on_unwind)?}} noalias nofree noundef{{( writable)?}} sret([24 x i8]) align 8{{( captures\(address\))?}} dereferenceable(24) %_0)
 #[no_mangle]
 pub extern "C" fn f_ret_int_double_int_s() -> IntDoubleInt {
     IntDoubleInt { a: 1, b: 2., c: 3 }
@@ -297,3 +297,5 @@ pub extern "C" fn f_double_u_arg(a: DoubleU) {}
 pub extern "C" fn f_ret_double_u() -> DoubleU {
     unsafe { DoubleU { a: 1. } }
 }
+
+// CHECK: !{{[0-9]+}} = !{i32 1, !"target-abi", !"lp64d"}

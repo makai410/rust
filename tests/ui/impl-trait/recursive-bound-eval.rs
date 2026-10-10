@@ -1,10 +1,10 @@
 //! Test that we can evaluate nested obligations when invoking methods on recursive calls on
 //! an RPIT.
 
-//@revisions: next current
+//@ revisions: next current
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
-
-//@[current] check-pass
+//@ check-pass
 
 pub trait Parser<E> {
     fn parse(&self) -> E;
@@ -18,7 +18,6 @@ impl<E, T: Fn() -> E> Parser<E> for T {
 
 pub fn recursive_fn<E>() -> impl Parser<E> {
     move || recursive_fn().parse()
-    //[next]~^ ERROR: type annotations needed
 }
 
 fn main() {}

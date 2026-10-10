@@ -1,11 +1,11 @@
 //! This module defines the `Llvm` struct, which represents the `[llvm]` table
 //! in the `bootstrap.toml` configuration file.
 
-use serde::{Deserialize, Deserializer};
+use std::collections::HashMap;
 
 use crate::core::config::StringOrBool;
-use crate::core::config::toml::{Merge, ReplaceOpt, TomlConfig};
-use crate::{HashMap, HashSet, PathBuf, define_config, exit};
+use crate::core::config::macros::define_config;
+use crate::core::config::toml::TomlConfig;
 
 define_config! {
     /// TOML representation of how the LLVM build is configured.
@@ -35,6 +35,7 @@ define_config! {
         allow_old_toolchain: Option<bool> = "allow-old-toolchain",
         offload: Option<bool> = "offload",
         polly: Option<bool> = "polly",
+        offload_clang_dir: Option<String> = "offload-clang-dir",
         clang: Option<bool> = "clang",
         enable_warnings: Option<bool> = "enable-warnings",
         download_ci_llvm: Option<StringOrBool> = "download-ci-llvm",
@@ -44,7 +45,6 @@ define_config! {
 
 /// Compares the current `Llvm` options against those in the CI LLVM builder and detects any incompatible options.
 /// It does this by destructuring the `Llvm` instance to make sure every `Llvm` field is covered and not missing.
-#[cfg(not(test))]
 pub fn check_incompatible_options_for_ci_llvm(
     current_config_toml: TomlConfig,
     ci_config_toml: TomlConfig,
@@ -112,6 +112,7 @@ pub fn check_incompatible_options_for_ci_llvm(
         use_linker,
         allow_old_toolchain,
         offload,
+        offload_clang_dir: _,
         polly,
         clang,
         enable_warnings,

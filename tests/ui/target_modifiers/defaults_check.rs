@@ -11,10 +11,12 @@
 //@[error] compile-flags: -Zreg-struct-return=true
 //@[ok] check-pass
 //@[ok_explicit] check-pass
+//@ ignore-backends: gcc
 
 #![feature(no_core)]
-//[error]~^ ERROR mixing `-Zreg-struct-return` will cause an ABI mismatch in crate `defaults_check`
 #![crate_type = "rlib"]
 #![no_core]
 
 extern crate default_reg_struct_return;
+
+//[error]~? ERROR mixing `-Zreg-struct-return` will cause an ABI mismatch in crate `defaults_check`

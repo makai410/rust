@@ -1,5 +1,7 @@
 //@ needs-llvm-components: avr
 //@ needs-rust-lld
+//@ ignore-backends: gcc
+
 //! Regression test for #129301/llvm-project#106722 within `rustc`.
 //!
 //! Some LLVM-versions had wrong offsets in the local labels, causing the first
@@ -15,9 +17,11 @@
 // crashes... so I'm going to disable this test for windows for now.
 //@ ignore-windows-gnu
 
-use run_make_support::{llvm_objdump, rustc};
+use run_make_support::{llvm_objdump, path, rustc, rustc_minicore};
 
 fn main() {
+    rustc_minicore().target("avr-none").target_cpu("avr").output("libminicore.rlib").run();
+
     rustc()
         .input("avr-rjmp-offsets.rs")
         .opt_level("s")
@@ -36,6 +40,7 @@ fn main() {
         .linker("rust-lld")
         .link_arg("--entry=main")
         .output("compiled")
+        .extern_("minicore", path("libminicore.rlib"))
         .run();
 
     let disassembly = llvm_objdump().disassemble().input("compiled").run().stdout_utf8();

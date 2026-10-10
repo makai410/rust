@@ -5,9 +5,8 @@ use clippy_utils::source::snippet_with_applicability;
 use clippy_utils::ty::{AdtVariantInfo, approx_ty_size, is_copy};
 use rustc_errors::Applicability;
 use rustc_hir::{Item, ItemKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::{self, Ty};
-use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -58,6 +57,8 @@ declare_clippy_lint! {
     "large size difference between variants on an enum"
 }
 
+impl_lint_pass!(LargeEnumVariant => [LARGE_ENUM_VARIANT]);
+
 pub struct LargeEnumVariant {
     maximum_size_difference_allowed: u64,
 }
@@ -70,12 +71,10 @@ impl LargeEnumVariant {
     }
 }
 
-impl_lint_pass!(LargeEnumVariant => [LARGE_ENUM_VARIANT]);
-
 impl<'tcx> LateLintPass<'tcx> for LargeEnumVariant {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &Item<'tcx>) {
         if let ItemKind::Enum(ident, _, ref def) = item.kind
-            && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity()
+            && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip()
             && let ty::Adt(adt, subst) = ty.kind()
             && adt.variants().len() > 1
             && !item.span.in_external_macro(cx.tcx.sess.source_map())

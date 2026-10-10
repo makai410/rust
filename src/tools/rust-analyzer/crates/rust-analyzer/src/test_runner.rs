@@ -2,14 +2,14 @@
 //! thread and report the result of each test in a channel.
 
 use crossbeam_channel::Sender;
-use paths::AbsPath;
+use paths::{AbsPath, Utf8Path};
 use project_model::TargetKind;
 use serde::Deserialize as _;
 use serde_derive::Deserialize;
 use toolchain::Tool;
 
 use crate::{
-    command::{CargoParser, CommandHandle},
+    command::{CommandHandle, JsonLinesParser},
     flycheck::CargoOptions,
 };
 
@@ -57,7 +57,7 @@ impl CargoTestOutputParser {
     }
 }
 
-impl CargoParser<CargoTestMessage> for CargoTestOutputParser {
+impl JsonLinesParser<CargoTestMessage> for CargoTestOutputParser {
     fn from_line(&self, line: &str, _error: &mut String) -> Option<CargoTestMessage> {
         let mut deserializer = serde_json::Deserializer::from_str(line);
         deserializer.disable_recursion_limit();
@@ -69,6 +69,13 @@ impl CargoParser<CargoTestMessage> for CargoTestOutputParser {
             } else {
                 CargoTestOutput::Custom { text: line.to_owned() }
             },
+        })
+    }
+
+    fn from_stderr_line(&self, line: &str, _error: &mut String) -> Option<CargoTestMessage> {
+        Some(CargoTestMessage {
+            target: self.target.clone(),
+            output: CargoTestOutput::Custom { text: line.to_owned() },
         })
     }
 
@@ -98,13 +105,15 @@ impl CargoTestHandle {
         path: Option<&str>,
         options: CargoOptions,
         root: &AbsPath,
+        ws_target_dir: Option<&Utf8Path>,
         test_target: TestTarget,
         sender: Sender<CargoTestMessage>,
-    ) -> std::io::Result<Self> {
+        toolchain_version: Option<&semver::Version>,
+    ) -> anyhow::Result<Self> {
         let mut cmd = toolchain::command(Tool::Cargo.path(), root, &options.extra_env);
         cmd.env("RUSTC_BOOTSTRAP", "1");
         cmd.arg("--color=always");
-        cmd.arg("test");
+        cmd.arg(&options.subcommand); // test, usually
 
         cmd.arg("--package");
         cmd.arg(&test_target.package);
@@ -123,7 +132,12 @@ impl CargoTestHandle {
         cmd.arg("--no-fail-fast");
         cmd.arg("--manifest-path");
         cmd.arg(root.join("Cargo.toml"));
-        options.apply_on_command(&mut cmd);
+        options.apply_on_command(
+            &mut cmd,
+            ws_target_dir,
+            Some(&test_target.package),
+            toolchain_version,
+        );
         cmd.arg("--");
         if let Some(path) = path {
             cmd.arg(path);
@@ -136,7 +150,12 @@ impl CargoTestHandle {
         }
 
         Ok(Self {
-            _handle: CommandHandle::spawn(cmd, CargoTestOutputParser::new(&test_target), sender)?,
+            _handle: CommandHandle::spawn(
+                cmd,
+                CargoTestOutputParser::new(&test_target),
+                sender,
+                None,
+            )?,
         })
     }
 }

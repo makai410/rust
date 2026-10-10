@@ -46,6 +46,7 @@ LL | trait Sub: Super<Assoc = u16> {}
 note: required by a bound in `BoundOnAssoc::Assoc`
   --> $DIR/super-assoc-mismatch.rs:18:17
    |
+LL | trait BoundOnAssoc {
 LL |     type Assoc: Sub;
    |                 ^^^ required by this bound in `BoundOnAssoc::Assoc`
 
@@ -77,7 +78,6 @@ help: this trait has no implementations, consider adding one
    |
 LL | trait Sub: Super<Assoc = u16> {}
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: see issue #48214
 help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
    |
 LL + #![feature(trivial_bounds)]
@@ -98,7 +98,6 @@ note: required by a bound in `MultiAssoc`
   --> $DIR/super-assoc-mismatch.rs:46:23
    |
 LL | trait MultiAssoc
-   |       ---------- required by a bound in this trait
 LL | where
 LL |     Self::Assoc1<()>: SubGeneric<Self::Assoc2>
    |                       ^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `MultiAssoc`

@@ -10,13 +10,6 @@
 use std::sync::atomic::*;
 use std::thread::spawn;
 
-#[allow(dead_code)]
-#[derive(Copy, Clone)]
-struct EvilSend<T>(pub T);
-
-unsafe impl<T> Send for EvilSend<T> {}
-unsafe impl<T> Sync for EvilSend<T> {}
-
 // We can't create static items because we need to run each test multiple times.
 fn static_uninit_atomic() -> &'static AtomicUsize {
     unsafe { Box::leak(Box::new_uninit()).assume_init_ref() }
@@ -34,7 +27,7 @@ fn relaxed() {
     j2.join().unwrap();
 }
 
-pub fn main() {
+fn main() {
     // If we try often enough, we should hit UB.
     for _ in 0..100 {
         relaxed();

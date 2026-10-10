@@ -1,198 +1,321 @@
-mod argument;
-mod compile;
-mod config;
 mod intrinsic;
 mod json_parser;
 mod types;
 
-use std::fs::{self, File};
-
-use rayon::prelude::*;
-
-use crate::common::cli::ProcessedCli;
-use crate::common::compare::compare_outputs;
-use crate::common::gen_c::{write_main_cpp, write_mod_cpp};
-use crate::common::gen_rust::{
-    compile_rust_programs, write_bin_cargo_toml, write_lib_cargo_toml, write_lib_rs, write_main_rs,
-};
+use crate::common::argument::Argument;
+use crate::common::cli::{CcArgStyle, ProcessedCli};
 use crate::common::intrinsic::Intrinsic;
-use crate::common::intrinsic_helpers::TypeKind;
-use crate::common::{SupportedArchitectureTest, chunk_info};
-use config::{AARCH_CONFIGURATIONS, F16_FORMATTING_DEF, POLY128_OSTREAM_DEF, build_notices};
-use intrinsic::ArmIntrinsicType;
-use json_parser::get_neon_intrinsics;
+use crate::common::intrinsic_helpers::{SimdLen, TypeDefinition, TypeKind};
+use crate::common::values::test_values_array_name;
+use crate::common::{PASSES, PREDICATE_LOCAL, SupportedArchitecture};
+use intrinsic::ArmType;
+use json_parser::get_intrinsics;
 
-pub struct ArmArchitectureTest {
-    intrinsics: Vec<Intrinsic<ArmIntrinsicType>>,
-    cli_options: ProcessedCli,
-}
+#[derive(PartialEq)]
+pub struct Arm(Vec<Intrinsic<Arm>>);
 
-impl SupportedArchitectureTest for ArmArchitectureTest {
-    fn create(cli_options: ProcessedCli) -> Box<Self> {
-        let a32 = cli_options.target.contains("v7");
-        let mut intrinsics = get_neon_intrinsics(&cli_options.filename, &cli_options.target)
-            .expect("Error parsing input file");
+impl SupportedArchitecture for Arm {
+    type Type = ArmType;
+
+    fn intrinsics(&self) -> &[Intrinsic<Self>] {
+        &self.0
+    }
+
+    const NOTICE: &str = r#"
+// This is a transient test file, not intended for distribution. Some aspects of the
+// test are derived from a JSON specification, published under the same license as the
+// `intrinsic-test` crate.
+"#;
+
+    const C_PRELUDE: &str = r#"
+#include <arm_acle.h>
+#include <arm_fp16.h>
+#include <arm_neon.h>
+#ifdef __ARM_FEATURE_SVE
+#include <arm_sve.h>
+#endif
+"#;
+    const RUST_PRELUDE: &str = RUST_PRELUDE;
+
+    const C_NAME_PREFIX: &str = "";
+
+    fn c_compiler_flags(&self, cli_options: &ProcessedCli) -> Vec<&str> {
+        // GCC uses an extra `-` in the arch name
+        let big_endian = cli_options.target.starts_with("aarch64_be");
+        let a32 = cli_options.target.starts_with("armv7");
+        match cli_options.cc_arg_style {
+            CcArgStyle::Clang if !a32 && !big_endian => vec![
+                "-march=armv8.6a+crypto+crc+dotprod+fp16+sve2-aes+sve2-sm4+sve2-sha3+sve2-bitperm+\
+                 f32mm+f64mm+sve2p1",
+            ],
+            CcArgStyle::Clang => vec!["-march=armv8.6a+crypto+crc+dotprod+fp16"],
+            // SVE tests aren't run under GCC so there are no target features added for SVE
+            CcArgStyle::Gcc => vec!["-march=armv8.6-a+crypto+crc+dotprod+fp16+sha3+sm4"],
+        }
+    }
+
+    fn create(cli_options: &ProcessedCli) -> Self {
+        let big_endian = cli_options.target.starts_with("aarch64_be");
+        let a32 = cli_options.target.starts_with("armv7");
+        let mut intrinsics =
+            get_intrinsics(&cli_options.filename).expect("Error parsing input file");
 
         intrinsics.sort_by(|a, b| a.name.cmp(&b.name));
+        intrinsics.dedup();
 
-        let mut intrinsics = intrinsics
+        let sample_percentage: usize = cli_options.sample_percentage as usize;
+        let sample_size = (intrinsics.len() * sample_percentage) / 100;
+
+        let intrinsics = intrinsics
             .into_iter()
-            // Not sure how we would compare intrinsic that returns void.
+            // Skip intrinsics that don't return a value.
             .filter(|i| i.results.kind() != TypeKind::Void)
+            // Skip bfloat intrinsics - not currently supported
             .filter(|i| i.results.kind() != TypeKind::BFloat)
             .filter(|i| !i.arguments.iter().any(|a| a.ty.kind() == TypeKind::BFloat))
+            // Skip SVE intrinsics that have `f16` - not yet implemented!
+            .filter(|i| {
+                let has_f16_arg = i
+                    .arguments
+                    .iter()
+                    .any(|a| a.ty.kind() == TypeKind::Float && a.ty.bit_len == Some(16));
+                let has_sve_arg = i
+                    .arguments
+                    .iter()
+                    .any(|a| a.ty.num_lanes() == SimdLen::Scalable);
+                !(has_f16_arg && has_sve_arg)
+            })
+            .filter(|i| {
+                let has_f16_ret =
+                    i.results.kind() == TypeKind::Float && i.results.bit_len == Some(16);
+                let has_sve_ret = i.results.num_lanes() == SimdLen::Scalable;
+                !(has_f16_ret && has_sve_ret)
+            })
+            // Skip `svqcvtn{u,}n*_x2` intrinsics - not yet implemented!
+            .filter(|i| !(i.name.starts_with("svqcvtn") && i.name.ends_with("_x2")))
+            // Skip `svqrshr{u,}n*_x2` intrinsics - not yet implemented!
+            .filter(|i| !(i.name.starts_with("svqrshrn") && i.name.ends_with("_x2")))
+            .filter(|i| !(i.name.starts_with("svqrshrun") && i.name.ends_with("_x2")))
+            // Skip `svclamp*` intrinsics - not yet implemented!
+            .filter(|i| !i.name.starts_with("svclamp"))
+            // Skip `svdot{_lane,}_{s,u}32_{s,u}16` intrinsics - not yet implemented!
+            .filter(|i| {
+                i.name != "svdot_lane_u32_u16"
+                    && i.name != "svdot_lane_s32_s16"
+                    && i.name != "svdot_u32_u16"
+                    && i.name != "svdot_s32_s16"
+            })
+            // Skip `svrevd*` intrinsics - not yet implemented!
+            .filter(|i| !i.name.starts_with("svrevd"))
+            // Skip `svpsel_lane_b*` intrinsics - not yet implemented!
+            .filter(|i| !i.name.starts_with("svpsel_lane_b"))
+            // Skip `svundef*` intrinsics - to avoid undefined behaviour in Rust, these return
+            // zeroed vectors in Rust, which are inherently going to be different than the
+            // undefined vectors returned by the C intrinsics.
+            .filter(|i| !i.name.starts_with("svundef"))
+            // These load intrinsics expect each element in the scalable vector `bases` argument to
+            // be able to be cast to a pointer, which we don't support generating tests for yet.
+            .filter(|i| !(i.name.starts_with("svld") && i.name.contains("_gather_")))
             // Skip pointers for now, we would probably need to look at the return
             // type to work out how many elements we need to point to.
             .filter(|i| !i.arguments.iter().any(|a| a.is_ptr()))
+            // Skip intrinsics with 128-bit elements (e.g. `p128`)
             .filter(|i| !i.arguments.iter().any(|a| a.ty.inner_size() == 128))
+            // Skip intrinsics from `--skip`
             .filter(|i| !cli_options.skip.contains(&i.name))
+            // Skip A64-specific intrinsics on A32
             .filter(|i| !(a32 && i.arch_tags == vec!["A64".to_string()]))
+            // Skip SVE intrinsics on big endian
+            .filter(|i| !(big_endian && (i.extension == "SVE" || i.extension == "SVE2")))
+            // Skip SVE intrinsics when testing against GCC as our wrappers run into ICEs
+            // See <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=125818>
+            .filter(|i| {
+                !(matches!(cli_options.cc_arg_style, CcArgStyle::Gcc)
+                    && (i.extension == "SVE" || i.extension == "SVE2"))
+            })
+            .take(sample_size)
             .collect::<Vec<_>>();
-        intrinsics.dedup();
 
-        Box::new(Self {
-            intrinsics,
-            cli_options,
-        })
+        Self(intrinsics)
     }
 
-    fn build_c_file(&self) -> bool {
-        let c_target = "aarch64";
-        let platform_headers = &["arm_neon.h", "arm_acle.h", "arm_fp16.h"];
-
-        let (chunk_size, chunk_count) = chunk_info(self.intrinsics.len());
-
-        let cpp_compiler_wrapped = compile::build_cpp_compilation(&self.cli_options);
-
-        let notice = &build_notices("// ");
-        fs::create_dir_all("c_programs").unwrap();
-        self.intrinsics
-            .par_chunks(chunk_size)
-            .enumerate()
-            .map(|(i, chunk)| {
-                let c_filename = format!("c_programs/mod_{i}.cpp");
-                let mut file = File::create(&c_filename).unwrap();
-                write_mod_cpp(&mut file, notice, c_target, platform_headers, chunk).unwrap();
-
-                // compile this cpp file into a .o file.
-                //
-                // This is done because `cpp_compiler_wrapped` is None when
-                // the --generate-only flag is passed
-                if let Some(cpp_compiler) = cpp_compiler_wrapped.as_ref() {
-                    let output = cpp_compiler
-                        .compile_object_file(&format!("mod_{i}.cpp"), &format!("mod_{i}.o"))?;
-                    assert!(output.status.success(), "{output:?}");
-                }
-
-                Ok(())
-            })
-            .collect::<Result<(), std::io::Error>>()
-            .unwrap();
-
-        let mut file = File::create("c_programs/main.cpp").unwrap();
-        write_main_cpp(
-            &mut file,
-            c_target,
-            POLY128_OSTREAM_DEF,
-            self.intrinsics.iter().map(|i| i.name.as_str()),
-        )
-        .unwrap();
-
-        // This is done because `cpp_compiler_wrapped` is None when
-        // the --generate-only flag is passed
-        if let Some(cpp_compiler) = cpp_compiler_wrapped.as_ref() {
-            // compile this cpp file into a .o file
-            info!("compiling main.cpp");
-            let output = cpp_compiler
-                .compile_object_file("main.cpp", "intrinsic-test-programs.o")
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-
-            let object_files = (0..chunk_count)
-                .map(|i| format!("mod_{i}.o"))
-                .chain(["intrinsic-test-programs.o".to_owned()]);
-
-            let output = cpp_compiler
-                .link_executable(object_files, "intrinsic-test-programs")
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-        }
-
-        true
+    fn predicate_function(size: u32) -> String {
+        format!("svptrue_b{size}()")
     }
 
-    fn build_rust_file(&self) -> bool {
-        std::fs::create_dir_all("rust_programs/src").unwrap();
+    fn load_call(arg: &Argument<Self>, idx: usize) -> String {
+        let name = arg.generate_name();
+        let load = arg.ty.load_function();
+        let ptr = format!(
+            "{vals_name}.as_ptr().add((i+{idx}) % {PASSES}) as _",
+            vals_name = test_values_array_name(&arg.ty)
+        );
 
-        let architecture = if self.cli_options.target.contains("v7") {
-            "arm"
-        } else {
-            "aarch64"
-        };
-
-        let (chunk_size, chunk_count) = chunk_info(self.intrinsics.len());
-
-        let mut cargo = File::create("rust_programs/Cargo.toml").unwrap();
-        write_bin_cargo_toml(&mut cargo, chunk_count).unwrap();
-
-        let mut main_rs = File::create("rust_programs/src/main.rs").unwrap();
-        write_main_rs(
-            &mut main_rs,
-            chunk_count,
-            AARCH_CONFIGURATIONS,
-            "",
-            self.intrinsics.iter().map(|i| i.name.as_str()),
-        )
-        .unwrap();
-
-        let target = &self.cli_options.target;
-        let toolchain = self.cli_options.toolchain.as_deref();
-        let linker = self.cli_options.linker.as_deref();
-
-        let notice = &build_notices("// ");
-        self.intrinsics
-            .par_chunks(chunk_size)
-            .enumerate()
-            .map(|(i, chunk)| {
-                std::fs::create_dir_all(format!("rust_programs/mod_{i}/src"))?;
-
-                let rust_filename = format!("rust_programs/mod_{i}/src/lib.rs");
-                trace!("generating `{rust_filename}`");
-                let mut file = File::create(rust_filename)?;
-
-                let cfg = AARCH_CONFIGURATIONS;
-                let definitions = F16_FORMATTING_DEF;
-                write_lib_rs(&mut file, architecture, notice, cfg, definitions, chunk)?;
-
-                let toml_filename = format!("rust_programs/mod_{i}/Cargo.toml");
-                trace!("generating `{toml_filename}`");
-                let mut file = File::create(toml_filename).unwrap();
-
-                write_lib_cargo_toml(&mut file, &format!("mod_{i}"))?;
-
-                Ok(())
-            })
-            .collect::<Result<(), std::io::Error>>()
-            .unwrap();
-
-        compile_rust_programs(toolchain, target, linker)
-    }
-
-    fn compare_outputs(&self) -> bool {
-        if self.cli_options.toolchain.is_some() {
-            let intrinsics_name_list = self
-                .intrinsics
-                .iter()
-                .map(|i| i.name.clone())
-                .collect::<Vec<_>>();
-
-            compare_outputs(
-                &intrinsics_name_list,
-                &self.cli_options.runner,
-                &self.cli_options.target,
-            )
-        } else {
-            true
+        match arg.ty.num_lanes() {
+            // If the load is of a `svbool_t`, then we load a `svint8_t` and
+            SimdLen::Scalable if matches!(arg.ty.kind(), TypeKind::Bool) => {
+                format!(
+                    r#"
+let {name} = {load}({PREDICATE_LOCAL}, {ptr});
+let {name} = svcmpne_n_s8({PREDICATE_LOCAL}, {name}, 0);
+                "#
+                )
+            }
+            // If this load is of a scalable vector, then prepend an additional argument
+            // containing the predicate for the load.
+            SimdLen::Scalable => format!("let {name} = {load}({PREDICATE_LOCAL}, {ptr});"),
+            SimdLen::Fixed(..) => format!("let {name} = {load}({ptr});"),
         }
     }
 }
+
+const RUST_PRELUDE: &str = r#"
+#![cfg_attr(target_arch = "arm", feature(stdarch_arm_neon_intrinsics))]
+#![cfg_attr(target_arch = "arm", feature(stdarch_aarch32_crc32))]
+#![cfg_attr(any(target_arch = "aarch64", target_arch = "arm64ec"), feature(stdarch_neon_fcma))]
+#![cfg_attr(any(target_arch = "aarch64", target_arch = "arm64ec"), feature(stdarch_neon_i8mm))]
+#![cfg_attr(any(target_arch = "aarch64", target_arch = "arm64ec"), feature(stdarch_neon_sm4))]
+#![cfg_attr(any(target_arch = "aarch64", target_arch = "arm64ec"), feature(stdarch_neon_ftts))]
+#![cfg_attr(any(target_arch = "aarch64", target_arch = "arm64ec"), feature(stdarch_neon_feat_lut))]
+#![cfg_attr(any(target_arch = "aarch64", target_arch = "arm64ec"), feature(stdarch_neon_fp8))]
+#![cfg_attr(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"), feature(stdarch_aarch64_sve))]
+#![cfg_attr(any(target_arch = "aarch64", target_arch = "arm64ec"), feature(faminmax))]
+#![feature(stdarch_neon_f16)]
+
+#[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+use core_arch::arch::aarch64::*;
+
+#[cfg(target_arch = "arm")]
+use core_arch::arch::arm::*;
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+const fn svpattern_from_i32(value: i32) -> svpattern {
+    match value {
+        0 => svpattern::SV_POW2,
+        1 => svpattern::SV_VL1,
+        2 => svpattern::SV_VL2,
+        3 => svpattern::SV_VL3,
+        4 => svpattern::SV_VL4,
+        5 => svpattern::SV_VL5,
+        6 => svpattern::SV_VL6,
+        7 => svpattern::SV_VL7,
+        8 => svpattern::SV_VL8,
+        9 => svpattern::SV_VL16,
+        10 => svpattern::SV_VL32,
+        11 => svpattern::SV_VL64,
+        12 => svpattern::SV_VL128,
+        13 => svpattern::SV_VL256,
+        29 => svpattern::SV_MUL4,
+        30 => svpattern::SV_MUL3,
+        31 => svpattern::SV_ALL,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+const fn svprfop_from_i32(value: i32) -> svprfop {
+    match value {
+        0 => svprfop::SV_PLDL1KEEP,
+        1 => svprfop::SV_PLDL1STRM,
+        2 => svprfop::SV_PLDL2KEEP,
+        3 => svprfop::SV_PLDL2STRM,
+        4 => svprfop::SV_PLDL3KEEP,
+        5 => svprfop::SV_PLDL3STRM,
+        8 => svprfop::SV_PSTL1KEEP,
+        9 => svprfop::SV_PSTL1STRM,
+        10 => svprfop::SV_PSTL2KEEP,
+        11 => svprfop::SV_PSTL2STRM,
+        12 => svprfop::SV_PSTL3KEEP,
+        13 => svprfop::SV_PSTL3STRM,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svint8_to_slice(a: &svint8_t) -> &[i8] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntb() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svuint8_to_slice(a: &svuint8_t) -> &[u8] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntb() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svint16_to_slice(a: &svint16_t) -> &[i16] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcnth() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svuint16_to_slice(a: &svuint16_t) -> &[u16] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcnth() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svint32_to_slice(a: &svint32_t) -> &[i32] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntw() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svuint32_to_slice(a: &svuint32_t) -> &[u32] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntw() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svint64_to_slice(a: &svint64_t) -> &[i64] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntd() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svuint64_to_slice(a: &svuint64_t) -> &[u64] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntd() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svfloat32_to_slice(a: &svfloat32_t) -> &[NanEqF32] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntw() as usize)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svfloat64_to_slice(a: &svfloat64_t) -> &[NanEqF64] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntd() as usize)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Copy,Clone,PartialEq,Eq)]
+struct b8(u8);
+
+impl std::fmt::Debug for b8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08b}", self.0)
+    }
+}
+
+#[cfg(all(any(target_arch = "aarch64", target_arch = "arm64ec"), target_endian = "little"))]
+fn svbool_to_slice(a: &svbool_t) -> &[b8] {
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::from_ref(a).cast(), svcntd() as usize)
+    }
+}
+
+"#;

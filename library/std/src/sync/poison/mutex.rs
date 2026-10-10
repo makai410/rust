@@ -68,7 +68,7 @@ use crate::sys::sync as sys;
 ///     }
 ///
 ///     pub fn replace_with(&self, f: impl FnOnce(T) -> T) {
-///         let ptr = self.data.lock().expect("poisoned");
+///         let ptr = self.data.lock().expect("`Mutex` should not be poisoned");
 ///         // While `f` is running, the data is moved out of `*ptr`. If `f`
 ///         // panics, `*ptr` keeps pointing at a dropped value. The intention
 ///         // is that this will poison the mutex, so the following calls to
@@ -216,7 +216,7 @@ use crate::sys::sync as sys;
 /// threads.into_iter().for_each(|thread| {
 ///     thread
 ///         .join()
-///         .expect("The thread creating or execution failed !")
+///         .expect("Thread creation or execution should not fail")
 /// });
 ///
 /// assert_eq!(*res_mutex.lock().unwrap(), 800);
@@ -401,6 +401,7 @@ impl<T> Mutex<T> {
     /// assert_eq!(mutex.get_cloned().unwrap(), 11);
     /// ```
     #[unstable(feature = "lock_value_accessors", issue = "133407")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn set(&self, value: T) -> Result<(), PoisonError<T>> {
         if mem::needs_drop::<T>() {
             // If the contained value has non-trivial destructor, we
@@ -438,6 +439,7 @@ impl<T> Mutex<T> {
     /// assert_eq!(mutex.get_cloned().unwrap(), 11);
     /// ```
     #[unstable(feature = "lock_value_accessors", issue = "133407")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn replace(&self, value: T) -> LockResult<T> {
         match self.lock() {
             Ok(mut guard) => Ok(mem::replace(&mut *guard, value)),
@@ -480,10 +482,11 @@ impl<T: ?Sized> Mutex<T> {
     ///
     /// thread::spawn(move || {
     ///     *c_mutex.lock().unwrap() = 10;
-    /// }).join().expect("thread::spawn failed");
+    /// }).join().expect("`thread::spawn` should not fail");
     /// assert_eq!(*mutex.lock().unwrap(), 10);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
         unsafe {
             self.inner.lock();
@@ -528,10 +531,11 @@ impl<T: ?Sized> Mutex<T> {
     ///     } else {
     ///         println!("try_lock failed");
     ///     }
-    /// }).join().expect("thread::spawn failed");
+    /// }).join().expect("`thread::spawn` should not fail");
     /// assert_eq!(*mutex.lock().unwrap(), 10);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
         unsafe {
             if self.inner.try_lock() {
@@ -602,6 +606,7 @@ impl<T: ?Sized> Mutex<T> {
     /// ```
     #[inline]
     #[stable(feature = "mutex_unpoison", since = "1.77.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn clear_poison(&self) {
         self.poison.clear();
     }
@@ -668,7 +673,7 @@ impl<T: ?Sized> Mutex<T> {
     /// are properly synchronized to avoid data races, and that it is not read
     /// or written through after the mutex is dropped.
     #[unstable(feature = "mutex_data_ptr", issue = "140368")]
-    pub fn data_ptr(&self) -> *mut T {
+    pub const fn data_ptr(&self) -> *mut T {
         self.data.get()
     }
 }
@@ -683,7 +688,7 @@ impl<T> From<T> for Mutex<T> {
 }
 
 #[stable(feature = "mutex_default", since = "1.10.0")]
-impl<T: ?Sized + Default> Default for Mutex<T> {
+impl<T: Default> Default for Mutex<T> {
     /// Creates a `Mutex<T>`, with the `Default` value for T.
     fn default() -> Mutex<T> {
         Mutex::new(Default::default())
@@ -757,11 +762,13 @@ impl<T: ?Sized + fmt::Display> fmt::Display for MutexGuard<'_, T> {
     }
 }
 
-pub fn guard_lock<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a sys::Mutex {
+/// For use in [`nonpoison::condvar`](super::condvar).
+pub(super) fn guard_lock<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a sys::Mutex {
     &guard.lock.inner
 }
 
-pub fn guard_poison<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a poison::Flag {
+/// For use in [`nonpoison::condvar`](super::condvar).
+pub(super) fn guard_poison<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a poison::Flag {
     &guard.lock.poison
 }
 

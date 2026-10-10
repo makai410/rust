@@ -8,13 +8,18 @@ use std::io::{self, Write};
 use itertools::Itertools;
 use rustc_graphviz as dot;
 use rustc_middle::ty::UniverseIndex;
+use rustc_span::bug;
 
 use super::*;
 
 fn render_outlives_constraint(constraint: &OutlivesConstraint<'_>) -> String {
-    match constraint.locations {
-        Locations::All(_) => "All(...)".to_string(),
-        Locations::Single(loc) => format!("{loc:?}"),
+    if let ConstraintCategory::OutlivesUnnameablePlaceholder(unnameable) = constraint.category {
+        format!("{unnameable:?} unnameable")
+    } else {
+        match constraint.locations {
+            Locations::All(_) => "All(...)".to_string(),
+            Locations::Single(loc) => format!("{loc:?}"),
+        }
     }
 }
 
@@ -48,7 +53,7 @@ fn render_region_vid<'tcx>(
                 format!(" (for<{}>)", tcx.item_name(def_id))
             }
             ty::BoundRegionKind::ClosureEnv | ty::BoundRegionKind::Anon => " (for<'_>)".to_string(),
-            ty::BoundRegionKind::NamedAnon(_) => {
+            ty::BoundRegionKind::NamedForPrinting(_) => {
                 bug!("only used for pretty printing")
             }
         },

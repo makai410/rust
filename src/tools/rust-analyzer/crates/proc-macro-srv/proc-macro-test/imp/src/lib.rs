@@ -79,6 +79,16 @@ pub fn fn_like_span_ops(args: TokenStream) -> TokenStream {
     TokenStream::from_iter(vec![first, second, third])
 }
 
+/// Returns the line and column of the first token's span as two integer literals.
+#[proc_macro]
+pub fn fn_like_span_line_column(args: TokenStream) -> TokenStream {
+    let first = args.into_iter().next().unwrap();
+    let span = first.span();
+    let line = Literal::usize_unsuffixed(span.line());
+    let column = Literal::usize_unsuffixed(span.column());
+    TokenStream::from_iter(vec![TokenTree::Literal(line), TokenTree::Literal(column)])
+}
+
 #[proc_macro_attribute]
 pub fn attr_noop(_args: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -92,6 +102,11 @@ pub fn attr_panic(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn attr_error(args: TokenStream, item: TokenStream) -> TokenStream {
     format!("compile_error!(\"#[attr_error({})] {}\");", args, item).parse().unwrap()
+}
+
+#[proc_macro_derive(DeriveReemit, attributes(helper))]
+pub fn derive_reemit(item: TokenStream) -> TokenStream {
+    item
 }
 
 #[proc_macro_derive(DeriveEmpty)]

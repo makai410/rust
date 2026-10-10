@@ -180,7 +180,7 @@ impl CrateWithSource {
     /// copies a local folder
     #[expect(clippy::too_many_lines)]
     fn download_and_extract(&self) -> Crate {
-        #[allow(clippy::result_large_err)]
+        #[expect(clippy::result_large_err)]
         fn get(path: &str) -> Result<ureq::Response, ureq::Error> {
             const MAX_RETRIES: u8 = 4;
             let mut retries = 0;
@@ -281,8 +281,7 @@ impl CrateWithSource {
             CrateSource::Path { path } => {
                 fn is_cache_dir(entry: &DirEntry) -> bool {
                     fs::read(entry.path().join("CACHEDIR.TAG"))
-                        .map(|x| x.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
-                        .unwrap_or(false)
+                        .is_ok_and(|x| x.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
                 }
 
                 // copy path into the dest_crate_root but skip directories that contain a CACHEDIR.TAG file.

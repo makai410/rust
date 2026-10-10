@@ -7,12 +7,10 @@ fn main() {
     use std::hint::black_box;
 
     macro_rules! check {
-        ($ty:ty, $expr:expr) => {
-            {
-                const EXPECTED: $ty = $expr;
-                assert_eq!($expr, EXPECTED);
-            }
-        };
+        ($ty:ty, $expr:expr) => {{
+            const EXPECTED: $ty = $expr;
+            assert_eq!($expr, EXPECTED);
+        }};
     }
 
     check!(u32, (2220326408_u32 + black_box(1)) >> (32 - 6));
@@ -320,5 +318,30 @@ fn main() {
         const VAL4: T = 63236519889708027473620326106273939584_i128;
         const VAL5: T = 73236519889708027473620326106273939584_i128;
         check_ops128!();
+    }
+
+    {
+        #[allow(dead_code)]
+        #[repr(u8)]
+        enum Inner {
+            L0 = 0,
+            H255 = 255,
+        }
+        #[allow(dead_code)]
+        enum O {
+            A(Inner),
+            B,
+            C,
+        }
+
+        #[inline(never)]
+        fn which(o: &O) -> &'static str {
+            match o {
+                O::A(_) => "a",
+                O::B => "b",
+                O::C => "c",
+            }
+        }
+        assert_eq!(which(black_box(&O::A(Inner::H255))), "a");
     }
 }

@@ -1,10 +1,10 @@
-#![feature(box_patterns)]
+#![feature(deref_patterns)]
 
 
 fn a() {
     let mut vec = [Box::new(1), Box::new(2), Box::new(3)];
     match vec {
-        [box ref _a, _, _] => {
+        [deref!(ref _a), _, _] => {
         //~^ NOTE `vec[_]` is borrowed here
             vec[0] = Box::new(4); //~ ERROR cannot assign
             //~^ NOTE `vec[_]` is assigned to here
@@ -35,8 +35,7 @@ fn c() {
         //~^ ERROR cannot move out
         //~| NOTE cannot move out
         &mut [_a,
-        //~^ NOTE data moved here
-        //~| NOTE move occurs because `_a` has type
+        //~^ NOTE data moved here because `_a` has type
         //~| HELP consider removing the mutable borrow
             ..
         ] => {
@@ -59,8 +58,7 @@ fn d() {
         &mut [
         //~^ HELP consider removing the mutable borrow
          _b] => {}
-        //~^ NOTE data moved here
-        //~| NOTE move occurs because `_b` has type
+        //~^ NOTE data moved here because `_b` has type
         _ => {}
     }
     let a = vec[0]; //~ ERROR cannot move out

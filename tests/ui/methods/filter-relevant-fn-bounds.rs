@@ -9,8 +9,6 @@ impl Wrapper {
     //~^ ERROR the trait bound `for<'a> F: Output<'a>` is not satisfied
     where
         F: for<'a> FnOnce(<F as Output<'a>>::Type),
-        //~^ ERROR the trait bound `for<'a> F: Output<'a>` is not satisfied
-        //~| ERROR the trait bound `for<'a> F: Output<'a>` is not satisfied
     {
     }
 }
@@ -18,5 +16,5 @@ impl Wrapper {
 fn main() {
     let mut wrapper = Wrapper;
     wrapper.do_something_wrapper(|value| ());
-    //~^ ERROR expected a `FnOnce
+    //~^ ERROR expected an `FnOnce
 }

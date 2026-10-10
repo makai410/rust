@@ -1,10 +1,10 @@
+//@ edition:2015..2021
 //@ run-rustfix
 //@ needs-unwind
 
 #![deny(rust_2021_incompatible_closure_captures)]
 //~^ NOTE: the lint level is defined here
 #![feature(fn_traits)]
-#![feature(never_type)]
 
 use std::panic;
 

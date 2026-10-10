@@ -1,6 +1,8 @@
 error: coroutine cannot be sent between threads safely
   --> $DIR/parent-expression.rs:25:13
    |
+LL |   macro_rules! type_combinations {
+...
 LL |               assert_send(g);
    |               ^^^^^^^^^^^^^^ coroutine is not `Send`
 ...
@@ -12,7 +14,11 @@ LL | |         };
 LL | |     );
    | |_____- in this macro invocation
    |
-   = help: within `{coroutine@$DIR/parent-expression.rs:19:34: 19:41}`, the trait `Send` is not implemented for `derived_drop::Client`
+help: within `{coroutine@$DIR/parent-expression.rs:19:34: 19:41}`, the trait `Send` is not implemented for `derived_drop::Client`
+  --> $DIR/parent-expression.rs:51:46
+   |
+LL |         derived_drop => { #[derive(Default)] pub struct Client { pub nickname: String } };
+   |                                              ^^^^^^^^^^^^^^^^^
 note: coroutine is not `Send` as this value is used across a yield
   --> $DIR/parent-expression.rs:23:22
    |
@@ -34,11 +40,12 @@ note: required by a bound in `assert_send`
    |
 LL | fn assert_send<T: Send>(_thing: T) {}
    |                   ^^^^ required by this bound in `assert_send`
-   = note: this error originates in the macro `type_combinations` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: coroutine cannot be sent between threads safely
   --> $DIR/parent-expression.rs:25:13
    |
+LL |   macro_rules! type_combinations {
+...
 LL |               assert_send(g);
    |               ^^^^^^^^^^^^^^ coroutine is not `Send`
 ...
@@ -50,7 +57,11 @@ LL | |         };
 LL | |     );
    | |_____- in this macro invocation
    |
-   = help: within `{coroutine@$DIR/parent-expression.rs:19:34: 19:41}`, the trait `Send` is not implemented for `significant_drop::Client`
+help: within `{coroutine@$DIR/parent-expression.rs:19:34: 19:41}`, the trait `Send` is not implemented for `significant_drop::Client`
+  --> $DIR/parent-expression.rs:55:13
+   |
+LL |             pub struct Client;
+   |             ^^^^^^^^^^^^^^^^^
 note: coroutine is not `Send` as this value is used across a yield
   --> $DIR/parent-expression.rs:23:22
    |
@@ -72,11 +83,12 @@ note: required by a bound in `assert_send`
    |
 LL | fn assert_send<T: Send>(_thing: T) {}
    |                   ^^^^ required by this bound in `assert_send`
-   = note: this error originates in the macro `type_combinations` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: coroutine cannot be sent between threads safely
   --> $DIR/parent-expression.rs:25:13
    |
+LL |   macro_rules! type_combinations {
+...
 LL |               assert_send(g);
    |               ^^^^^^^^^^^^^^ coroutine is not `Send`
 ...
@@ -88,7 +100,11 @@ LL | |         };
 LL | |     );
    | |_____- in this macro invocation
    |
-   = help: within `{coroutine@$DIR/parent-expression.rs:19:34: 19:41}`, the trait `Send` is not implemented for `insignificant_dtor::Client`
+help: within `{coroutine@$DIR/parent-expression.rs:19:34: 19:41}`, the trait `Send` is not implemented for `insignificant_dtor::Client`
+  --> $DIR/parent-expression.rs:64:13
+   |
+LL |             pub struct Client;
+   |             ^^^^^^^^^^^^^^^^^
 note: coroutine is not `Send` as this value is used across a yield
   --> $DIR/parent-expression.rs:23:22
    |
@@ -110,7 +126,6 @@ note: required by a bound in `assert_send`
    |
 LL | fn assert_send<T: Send>(_thing: T) {}
    |                   ^^^^ required by this bound in `assert_send`
-   = note: this error originates in the macro `type_combinations` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error: aborting due to 3 previous errors
 

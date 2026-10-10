@@ -1,6 +1,6 @@
 //! List of the removed feature gates.
 
-use std::num::{NonZero, NonZeroU32};
+use std::num::NonZero;
 
 use rustc_span::sym;
 
@@ -17,7 +17,7 @@ macro_rules! opt_nonzero_u32 {
         None
     };
     ($val:expr) => {
-        Some(NonZeroU32::new($val).unwrap())
+        Some(<NonZero<u32>>::new($val).unwrap())
     };
 }
 
@@ -34,7 +34,7 @@ macro_rules! declare_features {
                     issue: to_nonzero($issue),
                 },
                 reason: $reason,
-                pull:  opt_nonzero_u32!($($pull)?),
+                pull: opt_nonzero_u32!($($pull)?),
             }),+
         ];
     };
@@ -55,13 +55,19 @@ declare_features! (
     /// Allows using the `amdgpu-kernel` ABI.
     (removed, abi_amdgpu_kernel, "1.77.0", Some(51575), None, 120495),
     (removed, abi_c_cmse_nonsecure_call, "1.90.0", Some(81391), Some("renamed to abi_cmse_nonsecure_call"), 142146),
+    (removed, abi_unadjusted, "1.100.0", None, Some("merged into link_llvm_intrinsics"), 161398),
     (removed, advanced_slice_patterns, "1.42.0", Some(62254),
      Some("merged into `#![feature(slice_patterns)]`"), 67712),
     (removed, allocator, "1.0.0", None, None),
     /// Allows a test to fail without failing the whole suite.
     (removed, allow_fail, "1.60.0", Some(46488), Some("removed due to no clear use cases"), 93416),
+    /// Allows users to enforce equality of associated constants `TraitImpl<AssocConst=3>`.
+    (removed, associated_const_equality, "1.94.0", Some(92827),
+     Some("merged into `gca_min_const_items`")),
     (removed, await_macro, "1.38.0", Some(50547),
      Some("subsumed by `.await` syntax"), 62293),
+    /// Allows using `box` in patterns (RFC 469).
+    (removed, box_patterns, "1.100.0", Some(29641), Some("superseded by `deref_patterns`")),
     /// Allows using the `box $expr` syntax.
     (removed, box_syntax, "1.70.0", Some(49733), Some("replaced with `#[rustc_box]`"), 108471),
     /// Allows capturing disjoint fields in a closure/coroutine (RFC 2229).
@@ -92,15 +98,23 @@ declare_features! (
     (removed, crate_visibility_modifier, "1.63.0", Some(53120), Some("removed in favor of `pub(crate)`"), 97254),
     /// Allows using custom attributes (RFC 572).
     (removed, custom_attribute, "1.0.0", Some(29642),
-     Some("removed in favor of `#![register_tool]` and `#![register_attr]`"), 66070),
+     Some("removed in favor of `#![register_tool]`"), 66070),
     /// Allows the use of `#[derive(Anything)]` as sugar for `#[derive_Anything]`.
     (removed, custom_derive, "1.32.0", Some(29644),
      Some("subsumed by `#[proc_macro_derive]`")),
     /// Allows default type parameters to influence type inference.
     (removed, default_type_parameter_fallback, "1.82.0", Some(27336),
      Some("never properly implemented; requires significant design work"), 127655),
+    /// Allows using `#[deprecated_safe]` to deprecate the safeness of a function or trait
+    (removed, deprecated_safe, "1.95.0", Some(94978), Some("never properly implemented, in the way of attribute refactor"), 152554),
     /// Allows deriving traits as per `SmartPointer` specification
     (removed, derive_smart_pointer, "1.84.0", Some(123430), Some("replaced by `CoercePointee`"), 131284),
+    /// Allows macros to customize macro argument matcher diagnostics.
+    (removed, diagnostic_on_unmatch_args, "1.98.0", Some(155642), Some("renamed to `diagnostic_on_unmatched_args`"), 157887),
+    /// Tells rustdoc to automatically generate `#[doc(cfg(...))]`.
+    (removed, doc_auto_cfg, "1.92.0", Some(43781), Some("merged into `doc_cfg`"), 138907),
+    /// Allows `#[doc(cfg_hide(...))]`.
+    (removed, doc_cfg_hide, "1.92.0", Some(43781), Some("merged into `doc_cfg`"), 138907),
     /// Allows using `#[doc(keyword = "...")]`.
     (removed, doc_keyword, "1.58.0", Some(51315),
      Some("merged into `#![feature(rustdoc_internals)]`"), 90420),
@@ -153,6 +167,7 @@ declare_features! (
         ),
         133768
     ),
+    (removed, generic_const_args, "1.100.0", Some(151972), Some("renamed to `gca_const_items`")),
     (removed, import_shadowing, "1.0.0", None, None),
     /// Allows in-band quantification of lifetime bindings (e.g., `fn foo(x: &'a u8) -> &'a u8`).
     (removed, in_band_lifetimes, "1.61.0", Some(44524),
@@ -163,8 +178,13 @@ declare_features! (
     /// Allow anonymous constants from an inline `const` block in pattern position
     (removed, inline_const_pat, "1.88.0", Some(76001),
      Some("removed due to implementation concerns as it requires significant refactorings"), 138492),
+    /// A temporary feature gate used to enable parser extensions needed
+    /// to bootstrap fix for #5723.
+    (removed, issue_5723_bootstrap, "1.95.0", None, None),
     /// Lazily evaluate constants. This allows constants to depend on type parameters.
     (removed, lazy_normalization_consts, "1.56.0", Some(72219), Some("superseded by `generic_const_exprs`"), 88369),
+    /// Allow to have type alias types for inter-crate use.
+    (removed, lazy_type_alias, "1.72.0", Some(112792), Some("renamed to `checked_type_aliases`"), 158758),
     /// Changes `impl Trait` to capture all lifetimes in scope.
     (removed, lifetime_capture_rules_2024, "1.87.0", None, Some("unnecessary -- use edition 2024 instead"), 136787),
     /// Allows using the `#[link_args]` attribute.
@@ -173,9 +193,12 @@ declare_features! (
            which is available from cargo build scripts with `cargo:rustc-link-arg` now"), 83820),
     (removed, macro_reexport, "1.0.0", Some(29638),
      Some("subsumed by `pub use`"), 49982),
+    (removed, macroless_const_item_generic_const_args, "1.100.0", Some(162540), Some("renamed to `gca_macroless_items`")),
+    (removed, macroless_generic_const_args, "1.100.0", Some(159006), Some("renamed to `gca_macroless_args`")),
     /// Allows using `#[main]` to replace the entrypoint `#[lang = "start"]` calls.
     (removed, main, "1.53.0", Some(29634), None, 84217),
     (removed, managed_boxes, "1.0.0", None, None),
+    (removed, min_generic_const_args, "1.100.0", Some(132980), Some("renamed to `gca_min_const_items`")),
     /// Allows the use of type alias impl trait in function return positions
     (removed, min_type_alias_impl_trait, "1.56.0", Some(63063),
      Some("removed in favor of full type_alias_impl_trait"), 87564),
@@ -185,14 +208,16 @@ declare_features! (
      Some("subsumed by `#![feature(allocator_internals)]`")),
     /// Allows use of unary negate on unsigned integers, e.g., -e for e: u8
     (removed, negate_unsigned, "1.0.0", Some(29645), None),
+    /// Allows diverging expressions to fall back to `!` rather than `()`.
+    (removed, never_type_fallback, "1.93.0", Some(65992), Some("removed in favor of unconditional fallback"), 148871),
     /// Allows `#[no_coverage]` on functions.
     /// The feature was renamed to `coverage_attribute` and the attribute to `#[coverage(on|off)]`
     (removed, no_coverage, "1.74.0", Some(84605), Some("renamed to `coverage_attribute`"), 114656),
     /// Allows `#[no_debug]`.
     (removed, no_debug, "1.43.0", Some(29721), Some("removed due to lack of demand"), 69667),
-    // Allows the use of `no_sanitize` attribute.
+    /// Allows the use of `no_sanitize` attribute.
     /// The feature was renamed to `sanitize` and the attribute to `#[sanitize(xyz = "on|off")]`
-    (removed, no_sanitize, "CURRENT_RUSTC_VERSION", Some(39699), Some(r#"renamed to sanitize(xyz = "on|off")"#), 142681),
+    (removed, no_sanitize, "1.91.0", Some(39699), Some(r#"renamed to sanitize(xyz = "on|off")"#), 142681),
     /// Note: this feature was previously recorded in a separate
     /// `STABLE_REMOVED` list because it, uniquely, was once stable but was
     /// then removed. But there was no utility storing it separately, so now
@@ -203,7 +228,7 @@ declare_features! (
     (removed, object_safe_for_dispatch, "1.83.0", Some(43561),
      Some("renamed to `dyn_compatible_for_dispatch`"), 131511),
     /// Allows using `#[omit_gdb_pretty_printer_section]`.
-    (removed, omit_gdb_pretty_printer_section, "CURRENT_RUSTC_VERSION", None, None, 144738),
+    (removed, omit_gdb_pretty_printer_section, "1.91.0", None, None, 144738),
     /// Allows using `#[on_unimplemented(..)]` on traits.
     /// (Moved to `rustc_attrs`.)
     (removed, on_unimplemented, "1.40.0", None, None, 65794),
@@ -245,7 +270,7 @@ declare_features! (
     (removed, pushpop_unsafe, "1.2.0", None, None),
     (removed, quad_precision_float, "1.0.0", None, None),
     (removed, quote, "1.33.0", Some(29601), None),
-    (removed, ref_pat_everywhere, "1.80.0", Some(123076), Some("superseded by `ref_pat_eat_one_layer_2024"), 125168),
+    (removed, ref_pat_everywhere, "1.80.0", Some(123076), Some("superseded by `ref_pat_eat_one_layer_2024`"), 125168),
     (removed, reflect, "1.0.0", Some(27749), None),
     /// Allows using the `#[register_attr]` attribute.
     (removed, register_attr, "1.65.0", Some(66080),
@@ -265,7 +290,12 @@ declare_features! (
     /// Allows `#[link(kind = "static-nobundle", ...)]`.
     (removed, static_nobundle, "1.63.0", Some(37403),
      Some(r#"subsumed by `#[link(kind = "static", modifiers = "-bundle", ...)]`"#), 95818),
+    /// Allows string patterns to dereference values to match them.
+    (removed, string_deref_patterns, "1.94.0", Some(87121), Some("superseded by `deref_patterns`"), 150530),
     (removed, struct_inherit, "1.0.0", None, None),
+    /// Allows the use of target_feature when a function is marked inline(always).
+    (removed, target_feature_inline_always, "1.97.0", Some(145574),
+     Some("removed because of unfixable soundness issues")),
     (removed, test_removed_feature, "1.0.0", None, None),
     /// Allows using items which are missing stability attributes
     (removed, unmarked_api, "1.0.0", None, None),
@@ -293,19 +323,5 @@ declare_features! (
 
     // -------------------------------------------------------------------------
     // feature-group-end: removed features
-    // -------------------------------------------------------------------------
-
-
-    // -------------------------------------------------------------------------
-    // feature-group-start: removed library features
-    // -------------------------------------------------------------------------
-    //
-    // FIXME(#141617): we should have a better way to track removed library features, but we reuse
-    // the infrastructure here so users still get hints. The symbols used here can be remove from
-    // `symbol.rs` when that happens.
-    (removed, concat_idents, "1.90.0", Some(29599),
-     Some("use the `${concat(..)}` metavariable expression instead"), 142704),
-    // -------------------------------------------------------------------------
-    // feature-group-end: removed library features
     // -------------------------------------------------------------------------
 );

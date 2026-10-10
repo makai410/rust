@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use rustc_errors::{Diag, FatalAbort};
+use rustc_errors::Diag;
 
 use super::UnstableOptions;
 use crate::EarlyDiagCtxt;
@@ -21,11 +21,13 @@ pub(crate) struct ExternOpt {
 ///
 /// The options field will be a string containing comma-separated options that will need further
 /// parsing and processing.
+///
+/// On error, the returned `Diag` is fatal.
 pub(crate) fn split_extern_opt<'a>(
     early_dcx: &'a EarlyDiagCtxt,
     unstable_opts: &UnstableOptions,
     extern_opt: &str,
-) -> Result<ExternOpt, Diag<'a, FatalAbort>> {
+) -> Result<ExternOpt, Diag<'a>> {
     let (name, path) = match extern_opt.split_once('=') {
         None => (extern_opt.to_string(), None),
         Some((name, path)) => (name.to_string(), Some(PathBuf::from(path))),
@@ -43,13 +45,19 @@ pub(crate) fn split_extern_opt<'a>(
         }
     };
 
+    // Reject paths with more than two segments.
+    if unstable_opts.namespaced_crates && crate_name.split("::").count() > 2 {
+        return Err(early_dcx.early_struct_fatal(format!(
+            "crate name `{crate_name}` passed to `--extern` can have at most two segments."
+        )));
+    }
+
     if !valid_crate_name(&crate_name, unstable_opts) {
         let mut error = early_dcx.early_struct_fatal(format!(
             "crate name `{crate_name}` passed to `--extern` is not a valid ASCII identifier"
         ));
         let adjusted_name = crate_name.replace('-', "_");
         if is_ascii_ident(&adjusted_name) {
-            #[allow(rustc::diagnostic_outside_of_impl)] // FIXME
             error
                 .help(format!("consider replacing the dashes with underscores: `{adjusted_name}`"));
         }

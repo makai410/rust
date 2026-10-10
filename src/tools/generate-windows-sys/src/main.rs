@@ -19,6 +19,8 @@ pub struct WSADATA {
 }
 #[cfg(target_arch = "arm")]
 pub enum CONTEXT {}
+#[cfg(target_arch = "arm")]
+pub type PCONTEXT = *mut CONTEXT;
 "#;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -33,7 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut f = std::fs::File::options().append(true).open("windows_sys.rs")?;
     f.write_all(ARM32_SHIM.as_bytes())?;
-    writeln!(&mut f, "// ignore-tidy-filelength")?;
+    writeln!(&mut f, "// ignore-tidy-file-filelength")?;
 
     Ok(())
 }

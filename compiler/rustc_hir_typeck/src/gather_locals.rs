@@ -135,7 +135,7 @@ impl<'a, 'tcx> GatherLocalsVisitor<'a, 'tcx> {
     /// again during type checking by querying [`FnCtxt::local_ty`] for the same hir_id.
     fn declare(&mut self, decl: Declaration<'tcx>) {
         let local_ty = match decl.ty {
-            Some(ref ty) => {
+            Some(ty) => {
                 let o_ty = self.fcx.lower_ty(ty);
 
                 let c_ty = self.fcx.infcx.canonicalize_user_type_annotation(
@@ -193,7 +193,7 @@ impl<'a, 'tcx> Visitor<'tcx> for GatherLocalsVisitor<'a, 'tcx> {
                         // ascription, or if it's an implicit `self` parameter
                         ObligationCauseCode::SizedArgumentType(
                             if ty_span == ident.span
-                                && self.fcx.tcx.is_closure_like(self.fcx.body_id.into())
+                                && self.fcx.tcx.is_closure_like(self.fcx.body_def_id.into())
                             {
                                 None
                             } else {

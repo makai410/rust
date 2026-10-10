@@ -4,7 +4,7 @@ use clippy_utils::sugg;
 use rustc_errors::Applicability;
 use rustc_hir::Expr;
 use rustc_lint::LateContext;
-use rustc_middle::ty::{self, Ty, TypeVisitableExt};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt as _};
 
 /// Checks for `useless_transmute` lint.
 /// Returns `true` if it's triggered, otherwise returns `false`.
@@ -49,17 +49,7 @@ pub(super) fn check<'tcx>(
             true
         },
         (ty::Int(_) | ty::Uint(_), ty::RawPtr(_, _)) => {
-            span_lint_and_then(
-                cx,
-                USELESS_TRANSMUTE,
-                e.span,
-                "transmute from an integer to a pointer",
-                |diag| {
-                    if let Some(arg) = sugg::Sugg::hir_opt(cx, arg) {
-                        diag.span_suggestion(e.span, "try", arg.as_ty(to_ty.to_string()), Applicability::Unspecified);
-                    }
-                },
-            );
+            // Handled by the upstream rustc `integer_to_ptr_transmutes` lint
             true
         },
         _ => false,

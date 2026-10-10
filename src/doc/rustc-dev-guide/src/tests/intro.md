@@ -1,9 +1,9 @@
 # Testing the compiler
 
-The Rust project runs a wide variety of different tests, orchestrated by the
-build system (`./x test`). This section gives a brief overview of the different
-testing tools. Subsequent chapters dive into [running tests](running.md) and
-[adding new tests](adding.md).
+The Rust project runs a wide variety of different tests,
+orchestrated by the build system (`./x test`).
+This section gives a brief overview of the different testing tools.
+Subsequent chapters dive into [running tests](running.md) and [adding new tests](adding.md).
 
 ## Kinds of tests
 
@@ -12,25 +12,25 @@ Almost all of them are driven by `./x test`, with some exceptions noted below.
 
 ### Compiletest
 
-The main test harness for testing the compiler itself is a tool called
-[compiletest].
+The main test harness for testing the compiler itself is a tool called [compiletest].
 
-[compiletest] supports running different styles of tests, organized into *test
-suites*. A *test mode* may provide common presets/behavior for a set of *test
-suites*. [compiletest]-supported tests are located in the [`tests`] directory.
+[compiletest] supports running different styles of tests,
+organized into *test suites*.
+A *test mode* may provide common presets/behavior for a set of *test suites*.
+[compiletest]-supported tests are located in the [`tests`] directory.
 
 The [Compiletest chapter][compiletest] goes into detail on how to use this tool.
 
 > Example: `./x test tests/ui`
 
 [compiletest]: compiletest.md
-[`tests`]: https://github.com/rust-lang/rust/tree/master/tests
+[`tests`]: https://github.com/rust-lang/rust/tree/HEAD/tests
 
 ### Package tests
 
-The standard library and many of the compiler packages include typical Rust
-`#[test]` unit tests, integration tests, and documentation tests. You can pass a
-path to `./x test` for almost any package in the `library/` or `compiler/`
+The standard library and many of the compiler packages include typical Rust `#[test]` unit tests,
+integration tests, and documentation tests.
+You can pass a path to `./x test` for almost any package in the `library/` or `compiler/`
 directory, and `x` will essentially run `cargo test` on that package.
 
 Examples:
@@ -41,13 +41,14 @@ Examples:
 | `./x test library/core`                   | Runs tests on `core` only             |
 | `./x test compiler/rustc_data_structures` | Runs tests on `rustc_data_structures` |
 
-The standard library relies very heavily on documentation tests to cover its
-functionality. However, unit tests and integration tests can also be used as
-needed. Almost all of the compiler packages have doctests disabled.
+The standard library relies very heavily on documentation tests to cover its functionality.
+However, unit tests and integration tests can also be used as needed.
+Almost all of the compiler packages have doctests disabled.
 
 All standard library and compiler unit tests are placed in separate `tests` file
-(which is enforced in [tidy][tidy-unit-tests]). This ensures that when the test
-file is changed, the crate does not need to be recompiled. For example:
+(which is enforced in [tidy][tidy-unit-tests]).
+This ensures that when the test file is changed, the crate does not need to be recompiled.
+For example:
 
 ```rust,ignore
 #[cfg(test)]
@@ -55,31 +56,32 @@ mod tests;
 ```
 
 If it wasn't done this way, and you were working on something like `core`, that
-would require recompiling the entire standard library, and the entirety of
-`rustc`.
+would require recompiling the entire standard library, and the entirety of `rustc`.
 
-`./x test` includes some CLI options for controlling the behavior with these
-package tests:
+`./x test` includes some CLI options for controlling the behavior with these package tests:
 
 * `--doc` — Only runs documentation tests in the package.
-* `--no-doc` — Run all tests *except* documentation tests.
+* `--all-targets` — Run all tests *except* documentation tests.
+* `--tests` — Only runs unit and integration tests
 
-[tidy-unit-tests]: https://github.com/rust-lang/rust/blob/master/src/tools/tidy/src/unit_tests.rs
+[tidy-unit-tests]: https://github.com/rust-lang/rust/blob/HEAD/src/tools/tidy/src/unit_tests.rs
 
 ### Tidy
 
-Tidy is a custom tool used for validating source code style and formatting
-conventions, such as rejecting long lines. There is more information in the
-[section on coding conventions](../conventions.md#formatting).
+Tidy is a custom tool used for validating source code style and formatting conventions,
+such as rejecting long lines.
+There is more information in the
+[section on coding conventions](../conventions.md#formatting) or the [Tidy Readme].
 
 > Examples: `./x test tidy`
+
+[Tidy Readme]: https://github.com/rust-lang/rust/blob/HEAD/src/tools/tidy/Readme.md
 
 
 ### Formatting
 
-Rustfmt is integrated with the build system to enforce uniform style across the
-compiler. The formatting check is automatically run by the Tidy tool mentioned
-above.
+Rustfmt is integrated with the build system to enforce uniform style across the compiler.
+The formatting check is automatically run by the Tidy tool mentioned above.
 
 Examples:
 
@@ -91,10 +93,10 @@ Examples:
 
 ### Book documentation tests
 
-All of the books that are published have their own tests, primarily for
-validating that the Rust code examples pass. Under the hood, these are
-essentially using `rustdoc --test` on the markdown files. The tests can be run
-by passing a path to a book to `./x test`.
+All of the books that are published have their own tests,
+primarily for validating that the Rust code examples pass.
+Under the hood, these are essentially using `rustdoc --test` on the markdown files.
+The tests can be run by passing a path to a book to `./x test`.
 
 > Example: `./x test src/doc/book`
 
@@ -111,8 +113,8 @@ This requires building all of the documentation, which might take a while.
 
 ### `distcheck`
 
-`distcheck` verifies that the source distribution tarball created by the build
-system will unpack, build, and run all tests.
+`distcheck` verifies that the source distribution tarball created by the build system will unpack,
+build, and run all tests.
 
 ```console
 ./x test distcheck
@@ -120,41 +122,40 @@ system will unpack, build, and run all tests.
 
 ### Tool tests
 
-Packages that are included with Rust have all of their tests run as well. This
-includes things such as cargo, clippy, rustfmt, miri, bootstrap (testing the
+Packages that are included with Rust have all of their tests run as well.
+This includes things such as cargo, clippy, rustfmt, miri, bootstrap (testing the
 Rust build system itself), etc.
 
-Most of the tools are located in the [`src/tools`] directory. To run the tool's
-tests, just pass its path to `./x test`.
+Most of the tools are located in the [`src/tools`] directory.
+To run the tool's tests, just pass its path to `./x test`.
 
 > Example: `./x test src/tools/cargo`
 
 Usually these tools involve running `cargo test` within the tool's directory.
 
-If you want to run only a specified set of tests, append `--test-args
-FILTER_NAME` to the command.
+If you want to run only a specified set of tests, append `--test-args FILTER_NAME` to the command.
 
 > Example: `./x test src/tools/miri --test-args padding`
 
-In CI, some tools are allowed to fail. Failures send notifications to the
-corresponding teams, and is tracked on the [toolstate website]. More information
-can be found in the [toolstate documentation].
+In CI, some tools are allowed to fail.
+Failures send notifications to the corresponding teams, and are tracked on the [toolstate website].
+More information can be found in the [toolstate documentation].
 
-[`src/tools`]: https://github.com/rust-lang/rust/tree/master/src/tools/
+[`src/tools`]: https://github.com/rust-lang/rust/tree/HEAD/src/tools/
 [toolstate documentation]: https://forge.rust-lang.org/infra/toolstate.html
 [toolstate website]: https://rust-lang-nursery.github.io/rust-toolstate/
 
 ### Ecosystem testing
 
 Rust tests integration with real-world code to catch regressions and make
-informed decisions about the evolution of the language. There are several kinds
-of ecosystem tests, including Crater. See the [Ecosystem testing
-chapter](ecosystem.md) for more details.
+informed decisions about the evolution of the language.
+There are several kinds of ecosystem tests, including Crater.
+See the [Ecosystem testing chapter](ecosystem.md) for more details.
 
 ### Performance testing
 
-A separate infrastructure is used for testing and tracking performance of the
-compiler. See the [Performance testing chapter](perf.md) for more details.
+A separate infrastructure is used for testing and tracking performance of the compiler.
+See the [Performance testing chapter](perf.md) for more details.
 
 ### Codegen backend testing
 

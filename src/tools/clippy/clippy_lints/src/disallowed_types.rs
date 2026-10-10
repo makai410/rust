@@ -5,10 +5,9 @@ use clippy_utils::paths::PathNS;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefIdMap;
-use rustc_hir::{AmbigArg, Item, ItemKind, PolyTraitRef, PrimTy, Ty, TyKind, UseKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_hir::{AmbigArg, Item, ItemKind, PolyTraitRef, PrimTy, Ty, TyKind, UseKind, UseTree};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 
 declare_clippy_lint! {
@@ -57,6 +56,8 @@ declare_clippy_lint! {
     "use of disallowed types"
 }
 
+impl_lint_pass!(DisallowedTypes => [DISALLOWED_TYPES]);
+
 pub struct DisallowedTypes {
     def_ids: DefIdMap<(&'static str, &'static DisallowedPath)>,
     prim_tys: FxHashMap<PrimTy, (&'static str, &'static DisallowedPath)>,
@@ -104,12 +105,13 @@ pub fn def_kind_predicate(def_kind: DefKind) -> bool {
     )
 }
 
-impl_lint_pass!(DisallowedTypes => [DISALLOWED_TYPES]);
-
 impl<'tcx> LateLintPass<'tcx> for DisallowedTypes {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
-        if let ItemKind::Use(path, UseKind::Single(_)) = &item.kind
-            && let Some(res) = path.res.type_ns
+        if let ItemKind::Use(UseTree {
+            prefix,
+            kind: UseKind::Single(_),
+        }) = &item.kind
+            && let Some(res) = prefix.res.type_ns
         {
             self.check_res_emit(cx, &res, item.span);
         }

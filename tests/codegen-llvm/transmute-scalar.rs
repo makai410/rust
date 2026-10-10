@@ -1,12 +1,12 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ compile-flags: -C opt-level=0 -C no-prepopulate-passes --target=x86_64-unknown-linux-gnu
 //@ needs-llvm-components: x86
 
 #![crate_type = "lib"]
-#![feature(no_core, repr_simd)]
+#![feature(no_core)]
 #![no_core]
 extern crate minicore;
-
+use minicore::simd::Simd;
 use minicore::*;
 
 // With opaque ptrs in LLVM, `transmute` can load/store any `alloca` as any type,
@@ -56,7 +56,7 @@ pub fn ptr_to_int(p: *mut u16) -> usize {
 }
 
 // CHECK: define{{.*}}ptr @int_to_ptr([[USIZE]] %i)
-// CHECK: %_0 = getelementptr i8, ptr null, [[USIZE]] %i
+// CHECK: %_0 = inttoptr [[USIZE]] %i to ptr
 // CHECK-NEXT: ret ptr %_0
 #[no_mangle]
 pub fn int_to_ptr(i: usize) -> *mut u16 {
@@ -108,8 +108,7 @@ pub fn fake_bool_unsigned_to_bool(b: FakeBoolUnsigned) -> bool {
     unsafe { mem::transmute(b) }
 }
 
-#[repr(simd)]
-struct S([i64; 1]);
+type S = Simd<i64, 1>;
 
 // CHECK-LABEL: define{{.*}}i64 @single_element_simd_to_scalar(<1 x i64> %b)
 // CHECK-NEXT: start:

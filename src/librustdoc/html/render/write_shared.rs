@@ -11,10 +11,10 @@
 //!    contents, so they do not include a hash in their filename and are not safe to
 //!    cache with `Cache-Control: immutable`. They include the contents of the
 //!    --resource-suffix flag and are emitted when --emit-type is empty (default)
-//!    or contains "invocation-specific".
+//!    or contains "html-non-static-files".
 
 use std::cell::RefCell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::iter::once;
@@ -25,12 +25,11 @@ use std::str::FromStr;
 use std::{fmt, fs};
 
 use indexmap::IndexMap;
-use regex::Regex;
 use rustc_ast::join_path_syms;
-use rustc_data_structures::flock;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::fast_reject::DeepRejectCtxt;
+use rustc_session::Session;
 use rustc_span::Symbol;
 use rustc_span::def_id::DefId;
 use serde::de::DeserializeOwned;
@@ -44,14 +43,20 @@ use crate::docfs::PathError;
 use crate::error::Error;
 use crate::formats::Impl;
 use crate::formats::item_type::ItemType;
+use crate::html::format::{print_impl, print_path};
 use crate::html::layout;
 use crate::html::render::ordered_json::{EscapedJson, OrderedJson};
+use crate::html::render::print_item::compare_names;
 use crate::html::render::search_index::{SerializedSearchIndex, build_index};
 use crate::html::render::sorted_template::{self, FileFormat, SortedTemplate};
-use crate::html::render::{AssocItemLink, ImplRenderingParameters, StylePath};
+use crate::html::render::{
+    AssocItemLink, ImplRenderingParameters, StylePath, scrape_examples_help,
+};
 use crate::html::static_files::{self, suffix_path};
 use crate::visit::DocVisitor;
-use crate::{try_err, try_none};
+use crate::{DOC_RUST_LANG_ORG_VERSION, try_err, try_none};
+
+mod flock;
 
 pub(crate) fn write_shared(
     cx: &mut Context<'_>,
@@ -63,10 +68,16 @@ pub(crate) fn write_shared(
     cx.shared.fs.set_sync_only(true);
     let lock_file = cx.dst.join(".lock");
     // Write shared runs within a flock; disable thread dispatching of IO temporarily.
-    let _lock = try_err!(flock::Lock::new(&lock_file, true, true, true), &lock_file);
+    let _lock = try_err!(flock::Lock::new(&lock_file), &lock_file);
 
-    let search_index =
-        build_index(krate, &mut cx.shared.cache, tcx, &cx.dst, &cx.shared.resource_suffix)?;
+    let search_index = build_index(
+        krate,
+        &mut cx.shared.cache,
+        tcx,
+        &cx.dst,
+        &cx.shared.resource_suffix,
+        &opt.should_merge,
+    )?;
 
     let crate_name = krate.name(cx.tcx());
     let crate_name = crate_name.as_str(); // rand
@@ -83,9 +94,11 @@ pub(crate) fn write_shared(
     };
 
     if let Some(parts_out_dir) = &opt.parts_out_dir {
-        create_parents(&parts_out_dir.0)?;
+        let mut parts_out_file = parts_out_dir.0.clone();
+        parts_out_file.push(&format!("{crate_name}.json"));
+        create_parents(&parts_out_file)?;
         try_err!(
-            fs::write(&parts_out_dir.0, serde_json::to_string(&info).unwrap()),
+            fs::write(&parts_out_file, serde_json::to_string(&info).unwrap()),
             &parts_out_dir.0
         );
     }
@@ -102,27 +115,9 @@ pub(crate) fn write_shared(
             cx.shared.layout.css_file_extension.as_deref(),
             &cx.shared.resource_suffix,
             cx.info.include_sources,
+            &cx.shared.layout,
+            cx.sess(),
         )?;
-        match &opt.index_page {
-            Some(index_page) if opt.enable_index_page => {
-                let mut md_opts = opt.clone();
-                md_opts.output = cx.dst.clone();
-                md_opts.external_html = cx.shared.layout.external_html.clone();
-                try_err!(
-                    crate::markdown::render_and_write(index_page, md_opts, cx.shared.edition()),
-                    &index_page
-                );
-            }
-            None if opt.enable_index_page => {
-                write_rendered_cci::<CratesIndexPart, _>(
-                    || CratesIndexPart::blank(cx),
-                    &cx.dst,
-                    &crates,
-                    &opt.should_merge,
-                )?;
-            }
-            _ => {} // they don't want an index page
-        }
     }
 
     cx.shared.fs.set_sync_only(false);
@@ -140,9 +135,148 @@ pub(crate) fn write_not_crate_specific(
     css_file_extension: Option<&Path>,
     resource_suffix: &str,
     include_sources: bool,
+    layout: &layout::Layout,
+    sess: &Session,
 ) -> Result<(), Error> {
     write_rendered_cross_crate_info(crates, dst, opt, include_sources, resource_suffix)?;
-    write_static_files(dst, opt, style_files, css_file_extension, resource_suffix)?;
+    write_resources(dst, opt, style_files, css_file_extension, resource_suffix)?;
+    // index.html
+    match &opt.index_page {
+        Some(index_page) if opt.enable_index_page => {
+            let mut md_opts = opt.clone();
+            md_opts.output = dst.to_path_buf();
+            md_opts.external_html = layout.external_html.clone();
+            let file = try_err!(sess.source_map().load_file(&index_page), &index_page);
+            try_err!(crate::markdown::render_and_write(file, md_opts, sess.edition()), &index_page);
+        }
+        None if opt.enable_index_page => {
+            write_rendered_cci::<CratesIndexPart, _>(
+                || CratesIndexPart::blank(layout, opt, style_files),
+                &dst,
+                &crates,
+                &opt.should_merge,
+            )?;
+        }
+        _ => {} // they don't want an index page
+    }
+
+    if opt.emit.contains(&EmitType::HtmlNonStaticFiles) {
+        // Standalone pages for the Settings and Help popovers.
+        //
+        // Normally, these are pure DHTML popovers, but, for user convenience,
+        // the buttons that open them are links to these HTML files, which use the same JavaScript
+        // to populate the page. That way, you can open a new tab, or add a browser bookmark,
+        // that points at the page.
+        let settings_file = dst.join("settings.html");
+        let help_file = dst.join("help.html");
+        let scrape_examples_help_file = dst.join("scrape-examples-help.html");
+
+        let page = layout::Page {
+            title: "Settings",
+            short_title: "Settings",
+            css_class: "mod sys",
+            root_path: "./",
+            static_root_path: opt.static_root_path.as_deref(),
+            description: "Settings of Rustdoc",
+            resource_suffix: &opt.resource_suffix,
+            rust_logo: true,
+        };
+        let sidebar = "<h2 class=\"location\">Settings</h2><div class=\"sidebar-elems\"></div>";
+        let v = layout::render(
+            &layout,
+            &page,
+            sidebar,
+            fmt::from_fn(|buf| {
+                write!(
+                    buf,
+                    "<div class=\"main-heading\">\
+                        <h1>Rustdoc settings</h1>\
+                        <span class=\"out-of-band\">\
+                            <a id=\"back\" href=\"javascript:void(0)\" onclick=\"history.back();\">\
+                            Back\
+                        </a>\
+                        </span>\
+                        </div>\
+                        <noscript>\
+                        <section>\
+                            You need to enable JavaScript be able to update your settings.\
+                        </section>\
+                        </noscript>\
+                        <script defer src=\"{static_root_path}{settings_js}\"></script>",
+                    static_root_path = page.get_static_root_path(),
+                    settings_js = static_files::STATIC_FILES.settings_js,
+                )?;
+                // Pre-load all theme CSS files, so that switching feels seamless.
+                //
+                // When loading settings.html as a popover, the equivalent HTML is
+                // generated in main.js.
+                for file in style_files {
+                    if let Ok(theme) = file.basename() {
+                        write!(
+                            buf,
+                            "<link rel=\"preload\" href=\"{root_path}{theme}{suffix}.css\" \
+                                as=\"style\">",
+                            root_path = page.static_root_path.unwrap_or(""),
+                            suffix = page.resource_suffix,
+                        )?;
+                    }
+                }
+                Ok(())
+            }),
+            &style_files,
+        );
+        try_err!(std::fs::write(&settings_file, v), &settings_file);
+
+        let page = layout::Page {
+            title: "Help",
+            short_title: "Help",
+            css_class: "mod sys",
+            root_path: "./",
+            static_root_path: opt.static_root_path.as_deref(),
+            description: "Documentation for Rustdoc",
+            resource_suffix: &opt.resource_suffix,
+            rust_logo: true,
+        };
+        let sidebar = "<h2 class=\"location\">Help</h2><div class=\"sidebar-elems\"></div>";
+        let v = layout::render(
+            &layout,
+            &page,
+            sidebar,
+            format_args!(
+                "<div class=\"main-heading\">\
+                    <h1>Rustdoc help</h1>\
+                    <span class=\"out-of-band\">\
+                        <a id=\"back\" href=\"javascript:void(0)\" onclick=\"history.back();\">\
+                        Back\
+                    </a>\
+                    </span>\
+                    </div>\
+                    <noscript>\
+                    <section>\
+                        <p>You need to enable JavaScript to use keyboard commands or search.</p>\
+                        <p>For more information, browse the <a href=\"{DOC_RUST_LANG_ORG_VERSION}/rustdoc/\">rustdoc handbook</a>.</p>\
+                    </section>\
+                    </noscript>",
+            ),
+            &style_files,
+        );
+        try_err!(std::fs::write(&help_file, v), &help_file);
+
+        if layout.scrape_examples_extension {
+            let page = layout::Page {
+                title: "About scraped examples",
+                short_title: "About scraped examples",
+                css_class: "mod sys",
+                root_path: "./",
+                static_root_path: opt.static_root_path.as_deref(),
+                description: "How the scraped examples feature works in Rustdoc",
+                resource_suffix: &opt.resource_suffix,
+                rust_logo: true,
+            };
+            let v = layout::render(&layout, &page, "", scrape_examples_help(), &style_files);
+            try_err!(std::fs::write(&scrape_examples_help_file, v), &scrape_examples_help_file);
+        }
+    }
     Ok(())
 }
 
@@ -154,7 +288,7 @@ fn write_rendered_cross_crate_info(
     resource_suffix: &str,
 ) -> Result<(), Error> {
     let m = &opt.should_merge;
-    if opt.should_emit_crate() {
+    if opt.emit.contains(&EmitType::HtmlNonStaticFiles) {
         if include_sources {
             write_rendered_cci::<SourcesPart, _>(SourcesPart::blank, dst, crates, m)?;
         }
@@ -172,43 +306,45 @@ fn write_rendered_cross_crate_info(
 
 /// Writes the static files, the style files, and the css extensions.
 /// Have to be careful about these, because they write to the root out dir.
-fn write_static_files(
+fn write_resources(
     dst: &Path,
     opt: &RenderOptions,
     style_files: &[StylePath],
     css_file_extension: Option<&Path>,
     resource_suffix: &str,
 ) -> Result<(), Error> {
-    let static_dir = dst.join("static.files");
-    try_err!(fs::create_dir_all(&static_dir), &static_dir);
+    if opt.emit.contains(&EmitType::HtmlNonStaticFiles) {
+        // Handle added third-party themes
+        for entry in style_files {
+            let theme = entry.basename()?;
+            let extension =
+                try_none!(try_none!(entry.path.extension(), &entry.path).to_str(), &entry.path);
 
-    // Handle added third-party themes
-    for entry in style_files {
-        let theme = entry.basename()?;
-        let extension =
-            try_none!(try_none!(entry.path.extension(), &entry.path).to_str(), &entry.path);
+            // Skip the official themes. They are written below as part of STATIC_FILES_LIST.
+            if matches!(theme.as_str(), "light" | "dark" | "ayu") {
+                continue;
+            }
 
-        // Skip the official themes. They are written below as part of STATIC_FILES_LIST.
-        if matches!(theme.as_str(), "light" | "dark" | "ayu") {
-            continue;
+            let bytes = try_err!(fs::read(&entry.path), &entry.path);
+            let filename = format!("{theme}{resource_suffix}.{extension}");
+            let dst_filename = dst.join(filename);
+            try_err!(fs::write(&dst_filename, bytes), &dst_filename);
         }
 
-        let bytes = try_err!(fs::read(&entry.path), &entry.path);
-        let filename = format!("{theme}{resource_suffix}.{extension}");
-        let dst_filename = dst.join(filename);
-        try_err!(fs::write(&dst_filename, bytes), &dst_filename);
+        // When the user adds their own CSS files with --extend-css, we write that as an
+        // invocation-specific file (that is, with a resource suffix).
+        if let Some(css) = css_file_extension {
+            let buffer = try_err!(fs::read_to_string(css), css);
+            let path = static_files::suffix_path("theme.css", resource_suffix);
+            let dst_path = dst.join(path);
+            try_err!(fs::write(&dst_path, buffer), &dst_path);
+        }
     }
 
-    // When the user adds their own CSS files with --extend-css, we write that as an
-    // invocation-specific file (that is, with a resource suffix).
-    if let Some(css) = css_file_extension {
-        let buffer = try_err!(fs::read_to_string(css), css);
-        let path = static_files::suffix_path("theme.css", resource_suffix);
-        let dst_path = dst.join(path);
-        try_err!(fs::write(&dst_path, buffer), &dst_path);
-    }
+    if opt.emit.contains(&EmitType::HtmlStaticFiles) {
+        let static_dir = dst.join("static.files");
+        try_err!(fs::create_dir_all(&static_dir), &static_dir);
 
-    if opt.emit.is_empty() || opt.emit.contains(&EmitType::Toolchain) {
         static_files::for_each(|f: &static_files::StaticFile| {
             let filename = static_dir.join(f.output_filename());
             let contents: &[u8] =
@@ -237,13 +373,30 @@ impl CrateInfo {
     pub(crate) fn read_many(parts_paths: &[PathToParts]) -> Result<Vec<Self>, Error> {
         parts_paths
             .iter()
-            .map(|parts_path| {
-                let path = &parts_path.0;
-                let parts = try_err!(fs::read(path), &path);
-                let parts: CrateInfo = try_err!(serde_json::from_slice(&parts), &path);
-                Ok::<_, Error>(parts)
+            .fold(Ok(Vec::new()), |acc, parts_path| {
+                let mut acc = acc?;
+                let dir = &parts_path.0;
+                let mut files: Vec<Result<PathBuf, std::io::Error>> = try_err!(std::fs::read_dir(dir), dir.as_path())
+                    .map(|file| Ok(file?.path()))
+                    .collect();
+                files.sort_by_key(|p| p.as_ref().map_or(PathBuf::new(), |p| p.clone()));
+                acc.append(&mut files
+                    .into_iter()
+                    .filter_map(|file| {
+                        let to_crate_info = |file: Result<PathBuf, std::io::Error>| -> Result<Option<CrateInfo>, Error> {
+                            let file = try_err!(file, dir.as_path());
+                            if file.extension() != Some(OsStr::new("json")) {
+                                return Ok(None);
+                            }
+                            let parts = try_err!(fs::read(&file), &file);
+                            let parts: CrateInfo = try_err!(serde_json::from_slice(&parts), &file);
+                            Ok(Some(parts))
+                        };
+                        to_crate_info(file).transpose()
+                    })
+                    .collect::<Result<Vec<CrateInfo>, Error>>()?);
+                Ok(acc)
             })
-            .collect::<Result<Vec<CrateInfo>, Error>>()
     }
 }
 
@@ -353,12 +506,15 @@ fn hack_get_external_crate_names(
     };
     // this is only run once so it's fine not to cache it
     // !dot_matches_new_line: all crates on same line. greedy: match last bracket
-    let regex = Regex::new(r"\[.*\]").unwrap();
-    let Some(content) = regex.find(&content) else {
-        return Err(Error::new("could not find crates list in crates.js", path));
-    };
-    let content: Vec<String> = try_err!(serde_json::from_str(content.as_str()), &path);
-    Ok(content)
+    if let Some(start) = content.find('[')
+        && let Some(end) = content[start..].find(']')
+    {
+        let content: Vec<String> =
+            try_err!(serde_json::from_str(&content[start..=start + end]), &path);
+        Ok(content)
+    } else {
+        Err(Error::new("could not find crates list in crates.js", path))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
@@ -372,22 +528,29 @@ impl CciPart for CratesIndexPart {
 }
 
 impl CratesIndexPart {
-    fn blank(cx: &Context<'_>) -> SortedTemplate<<Self as CciPart>::FileFormat> {
+    fn blank(
+        layout: &layout::Layout,
+        opt: &RenderOptions,
+        style_files: &[StylePath],
+    ) -> SortedTemplate<<Self as CciPart>::FileFormat> {
         let page = layout::Page {
             title: "Index of crates",
             short_title: "Crates",
             css_class: "mod sys",
             root_path: "./",
-            static_root_path: cx.shared.static_root_path.as_deref(),
+            static_root_path: opt.static_root_path.as_deref(),
             description: "List of crates",
-            resource_suffix: &cx.shared.resource_suffix,
+            resource_suffix: &opt.resource_suffix,
             rust_logo: true,
         };
-        let layout = &cx.shared.layout;
-        let style_files = &cx.shared.style_files;
         const DELIMITER: &str = "\u{FFFC}"; // users are being naughty if they have this
-        let content =
-            format!("<h1>List of all crates</h1><ul class=\"all-items\">{DELIMITER}</ul>");
+        let content = format_args!(
+            "<div class=\"main-heading\">\
+                <h1>List of all crates</h1>\
+                <rustdoc-toolbar></rustdoc-toolbar>\
+            </div>\
+            <ul class=\"all-items\">{DELIMITER}</ul>"
+        );
         let template = layout::render(layout, &page, "", content, style_files);
         SortedTemplate::from_template(&template, DELIMITER)
             .expect("Object Replacement Character (U+FFFC) should not appear in the --index-page")
@@ -476,33 +639,35 @@ impl Hierarchy {
 
     fn add_path(self: &Rc<Self>, path: &Path) {
         let mut h = Rc::clone(self);
-        let mut elems = path
+        let mut components = path
             .components()
-            .filter_map(|s| match s {
-                Component::Normal(s) => Some(s.to_owned()),
-                Component::ParentDir => Some(OsString::from("..")),
-                _ => None,
-            })
+            .filter(|component| matches!(component, Component::Normal(_) | Component::ParentDir))
             .peekable();
-        loop {
-            let cur_elem = elems.next().expect("empty file path");
-            if cur_elem == ".." {
-                if let Some(parent) = h.parent.upgrade() {
+
+        assert!(components.peek().is_some(), "empty file path");
+        while let Some(component) = components.next() {
+            match component {
+                Component::Normal(s) => {
+                    if components.peek().is_none() {
+                        h.elems.borrow_mut().insert(s.to_owned());
+                        break;
+                    }
+                    h = {
+                        let mut children = h.children.borrow_mut();
+
+                        if let Some(existing) = children.get(s) {
+                            Rc::clone(existing)
+                        } else {
+                            let new_node = Rc::new(Self::with_parent(s.to_owned(), &h));
+                            children.insert(s.to_owned(), Rc::clone(&new_node));
+                            new_node
+                        }
+                    };
+                }
+                Component::ParentDir if let Some(parent) = h.parent.upgrade() => {
                     h = parent;
                 }
-                continue;
-            }
-            if elems.peek().is_none() {
-                h.elems.borrow_mut().insert(cur_elem);
-                break;
-            } else {
-                let entry = Rc::clone(
-                    h.children
-                        .borrow_mut()
-                        .entry(cur_elem.clone())
-                        .or_insert_with(|| Rc::new(Self::with_parent(cur_elem, &h))),
-                );
-                h = entry;
+                _ => {}
             }
         }
     }
@@ -562,18 +727,14 @@ impl TypeAliasPart {
                         if let Some(ret) = &mut ret {
                             ret.aliases.push(type_alias_fqp);
                         } else {
-                            let target_did = impl_
-                                .inner_impl()
-                                .trait_
-                                .as_ref()
-                                .map(|trait_| trait_.def_id())
-                                .or_else(|| impl_.inner_impl().for_.def_id(&cx.shared.cache));
+                            let target_trait_did =
+                                impl_.inner_impl().trait_.as_ref().map(|trait_| trait_.def_id());
                             let provided_methods;
-                            let assoc_link = if let Some(target_did) = target_did {
+                            let assoc_link = if let Some(target_trait_did) = target_trait_did {
                                 provided_methods =
                                     impl_.inner_impl().provided_trait_methods(cx.tcx());
                                 AssocItemLink::GotoSource(
-                                    ItemId::DefId(target_did),
+                                    ItemId::DefId(target_trait_did),
                                     &provided_methods,
                                 )
                             } else {
@@ -600,7 +761,7 @@ impl TypeAliasPart {
                                 .inner_impl()
                                 .trait_
                                 .as_ref()
-                                .map(|trait_| format!("{:#}", trait_.print(cx)));
+                                .map(|trait_| format!("{:#}", print_path(trait_, cx)));
                             ret = Some(AliasSerializableImpl {
                                 text,
                                 trait_,
@@ -645,7 +806,7 @@ impl TraitAliasPart {
     fn blank() -> SortedTemplate<<Self as CciPart>::FileFormat> {
         SortedTemplate::from_before_after(
             r"(function() {
-    var implementors = Object.fromEntries([",
+    const implementors = Object.fromEntries([",
             r"]);
     if (window.register_implementors) {
         window.register_implementors(implementors);
@@ -673,12 +834,17 @@ impl TraitAliasPart {
             // FIXME: this is a vague explanation for why this can't be a `get`, in
             //        theory it should be...
             let (remote_path, remote_item_type) = match cache.exact_paths.get(&did) {
-                Some(p) => match cache.paths.get(&did).or_else(|| cache.external_paths.get(&did)) {
+                Some(p) => match cache
+                    .paths
+                    .get(&did)
+                    .map(|info| (&info.parts, info.ty))
+                    .or_else(|| cache.external_paths.get(&did).map(|(parts, ty)| (parts, *ty)))
+                {
                     Some((_, t)) => (p, t),
                     None => continue,
                 },
                 None => match cache.external_paths.get(&did) {
-                    Some((p, t)) => (p, t),
+                    Some((p, t)) => (p, *t),
                     None => continue,
                 },
             };
@@ -698,10 +864,14 @@ impl TraitAliasPart {
                     {
                         None
                     } else {
+                        let impl_ = imp.inner_impl();
+                        let print = print_impl(impl_, false, cx);
                         Some(Implementor {
-                            text: imp.inner_impl().print(false, cx).to_string(),
+                            text: format!("{}", print),
+                            cmp_text: format!("{:#}", print),
                             synthetic: imp.inner_impl().kind.is_auto(),
                             types: collect_paths_for_type(&imp.inner_impl().for_, cache),
+                            is_negative: impl_.is_negative_trait_impl(),
                         })
                     }
                 })
@@ -720,8 +890,17 @@ impl TraitAliasPart {
             }
             path.push(format!("{remote_item_type}.{}.js", remote_path[remote_path.len() - 1]));
 
-            let part = OrderedJson::array_sorted(
-                implementors.map(|implementor| OrderedJson::serialize(implementor).unwrap()),
+            let mut implementors = implementors.collect::<Vec<_>>();
+            // Negative impls are naturally sorted first, because `impl !A` is less than `impl B`
+            // for any value of `B`, because `!` is less than any identifier-starting char.
+            implementors.sort_unstable_by(|a, b| compare_names(&a.cmp_text, &b.cmp_text));
+
+            let part = OrderedJson::array_unsorted(
+                implementors
+                    .iter()
+                    .map(OrderedJson::serialize)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
             );
             path_parts.push(path, OrderedJson::array_unsorted([crate_name_json, &part]));
         }
@@ -730,9 +909,14 @@ impl TraitAliasPart {
 }
 
 struct Implementor {
+    // HTML text used in generated output.
     text: String,
+    // Plain text used just for sorting output. This is a performance win, because this plain text
+    // is much shorter than the HTML output and sorting is hot.
+    cmp_text: String,
     synthetic: bool,
     types: Vec<String>,
+    is_negative: bool,
 }
 
 impl Serialize for Implementor {
@@ -742,6 +926,7 @@ impl Serialize for Implementor {
     {
         let mut seq = serializer.serialize_seq(None)?;
         seq.serialize_element(&self.text)?;
+        seq.serialize_element(if self.is_negative { &1 } else { &0 })?;
         if self.synthetic {
             seq.serialize_element(&1)?;
             seq.serialize_element(&self.types)?;
@@ -807,8 +992,10 @@ impl<'item> DocVisitor<'item> for TypeImplCollector<'_, '_, 'item> {
             return;
         }
         let Some(target_did) = t.type_.def_id(cache) else { return };
-        let get_extern = { || cache.external_paths.get(&target_did) };
-        let Some(&(ref target_fqp, target_type)) = cache.paths.get(&target_did).or_else(get_extern)
+        let get_extern =
+            { || cache.external_paths.get(&target_did).map(|(parts, ty)| (parts, *ty)) };
+        let Some((target_fqp, target_type)) =
+            cache.paths.get(&target_did).map(|info| (&info.parts, info.ty)).or_else(get_extern)
         else {
             return;
         };
@@ -824,7 +1011,7 @@ impl<'item> DocVisitor<'item> for TypeImplCollector<'_, '_, 'item> {
                 .collect();
             AliasedType { target_fqp: &target_fqp[..], target_type, impl_ }
         });
-        let get_local = { || cache.paths.get(&self_did).map(|(p, _)| p) };
+        let get_local = { || cache.paths.get(&self_did).map(|info| &info.parts) };
         let Some(self_fqp) = cache.exact_paths.get(&self_did).or_else(get_local) else {
             return;
         };
@@ -838,9 +1025,10 @@ impl<'item> DocVisitor<'item> for TypeImplCollector<'_, '_, 'item> {
             // Only include this impl if it actually unifies with this alias.
             // Synthetic impls are not included; those are also included in the HTML.
             //
-            // FIXME(lazy_type_alias): Once the feature is complete or stable, rewrite this
+            // FIXME(checked_type_alias): Once the feature is complete or stable, rewrite this
             // to use type unification.
-            // Be aware of `tests/rustdoc/type-alias/deeply-nested-112515.rs` which might regress.
+            // Be aware of `tests/rustdoc-html/type-alias/deeply-nested-112515.rs` which might
+            // regress.
             let Some(impl_did) = impl_item_id.as_def_id() else { continue };
             let for_ty = self.cx.tcx().type_of(impl_did).skip_binder();
             let reject_cx = DeepRejectCtxt::relate_infer_infer(self.cx.tcx());

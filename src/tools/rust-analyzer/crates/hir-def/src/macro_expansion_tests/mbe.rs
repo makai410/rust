@@ -35,9 +35,9 @@ macro_rules! f {
     };
 }
 
-struct#0:MacroRules[BE8F, 0]@58..64#14336# MyTraitMap2#0:MacroCall[BE8F, 0]@31..42#ROOT2024# {#0:MacroRules[BE8F, 0]@72..73#14336#
-    map#0:MacroRules[BE8F, 0]@86..89#14336#:#0:MacroRules[BE8F, 0]@89..90#14336# #0:MacroRules[BE8F, 0]@89..90#14336#::#0:MacroRules[BE8F, 0]@91..93#14336#std#0:MacroRules[BE8F, 0]@93..96#14336#::#0:MacroRules[BE8F, 0]@96..98#14336#collections#0:MacroRules[BE8F, 0]@98..109#14336#::#0:MacroRules[BE8F, 0]@109..111#14336#HashSet#0:MacroRules[BE8F, 0]@111..118#14336#<#0:MacroRules[BE8F, 0]@118..119#14336#(#0:MacroRules[BE8F, 0]@119..120#14336#)#0:MacroRules[BE8F, 0]@120..121#14336#>#0:MacroRules[BE8F, 0]@121..122#14336#,#0:MacroRules[BE8F, 0]@122..123#14336#
-}#0:MacroRules[BE8F, 0]@132..133#14336#
+struct#0:MacroRules[BE8F, 0]@58..64#1920# MyTraitMap2#0:MacroCall[BE8F, 0]@31..42#ROOT2024# {#0:MacroRules[BE8F, 0]@72..73#1920#
+    map#0:MacroRules[BE8F, 0]@86..89#1920#:#0:MacroRules[BE8F, 0]@89..90#1920# #0:MacroRules[BE8F, 0]@89..90#1920#::#0:MacroRules[BE8F, 0]@91..93#1920#std#0:MacroRules[BE8F, 0]@93..96#1920#::#0:MacroRules[BE8F, 0]@96..98#1920#collections#0:MacroRules[BE8F, 0]@98..109#1920#::#0:MacroRules[BE8F, 0]@109..111#1920#HashSet#0:MacroRules[BE8F, 0]@111..118#1920#<#0:MacroRules[BE8F, 0]@118..119#1920#(#0:MacroRules[BE8F, 0]@119..120#1920#)#0:MacroRules[BE8F, 0]@120..121#1920#>#0:MacroRules[BE8F, 0]@121..122#1920#,#0:MacroRules[BE8F, 0]@122..123#1920#
+}#0:MacroRules[BE8F, 0]@132..133#1920#
 "#]],
     );
 }
@@ -197,7 +197,7 @@ macro_rules! mk_struct {
 #[macro_use]
 mod foo;
 
-struct#1:MacroRules[DB0C, 0]@59..65#14336# Foo#0:MacroCall[DB0C, 0]@32..35#ROOT2024#(#1:MacroRules[DB0C, 0]@70..71#14336#u32#0:MacroCall[DB0C, 0]@41..44#ROOT2024#)#1:MacroRules[DB0C, 0]@74..75#14336#;#1:MacroRules[DB0C, 0]@75..76#14336#
+struct#1:MacroRules[DB0C, 0]@59..65#1920# Foo#0:MacroCall[DB0C, 0]@32..35#ROOT2024#(#1:MacroRules[DB0C, 0]@70..71#1920#u32#0:MacroCall[DB0C, 0]@41..44#ROOT2024#)#1:MacroRules[DB0C, 0]@74..75#1920#;#1:MacroRules[DB0C, 0]@75..76#1920#
 "#]],
     );
 }
@@ -300,21 +300,21 @@ fn match_by_first_token_literally() {
     check(
         r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     (= $i:ident) => ( fn $i() {} );
     (+ $i:ident) => ( struct $i; )
 }
-m! { foo }
+m! { Foo }
 m! { = bar }
 m! { + Baz }
 "#,
         expect![[r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     (= $i:ident) => ( fn $i() {} );
     (+ $i:ident) => ( struct $i; )
 }
-mod foo {}
+enum Foo {}
 fn bar() {}
 struct Baz;
 "#]],
@@ -326,21 +326,21 @@ fn match_by_last_token_literally() {
     check(
         r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     ($i:ident =) => ( fn $i() {} );
     ($i:ident +) => ( struct $i; )
 }
-m! { foo }
+m! { Foo }
 m! { bar = }
 m! { Baz + }
 "#,
         expect![[r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     ($i:ident =) => ( fn $i() {} );
     ($i:ident +) => ( struct $i; )
 }
-mod foo {}
+enum Foo {}
 fn bar() {}
 struct Baz;
 "#]],
@@ -352,21 +352,21 @@ fn match_by_ident() {
     check(
         r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     (spam $i:ident) => ( fn $i() {} );
     (eggs $i:ident) => ( struct $i; )
 }
-m! { foo }
+m! { Foo }
 m! { spam bar }
 m! { eggs Baz }
 "#,
         expect![[r#"
 macro_rules! m {
-    ($i:ident) => ( mod $i {} );
+    ($i:ident) => ( enum $i {} );
     (spam $i:ident) => ( fn $i() {} );
     (eggs $i:ident) => ( struct $i; )
 }
-mod foo {}
+enum Foo {}
 fn bar() {}
 struct Baz;
 "#]],
@@ -378,12 +378,12 @@ fn match_by_separator_token() {
     check(
         r#"
 macro_rules! m {
-    ($($i:ident),*) => ($(mod $i {} )*);
+    ($($i:ident),*) => ($(enum $i {} )*);
     ($($i:ident)#*) => ($(fn $i() {} )*);
     ($i:ident ,# $ j:ident) => ( struct $i; struct $ j; )
 }
 
-m! { foo, bar }
+m! { Baz, Qux }
 
 m! { foo# bar }
 
@@ -391,13 +391,13 @@ m! { Foo,# Bar }
 "#,
         expect![[r#"
 macro_rules! m {
-    ($($i:ident),*) => ($(mod $i {} )*);
+    ($($i:ident),*) => ($(enum $i {} )*);
     ($($i:ident)#*) => ($(fn $i() {} )*);
     ($i:ident ,# $ j:ident) => ( struct $i; struct $ j; )
 }
 
-mod foo {}
-mod bar {}
+enum Baz {}
+enum Qux {}
 
 fn foo() {}
 fn bar() {}
@@ -423,10 +423,10 @@ m! { foo, bar }
 macro_rules! m {
     ($($i:ident),*) => ( impl Bar { $(fn $i() {})* } );
 }
-impl#\14336# Bar#\14336# {#\14336#
-    fn#\14336# foo#\ROOT2024#(#\14336#)#\14336# {#\14336#}#\14336#
-    fn#\14336# bar#\ROOT2024#(#\14336#)#\14336# {#\14336#}#\14336#
-}#\14336#
+impl#\1920# Bar#\1920# {#\1920#
+    fn#\1920# foo#\ROOT2024#(#\1920#)#\1920# {#\1920#}#\1920#
+    fn#\1920# bar#\ROOT2024#(#\1920#)#\1920# {#\1920#}#\1920#
+}#\1920#
 "#]],
     );
 }
@@ -1114,11 +1114,11 @@ fn test_single_item() {
     check(
         r#"
 macro_rules! m { ($i:item) => ( $i ) }
-m! { mod c {} }
+m! { struct C {} }
 "#,
         expect![[r#"
 macro_rules! m { ($i:item) => ( $i ) }
-mod c {}
+struct C {}
 "#]],
     )
 }
@@ -1144,6 +1144,7 @@ m! {
     type T = u8;
 }
 "#,
+        // The modules are counted twice, once because of the module and once because of the macro call.
         expect![[r#"
 macro_rules! m { ($($i:item)*) => ($($i )*) }
 extern crate a;
@@ -1161,7 +1162,9 @@ trait J {}
 fn h() {}
 extern {}
 type T = u8;
-"#]],
+
+mod b;
+mod c {}"#]],
     );
 }
 
@@ -1195,7 +1198,7 @@ m! { hello::world }
 macro_rules! m {
     ($m:meta) => ( #[$m] fn bar() {} )
 }
-#[cfg(target_os = "windows")] fn bar() {}
+#[cfg (target_os = "windows")] fn bar() {}
 #[hello::world] fn bar() {}
 "#]],
     );
@@ -1959,28 +1962,6 @@ fn f() {
 }
 
 #[test]
-fn test_edition_handling_in() {
-    check(
-        r#"
-//- /main.rs crate:main deps:old edition:2021
-fn f() {
-    old::parse_try_old!(try!{});
-}
-//- /old.rs crate:old edition:2015
-#[macro_export]
-macro_rules! parse_try_old {
-    ($it:expr) => {};
-}
- "#,
-        expect![[r#"
-fn f() {
-    ;
-}
-"#]],
-    );
-}
-
-#[test]
 fn semicolon_does_not_glue() {
     check(
         r#"
@@ -2047,6 +2028,36 @@ macro_rules! m {
 }
 fn f() {
     let _ = stringify!(0 'b 1 'b 2);
+}
+    "#]],
+    );
+}
+
+#[test]
+fn per_token_edition() {
+    check(
+        r#"
+//- /foo.rs crate:foo edition:2024
+#[macro_export]
+macro_rules! m {
+    ($e:expr) => {};
+}
+//- /bar.rs crate:bar deps:foo edition:2021
+fn gen() -> usize {
+    0
+}
+
+fn foo() {
+    foo::m!(gen());
+}
+    "#,
+        expect![[r#"
+fn gen() -> usize {
+    0
+}
+
+fn foo() {
+    ;
 }
     "#]],
     );

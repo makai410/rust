@@ -11,7 +11,6 @@
 //! For a high-level overview of how this solver works, check out the relevant
 //! section of the rustc-dev-guide.
 
-mod alias_relate;
 mod assembly;
 mod effect_goals;
 mod eval_ctxt;
@@ -24,10 +23,13 @@ mod trait_goals;
 use derive_where::derive_where;
 use rustc_type_ir::inherent::*;
 pub use rustc_type_ir::solve::*;
-use rustc_type_ir::{self as ty, Interner, TypingMode};
+use rustc_type_ir::{self as ty, Const, Interner, Region, TypeVisitableExt};
 use tracing::instrument;
 
-pub use self::eval_ctxt::{EvalCtxt, GenerateProofTree, SolverDelegateEvalExt};
+pub use self::eval_ctxt::{
+    EvalCtxt, GenerateProofTree, SolverDelegateEvalExt,
+    evaluate_root_goal_for_proof_tree_raw_provider, fast_path,
+};
 use crate::delegate::SolverDelegate;
 use crate::solve::assembly::Candidate;
 
@@ -36,17 +38,11 @@ use crate::solve::assembly::Candidate;
 ///
 /// We previously used  `cx.recursion_limit().0.checked_ilog2().unwrap_or(0)` for this.
 /// However, it feels unlikely that uncreasing the recursion limit by a power of two
-/// to get one more itereation is every useful or desirable. We now instead used a constant
+/// to get one more iteration is ever useful or desirable. We now instead used a constant
 /// here. If there ever ends up some use-cases where a bigger number of fixpoint iterations
-/// is required, we can add a new attribute for that or revert this to be dependant on the
+/// is required, we can add a new attribute for that or revert this to be dependent on the
 /// recursion limit again. However, this feels very unlikely.
 const FIXPOINT_STEP_LIMIT: usize = 8;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum GoalEvaluationKind {
-    Root,
-    Nested,
-}
 
 /// Whether evaluating this goal ended up changing the
 /// inference state.
@@ -66,7 +62,7 @@ fn has_no_inference_or_external_constraints<I: Interner>(
         ref opaque_types,
         ref normalization_nested_goals,
     } = *response.value.external_constraints;
-    response.value.var_values.is_identity()
+    response.value.is_identity()
         && region_constraints.is_empty()
         && opaque_types.is_empty()
         && normalization_nested_goals.is_empty()
@@ -78,9 +74,37 @@ fn has_only_region_constraints<I: Interner>(response: ty::Canonical<I, Response<
         ref opaque_types,
         ref normalization_nested_goals,
     } = *response.value.external_constraints;
-    response.value.var_values.is_identity_modulo_regions()
+    response.value.is_identity_modulo_regions()
         && opaque_types.is_empty()
         && normalization_nested_goals.is_empty()
+}
+
+/// Whether two canonical responses are exactly equal except for their
+/// region constraints.
+fn equal_response_modulo_region_constraints<I: Interner>(
+    a: &CanonicalResponse<I>,
+    b: &CanonicalResponse<I>,
+) -> bool {
+    let CanonicalResponse {
+        max_universe: a_max_universe,
+        var_kinds: a_var_kinds,
+        value:
+            Response {
+                var_values: a_var_values,
+                certainty: a_certainty,
+                external_constraints: a_external_constraints,
+            },
+    } = a;
+
+    let ExternalConstraintsData { region_constraints: _, opaque_types, normalization_nested_goals } =
+        &**a_external_constraints;
+
+    a_max_universe == &b.max_universe
+        && a_var_kinds == &b.var_kinds
+        && a_var_values == &b.value.var_values
+        && a_certainty == &b.value.certainty
+        && opaque_types == &b.value.external_constraints.opaque_types
+        && normalization_nested_goals == &b.value.external_constraints.normalization_nested_goals
 }
 
 impl<'a, D, I> EvalCtxt<'a, D>
@@ -91,25 +115,60 @@ where
     #[instrument(level = "trace", skip(self))]
     fn compute_type_outlives_goal(
         &mut self,
-        goal: Goal<I, ty::OutlivesPredicate<I, I::Ty>>,
-    ) -> QueryResult<I> {
-        let ty::OutlivesPredicate(ty, lt) = goal.predicate;
-        self.register_ty_outlives(ty, lt);
-        self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+        goal: Goal<I, ty::OutlivesClause<I, I::Ty>>,
+    ) -> QueryResultOrRerunNonErased<I> {
+        let ty::OutlivesClause(ty, lt) = goal.predicate;
+        let ty = self.normalize(goal.param_env, ty::Unnormalized::new_wip(ty))?;
+
+        // The normalized type can still contain non-rigid higher ranked aliases if their
+        // normalization ends up with ambiguity. Or we have non-rigid aliases inside rigid ones.
+        // Infer vars may be resolved to types/consts containing non-rigid aliases later.
+        // Thus we should stall this goal to avoid registering non-rigid type outlives into
+        // the outer infcx.
+        if ty.has_non_region_infer() || ty.has_non_rigid_aliases() {
+            self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+        } else {
+            // We drop region constraints in ambiguous response so there's no need to add them in
+            // the ambiguous branch. Also this guarantees we don't have ty vars when destructuring
+            // type outlives.
+            if self.cx().assumptions_on_binders() {
+                use rustc_type_ir::region_constraint::RegionConstraint;
+
+                let constraint = self.destructure_type_outlives(ty, lt);
+                self.register_solver_region_constraint(RegionConstraint::new_from_or(constraint));
+            } else {
+                self.register_ty_outlives(ty, lt);
+            }
+
+            self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+        }
     }
 
     #[instrument(level = "trace", skip(self))]
     fn compute_region_outlives_goal(
         &mut self,
-        goal: Goal<I, ty::OutlivesPredicate<I, I::Region>>,
-    ) -> QueryResult<I> {
-        let ty::OutlivesPredicate(a, b) = goal.predicate;
-        self.register_region_outlives(a, b);
+        goal: Goal<I, ty::OutlivesClause<I, Region<I>>>,
+    ) -> QueryResultOrRerunNonErased<I> {
+        let ty::OutlivesClause(a, b) = goal.predicate;
+
+        if self.cx().assumptions_on_binders() {
+            use rustc_type_ir::region_constraint::{LeafRegionConstraint, RegionConstraint};
+
+            let constraint =
+                RegionConstraint::new_leaf(LeafRegionConstraint::RegionOutlives(a, b, ()));
+            self.register_solver_region_constraint(constraint);
+        } else {
+            self.register_region_outlives(a, b, VisibleForLeakCheck::Yes);
+        }
+
         self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
     }
 
     #[instrument(level = "trace", skip(self))]
-    fn compute_coerce_goal(&mut self, goal: Goal<I, ty::CoercePredicate<I>>) -> QueryResult<I> {
+    fn compute_coerce_goal(
+        &mut self,
+        goal: Goal<I, ty::CoercePredicate<I>>,
+    ) -> QueryResultOrRerunNonErased<I> {
         self.compute_subtype_goal(Goal {
             param_env: goal.param_env,
             predicate: ty::SubtypePredicate {
@@ -121,28 +180,41 @@ where
     }
 
     #[instrument(level = "trace", skip(self))]
-    fn compute_subtype_goal(&mut self, goal: Goal<I, ty::SubtypePredicate<I>>) -> QueryResult<I> {
-        if goal.predicate.a.is_ty_var() && goal.predicate.b.is_ty_var() {
-            self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
-        } else {
-            self.sub(goal.param_env, goal.predicate.a, goal.predicate.b)?;
-            self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+    fn compute_subtype_goal(
+        &mut self,
+        goal: Goal<I, ty::SubtypePredicate<I>>,
+    ) -> QueryResultOrRerunNonErased<I> {
+        match (goal.predicate.a.kind(), goal.predicate.b.kind()) {
+            (ty::Infer(ty::TyVar(a_vid)), ty::Infer(ty::TyVar(b_vid))) => {
+                self.sub_unify_ty_vids_raw(a_vid, b_vid);
+                self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+            }
+            _ => {
+                self.sub(goal.param_env, goal.predicate.a, goal.predicate.b)?;
+                self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+            }
         }
     }
 
-    fn compute_dyn_compatible_goal(&mut self, trait_def_id: I::DefId) -> QueryResult<I> {
+    fn compute_dyn_compatible_goal(
+        &mut self,
+        trait_def_id: I::TraitId,
+    ) -> QueryResultOrRerunNonErased<I> {
         if self.cx().trait_is_dyn_compatible(trait_def_id) {
             self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
         } else {
-            Err(NoSolution)
+            Err(NoSolution.into())
         }
     }
 
     #[instrument(level = "trace", skip(self))]
-    fn compute_well_formed_goal(&mut self, goal: Goal<I, I::Term>) -> QueryResult<I> {
+    fn compute_well_formed_goal(
+        &mut self,
+        goal: Goal<I, I::Term>,
+    ) -> QueryResultOrRerunNonErased<I> {
         match self.well_formed_goals(goal.param_env, goal.predicate) {
             Some(goals) => {
-                self.add_goals(GoalSource::Misc, goals);
+                self.add_goals(GoalSource::Misc, goals)?;
                 self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
             }
             None => self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS),
@@ -153,23 +225,32 @@ where
         &mut self,
         param_env: <I as Interner>::ParamEnv,
         symbol: <I as Interner>::Symbol,
-    ) -> QueryResult<I> {
-        if self.may_use_unstable_feature(param_env, symbol) {
+    ) -> QueryResultOrRerunNonErased<I> {
+        if self.may_use_unstable_feature(param_env, symbol)? {
             self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
         } else {
-            self.evaluate_added_goals_and_make_canonical_response(Certainty::Maybe(
-                MaybeCause::Ambiguity,
-            ))
+            self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
         }
     }
 
     #[instrument(level = "trace", skip(self))]
     fn compute_const_evaluatable_goal(
         &mut self,
-        Goal { param_env, predicate: ct }: Goal<I, I::Const>,
-    ) -> QueryResult<I> {
+        Goal { param_env, predicate: ct }: Goal<I, Const<I>>,
+    ) -> QueryResultOrRerunNonErased<I> {
         match ct.kind() {
-            ty::ConstKind::Unevaluated(uv) => {
+            ty::ConstKind::Alias(ty::IsRigid::Yes, _)
+            | ty::ConstKind::Placeholder(_)
+            | ty::ConstKind::Value(_)
+            | ty::ConstKind::Error(_) => {
+                self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+            }
+
+            ty::ConstKind::Infer(_) => {
+                self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+            }
+
+            ty::ConstKind::Alias(ty::IsRigid::No, alias_const) => {
                 // We never return `NoSolution` here as `evaluate_const` emits an
                 // error itself when failing to evaluate, so emitting an additional fulfillment
                 // error in that case is unnecessary noise. This may change in the future once
@@ -178,18 +259,13 @@ where
 
                 // FIXME(generic_const_exprs): Implement handling for generic
                 // const expressions here.
-                if let Some(_normalized) = self.evaluate_const(param_env, uv) {
+                if let Some(_normalized) = self.evaluate_const(param_env, alias_const)? {
                     self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
                 } else {
                     self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
                 }
             }
-            ty::ConstKind::Infer(_) => {
-                self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
-            }
-            ty::ConstKind::Placeholder(_) | ty::ConstKind::Value(_) | ty::ConstKind::Error(_) => {
-                self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
-            }
+
             // We can freely ICE here as:
             // - `Param` gets replaced with a placeholder during canonicalization
             // - `Bound` cannot exist as we don't have a binder around the self Type
@@ -203,21 +279,28 @@ where
     #[instrument(level = "trace", skip(self), ret)]
     fn compute_const_arg_has_type_goal(
         &mut self,
-        goal: Goal<I, (I::Const, I::Ty)>,
-    ) -> QueryResult<I> {
+        goal: Goal<I, (Const<I>, I::Ty)>,
+    ) -> QueryResultOrRerunNonErased<I> {
         let (ct, ty) = goal.predicate;
         let ct = self.structurally_normalize_const(goal.param_env, ct)?;
 
         let ct_ty = match ct.kind() {
             ty::ConstKind::Infer(_) => {
-                return self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS);
+                return self
+                    .evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+                    .map_err(Into::into);
             }
             ty::ConstKind::Error(_) => {
-                return self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes);
+                return self
+                    .evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                    .map_err(Into::into);
             }
-            ty::ConstKind::Unevaluated(uv) => {
-                self.cx().type_of(uv.def).instantiate(self.cx(), uv.args)
+            ty::ConstKind::Alias(ty::IsRigid::Yes, alias_const) => {
+                alias_const.type_of(self.cx()).skip_norm_wip()
             }
+            ty::ConstKind::Alias(ty::IsRigid::No, _) => unimplemented!(
+                "non-rigid unevaluated constant for compute_const_arg_has_type_goal: {ct:?}"
+            ),
             ty::ConstKind::Expr(_) => unimplemented!(
                 "`feature(generic_const_exprs)` is not supported in the new trait solver"
             ),
@@ -232,7 +315,7 @@ where
         };
 
         self.eq(goal.param_env, ct_ty, ty)?;
-        self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+        self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes).map_err(Into::into)
     }
 }
 
@@ -263,13 +346,36 @@ where
             candidate.result.value.certainty == Certainty::Yes
                 && has_no_inference_or_external_constraints(candidate.result)
         });
-        if let Some((i, c)) = always_applicable {
-            return Some((c.result, MergeCandidateInfo::AlwaysApplicable(i)));
+
+        if let Some((i, candidate)) = always_applicable {
+            return Some((candidate.result, MergeCandidateInfo::AlwaysApplicable(i)));
         }
 
         let one: CanonicalResponse<I> = candidates[0].result;
-        if candidates[1..].iter().all(|candidate| candidate.result == one) {
-            return Some((one, MergeCandidateInfo::EqualResponse));
+
+        if candidates[1..]
+            .iter()
+            .all(|candidate| equal_response_modulo_region_constraints(&one, &candidate.result))
+        {
+            let region_constraints = &one.value.external_constraints.region_constraints;
+            if candidates[1..].iter().all(|candidate| {
+                &candidate.result.value.external_constraints.region_constraints
+                    == region_constraints
+            }) {
+                return Some((one, MergeCandidateInfo::EqualResponse));
+            }
+
+            // If candidates differ only in region constraints, their merged region
+            // constraints are an `Or` of their respective constraints. If one of them
+            // has no region constraints, the `Or` constraint evaluates to `true`.
+            //
+            // This is a special case of `-Zassumptions-on-binders` and should be
+            // replaced eventually.
+            if let Some(candidate) = candidates.iter().find(|candidate| {
+                candidate.result.value.external_constraints.region_constraints.is_empty()
+            }) {
+                return Some((candidate.result, MergeCandidateInfo::EqualResponse));
+            }
         }
 
         None
@@ -277,18 +383,16 @@ where
 
     fn bail_with_ambiguity(&mut self, candidates: &[Candidate<I>]) -> CanonicalResponse<I> {
         debug_assert!(candidates.len() > 1);
-        let maybe_cause =
-            candidates.iter().fold(MaybeCause::Ambiguity, |maybe_cause, candidates| {
-                // Pull down the certainty of `Certainty::Yes` to ambiguity when combining
-                // these responses, b/c we're combining more than one response and this we
-                // don't know which one applies.
-                let candidate = match candidates.result.value.certainty {
-                    Certainty::Yes => MaybeCause::Ambiguity,
-                    Certainty::Maybe(candidate) => candidate,
-                };
-                maybe_cause.or(candidate)
-            });
-        self.make_ambiguous_response_no_constraints(maybe_cause)
+        let maybe = candidates.iter().fold(MaybeInfo::AMBIGUOUS, |maybe, candidate| {
+            // We pull down the certainty of `Certainty::Yes` to ambiguity when combining
+            // these responses, b/c we're combining more than one response and this we
+            // don't know which one applies.
+            match candidate.result.value.certainty {
+                Certainty::Yes => maybe,
+                Certainty::Maybe(cand_maybe) => maybe.or(cand_maybe),
+            }
+        });
+        self.make_ambiguous_response_no_constraints(maybe)
     }
 
     /// If we fail to merge responses we flounder and return overflow or ambiguity.
@@ -311,7 +415,7 @@ where
         &mut self,
         param_env: I::ParamEnv,
         ty: I::Ty,
-    ) -> Result<I::Ty, NoSolution> {
+    ) -> Result<I::Ty, NoSolutionOrRerunNonErased> {
         self.structurally_normalize_term(param_env, ty.into()).map(|term| term.expect_ty())
     }
 
@@ -325,8 +429,8 @@ where
     fn structurally_normalize_const(
         &mut self,
         param_env: I::ParamEnv,
-        ct: I::Const,
-    ) -> Result<I::Const, NoSolution> {
+        ct: Const<I>,
+    ) -> Result<Const<I>, NoSolutionOrRerunNonErased> {
         self.structurally_normalize_term(param_env, ct.into()).map(|term| term.expect_const())
     }
 
@@ -338,63 +442,31 @@ where
         &mut self,
         param_env: I::ParamEnv,
         term: I::Term,
-    ) -> Result<I::Term, NoSolution> {
-        if let Some(_) = term.to_alias_term() {
-            let normalized_term = self.next_term_infer_of_kind(term);
-            let alias_relate_goal = Goal::new(
+    ) -> Result<I::Term, NoSolutionOrRerunNonErased> {
+        if !self.cx().renormalize_rigid_aliases() && !term.is_non_rigid_alias() {
+            return Ok(term);
+        }
+
+        if let Some(alias) = term.to_alias_term() {
+            let normalized_term = self.next_term_infer_of_alias_kind(alias);
+            let projection_goal = Goal::new(
                 self.cx(),
                 param_env,
-                ty::PredicateKind::AliasRelate(
-                    term,
-                    normalized_term,
-                    ty::AliasRelationDirection::Equate,
-                ),
+                ty::ProjectionClause { projection_term: alias, term: normalized_term },
             );
             // We normalize the self type to be able to relate it with
             // types from candidates.
-            self.add_goal(GoalSource::TypeRelating, alias_relate_goal);
+            self.add_goal(GoalSource::Normalization, projection_goal)?;
             self.try_evaluate_added_goals()?;
-            Ok(self.resolve_vars_if_possible(normalized_term))
+            Ok(self.deeply_resolve_ignoring_regions(normalized_term))
         } else {
             Ok(term)
         }
     }
-
-    fn opaque_type_is_rigid(&self, def_id: I::DefId) -> bool {
-        match self.typing_mode() {
-            // Opaques are never rigid outside of analysis mode.
-            TypingMode::Coherence | TypingMode::PostAnalysis => false,
-            // During analysis, opaques are rigid unless they may be defined by
-            // the current body.
-            TypingMode::Analysis { defining_opaque_types_and_generators: non_rigid_opaques }
-            | TypingMode::Borrowck { defining_opaque_types: non_rigid_opaques }
-            | TypingMode::PostBorrowckAnalysis { defined_opaque_types: non_rigid_opaques } => {
-                !def_id.as_local().is_some_and(|def_id| non_rigid_opaques.contains(&def_id))
-            }
-        }
-    }
-}
-
-fn response_no_constraints_raw<I: Interner>(
-    cx: I,
-    max_universe: ty::UniverseIndex,
-    variables: I::CanonicalVarKinds,
-    certainty: Certainty,
-) -> CanonicalResponse<I> {
-    ty::Canonical {
-        max_universe,
-        variables,
-        value: Response {
-            var_values: ty::CanonicalVarValues::make_identity(cx, variables),
-            // FIXME: maybe we should store the "no response" version in cx, like
-            // we do for cx.types and stuff.
-            external_constraints: cx.mk_external_constraints(ExternalConstraintsData::default()),
-            certainty,
-        },
-    }
 }
 
 /// The result of evaluating a goal.
+#[derive_where(Debug; I: Interner)]
 pub struct GoalEvaluation<I: Interner> {
     /// The goal we've evaluated. This is the input goal, but potentially with its
     /// inference variables resolved. This never applies any inference constraints
@@ -418,13 +490,4 @@ pub struct GoalEvaluation<I: Interner> {
     /// If the [`Certainty`] was `Maybe`, then keep track of whether the goal has changed
     /// before rerunning it.
     pub stalled_on: Option<GoalStalledOn<I>>,
-}
-
-/// The conditions that must change for a goal to warrant
-#[derive_where(Clone, Debug; I: Interner)]
-pub struct GoalStalledOn<I: Interner> {
-    pub num_opaques: usize,
-    pub stalled_vars: Vec<I::GenericArg>,
-    /// The cause that will be returned on subsequent evaluations if this goal remains stalled.
-    pub stalled_cause: MaybeCause,
 }

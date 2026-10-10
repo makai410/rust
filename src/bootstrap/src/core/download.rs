@@ -6,15 +6,17 @@ use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use build_helper::ci::CiEnv;
 use build_helper::git::PathFreshness;
+use build_helper::stage0_parser::VersionMetadata;
 use xz2::bufread::XzDecoder;
 
-use crate::core::config::{BUILDER_CONFIG_FILENAME, Target, TargetSelection};
+use crate::core::build_steps::llvm::detect_llvm_freshness;
+use crate::core::config::toml::llvm::check_incompatible_options_for_ci_llvm;
+use crate::core::config::{BUILDER_CONFIG_FILENAME, Config, TargetSelection};
 use crate::utils::build_stamp::BuildStamp;
-use crate::utils::channel;
 use crate::utils::exec::{ExecutionContext, command};
-use crate::utils::helpers::{exe, hex_encode, move_file};
-use crate::{Config, t};
+use crate::utils::helpers::{self, exe, hex_encode, move_file, t};
 
 static SHOULD_FIX_BINS_AND_DYLIBS: OnceLock<bool> = OnceLock::new();
 
@@ -73,7 +75,7 @@ impl Config {
 
     fn download_file(&self, url: &str, dest_path: &Path, help_on_error: &str) {
         let dwn_ctx: DownloadContext<'_> = self.into();
-        download_file(dwn_ctx, url, dest_path, help_on_error);
+        download_file(dwn_ctx, &self.out, url, dest_path, help_on_error);
     }
 
     fn unpack(&self, tarball: &Path, dst: &Path, pattern: &str) {
@@ -106,16 +108,15 @@ enum DownloadSource {
 
 /// Functions that are only ever called once, but named for clarity and to avoid thousand-line functions.
 impl Config {
-    pub(crate) fn download_clippy(&self) -> PathBuf {
-        self.verbose(|| println!("downloading stage0 clippy artifacts"));
+    pub(crate) fn download_clippy(&self, initial_sysroot: &Path) -> PathBuf {
+        self.do_if_verbose(|| println!("downloading stage0 clippy artifacts"));
 
         let date = &self.stage0_metadata.compiler.date;
         let version = &self.stage0_metadata.compiler.version;
         let host = self.host_target;
 
-        let clippy_stamp =
-            BuildStamp::new(&self.initial_sysroot).with_prefix("clippy").add_stamp(date);
-        let cargo_clippy = self.initial_sysroot.join("bin").join(exe("cargo-clippy", host));
+        let clippy_stamp = BuildStamp::new(initial_sysroot).with_prefix("clippy").add_stamp(date);
+        let cargo_clippy = initial_sysroot.join("bin").join(exe("cargo-clippy", host));
         if cargo_clippy.exists() && clippy_stamp.is_up_to_date() {
             return cargo_clippy;
         }
@@ -152,7 +153,9 @@ impl Config {
     }
 
     pub(crate) fn download_ci_rustc(&self, commit: &str) {
-        self.verbose(|| println!("using downloaded stage2 artifacts from CI (commit {commit})"));
+        self.do_if_verbose(|| {
+            println!("using downloaded stage2 artifacts from CI (commit {commit})")
+        });
 
         let version = self.artifact_version_part(commit);
         // download-rustc doesn't need its own cargo, it can just use beta's. But it does need the
@@ -166,6 +169,30 @@ impl Config {
             &extra_components,
             Self::download_ci_component,
         );
+    }
+
+    pub(crate) fn download_std_json_docs(
+        &self,
+        target: TargetSelection,
+        commit: &str,
+    ) -> Option<PathBuf> {
+        if self.dry_run() {
+            return None;
+        }
+
+        self.do_if_verbose(|| println!("using downloaded std json docs from CI (commit {commit})"));
+
+        let version = self.artifact_version_part(commit);
+        download_component(
+            DownloadContext::from(self),
+            &self.out,
+            DownloadSource::CI,
+            format!("rust-docs-json-{version}-{target}.tar.xz"),
+            "rust-docs-json-preview",
+            // When using DownloadSource::CI, the key is assumed to end with -llvm-assertions
+            &format!("{commit}-{}", self.llvm_assertions),
+            "ci-docs-json",
+        )
     }
 
     fn download_toolchain(
@@ -238,45 +265,38 @@ impl Config {
         destination: &str,
     ) {
         let dwn_ctx: DownloadContext<'_> = self.into();
-        download_component(dwn_ctx, mode, filename, prefix, key, destination);
+        download_component(dwn_ctx, &self.out, mode, filename, prefix, key, destination);
     }
 
-    #[cfg(test)]
-    pub(crate) fn maybe_download_ci_llvm(&self) {}
-
-    #[cfg(not(test))]
-    pub(crate) fn maybe_download_ci_llvm(&self) {
-        use build_helper::exit;
-        use build_helper::git::PathFreshness;
-
-        use crate::core::build_steps::llvm::detect_llvm_freshness;
-        use crate::core::config::toml::llvm::check_incompatible_options_for_ci_llvm;
-
-        if !self.llvm_from_ci {
-            return;
+    /// Attempts to download LLVM from CI for the given **target**.
+    /// Returns a path to the downloaded and extracted directory.
+    pub(crate) fn maybe_download_ci_llvm(&self, target: TargetSelection) -> Option<PathBuf> {
+        // Never try to download CI LLVM during unit tests.
+        if cfg!(test) {
+            return None;
         }
 
-        let llvm_root = self.ci_llvm_root();
+        let llvm_root = self.out.join(target).join("ci-llvm");
         let llvm_freshness =
             detect_llvm_freshness(self, self.rust_info.is_managed_git_subrepository());
-        self.verbose(|| {
+        self.do_if_verbose(|| {
             eprintln!("LLVM freshness: {llvm_freshness:?}");
         });
         let llvm_sha = match llvm_freshness {
             PathFreshness::LastModifiedUpstream { upstream } => upstream,
-            PathFreshness::HasLocalModifications { upstream } => upstream,
+            PathFreshness::HasLocalModifications { upstream, modifications: _ } => upstream,
             PathFreshness::MissingUpstream => {
                 eprintln!("error: could not find commit hash for downloading LLVM");
                 eprintln!("HELP: maybe your repository history is too shallow?");
                 eprintln!("HELP: consider disabling `download-ci-llvm`");
                 eprintln!("HELP: or fetch enough history to include one upstream commit");
-                crate::exit!(1);
+                helpers::exit_process(1);
             }
         };
         let stamp_key = format!("{}{}", llvm_sha, self.llvm_assertions);
         let llvm_stamp = BuildStamp::new(&llvm_root).with_prefix("llvm").add_stamp(stamp_key);
         if !llvm_stamp.is_up_to_date() && !self.dry_run() {
-            self.download_ci_llvm(&llvm_sha);
+            self.download_ci_llvm(&llvm_root, target, &llvm_sha);
 
             if self.should_fix_bins_and_dylibs() {
                 for entry in t!(fs::read_dir(llvm_root.join("bin"))) {
@@ -295,7 +315,7 @@ impl Config {
             let now = std::time::SystemTime::now();
             let file_times = fs::FileTimes::new().set_accessed(now).set_modified(now);
 
-            let llvm_config = llvm_root.join("bin").join(exe("llvm-config", self.host_target));
+            let llvm_config = llvm_root.join("bin").join(exe("llvm-config", target));
             t!(crate::utils::helpers::set_file_times(llvm_config, file_times));
 
             if self.should_fix_bins_and_dylibs() {
@@ -326,17 +346,20 @@ impl Config {
                 }
                 Err(e) => {
                     eprintln!("ERROR: Failed to parse CI LLVM bootstrap.toml: {e}");
-                    exit!(2);
+                    helpers::exit_process(2);
                 }
             };
         };
+        Some(llvm_root)
     }
 
-    #[cfg(not(test))]
-    fn download_ci_llvm(&self, llvm_sha: &str) {
+    fn download_ci_llvm(&self, llvm_root: &Path, target: TargetSelection, llvm_sha: &str) {
+        // For unit tests, downloading should have been blocked by `maybe_download_ci_llvm`.
+        assert!(cfg!(not(test)), "unit tests shouldn't be downloading CI LLVM");
+
         let llvm_assertions = self.llvm_assertions;
 
-        let cache_prefix = format!("llvm-{llvm_sha}-{llvm_assertions}");
+        let cache_prefix = format!("llvm-{}-{llvm_sha}-{llvm_assertions}", target.triple);
         let cache_dst =
             self.bootstrap_cache_path.as_ref().cloned().unwrap_or_else(|| self.out.join("cache"));
 
@@ -350,23 +373,25 @@ impl Config {
             &self.stage0_metadata.config.artifacts_server
         };
         let version = self.artifact_version_part(llvm_sha);
-        let filename = format!("rust-dev-{}-{}.tar.xz", version, self.host_target.triple);
+        let filename = format!("rust-dev-{}-{}.tar.xz", version, target.triple);
         let tarball = rustc_cache.join(&filename);
         if !tarball.exists() {
-            let help_on_error = "ERROR: failed to download llvm from ci
+            let help_on_error = format!(
+                "ERROR: failed to download llvm from CI for `{target}`
 
     HELP: There could be two reasons behind this:
-        1) The host triple is not supported for `download-ci-llvm`.
+        1) `{target}` is not supported for `download-ci-llvm`.
         2) Old builds get deleted after a certain time.
     HELP: In either case, disable `download-ci-llvm` in your bootstrap.toml:
 
     [llvm]
     download-ci-llvm = false
-    ";
-            self.download_file(&format!("{base}/{llvm_sha}/{filename}"), &tarball, help_on_error);
+    ",
+                target = target.triple
+            );
+            self.download_file(&format!("{base}/{llvm_sha}/{filename}"), &tarball, &help_on_error);
         }
-        let llvm_root = self.ci_llvm_root();
-        self.unpack(&tarball, &llvm_root, "rust-dev");
+        self.unpack(&tarball, llvm_root, "rust-dev");
     }
 
     pub fn download_ci_gcc(&self, gcc_sha: &str, root_dir: &Path) {
@@ -380,7 +405,7 @@ impl Config {
         }
         let base = &self.stage0_metadata.config.artifacts_server;
         let version = self.artifact_version_part(gcc_sha);
-        let filename = format!("gcc-{version}-{}.tar.xz", self.host_target.triple);
+        let filename = format!("gcc-dev-{version}-{}.tar.xz", self.host_target.triple);
         let tarball = gcc_cache.join(&filename);
         if !tarball.exists() {
             let help_on_error = "ERROR: failed to download gcc from ci
@@ -395,7 +420,17 @@ impl Config {
     ";
             self.download_file(&format!("{base}/{gcc_sha}/{filename}"), &tarball, help_on_error);
         }
-        self.unpack(&tarball, root_dir, "gcc");
+        self.unpack(&tarball, root_dir, "gcc-dev");
+
+        if self.should_fix_bins_and_dylibs() {
+            let lib_dir = root_dir.join("lib");
+            for entry in t!(fs::read_dir(lib_dir)) {
+                let lib = t!(entry).path();
+                if path_is_dylib(&lib) {
+                    self.fix_bin_or_dylib(&lib);
+                }
+            }
+        }
     }
 }
 
@@ -403,19 +438,20 @@ impl Config {
 pub(crate) struct DownloadContext<'a> {
     pub path_modification_cache: Arc<Mutex<HashMap<Vec<&'static str>, PathFreshness>>>,
     pub src: &'a Path,
-    pub rust_info: &'a channel::GitInfo,
     pub submodules: &'a Option<bool>,
-    pub download_rustc_commit: &'a Option<String>,
     pub host_target: TargetSelection,
-    pub llvm_from_ci: bool,
-    pub target_config: &'a HashMap<TargetSelection, Target>,
-    pub out: &'a Path,
     pub patch_binaries_for_nix: Option<bool>,
     pub exec_ctx: &'a ExecutionContext,
     pub stage0_metadata: &'a build_helper::stage0_parser::Stage0,
     pub llvm_assertions: bool,
     pub bootstrap_cache_path: &'a Option<PathBuf>,
-    pub is_running_on_ci: bool,
+    pub ci_env: CiEnv,
+}
+
+impl<'a> DownloadContext<'a> {
+    pub fn is_running_on_ci(&self) -> bool {
+        self.ci_env.is_running_in_ci()
+    }
 }
 
 impl<'a> AsRef<DownloadContext<'a>> for DownloadContext<'a> {
@@ -430,18 +466,13 @@ impl<'a> From<&'a Config> for DownloadContext<'a> {
             path_modification_cache: value.path_modification_cache.clone(),
             src: &value.src,
             host_target: value.host_target,
-            rust_info: &value.rust_info,
-            download_rustc_commit: &value.download_rustc_commit,
             submodules: &value.submodules,
-            llvm_from_ci: value.llvm_from_ci,
-            target_config: &value.target_config,
-            out: &value.out,
             patch_binaries_for_nix: value.patch_binaries_for_nix,
             exec_ctx: &value.exec_ctx,
             stage0_metadata: &value.stage0_metadata,
             llvm_assertions: value.llvm_assertions,
             bootstrap_cache_path: &value.bootstrap_cache_path,
-            is_running_on_ci: value.is_running_on_ci,
+            ci_env: value.ci_env,
         }
     }
 }
@@ -456,6 +487,7 @@ pub(crate) fn is_download_ci_available(target_triple: &str, llvm_assertions: boo
     // All tier 1 targets and tier 2 targets with host tools.
     const SUPPORTED_PLATFORMS: &[&str] = &[
         "aarch64-apple-darwin",
+        "aarch64-pc-windows-gnullvm",
         "aarch64-pc-windows-msvc",
         "aarch64-unknown-linux-gnu",
         "aarch64-unknown-linux-musl",
@@ -468,12 +500,15 @@ pub(crate) fn is_download_ci_available(target_triple: &str, llvm_assertions: boo
         "loongarch64-unknown-linux-gnu",
         "powerpc-unknown-linux-gnu",
         "powerpc64-unknown-linux-gnu",
+        "powerpc64-unknown-linux-musl",
         "powerpc64le-unknown-linux-gnu",
         "powerpc64le-unknown-linux-musl",
         "riscv64gc-unknown-linux-gnu",
+        "riscv64gc-unknown-linux-musl",
         "s390x-unknown-linux-gnu",
         "x86_64-apple-darwin",
         "x86_64-pc-windows-gnu",
+        "x86_64-pc-windows-gnullvm",
         "x86_64-pc-windows-msvc",
         "x86_64-unknown-freebsd",
         "x86_64-unknown-illumos",
@@ -492,32 +527,23 @@ pub(crate) fn is_download_ci_available(target_triple: &str, llvm_assertions: boo
     }
 }
 
-#[cfg(test)]
-pub(crate) fn maybe_download_rustfmt<'a>(
-    dwn_ctx: impl AsRef<DownloadContext<'a>>,
-) -> Option<PathBuf> {
-    Some(PathBuf::new())
-}
-
 /// NOTE: rustfmt is a completely different toolchain than the bootstrap compiler, so it can't
 /// reuse target directories or artifacts
-#[cfg(not(test))]
-pub(crate) fn maybe_download_rustfmt<'a>(
-    dwn_ctx: impl AsRef<DownloadContext<'a>>,
-) -> Option<PathBuf> {
-    use build_helper::stage0_parser::VersionMetadata;
-
-    let dwn_ctx = dwn_ctx.as_ref();
-
-    if dwn_ctx.exec_ctx.dry_run() {
+pub(crate) fn maybe_download_rustfmt(config: &Config, out: &Path) -> Option<PathBuf> {
+    // Don't actually download rustfmt during unit tests.
+    if cfg!(test) {
         return Some(PathBuf::new());
     }
 
-    let VersionMetadata { date, version } = dwn_ctx.stage0_metadata.rustfmt.as_ref()?;
+    if config.dry_run() {
+        return Some(PathBuf::new());
+    }
+
+    let VersionMetadata { date, version, .. } = config.stage0_metadata.rustfmt.as_ref()?;
     let channel = format!("{version}-{date}");
 
-    let host = dwn_ctx.host_target;
-    let bin_root = dwn_ctx.out.join(host).join("rustfmt");
+    let host = config.host_target;
+    let bin_root = out.join(host).join("rustfmt");
     let rustfmt_path = bin_root.join("bin").join(exe("rustfmt", host));
     let rustfmt_stamp = BuildStamp::new(&bin_root).with_prefix("rustfmt").add_stamp(channel);
     if rustfmt_path.exists() && rustfmt_stamp.is_up_to_date() {
@@ -525,7 +551,8 @@ pub(crate) fn maybe_download_rustfmt<'a>(
     }
 
     download_component(
-        dwn_ctx,
+        DownloadContext::from(config),
+        out,
         DownloadSource::Dist,
         format!("rustfmt-{version}-{build}.tar.xz", build = host.triple),
         "rustfmt-preview",
@@ -534,7 +561,8 @@ pub(crate) fn maybe_download_rustfmt<'a>(
     );
 
     download_component(
-        dwn_ctx,
+        DownloadContext::from(config),
+        out,
         DownloadSource::Dist,
         format!("rustc-{version}-{build}.tar.xz", build = host.triple),
         "rustc",
@@ -542,14 +570,14 @@ pub(crate) fn maybe_download_rustfmt<'a>(
         "rustfmt",
     );
 
-    if should_fix_bins_and_dylibs(dwn_ctx.patch_binaries_for_nix, dwn_ctx.exec_ctx) {
-        fix_bin_or_dylib(dwn_ctx.out, &bin_root.join("bin").join("rustfmt"), dwn_ctx.exec_ctx);
-        fix_bin_or_dylib(dwn_ctx.out, &bin_root.join("bin").join("cargo-fmt"), dwn_ctx.exec_ctx);
+    if should_fix_bins_and_dylibs(config.patch_binaries_for_nix, &config.exec_ctx) {
+        fix_bin_or_dylib(out, &bin_root.join("bin").join("rustfmt"), &config.exec_ctx);
+        fix_bin_or_dylib(out, &bin_root.join("bin").join("cargo-fmt"), &config.exec_ctx);
         let lib_dir = bin_root.join("lib");
         for lib in t!(fs::read_dir(&lib_dir), lib_dir.display().to_string()) {
             let lib = t!(lib);
             if path_is_dylib(&lib.path()) {
-                fix_bin_or_dylib(dwn_ctx.out, &lib.path(), dwn_ctx.exec_ctx);
+                fix_bin_or_dylib(out, &lib.path(), &config.exec_ctx);
             }
         }
     }
@@ -558,13 +586,14 @@ pub(crate) fn maybe_download_rustfmt<'a>(
     Some(rustfmt_path)
 }
 
-#[cfg(test)]
-pub(crate) fn download_beta_toolchain<'a>(dwn_ctx: impl AsRef<DownloadContext<'a>>) {}
+pub(crate) fn download_beta_toolchain<'a>(dwn_ctx: impl AsRef<DownloadContext<'a>>, out: &Path) {
+    // Don't actually download a beta toolchain during unit tests.
+    if cfg!(test) {
+        return;
+    }
 
-#[cfg(not(test))]
-pub(crate) fn download_beta_toolchain<'a>(dwn_ctx: impl AsRef<DownloadContext<'a>>) {
     let dwn_ctx = dwn_ctx.as_ref();
-    dwn_ctx.exec_ctx.verbose(|| {
+    dwn_ctx.exec_ctx.do_if_verbose(|| {
         println!("downloading stage0 beta artifacts");
     });
 
@@ -574,6 +603,7 @@ pub(crate) fn download_beta_toolchain<'a>(dwn_ctx: impl AsRef<DownloadContext<'a
     let sysroot = "stage0";
     download_toolchain(
         dwn_ctx,
+        out,
         &version,
         sysroot,
         &date,
@@ -583,8 +613,10 @@ pub(crate) fn download_beta_toolchain<'a>(dwn_ctx: impl AsRef<DownloadContext<'a
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn download_toolchain<'a>(
     dwn_ctx: impl AsRef<DownloadContext<'a>>,
+    out: &Path,
     version: &str,
     sysroot: &str,
     stamp_key: &str,
@@ -592,9 +624,11 @@ fn download_toolchain<'a>(
     destination: &str,
     mode: DownloadSource,
 ) {
+    assert!(cfg!(not(test)), "unit tests shouldn't be downloading a toolchain");
+
     let dwn_ctx = dwn_ctx.as_ref();
     let host = dwn_ctx.host_target.triple;
-    let bin_root = dwn_ctx.out.join(host).join(sysroot);
+    let bin_root = out.join(host).join(sysroot);
     let rustc_stamp = BuildStamp::new(&bin_root).with_prefix("rustc").add_stamp(stamp_key);
 
     if !bin_root.join("bin").join(exe("rustc", dwn_ctx.host_target)).exists()
@@ -605,20 +639,28 @@ fn download_toolchain<'a>(
         }
         let filename = format!("rust-std-{version}-{host}.tar.xz");
         let pattern = format!("rust-std-{host}");
-        download_component(dwn_ctx, mode.clone(), filename, &pattern, stamp_key, destination);
+        download_component(dwn_ctx, out, mode.clone(), filename, &pattern, stamp_key, destination);
         let filename = format!("rustc-{version}-{host}.tar.xz");
-        download_component(dwn_ctx, mode.clone(), filename, "rustc", stamp_key, destination);
+        download_component(dwn_ctx, out, mode.clone(), filename, "rustc", stamp_key, destination);
 
         for component in extra_components {
             let filename = format!("{component}-{version}-{host}.tar.xz");
-            download_component(dwn_ctx, mode.clone(), filename, component, stamp_key, destination);
+            download_component(
+                dwn_ctx,
+                out,
+                mode.clone(),
+                filename,
+                component,
+                stamp_key,
+                destination,
+            );
         }
 
         if should_fix_bins_and_dylibs(dwn_ctx.patch_binaries_for_nix, dwn_ctx.exec_ctx) {
-            fix_bin_or_dylib(dwn_ctx.out, &bin_root.join("bin").join("rustc"), dwn_ctx.exec_ctx);
-            fix_bin_or_dylib(dwn_ctx.out, &bin_root.join("bin").join("rustdoc"), dwn_ctx.exec_ctx);
+            fix_bin_or_dylib(out, &bin_root.join("bin").join("rustc"), dwn_ctx.exec_ctx);
+            fix_bin_or_dylib(out, &bin_root.join("bin").join("rustdoc"), dwn_ctx.exec_ctx);
             fix_bin_or_dylib(
-                dwn_ctx.out,
+                out,
                 &bin_root.join("libexec").join("rust-analyzer-proc-macro-srv"),
                 dwn_ctx.exec_ctx,
             );
@@ -626,7 +668,7 @@ fn download_toolchain<'a>(
             for lib in t!(fs::read_dir(&lib_dir), lib_dir.display().to_string()) {
                 let lib = t!(lib);
                 if path_is_dylib(&lib.path()) {
-                    fix_bin_or_dylib(dwn_ctx.out, &lib.path(), dwn_ctx.exec_ctx);
+                    fix_bin_or_dylib(out, &lib.path(), dwn_ctx.exec_ctx);
                 }
             }
         }
@@ -659,7 +701,10 @@ fn fix_bin_or_dylib(out: &Path, fname: &Path, exec_ctx: &ExecutionContext) {
         // the `.nix-deps` location.
         //
         // bintools: Needed for the path of `ld-linux.so` (via `nix-support/dynamic-linker`).
+        // cc.lib: Needed similarly for `libstdc++.so.6`.
         // zlib: Needed as a system dependency of `libLLVM-*.so`.
+        // zstd.out: Needed as a system dependency of `libgccjit.so`. `.out` is necessary as the
+        //           default output of `zstd` derivation is `.bin`.
         // patchelf: Needed for patching ELF binaries (see doc comment above).
         let nix_deps_dir = out.join(".nix-deps");
         const NIX_EXPR: &str = "
@@ -668,8 +713,10 @@ fn fix_bin_or_dylib(out: &Path, fname: &Path, exec_ctx: &ExecutionContext) {
             name = \"rust-stage0-dependencies\";
             paths = [
                 zlib
+                zstd.out
                 patchelf
                 stdenv.cc.bintools
+                stdenv.cc.cc.lib
             ];
         }
         ";
@@ -750,27 +797,28 @@ fn should_fix_bins_and_dylibs(
 
 fn download_component<'a>(
     dwn_ctx: impl AsRef<DownloadContext<'a>>,
+    out: &Path,
     mode: DownloadSource,
     filename: String,
     prefix: &str,
     key: &str,
     destination: &str,
-) {
+) -> Option<PathBuf> {
     let dwn_ctx = dwn_ctx.as_ref();
 
     if dwn_ctx.exec_ctx.dry_run() {
-        return;
+        return None;
     }
 
     let cache_dst =
-        dwn_ctx.bootstrap_cache_path.as_ref().cloned().unwrap_or_else(|| dwn_ctx.out.join("cache"));
+        dwn_ctx.bootstrap_cache_path.as_ref().cloned().unwrap_or_else(|| out.join("cache"));
 
     let cache_dir = cache_dst.join(key);
     if !cache_dir.exists() {
         t!(fs::create_dir_all(&cache_dir));
     }
 
-    let bin_root = dwn_ctx.out.join(dwn_ctx.host_target).join(destination);
+    let bin_root = out.join(dwn_ctx.host_target).join(destination);
     let tarball = cache_dir.join(&filename);
     let (base_url, url, should_verify) = match mode {
         DownloadSource::CI => {
@@ -804,10 +852,9 @@ fn download_component<'a>(
         let sha256 = dwn_ctx.stage0_metadata.checksums_sha256.get(&url).expect(&error);
         if tarball.exists() {
             if verify(dwn_ctx.exec_ctx, &tarball, sha256) {
-                unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix);
-                return;
+                return Some(unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix));
             } else {
-                dwn_ctx.exec_ctx.verbose(|| {
+                dwn_ctx.exec_ctx.do_if_verbose(|| {
                     println!(
                         "ignoring cached file {} due to failed verification",
                         tarball.display()
@@ -818,8 +865,7 @@ fn download_component<'a>(
         }
         Some(sha256)
     } else if tarball.exists() {
-        unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix);
-        return;
+        return Some(unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix));
     } else {
         None
     };
@@ -835,20 +881,20 @@ HELP: if trying to compile an old commit of rustc, disable `download-rustc` in b
 download-rustc = false
 ";
     }
-    download_file(dwn_ctx, &format!("{base_url}/{url}"), &tarball, help_on_error);
+    download_file(dwn_ctx, out, &format!("{base_url}/{url}"), &tarball, help_on_error);
     if let Some(sha256) = checksum
         && !verify(dwn_ctx.exec_ctx, &tarball, sha256)
     {
         panic!("failed to verify {}", tarball.display());
     }
 
-    unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix);
+    Some(unpack(dwn_ctx.exec_ctx, &tarball, &bin_root, prefix))
 }
 
 pub(crate) fn verify(exec_ctx: &ExecutionContext, path: &Path, expected: &str) -> bool {
     use sha2::Digest;
 
-    exec_ctx.verbose(|| {
+    exec_ctx.do_if_verbose(|| {
         println!("verifying {}", path.display());
     });
 
@@ -886,7 +932,7 @@ pub(crate) fn verify(exec_ctx: &ExecutionContext, path: &Path, expected: &str) -
     verified
 }
 
-fn unpack(exec_ctx: &ExecutionContext, tarball: &Path, dst: &Path, pattern: &str) {
+fn unpack(exec_ctx: &ExecutionContext, tarball: &Path, dst: &Path, pattern: &str) -> PathBuf {
     eprintln!("extracting {} to {}", tarball.display(), dst.display());
     if !dst.exists() {
         t!(fs::create_dir_all(dst));
@@ -929,7 +975,7 @@ fn unpack(exec_ctx: &ExecutionContext, tarball: &Path, dst: &Path, pattern: &str
         short_path = short_path.strip_prefix(pattern).unwrap_or(short_path);
         let dst_path = dst.join(short_path);
 
-        exec_ctx.verbose(|| {
+        exec_ctx.do_if_verbose(|| {
             println!("extracting {} to {}", original_path.display(), dst.display());
         });
 
@@ -949,28 +995,30 @@ fn unpack(exec_ctx: &ExecutionContext, tarball: &Path, dst: &Path, pattern: &str
     if dst_dir.exists() {
         t!(fs::remove_dir_all(&dst_dir), format!("failed to remove {}", dst_dir.display()));
     }
+    dst.to_path_buf()
 }
 
 fn download_file<'a>(
     dwn_ctx: impl AsRef<DownloadContext<'a>>,
+    out: &Path,
     url: &str,
     dest_path: &Path,
     help_on_error: &str,
 ) {
     let dwn_ctx = dwn_ctx.as_ref();
 
-    dwn_ctx.exec_ctx.verbose(|| {
+    dwn_ctx.exec_ctx.do_if_verbose(|| {
         println!("download {url}");
     });
     // Use a temporary file in case we crash while downloading, to avoid a corrupt download in cache/.
-    let tempfile = tempdir(dwn_ctx.out).join(dest_path.file_name().unwrap());
+    let tempfile = tempdir(out).join(dest_path.file_name().unwrap());
     // While bootstrap itself only supports http and https downloads, downstream forks might
     // need to download components from other protocols. The match allows them adding more
     // protocols without worrying about merge conflicts if we change the HTTP implementation.
     match url.split_once("://").map(|(proto, _)| proto) {
         Some("http") | Some("https") => download_http_with_retries(
             dwn_ctx.host_target,
-            dwn_ctx.is_running_on_ci,
+            dwn_ctx.is_running_on_ci(),
             dwn_ctx.exec_ctx,
             &tempfile,
             url,
@@ -1001,6 +1049,8 @@ fn download_http_with_retries(
     help_on_error: &str,
 ) {
     println!("downloading {url}");
+    assert!(cfg!(not(test)), "unit tests shouldn't be downloading things: {url:?}");
+
     // Try curl. If that fails and we are on windows, fallback to PowerShell.
     // options should be kept in sync with
     // src/bootstrap/src/core/download.rs
@@ -1060,7 +1110,7 @@ fn download_http_with_retries(
                     ),
                 ]).run_capture_stdout(exec_ctx);
 
-                if powershell.is_failure() {
+                if powershell.is_success() {
                     return;
                 }
 
@@ -1070,7 +1120,7 @@ fn download_http_with_retries(
         if !help_on_error.is_empty() {
             eprintln!("{help_on_error}");
         }
-        crate::exit!(1);
+        helpers::exit_process(1);
     }
 }
 

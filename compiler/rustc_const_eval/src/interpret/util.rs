@@ -1,17 +1,60 @@
-use rustc_hir::def_id::LocalDefId;
-use rustc_middle::mir;
-use rustc_middle::mir::interpret::{AllocInit, Allocation, InterpResult, Pointer};
+use rustc_hir::def_id::{CRATE_DEF_ID, LocalDefId};
+use rustc_infer::infer::TyCtxtInferExt;
+use rustc_infer::traits::{Obligation, ObligationCause};
+use rustc_middle::mir::interpret::{AllocInit, Allocation, GlobalAlloc, InterpResult, Pointer};
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::ty::{TyCtxt, TypeVisitable, TypeVisitableExt};
+use rustc_middle::ty::{PolyExistentialPredicate, Ty, TyCtxt, TypeVisitable, TypeVisitableExt};
+use rustc_middle::{mir, ty};
+use rustc_span::span_bug;
+use rustc_trait_selection::traits::ObligationCtxt;
 use tracing::debug;
 
 use super::{InterpCx, MPlaceTy, MemoryKind, interp_ok, throw_inval};
 use crate::const_eval::{CompileTimeInterpCx, CompileTimeMachine, InterpretationResult};
+use crate::interpret::Machine;
+
+/// Checks if a type implements predicates.
+/// Calls `ensure_monomorphic_enough` on `ty` and `trait_ty` for you.
+pub(crate) fn type_implements_dyn_trait<'tcx, M: Machine<'tcx>>(
+    ecx: &mut InterpCx<'tcx, M>,
+    ty: Ty<'tcx>,
+    trait_ty: Ty<'tcx>,
+) -> InterpResult<'tcx, (bool, &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>)> {
+    ensure_monomorphic_enough(ty)?;
+    ensure_monomorphic_enough(trait_ty)?;
+
+    let ty::Dynamic(preds, _) = trait_ty.kind() else {
+        span_bug!(
+            ecx.find_closest_untracked_caller_location(),
+            "Invalid type provided to type_implements_predicates. U must be dyn Trait, got {trait_ty}."
+        );
+    };
+
+    let (infcx, param_env) = ecx.tcx.infer_ctxt().build_with_typing_env(ty::TypingEnv::new(
+        ecx.typing_env.param_env,
+        ty::TypingMode::Reflection,
+    ));
+
+    let ocx = ObligationCtxt::new(&infcx);
+    ocx.register_obligations(preds.iter().map(|pred: PolyExistentialPredicate<'_>| {
+        let pred = pred.with_self_ty(ecx.tcx.tcx, ty);
+        // Lifetimes can only be 'static because of the bound on T
+        let pred = rustc_middle::ty::fold_regions(ecx.tcx.tcx, pred, |r, _| {
+            if r == ecx.tcx.tcx.lifetimes.re_erased { ecx.tcx.tcx.lifetimes.re_static } else { r }
+        });
+        Obligation::new(ecx.tcx.tcx, ObligationCause::dummy(), param_env, pred)
+    }));
+    let type_impls_trait = ocx.evaluate_obligations_error_on_ambiguity().no_errors();
+    // Since `assumed_wf_tys=[]` the choice of LocalDefId is irrelevant, so using the "default"
+    let regions_are_valid = ocx.resolve_regions(CRATE_DEF_ID, param_env, []).is_empty();
+
+    interp_ok((regions_are_valid && type_impls_trait, preds))
+}
 
 /// Checks whether a type contains generic parameters which must be instantiated.
 ///
 /// In case it does, returns a `TooGeneric` const eval error.
-pub(crate) fn ensure_monomorphic_enough<'tcx, T>(_tcx: TyCtxt<'tcx>, ty: T) -> InterpResult<'tcx>
+pub(crate) fn ensure_monomorphic_enough<'tcx, T>(ty: T) -> InterpResult<'tcx>
 where
     T: TypeVisitable<TyCtxt<'tcx>>,
 {
@@ -38,7 +81,14 @@ pub(crate) fn create_static_alloc<'tcx>(
     static_def_id: LocalDefId,
     layout: TyAndLayout<'tcx>,
 ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
-    let alloc = Allocation::try_new(layout.size, layout.align.abi, AllocInit::Uninit, ())?;
+    // Inherit size and align from the `GlobalAlloc::Static` so we can avoid duplicating
+    // the alignment attribute logic.
+    let (size, align) =
+        GlobalAlloc::Static(static_def_id.into()).size_and_align(*ecx.tcx, ecx.typing_env);
+    assert_eq!(size, layout.size);
+    assert!(align >= layout.align.abi);
+
+    let alloc = Allocation::try_new(size, align, AllocInit::Uninit, ())?;
     let alloc_id = ecx.tcx.reserve_and_set_static_alloc(static_def_id.into());
     assert_eq!(ecx.machine.static_root_ids, None);
     ecx.machine.static_root_ids = Some((alloc_id, static_def_id));
@@ -67,7 +117,7 @@ impl EnteredTraceSpan for tracing::span::EnteredSpan {
     }
 }
 
-/// Shortand for calling [crate::interpret::Machine::enter_trace_span] on a [tracing::info_span!].
+/// Shorthand for calling [crate::interpret::Machine::enter_trace_span] on a [tracing::info_span!].
 /// This is supposed to be compiled out when [crate::interpret::Machine::enter_trace_span] has the
 /// default implementation (i.e. when it does not actually enter the span but instead returns `()`).
 /// This macro takes a type implementing the [crate::interpret::Machine] trait as its first argument
@@ -114,7 +164,7 @@ impl EnteredTraceSpan for tracing::span::EnteredSpan {
 /// ### `tracing_separate_thread` parameter
 ///
 /// This macro was introduced to obtain better traces of Miri without impacting release performance.
-/// Miri saves traces using the the `tracing_chrome` `tracing::Layer` so that they can be visualized
+/// Miri saves traces using the `tracing_chrome` `tracing::Layer` so that they can be visualized
 /// in <https://ui.perfetto.dev>. To instruct `tracing_chrome` to put some spans on a separate trace
 /// thread/line than other spans when viewed in <https://ui.perfetto.dev>, you can pass
 /// `tracing_separate_thread = tracing::field::Empty` to the tracing macros. This is useful to

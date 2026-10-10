@@ -32,8 +32,6 @@ fn main() {
         extern crate crate_a1 as a;
         a::try_foo(foo);
         //~^ ERROR E0277
-        //~| HELP trait impl with same name found
-        //~| NOTE perhaps two different versions of crate `crate_a2`
 
         // We don't want to see the "version mismatch" help message here
         // because `implements_no_traits` has no impl for `Foo`
@@ -52,6 +50,5 @@ fn main() {
         // impls for the correct trait where the path is not misleading.
         a::try_foo(other_variant_implements_correct_trait);
         //~^ ERROR E0277
-        //~| HELP the trait `main::a::Bar` is implemented for `ImplementsTraitForUsize<usize>`
     }
 }

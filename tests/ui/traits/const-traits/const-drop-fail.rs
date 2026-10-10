@@ -1,6 +1,7 @@
 //@[new_precise] compile-flags: -Znext-solver
 //@[new_stock] compile-flags: -Znext-solver
 //@ revisions: new_stock old_stock new_precise old_precise
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@ ignore-backends: gcc
 
 #![feature(const_trait_impl, const_destruct)]
@@ -17,8 +18,9 @@ impl Drop for NonTrivialDrop {
 }
 
 struct ConstImplWithDropGlue(NonTrivialDrop);
+//~^ ERROR: `NonTrivialDrop` does not implement `[const] Destruct`
 
-impl const Drop for ConstImplWithDropGlue {
+const impl Drop for ConstImplWithDropGlue {
     fn drop(&mut self) {}
 }
 

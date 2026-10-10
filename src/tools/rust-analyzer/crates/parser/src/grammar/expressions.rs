@@ -1,7 +1,5 @@
 mod atom;
 
-use crate::grammar::attributes::ATTRIBUTE_FIRST;
-
 use super::*;
 
 pub(super) use atom::{EXPR_RECOVERY_SET, LITERAL_FIRST, literal, parse_asm_expr};
@@ -38,8 +36,7 @@ fn expr_no_struct(p: &mut Parser<'_>) {
 /// It needs to be parsed with lower precedence than `&&`, so that
 /// `if let true = true && false` is parsed as `if (let true = true) && (true)`
 /// and not `if let true = (true && true)`.
-fn expr_let(p: &mut Parser<'_>) {
-    let r = Restrictions { forbid_structs: true, prefer_stmt: false };
+fn expr_let(p: &mut Parser<'_>, r: Restrictions) {
     expr_bp(p, None, r, 5);
 }
 
@@ -301,8 +298,16 @@ fn expr_bp(
             //     match 1.. { _ => () };
             //     match a.b()..S { _ => () };
             // }
+
+            // test closure_postfix_range_method_call
+            // fn foo() {
+            //     || 1.. .method();
+            //     || 1.. .field;
+            // }
+            let has_access_after = p.at(T![.]) && p.nth_at(1, SyntaxKind::IDENT);
+            let struct_forbidden = r.forbid_structs && p.at(T!['{']);
             let has_trailing_expression =
-                p.at_ts(EXPR_FIRST) && !(r.forbid_structs && p.at(T!['{']));
+                p.at_ts(EXPR_FIRST) && !has_access_after && !struct_forbidden;
             if !has_trailing_expression {
                 // no RHS
                 lhs = m.complete(p, RANGE_EXPR);
@@ -324,7 +329,7 @@ fn expr_bp(
 }
 
 const LHS_FIRST: TokenSet =
-    atom::ATOM_EXPR_FIRST.union(TokenSet::new(&[T![&], T![*], T![!], T![.], T![-], T![_]]));
+    atom::ATOM_EXPR_FIRST.union(TokenSet::new(&[T![&], T![*], T![!], T![.], T![-], T![_], T![#]]));
 
 fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLike)> {
     let m;
@@ -384,6 +389,7 @@ fn lhs(p: &mut Parser<'_>, r: Restrictions) -> Option<(CompletedMarker, BlockLik
                     // }
                     let has_access_after = p.at(T![.]) && p.nth_at(1, SyntaxKind::IDENT);
                     let struct_forbidden = r.forbid_structs && p.at(T!['{']);
+                    // NOTE: Similar logic `is_range` flag in expr_bp()
                     if p.at_ts(EXPR_FIRST) && !has_access_after && !struct_forbidden {
                         expr_bp(p, None, r, 2);
                     }
@@ -430,6 +436,11 @@ fn postfix_expr(
             // }
             T!['('] if allow_calls => call_expr(p, lhs),
             T!['['] if allow_calls => index_expr(p, lhs),
+            // test_err postfix_dot_expr_ambiguity
+            // fn foo() {
+            //     x.
+            //     ()
+            // }
             T![.] => match postfix_dot_expr::<false>(p, lhs) {
                 Ok(it) => it,
                 Err(it) => {
@@ -458,6 +469,7 @@ fn postfix_dot_expr<const FLOAT_RECOVERY: bool>(
 
     if PATH_NAME_REF_KINDS.contains(p.nth(nth1))
         && (p.nth(nth2) == T!['('] || p.nth_at(nth2, T![::]))
+        || p.nth(nth1) == T!['(']
     {
         return Ok(method_call_expr::<FLOAT_RECOVERY>(p, lhs));
     }
@@ -526,19 +538,26 @@ fn method_call_expr<const FLOAT_RECOVERY: bool>(
     lhs: CompletedMarker,
 ) -> CompletedMarker {
     if FLOAT_RECOVERY {
-        assert!(p.at_ts(PATH_NAME_REF_KINDS) && (p.nth(1) == T!['('] || p.nth_at(1, T![::])));
-    } else {
         assert!(
-            p.at(T![.])
-                && PATH_NAME_REF_KINDS.contains(p.nth(1))
-                && (p.nth(2) == T!['('] || p.nth_at(2, T![::]))
+            p.at_ts(PATH_NAME_REF_KINDS) && (p.nth(1) == T!['('] || p.nth_at(1, T![::]))
+                || p.current() == T!['(']
+        );
+    } else {
+        assert!(p.at(T![.]));
+        assert!(
+            PATH_NAME_REF_KINDS.contains(p.nth(1)) && (p.nth(2) == T!['('] || p.nth_at(2, T![::]))
+                || p.nth(1) == T!['(']
         );
     }
     let m = lhs.precede(p);
     if !FLOAT_RECOVERY {
         p.bump(T![.]);
     }
-    name_ref_mod_path(p);
+    if p.at_ts(PATH_NAME_REF_KINDS) {
+        name_ref_mod_path(p);
+    } else {
+        p.error("expected method name, field name or number");
+    }
     generic_args::opt_generic_arg_list_expr(p);
     if p.at(T!['(']) {
         arg_list(p);
@@ -640,7 +659,7 @@ fn arg_list(p: &mut Parser<'_>) {
         T![')'],
         T![,],
         || "expected expression".into(),
-        EXPR_FIRST.union(ATTRIBUTE_FIRST),
+        EXPR_FIRST,
         |p| expr(p).is_some(),
     );
     m.complete(p, ARG_LIST);

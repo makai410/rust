@@ -11,6 +11,9 @@ set_github_token() {
 
 if [ -z "$ENABLE_LINKCHECK" ] ; then
   echo "Skipping link check."
+  # mdBook writes the render context to extensions over stdin.
+  # Discard it so mdBook doesn't warn about a broken pipe.
+  cat > /dev/null
   exit 0
 fi
 
@@ -32,7 +35,7 @@ elif [ "$GITHUB_EVENT_NAME" = "pull_request" ] ; then # running in PR CI build
 
   echo "Checking files changed since $BASE_SHA: $CHANGED_FILES"
 else # running locally
-  COMMIT_RANGE=master...
+  COMMIT_RANGE=main...
   CHANGED_FILES=$(git diff --name-only $COMMIT_RANGE | sed 's#^src/##' | tr '\n' ' ')
   FLAGS="-f $CHANGED_FILES"
 

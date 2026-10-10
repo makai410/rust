@@ -1,12 +1,11 @@
 use clippy_utils::diagnostics::span_lint_and_help;
-use clippy_utils::ty::is_type_diagnostic_item;
-use clippy_utils::{path_res, peel_blocks};
+use clippy_utils::peel_blocks;
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use rustc_hir::def::Res;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{Body, ExprKind, FnDecl, FnRetTy};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_span::{Span, sym};
 
 declare_clippy_lint! {
@@ -55,10 +54,9 @@ impl<'tcx> LateLintPass<'tcx> for SingleOptionMap {
             if let ExprKind::MethodCall(method_name, callee, args, _span) = func_body.kind
                 && method_name.ident.name == sym::map
                 && let callee_type = cx.typeck_results().expr_ty(callee)
-                && is_type_diagnostic_item(cx, callee_type, sym::Option)
+                && callee_type.is_diag_item(cx, sym::Option)
                 && let ExprKind::Path(_path) = callee.kind
-                && let Res::Local(_id) = path_res(cx, callee)
-                && matches!(path_res(cx, callee), Res::Local(_id))
+                && matches!(callee.basic_res(), Res::Local(_))
                 && !matches!(args[0].kind, ExprKind::Path(_))
             {
                 if let ExprKind::Closure(closure) = args[0].kind {
@@ -71,7 +69,7 @@ impl<'tcx> LateLintPass<'tcx> for SingleOptionMap {
                     } else if let ExprKind::MethodCall(_segment, receiver, method_args, _span) = value.kind
                         && matches!(receiver.kind, ExprKind::Path(_))
                         && method_args.iter().all(|arg| matches!(arg.kind, ExprKind::Path(_)))
-                        && method_args.iter().all(|arg| matches!(path_res(cx, arg), Res::Local(_)))
+                        && method_args.iter().all(|arg| matches!(arg.basic_res(), Res::Local(_)))
                     {
                         return;
                     }

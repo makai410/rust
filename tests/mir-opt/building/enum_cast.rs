@@ -1,4 +1,5 @@
-// skip-filecheck
+//@ compile-flags: -Zmir-opt-level=0
+//@ skip-filecheck
 // EMIT_MIR enum_cast.foo.built.after.mir
 // EMIT_MIR enum_cast.bar.built.after.mir
 // EMIT_MIR enum_cast.boo.built.after.mir

@@ -1,12 +1,10 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::{fs, io};
-
-use crate::ci::CiEnv;
+use std::{env, fs, io};
 
 /// Install all the npm deps, and return the path of `node_modules`.
-pub fn install(src_root_path: &Path, out_dir: &Path, npm: &Path) -> Result<PathBuf, io::Error> {
+pub fn install(src_root_path: &Path, out_dir: &Path, yarn: &Path) -> Result<PathBuf, io::Error> {
     let nm_path = out_dir.join("node_modules");
     let copy_to_build = |p| {
         fs::copy(src_root_path.join(p), out_dir.join(p)).map_err(|e| {
@@ -16,25 +14,36 @@ pub fn install(src_root_path: &Path, out_dir: &Path, npm: &Path) -> Result<PathB
     };
     // copy stuff to the output directory to make node_modules get put there.
     copy_to_build("package.json")?;
-    copy_to_build("package-lock.json")?;
+    copy_to_build("yarn.lock")?;
 
-    let mut cmd = Command::new(npm);
-    if CiEnv::is_ci() {
-        // `npm ci` redownloads every time and thus is too slow for local development.
-        cmd.arg("ci");
-    } else {
-        cmd.arg("install");
-    }
-    // disable a bunch of things we don't want.
-    // this makes tidy output less noisy, and also significantly improves runtime
-    // of repeated tidy invokations.
-    cmd.args(&["--audit=false", "--save=false", "--fund=false"]);
+    let mut cmd = Command::new(yarn);
+    cmd.arg("install");
+    // make sure our `yarn.lock` file actually means something
+    cmd.arg("--frozen-lockfile");
+
     cmd.current_dir(out_dir);
-    let exit_status = cmd.spawn()?.wait()?;
+    let exit_status = cmd
+        .spawn()
+        .map_err(|err| {
+            eprintln!("can not run yarn install");
+            io::Error::other(Box::<dyn Error + Send + Sync>::from(format!(
+                "unable to run yarn: {}",
+                err.kind()
+            )))
+        })?
+        .wait()?;
     if !exit_status.success() {
-        eprintln!("npm install did not exit successfully");
+        eprintln!("yarn install did not exit successfully");
         return Err(io::Error::other(Box::<dyn Error + Send + Sync>::from(format!(
-            "npm install returned exit code {exit_status}"
+            "yarn install returned exit code {exit_status}"
+        ))));
+    }
+    if env::var("BOOTSTRAP_SKIP_YARN_LOCK_CHECK").is_err()
+        && fs::read_to_string(src_root_path.join("yarn.lock"))?
+            != fs::read_to_string(out_dir.join("yarn.lock"))?
+    {
+        return Err(io::Error::other(Box::<dyn Error + Send + Sync>::from(format!(
+            "yarn lockfile was modified despite --frozen-lockfile.  please file a bug report.  this check can be bypassed by setting $BOOTSTRAP_SKIP_YARN_LOCK_CHECK`"
         ))));
     }
     Ok(nm_path)

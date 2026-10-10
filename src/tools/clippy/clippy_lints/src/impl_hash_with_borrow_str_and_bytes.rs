@@ -2,9 +2,8 @@ use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::ty::implements_trait;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{Item, ItemKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_middle::ty::Ty;
-use rustc_session::declare_lint_pass;
 use rustc_span::symbol::sym;
 
 declare_clippy_lint! {
@@ -69,7 +68,9 @@ declare_clippy_lint! {
     "ensures that the semantics of `Borrow` for `Hash` are satisfied when `Borrow<str>` and `Borrow<[u8]>` are implemented"
 }
 
-declare_lint_pass!(ImplHashWithBorrowStrBytes => [IMPL_HASH_BORROW_WITH_STR_AND_BYTES]);
+declare_lint_pass!(ImplHashWithBorrowStrBytes => [
+    IMPL_HASH_BORROW_WITH_STR_AND_BYTES,
+]);
 
 impl LateLintPass<'_> for ImplHashWithBorrowStrBytes {
     /// We are emitting this lint at the Hash impl of a type that implements all
@@ -77,7 +78,7 @@ impl LateLintPass<'_> for ImplHashWithBorrowStrBytes {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
         if let ItemKind::Impl(imp) = item.kind
             && let Some(of_trait) = imp.of_trait
-            && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity()
+            && let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip()
             && let Some(hash_id) = cx.tcx.get_diagnostic_item(sym::Hash)
             && Res::Def(DefKind::Trait, hash_id) == of_trait.trait_ref.path.res
             && let Some(borrow_id) = cx.tcx.get_diagnostic_item(sym::Borrow)

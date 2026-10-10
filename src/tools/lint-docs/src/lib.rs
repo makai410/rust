@@ -59,6 +59,8 @@ pub struct LintExtractor<'a> {
     pub rustc_target: &'a str,
     /// The target linker overriding `rustc`'s default
     pub rustc_linker: Option<&'a str>,
+    /// Stage of the compiler that builds the docs (the stage of `rustc_path`).
+    pub build_rustc_stage: u32,
     /// Verbose output.
     pub verbose: bool,
     /// Validate the style and the code example.
@@ -216,14 +218,7 @@ impl<'a> LintExtractor<'a> {
                         if let Some(text) = line.strip_prefix("/// ") {
                             doc_lines.push(text.to_string());
                         } else if let Some(text) = line.strip_prefix("#[doc = \"") {
-                            let escaped = text.strip_suffix("\"]").unwrap();
-                            let mut buf = String::new();
-                            unescape_str(escaped, |_, res| match res {
-                                Ok(c) => buf.push(c),
-                                Err(err) => {
-                                    assert!(!err.is_fatal(), "failed to unescape string literal")
-                                }
-                            });
+                            let buf = parse_doc_string(text);
                             doc_lines.push(buf);
                         } else if line == "///" {
                             doc_lines.push("".to_string());
@@ -234,6 +229,20 @@ impl<'a> LintExtractor<'a> {
                             // Ignore allow of lints (useful for
                             // invalid_rust_codeblocks).
                             continue;
+                        } else if let Some(text) =
+                            line.strip_prefix("#[cfg_attr(not(bootstrap), doc = \"")
+                        {
+                            if self.build_rustc_stage >= 1 {
+                                let buf = parse_doc_string(text);
+                                doc_lines.push(buf);
+                            }
+                        } else if let Some(text) =
+                            line.strip_prefix("#[cfg_attr(bootstrap, doc = \"")
+                        {
+                            if self.build_rustc_stage == 0 {
+                                let buf = parse_doc_string(text);
+                                doc_lines.push(buf);
+                            }
                         } else {
                             let name = lint_name(line).map_err(|e| {
                                 format!(
@@ -323,7 +332,6 @@ impl<'a> LintExtractor<'a> {
         if matches!(
             lint.name.as_str(),
             "unused_features" // broken lint
-            | "soft_unstable" // cannot have a stable example
         ) {
             return Ok(());
         }
@@ -465,6 +473,9 @@ impl<'a> LintExtractor<'a> {
         cmd.arg(format!("--edition={edition}"));
         // Just in case this is an unstable edition.
         cmd.arg("-Zunstable-options");
+        // FIXME(#160895): While the new solver is enabled by default on nightly,
+        // we don't want to use it in our tests for now.
+        cmd.arg("-Znext-solver=coherence");
         cmd.arg("--error-format=json");
         cmd.arg("--target").arg(self.rustc_target);
         if let Some(target_linker) = self.rustc_linker {
@@ -578,6 +589,23 @@ impl<'a> LintExtractor<'a> {
             .map_err(|e| format!("could not write to {}: {}", out_path.display(), e))?;
         Ok(())
     }
+}
+
+/// Parses a doc string that follows `#[doc = "`.
+fn parse_doc_string(text: &str) -> String {
+    let escaped = text.strip_suffix("]").unwrap_or(text);
+    let escaped = escaped.strip_suffix(")").unwrap_or(escaped).strip_suffix("\"");
+    let Some(escaped) = escaped else {
+        panic!("Cannot extract docstring content from {text}");
+    };
+    let mut buf = String::new();
+    unescape_str(escaped, |_, res| match res {
+        Ok(c) => buf.push(c),
+        Err(err) => {
+            assert!(!err.is_fatal(), "failed to unescape string literal")
+        }
+    });
+    buf
 }
 
 /// Adds `Lint`s that have been renamed.

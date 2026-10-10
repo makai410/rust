@@ -9,7 +9,7 @@ LL |     let mut x = foo::<&'a ()>;
    |                 ^^^^^^^^^^^^^ assignment requires that `'b` must outlive `'a`
    |
    = help: consider adding the following bound: `'b: 'a`
-   = note: requirement occurs because of a function pointer to `foo`
+   = note: requirement occurs because of the function item type defined by `foo`
    = note: the function `foo` is invariant over the parameter `T`
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
@@ -25,11 +25,17 @@ LL |     x = foo::<&'b ()>;
    |     ^^^^^^^^^^^^^^^^^ assignment requires that `'a` must outlive `'b`
    |
    = help: consider adding the following bound: `'a: 'b`
-   = note: requirement occurs because of a function pointer to `foo`
+   = note: requirement occurs because of the function item type defined by `foo`
    = note: the function `foo` is invariant over the parameter `T`
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
-help: `'a` and `'b` must be the same: replace one with the other
+error: one or more lifetime errors were found in this item
+  --> $DIR/fn_def_coercion.rs:9:4
+   |
+LL | fn f<'a, 'b, 'c: 'a + 'b>(a: &'a (), b: &'b (), c: &'c ()) {
+   |    ^
+   |
+   = help: `'a` and `'b` must be the same: replace one with the other
 
 error: lifetime may not live long enough
   --> $DIR/fn_def_coercion.rs:20:12
@@ -56,7 +62,7 @@ LL |     x = foo::<&'b ()>;
    |     ^^^^^^^^^^^^^^^^^ assignment requires that `'a` must outlive `'b`
    |
    = help: consider adding the following bound: `'a: 'b`
-   = note: requirement occurs because of a function pointer to `foo`
+   = note: requirement occurs because of the function item type defined by `foo`
    = note: the function `foo` is invariant over the parameter `T`
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
@@ -72,13 +78,17 @@ LL |     x = foo::<&'a ()>;
    |     ^^^^^^^^^^^^^^^^^ assignment requires that `'b` must outlive `'a`
    |
    = help: consider adding the following bound: `'b: 'a`
-   = note: requirement occurs because of a function pointer to `foo`
+   = note: requirement occurs because of the function item type defined by `foo`
    = note: the function `foo` is invariant over the parameter `T`
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
-help: `'a` and `'b` must be the same: replace one with the other
+error: one or more lifetime errors were found in this item
+  --> $DIR/fn_def_coercion.rs:28:4
    |
-   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+LL | fn i<'a, 'b, 'c: 'a + 'b>(a: &'a (), b: &'b (), c: &'c ()) {
+   |    ^
+   |
+   = help: `'a` and `'b` must be the same: replace one with the other
 
 error: lifetime may not live long enough
   --> $DIR/fn_def_coercion.rs:39:17
@@ -92,7 +102,7 @@ LL |         true => foo::<&'b ()>,
    |                 ^^^^^^^^^^^^^ assignment requires that `'a` must outlive `'b`
    |
    = help: consider adding the following bound: `'a: 'b`
-   = note: requirement occurs because of a function pointer to `foo`
+   = note: requirement occurs because of the function item type defined by `foo`
    = note: the function `foo` is invariant over the parameter `T`
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
@@ -108,13 +118,17 @@ LL |         false => foo::<&'a ()>,
    |                  ^^^^^^^^^^^^^ assignment requires that `'b` must outlive `'a`
    |
    = help: consider adding the following bound: `'b: 'a`
-   = note: requirement occurs because of a function pointer to `foo`
+   = note: requirement occurs because of the function item type defined by `foo`
    = note: the function `foo` is invariant over the parameter `T`
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
-help: `'a` and `'b` must be the same: replace one with the other
+error: one or more lifetime errors were found in this item
+  --> $DIR/fn_def_coercion.rs:37:4
    |
-   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+LL | fn j<'a, 'b, 'c: 'a + 'b>(a: &'a (), b: &'b (), c: &'c ()) {
+   |    ^
+   |
+   = help: `'a` and `'b` must be the same: replace one with the other
 
 error: lifetime may not live long enough
   --> $DIR/fn_def_coercion.rs:49:17
@@ -128,7 +142,7 @@ LL |         true => foo::<&'c ()>,
    |                 ^^^^^^^^^^^^^ assignment requires that `'a` must outlive `'c`
    |
    = help: consider adding the following bound: `'a: 'c`
-   = note: requirement occurs because of a function pointer to `foo`
+   = note: requirement occurs because of the function item type defined by `foo`
    = note: the function `foo` is invariant over the parameter `T`
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
@@ -144,14 +158,9 @@ LL |         false => foo::<&'a ()>,
    |                  ^^^^^^^^^^^^^ assignment requires that `'b` must outlive `'a`
    |
    = help: consider adding the following bound: `'b: 'a`
-   = note: requirement occurs because of a function pointer to `foo`
+   = note: requirement occurs because of the function item type defined by `foo`
    = note: the function `foo` is invariant over the parameter `T`
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
-help: the following changes may resolve your lifetime errors
-   |
-   = help: add bound `'a: 'c`
-   = help: add bound `'b: 'a`
-
-error: aborting due to 9 previous errors
+error: aborting due to 12 previous errors
 

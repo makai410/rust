@@ -1,13 +1,12 @@
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::source::{snippet_with_applicability, snippet_with_context, walk_span_to_context};
 use clippy_utils::visitors::for_each_expr_without_closures;
-use clippy_utils::{desugar_await, get_async_closure_expr, get_async_fn_body, is_async_fn, is_from_proc_macro};
+use clippy_utils::{desugar_await, get_async_closure_expr, get_async_fn_body, is_from_proc_macro};
 use core::ops::ControlFlow;
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{Block, Body, Expr, ExprKind, FnDecl, FnRetTy, HirId};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, LintContext as _, declare_lint_pass};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, SyntaxContext};
 
@@ -240,7 +239,7 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitReturn {
             return;
         }
 
-        let expr = if is_async_fn(kind) {
+        let expr = if kind.asyncness().is_async() {
             match get_async_fn_body(cx.tcx, body) {
                 Some(e) => e,
                 None => return,

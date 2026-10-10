@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 // CHECK-LABEL: @noop_back(
 pub fn noop_back(v: &mut VecDeque<u8>) {
     // CHECK-NOT: grow
-    // CHECK: tail call void @llvm.assume
     // CHECK-NOT: grow
     // CHECK: ret
     if let Some(x) = v.pop_back() {

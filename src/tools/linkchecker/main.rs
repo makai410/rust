@@ -78,6 +78,36 @@ const LINKCHECK_EXCEPTIONS: &[(&str, &[&str])] = &[
     ("core/primitive.slice.html", &["#method.to_ascii_uppercase", "#method.to_ascii_lowercase",
                                     "core/slice::sort_by_key", "core\\slice::sort_by_key",
                                     "#method.sort_by_cached_key"]),
+    ("core/io/struct.IoSlice.html", &[
+        "#method.to_ascii_uppercase",
+        "#method.to_ascii_lowercase",
+        "core/io/slice::sort_by_key",
+        "core\\io\\slice::sort_by_key",
+        "#method.sort_by_cached_key"
+    ]),
+    ("core/io/struct.IoSliceMut.html", &[
+        "#method.to_ascii_uppercase",
+        "#method.to_ascii_lowercase",
+        "core/io/slice::sort_by_key",
+        "core\\io\\slice::sort_by_key",
+        "#method.sort_by_cached_key"
+    ]),
+    ("alloc/io/struct.IoSlice.html", &[
+        "#method.to_ascii_uppercase",
+        "#method.to_ascii_lowercase",
+        "alloc/io/slice::sort_by_key",
+        "alloc\\io\\slice::sort_by_key",
+        "#method.sort_by_key",
+        "#method.sort_by_cached_key"
+    ]),
+    ("alloc/io/struct.IoSliceMut.html", &[
+        "#method.to_ascii_uppercase",
+        "#method.to_ascii_lowercase",
+        "alloc/io/slice::sort_by_key",
+        "alloc\\io\\slice::sort_by_key",
+        "#method.sort_by_key",
+        "#method.sort_by_cached_key"
+    ]),
 ];
 
 #[rustfmt::skip]
@@ -232,18 +262,7 @@ enum FileEntry {
 type Cache = HashMap<String, FileEntry>;
 
 fn small_url_encode(s: &str) -> String {
-    s.replace('<', "%3C")
-        .replace('>', "%3E")
-        .replace(' ', "%20")
-        .replace('?', "%3F")
-        .replace('\'', "%27")
-        .replace('&', "%26")
-        .replace(',', "%2C")
-        .replace(':', "%3A")
-        .replace(';', "%3B")
-        .replace('[', "%5B")
-        .replace(']', "%5D")
-        .replace('\"', "%22")
+    urlencoding::encode(s).to_string()
 }
 
 impl Checker {

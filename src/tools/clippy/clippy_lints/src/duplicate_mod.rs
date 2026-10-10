@@ -1,9 +1,8 @@
 use clippy_utils::diagnostics::span_lint_and_help;
 use rustc_ast::ast::{Crate, Inline, Item, ItemKind, ModKind};
 use rustc_errors::MultiSpan;
-use rustc_lint::{EarlyContext, EarlyLintPass, Level, LintContext};
-use rustc_middle::lint::LevelAndSource;
-use rustc_session::impl_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, Level, LintContext as _, impl_lint_pass};
+use rustc_middle::lint::UnstableLevelSpec;
 use rustc_span::{FileName, Span};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -46,10 +45,12 @@ declare_clippy_lint! {
     "file loaded as module multiple times"
 }
 
+impl_lint_pass!(DuplicateMod => [DUPLICATE_MOD]);
+
 struct Modules {
     local_path: PathBuf,
     spans: Vec<Span>,
-    lint_levels: Vec<LevelAndSource>,
+    lint_level_specs: Vec<UnstableLevelSpec>,
 }
 
 #[derive(Default)]
@@ -59,11 +60,9 @@ pub struct DuplicateMod {
     modules: BTreeMap<PathBuf, Modules>,
 }
 
-impl_lint_pass!(DuplicateMod => [DUPLICATE_MOD]);
-
 impl EarlyLintPass for DuplicateMod {
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &Item) {
-        if let ItemKind::Mod(_, _, ModKind::Loaded(_, Inline::No, mod_spans, _)) = &item.kind
+        if let ItemKind::Mod(_, _, ModKind::Loaded(_, Inline::No { .. }, mod_spans)) = &item.kind
             && let FileName::Real(real) = cx.sess().source_map().span_to_filename(mod_spans.inner_span)
             && let Some(local_path) = real.into_local_path()
             && let Ok(absolute_path) = local_path.canonicalize()
@@ -71,10 +70,10 @@ impl EarlyLintPass for DuplicateMod {
             let modules = self.modules.entry(absolute_path).or_insert(Modules {
                 local_path,
                 spans: Vec::new(),
-                lint_levels: Vec::new(),
+                lint_level_specs: Vec::new(),
             });
             modules.spans.push(item.span_with_attributes());
-            modules.lint_levels.push(cx.get_lint_level(DUPLICATE_MOD));
+            modules.lint_level_specs.push(cx.get_lint_level_spec(DUPLICATE_MOD));
         }
     }
 
@@ -82,7 +81,7 @@ impl EarlyLintPass for DuplicateMod {
         for Modules {
             local_path,
             spans,
-            lint_levels,
+            lint_level_specs,
         } in self.modules.values()
         {
             if spans.len() < 2 {
@@ -90,16 +89,16 @@ impl EarlyLintPass for DuplicateMod {
             }
 
             // At this point the lint would be emitted
-            assert_eq!(spans.len(), lint_levels.len());
+            assert_eq!(spans.len(), lint_level_specs.len());
             let spans: Vec<_> = spans
                 .iter()
-                .zip(lint_levels)
-                .filter_map(|(span, lvl)| {
-                    if let Some(id) = lvl.lint_id {
+                .zip(lint_level_specs)
+                .filter_map(|(span, level_spec)| {
+                    if let Some(id) = level_spec.lint_id() {
                         cx.fulfill_expectation(id);
                     }
 
-                    (!matches!(lvl.level, Level::Allow | Level::Expect)).then_some(*span)
+                    (!matches!(level_spec.level(), Level::Allow | Level::Expect)).then_some(*span)
                 })
                 .collect();
 

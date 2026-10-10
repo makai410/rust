@@ -1,12 +1,12 @@
 use rustc_ast::{Block, BlockCheckMode, Local, LocalKind, Stmt, StmtKind};
+use rustc_attr_ir::target::Target;
 use rustc_hir as hir;
-use rustc_hir::Target;
 use rustc_span::sym;
 use smallvec::SmallVec;
 
 use crate::{ImplTraitContext, ImplTraitPosition, LoweringContext};
 
-impl<'a, 'hir> LoweringContext<'a, 'hir> {
+impl<'hir> LoweringContext<'_, 'hir> {
     pub(super) fn lower_block(
         &mut self,
         b: &Block,
@@ -27,7 +27,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         hir::Block { hir_id, stmts, expr, rules, span: self.lower_span(b.span), targeted_by_break }
     }
 
-    fn lower_stmts(
+    pub(super) fn lower_stmts(
         &mut self,
         mut ast_stmts: &[Stmt],
     ) -> (&'hir [hir::Stmt<'hir>], Option<&'hir hir::Expr<'hir>>) {
@@ -44,17 +44,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                     stmts.push(hir::Stmt { hir_id, kind, span });
                 }
                 StmtKind::Item(it) => {
-                    stmts.extend(self.lower_item_ref(it).into_iter().enumerate().map(
-                        |(i, item_id)| {
-                            let hir_id = match i {
-                                0 => self.lower_node_id(s.id),
-                                _ => self.next_id(),
-                            };
-                            let kind = hir::StmtKind::Item(item_id);
-                            let span = self.lower_span(s.span);
-                            hir::Stmt { hir_id, kind, span }
-                        },
-                    ));
+                    let item_id = self.lower_item_ref(it);
+                    let hir_id = self.lower_node_id(s.id);
+                    let kind = hir::StmtKind::Item(item_id);
+                    let span = self.lower_span(s.span);
+                    stmts.push(hir::Stmt { hir_id, kind, span });
                 }
                 StmtKind::Expr(e) => {
                     let e = self.lower_expr(e);
@@ -98,7 +92,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         // Let statements are allowed to have impl trait in bindings.
         let super_ = l.super_.map(|span| self.lower_span(span));
         let ty = l.ty.as_ref().map(|t| {
-            self.lower_ty(t, self.impl_trait_in_bindings_ctxt(ImplTraitPosition::Variable))
+            self.lower_ty_alloc(t, self.impl_trait_in_bindings_ctxt(ImplTraitPosition::Variable))
         });
         let init = l.kind.init().map(|init| self.lower_expr(init));
         let hir_id = self.lower_node_id(l.id);

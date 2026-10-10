@@ -1,4 +1,4 @@
-use super::poison::once::ExclusiveState;
+use super::once::OnceExclusiveState;
 use crate::cell::UnsafeCell;
 use crate::mem::ManuallyDrop;
 use crate::ops::{Deref, DerefMut};
@@ -105,15 +105,6 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
         LazyLock { once: Once::new(), data: UnsafeCell::new(Data { f: ManuallyDrop::new(f) }) }
     }
 
-    /// Creates a new lazy value that is already initialized.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn preinit(value: T) -> LazyLock<T, F> {
-        let once = Once::new();
-        once.call_once(|| {});
-        LazyLock { once, data: UnsafeCell::new(Data { value: ManuallyDrop::new(value) }) }
-    }
-
     /// Consumes this `LazyLock` returning the stored value.
     ///
     /// Returns `Ok(value)` if `Lazy` is initialized and `Err(f)` otherwise.
@@ -140,14 +131,18 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     pub fn into_inner(mut this: Self) -> Result<T, F> {
         let state = this.once.state();
         match state {
-            ExclusiveState::Poisoned => panic_poisoned(),
+            OnceExclusiveState::Poisoned => panic_poisoned(),
             state => {
                 let this = ManuallyDrop::new(this);
                 let data = unsafe { ptr::read(&this.data) }.into_inner();
                 match state {
-                    ExclusiveState::Incomplete => Err(ManuallyDrop::into_inner(unsafe { data.f })),
-                    ExclusiveState::Complete => Ok(ManuallyDrop::into_inner(unsafe { data.value })),
-                    ExclusiveState::Poisoned => unreachable!(),
+                    OnceExclusiveState::Incomplete => {
+                        Err(ManuallyDrop::into_inner(unsafe { data.f }))
+                    }
+                    OnceExclusiveState::Complete => {
+                        Ok(ManuallyDrop::into_inner(unsafe { data.value }))
+                    }
+                    OnceExclusiveState::Poisoned => unreachable!(),
                 }
             }
         }
@@ -168,7 +163,6 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
     /// use std::sync::LazyLock;
     ///
     /// let mut lazy = LazyLock::new(|| 92);
@@ -179,7 +173,7 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     /// assert_eq!(*lazy, 44);
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
     pub fn force_mut(this: &mut LazyLock<T, F>) -> &mut T {
         #[cold]
         /// # Safety
@@ -189,7 +183,7 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
             impl<T, F> Drop for PoisonOnPanic<'_, T, F> {
                 #[inline]
                 fn drop(&mut self) {
-                    self.0.once.set_state(ExclusiveState::Poisoned);
+                    self.0.once.set_state(OnceExclusiveState::Poisoned);
                 }
             }
 
@@ -200,19 +194,19 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
             let guard = PoisonOnPanic(this);
             let data = f();
             guard.0.data.get_mut().value = ManuallyDrop::new(data);
-            guard.0.once.set_state(ExclusiveState::Complete);
+            guard.0.once.set_state(OnceExclusiveState::Complete);
             core::mem::forget(guard);
             // SAFETY: We put the value there above.
-            unsafe { &mut this.data.get_mut().value }
+            unsafe { LazyLock::get_unchecked_mut(this) }
         }
 
         let state = this.once.state();
         match state {
-            ExclusiveState::Poisoned => panic_poisoned(),
+            OnceExclusiveState::Poisoned => panic_poisoned(),
             // SAFETY: The `Once` states we completed the initialization.
-            ExclusiveState::Complete => unsafe { &mut this.data.get_mut().value },
+            OnceExclusiveState::Complete => unsafe { LazyLock::get_unchecked_mut(this) },
             // SAFETY: The state is `Incomplete`.
-            ExclusiveState::Incomplete => unsafe { really_init_mut(this) },
+            OnceExclusiveState::Incomplete => unsafe { really_init_mut(this) },
         }
     }
 
@@ -243,8 +237,13 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     /// ```
     #[inline]
     #[stable(feature = "lazy_cell", since = "1.80.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn force(this: &LazyLock<T, F>) -> &T {
-        this.once.call_once(|| {
+        this.once.call_once_force(|state| {
+            if state.is_poisoned() {
+                panic_poisoned();
+            }
+
             // SAFETY: `call_once` only runs this closure once, ever.
             let data = unsafe { &mut *this.data.get() };
             let f = unsafe { ManuallyDrop::take(&mut data.f) };
@@ -257,10 +256,9 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
         // * the closure was called and initialized `value`.
         // * the closure was called and panicked, so this point is never reached.
         // * the closure was not called, but a previous call initialized `value`.
-        // * the closure was not called because the Once is poisoned, so this point
-        //   is never reached.
+        // * the closure was not called because the Once is poisoned, which we handled above.
         // So `value` has definitely been initialized and will not be modified again.
-        unsafe { &*(*this.data.get()).value }
+        unsafe { LazyLock::get_unchecked(this) }
     }
 }
 
@@ -271,8 +269,6 @@ impl<T, F> LazyLock<T, F> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
-    ///
     /// use std::sync::LazyLock;
     ///
     /// let mut lazy = LazyLock::new(|| 92);
@@ -283,14 +279,14 @@ impl<T, F> LazyLock<T, F> {
     /// assert_eq!(*lazy, 44);
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
     pub fn get_mut(this: &mut LazyLock<T, F>) -> Option<&mut T> {
         // `state()` does not perform an atomic load, so prefer it over `is_complete()`.
         let state = this.once.state();
         match state {
             // SAFETY:
             // The closure has been run successfully, so `value` has been initialized.
-            ExclusiveState::Complete => Some(unsafe { &mut this.data.get_mut().value }),
+            OnceExclusiveState::Complete => Some(unsafe { LazyLock::get_unchecked_mut(this) }),
             _ => None,
         }
     }
@@ -301,8 +297,6 @@ impl<T, F> LazyLock<T, F> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(lazy_get)]
-    ///
     /// use std::sync::LazyLock;
     ///
     /// let lazy = LazyLock::new(|| 92);
@@ -312,16 +306,77 @@ impl<T, F> LazyLock<T, F> {
     /// assert_eq!(LazyLock::get(&lazy), Some(&92));
     /// ```
     #[inline]
-    #[unstable(feature = "lazy_get", issue = "129333")]
+    #[stable(feature = "lazy_get", since = "1.94.0")]
+    #[rustc_should_not_be_called_on_const_items]
     pub fn get(this: &LazyLock<T, F>) -> Option<&T> {
         if this.once.is_completed() {
             // SAFETY:
             // The closure has been run successfully, so `value` has been initialized
             // and will not be modified again.
-            Some(unsafe { &(*this.data.get()).value })
+            Some(unsafe { LazyLock::get_unchecked(this) })
         } else {
             None
         }
+    }
+
+    /// Returns a shared reference to the value stored in the `LazyLock` without
+    /// checking whether it has been initialized.
+    ///
+    /// # Safety
+    ///
+    /// The lazy value must be initialized before calling this function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(once_lazy_lock_get_unchecked)]
+    ///
+    /// use std::sync::LazyLock;
+    ///
+    /// let lazy = LazyLock::new(|| 42);
+    ///
+    /// // Initialize the lazy.
+    /// let _ = &*lazy;
+    ///
+    /// let value = unsafe { LazyLock::get_unchecked(&lazy) };
+    /// assert_eq!(*value, 42);
+    /// ```
+    #[inline]
+    #[unstable(feature = "once_lazy_lock_get_unchecked", issue = "162716")]
+    pub unsafe fn get_unchecked(this: &LazyLock<T, F>) -> &T {
+        debug_assert!(this.once.is_completed());
+        unsafe { &(*this.data.get()).value }
+    }
+
+    /// Returns a mutable reference to the value stored in the `LazyLock` without
+    /// checking whether it has been initialized.
+    ///
+    /// # Safety
+    ///
+    /// The lazy value must be initialized before calling this function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(once_lazy_lock_get_unchecked)]
+    ///
+    /// use std::sync::LazyLock;
+    ///
+    /// let mut lazy = LazyLock::new(|| 42);
+    ///
+    /// // Initialize the lazy.
+    /// let _ = &*lazy;
+    ///
+    /// let value = unsafe { LazyLock::get_unchecked_mut(&mut lazy) };
+    /// *value = 100;
+    ///
+    /// assert_eq!(*lazy, 100);
+    /// ```
+    #[inline]
+    #[unstable(feature = "once_lazy_lock_get_unchecked", issue = "162716")]
+    pub unsafe fn get_unchecked_mut(this: &mut LazyLock<T, F>) -> &mut T {
+        debug_assert!(this.once.is_completed());
+        unsafe { &mut this.data.get_mut().value }
     }
 }
 
@@ -329,11 +384,13 @@ impl<T, F> LazyLock<T, F> {
 impl<T, F> Drop for LazyLock<T, F> {
     fn drop(&mut self) {
         match self.once.state() {
-            ExclusiveState::Incomplete => unsafe { ManuallyDrop::drop(&mut self.data.get_mut().f) },
-            ExclusiveState::Complete => unsafe {
+            OnceExclusiveState::Incomplete => unsafe {
+                ManuallyDrop::drop(&mut self.data.get_mut().f)
+            },
+            OnceExclusiveState::Complete => unsafe {
                 ManuallyDrop::drop(&mut self.data.get_mut().value)
             },
-            ExclusiveState::Poisoned => {}
+            OnceExclusiveState::Poisoned => {}
         }
     }
 }
@@ -378,7 +435,8 @@ impl<T, F: FnOnce() -> T> DerefMut for LazyLock<T, F> {
 }
 
 #[stable(feature = "lazy_cell", since = "1.80.0")]
-impl<T: Default> Default for LazyLock<T> {
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+const impl<T: Default> Default for LazyLock<T> {
     /// Creates a new lazy value using `Default` as the initializing function.
     #[inline]
     fn default() -> LazyLock<T> {
@@ -395,6 +453,19 @@ impl<T: fmt::Debug, F> fmt::Debug for LazyLock<T, F> {
             None => d.field(&format_args!("<uninit>")),
         };
         d.finish()
+    }
+}
+
+#[stable(feature = "from_wrapper_impls", since = "1.96.0")]
+impl<T, F> From<T> for LazyLock<T, F> {
+    /// Constructs a `LazyLock` that starts already initialized
+    /// with the provided value.
+    #[inline]
+    fn from(value: T) -> Self {
+        LazyLock {
+            once: Once::new_complete(),
+            data: UnsafeCell::new(Data { value: ManuallyDrop::new(value) }),
+        }
     }
 }
 

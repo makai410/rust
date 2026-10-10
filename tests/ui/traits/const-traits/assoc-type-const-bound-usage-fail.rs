@@ -1,4 +1,5 @@
 //@ revisions: current next
+//@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 
 // Check that `[const]` item bounds only hold if the parent trait is `[const]`.
@@ -7,8 +8,7 @@
 
 #![feature(const_trait_impl)]
 
-#[const_trait]
-trait Trait {
+const trait Trait {
     type Assoc: [const] Trait;
     fn func();
 }

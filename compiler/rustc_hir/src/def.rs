@@ -1,20 +1,21 @@
 use std::array::IntoIter;
+use std::borrow::Cow;
 use std::fmt::Debug;
 
 use rustc_ast as ast;
 use rustc_ast::NodeId;
-use rustc_data_structures::stable_hasher::ToStableHashKey;
-use rustc_data_structures::unord::UnordMap;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_error_messages::{DiagArgValue, IntoDiagArg};
+use rustc_hir_id::HirId;
+use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::Symbol;
-use rustc_span::def_id::{DefId, LocalDefId};
+use rustc_span::def_id::DefId;
 use rustc_span::hygiene::MacroKind;
 
+use crate as hir;
 use crate::definitions::DefPathData;
-use crate::hir;
 
 /// Encodes if a `DefKind::Ctor` is the constructor of an enum variant or a struct.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum CtorOf {
     /// This `DefKind::Ctor` is a synthesized constructor of a tuple or unit struct.
     Struct,
@@ -23,7 +24,7 @@ pub enum CtorOf {
 }
 
 /// What kind of constructor something is.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum CtorKind {
     /// Constructor function automatically created by a tuple struct/variant.
     Fn,
@@ -33,7 +34,7 @@ pub enum CtorKind {
 
 /// A set of macro kinds, for macros that can have more than one kind
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encodable, Decodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+#[derive(StableHash)]
 pub struct MacroKinds(u8);
 bitflags::bitflags! {
     impl MacroKinds: u8 {
@@ -54,6 +55,17 @@ impl From<MacroKind> for MacroKinds {
 }
 
 impl MacroKinds {
+    // Constants to allow easy pattern-matching on any combination.
+    /// `ATTR | BANG`
+    pub const ATTR_BANG: MacroKinds = MacroKinds::ATTR.union(MacroKinds::BANG);
+    /// `DERIVE | BANG`
+    pub const DERIVE_BANG: MacroKinds = MacroKinds::DERIVE.union(MacroKinds::BANG);
+    /// `DERIVE | ATTR`
+    pub const DERIVE_ATTR: MacroKinds = MacroKinds::DERIVE.union(MacroKinds::ATTR);
+    /// `DERIVE | ATTR | BANG`
+    pub const DERIVE_ATTR_BANG: MacroKinds =
+        MacroKinds::DERIVE.union(MacroKinds::ATTR).union(MacroKinds::BANG);
+
     /// Convert the MacroKinds to a static string.
     ///
     /// This hardcodes all the possibilities, in order to return a static string.
@@ -63,10 +75,10 @@ impl MacroKinds {
             Self::BANG => "macro",
             Self::ATTR => "attribute macro",
             Self::DERIVE => "derive macro",
-            _ if self == (Self::ATTR | Self::BANG) => "attribute/function macro",
-            _ if self == (Self::DERIVE | Self::BANG) => "derive/function macro",
-            _ if self == (Self::ATTR | Self::DERIVE) => "attribute/derive macro",
-            _ if self.is_all() => "attribute/derive/function macro",
+            Self::ATTR_BANG => "attribute/function macro",
+            Self::DERIVE_BANG => "derive/function macro",
+            Self::DERIVE_ATTR => "attribute/derive macro",
+            Self::DERIVE_ATTR_BANG => "attribute/derive/function macro",
             _ if self.is_empty() => "useless macro",
             _ => unreachable!(),
         }
@@ -79,7 +91,7 @@ impl MacroKinds {
 }
 
 /// An attribute that is not a macro; e.g., `#[inline]` or `#[rustfmt::skip]`.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum NonMacroAttrKind {
     /// Single-segment attribute defined by the language (`#[inline]`)
     Builtin(Symbol),
@@ -94,7 +106,7 @@ pub enum NonMacroAttrKind {
 
 /// What kind of definition something is; e.g., `mod` vs `struct`.
 /// `enum DefPathData` may need to be updated if a new variant is added here.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum DefKind {
     // Type namespace
     Mod,
@@ -131,6 +143,11 @@ pub enum DefKind {
     },
     /// Refers to the struct or enum variant's constructor.
     ///
+    /// ```
+    /// struct S;
+    /// let x = S; // S in the value namespace is a Ctor
+    /// ```
+    ///
     /// The reason `Ctor` exists in addition to [`DefKind::Struct`] and
     /// [`DefKind::Variant`] is because structs and enum variants exist
     /// in the *type* namespace, whereas struct and enum variant *constructors*
@@ -155,7 +172,8 @@ pub enum DefKind {
     Use,
     /// An `extern` block.
     ForeignMod,
-    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]`.
+    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]` or `enum E { A = 1 + 2 }`, or an
+    /// inline constant, e.g. `const { 1 + 2 }`.
     ///
     /// Not all anon-consts are actually still relevant in the HIR. We lower
     /// trivial const-arguments directly to `hir::ConstArgKind::Path`, at which
@@ -166,8 +184,6 @@ pub enum DefKind {
     /// constants should only be reachable by iterating all definitions of a
     /// given crate, you should not have to worry about this.
     AnonConst,
-    /// An inline constant, e.g. `const { 1 + 2 }`
-    InlineConst,
     /// Opaque type, aka `impl Trait`.
     OpaqueTy,
     /// A field in a struct, enum or union. e.g.
@@ -186,11 +202,13 @@ pub enum DefKind {
     /// These are all represented with the same `ExprKind::Closure` in the AST and HIR,
     /// which makes it difficult to distinguish these during def collection. Therefore,
     /// we treat them all the same, and code which needs to distinguish them can match
-    /// or `hir::ClosureKind` or `type_of`.
+    /// on `hir::ClosureKind` or `type_of`.
     Closure,
     /// The definition of a synthetic coroutine body created by the lowering of a
     /// coroutine-closure, such as an async closure.
     SyntheticCoroutineBody,
+    /// Perma-unstable. Used for test infrastructure for binders.
+    TestBinderConstraints,
 }
 
 impl DefKind {
@@ -229,13 +247,13 @@ impl DefKind {
             DefKind::Use => "import",
             DefKind::ForeignMod => "foreign module",
             DefKind::AnonConst => "constant expression",
-            DefKind::InlineConst => "inline constant",
             DefKind::Field => "field",
             DefKind::Impl { .. } => "implementation",
             DefKind::Closure => "closure",
             DefKind::ExternCrate => "extern crate",
             DefKind::GlobalAsm => "global assembly block",
             DefKind::SyntheticCoroutineBody => "synthetic mir body",
+            DefKind::TestBinderConstraints => "test_binder_constraints!",
         }
     }
 
@@ -253,7 +271,6 @@ impl DefKind {
             | DefKind::OpaqueTy
             | DefKind::Impl { .. }
             | DefKind::Use
-            | DefKind::InlineConst
             | DefKind::ExternCrate => "an",
             DefKind::Macro(kinds) => kinds.article(),
             _ => "a",
@@ -286,7 +303,6 @@ impl DefKind {
 
             // Not namespaced.
             DefKind::AnonConst
-            | DefKind::InlineConst
             | DefKind::Field
             | DefKind::LifetimeParam
             | DefKind::ExternCrate
@@ -296,7 +312,8 @@ impl DefKind {
             | DefKind::GlobalAsm
             | DefKind::Impl { .. }
             | DefKind::OpaqueTy
-            | DefKind::SyntheticCoroutineBody => None,
+            | DefKind::SyntheticCoroutineBody
+            | DefKind::TestBinderConstraints => None,
         }
     }
 
@@ -333,12 +350,12 @@ impl DefKind {
             DefKind::Use => DefPathData::Use,
             DefKind::ForeignMod => DefPathData::ForeignMod,
             DefKind::AnonConst => DefPathData::AnonConst,
-            DefKind::InlineConst => DefPathData::AnonConst,
             DefKind::OpaqueTy => DefPathData::OpaqueTy,
             DefKind::GlobalAsm => DefPathData::GlobalAsm,
             DefKind::Impl { .. } => DefPathData::Impl,
             DefKind::Closure => DefPathData::Closure,
             DefKind::SyntheticCoroutineBody => DefPathData::SyntheticCoroutineBody,
+            DefKind::TestBinderConstraints => DefPathData::TestBinderConstraints,
         }
     }
 
@@ -365,7 +382,7 @@ impl DefKind {
         )
     }
 
-    /// Whether the corresponding item has generic parameters, ie. the `generics_of` query works.
+    /// Whether the corresponding item has generic parameters, i.e. the `generics_of` query works.
     pub fn has_generics(self) -> bool {
         match self {
             DefKind::AnonConst
@@ -380,7 +397,6 @@ impl DefKind {
             | DefKind::Fn
             | DefKind::ForeignTy
             | DefKind::Impl { .. }
-            | DefKind::InlineConst
             | DefKind::OpaqueTy
             | DefKind::Static { .. }
             | DefKind::Struct
@@ -389,7 +405,8 @@ impl DefKind {
             | DefKind::TraitAlias
             | DefKind::TyAlias
             | DefKind::Union
-            | DefKind::Variant => true,
+            | DefKind::Variant
+            | DefKind::TestBinderConstraints => true,
             DefKind::ConstParam
             | DefKind::ExternCrate
             | DefKind::ForeignMod
@@ -433,9 +450,9 @@ impl DefKind {
             | DefKind::ConstParam
             | DefKind::LifetimeParam
             | DefKind::AnonConst
-            | DefKind::InlineConst
             | DefKind::GlobalAsm
-            | DefKind::ExternCrate => false,
+            | DefKind::ExternCrate
+            | DefKind::TestBinderConstraints => false,
         }
     }
 }
@@ -468,8 +485,8 @@ impl DefKind {
 /// - the call to `str_to_string` will resolve to [`Res::Def`], with the [`DefId`]
 ///   pointing to the definition of `str_to_string` in the current crate.
 //
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
-pub enum Res<Id = hir::HirId> {
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
+pub enum Res<Id = HirId> {
     /// Definition having a unique ID (`DefId`), corresponds to something defined in user code.
     ///
     /// **Not bound to a specific namespace.**
@@ -524,29 +541,6 @@ pub enum Res<Id = hir::HirId> {
         /// to get the underlying type.
         alias_to: DefId,
 
-        /// Whether the `Self` type is disallowed from mentioning generics (i.e. when used in an
-        /// anonymous constant).
-        ///
-        /// HACK(min_const_generics): self types also have an optional requirement to **not**
-        /// mention any generic parameters to allow the following with `min_const_generics`:
-        /// ```
-        /// # struct Foo;
-        /// impl Foo { fn test() -> [u8; size_of::<Self>()] { todo!() } }
-        ///
-        /// struct Bar([u8; baz::<Self>()]);
-        /// const fn baz<T>() -> usize { 10 }
-        /// ```
-        /// We do however allow `Self` in repeat expression even if it is generic to not break code
-        /// which already works on stable while causing the `const_evaluatable_unchecked` future
-        /// compat lint:
-        /// ```
-        /// fn foo<T>() {
-        ///     let _bar = [1_u8; size_of::<*mut T>()];
-        /// }
-        /// ```
-        // FIXME(generic_const_exprs): Remove this bodge once that feature is stable.
-        forbid_generic: bool,
-
         /// Is this within an `impl Foo for bar`?
         is_trait_impl: bool,
     },
@@ -570,6 +564,13 @@ pub enum Res<Id = hir::HirId> {
     /// **Belongs to the type namespace.**
     ToolMod,
 
+    /// The resolution for an open module in a namespaced crate. E.g. `my_api`
+    /// in the namespaced crate `my_api::utils` when `my_api` isn't part of the
+    /// extern prelude.
+    ///
+    /// **Belongs to the type namespace.**
+    OpenMod(Symbol),
+
     // Macro namespace
     /// An attribute that is *not* implemented via macro.
     /// E.g., `#[inline]` and `#[rustfmt::skip]`, which are essentially directives,
@@ -586,67 +587,35 @@ pub enum Res<Id = hir::HirId> {
     Err,
 }
 
-/// The result of resolving a path before lowering to HIR,
-/// with "module" segments resolved and associated item
-/// segments deferred to type checking.
-/// `base_res` is the resolution of the resolved part of the
-/// path, `unresolved_segments` is the number of unresolved
-/// segments.
-///
-/// ```text
-/// module::Type::AssocX::AssocY::MethodOrAssocType
-/// ^~~~~~~~~~~~  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-/// base_res      unresolved_segments = 3
-///
-/// <T as Trait>::AssocX::AssocY::MethodOrAssocType
-///       ^~~~~~~~~~~~~~  ^~~~~~~~~~~~~~~~~~~~~~~~~
-///       base_res        unresolved_segments = 2
-/// ```
-#[derive(Copy, Clone, Debug)]
-pub struct PartialRes {
-    base_res: Res<NodeId>,
-    unresolved_segments: usize,
+impl Res {
+    pub fn in_namespace(self) -> PerNS<Option<Res>> {
+        match self {
+            Res::Def(DefKind::Mod | DefKind::Trait, _) => {
+                PerNS { type_ns: Some(self), value_ns: None, macro_ns: None }
+            }
+            Res::Def(DefKind::Enum, _) => {
+                PerNS { type_ns: None, value_ns: Some(self), macro_ns: None }
+            }
+            Res::Err => {
+                // Propagate the error to all namespaces, just to be sure.
+                let err = Some(Res::Err);
+                PerNS { type_ns: err, value_ns: err, macro_ns: err }
+            }
+            _ => panic!("bad path segment res {self:?}"),
+        }
+    }
 }
 
-impl PartialRes {
-    #[inline]
-    pub fn new(base_res: Res<NodeId>) -> Self {
-        PartialRes { base_res, unresolved_segments: 0 }
-    }
-
-    #[inline]
-    pub fn with_unresolved_segments(base_res: Res<NodeId>, mut unresolved_segments: usize) -> Self {
-        if base_res == Res::Err {
-            unresolved_segments = 0
-        }
-        PartialRes { base_res, unresolved_segments }
-    }
-
-    #[inline]
-    pub fn base_res(&self) -> Res<NodeId> {
-        self.base_res
-    }
-
-    #[inline]
-    pub fn unresolved_segments(&self) -> usize {
-        self.unresolved_segments
-    }
-
-    #[inline]
-    pub fn full_res(&self) -> Option<Res<NodeId>> {
-        (self.unresolved_segments == 0).then_some(self.base_res)
-    }
-
-    #[inline]
-    pub fn expect_full_res(&self) -> Res<NodeId> {
-        self.full_res().expect("unexpected unresolved segments")
+impl<Id> IntoDiagArg for Res<Id> {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Borrowed(self.descr()))
     }
 }
 
 /// Different kinds of symbols can coexist even if they share the same textual name.
 /// Therefore, they each have a separate universe (known as a "namespace").
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Encodable, Decodable)]
-#[derive(HashStable_Generic)]
+#[derive(StableHash)]
 pub enum Namespace {
     /// The type namespace includes `struct`s, `enum`s, `union`s, `trait`s, and `mod`s
     /// (and, by extension, crates).
@@ -673,17 +642,15 @@ impl Namespace {
     }
 }
 
-impl<CTX: crate::HashStableContext> ToStableHashKey<CTX> for Namespace {
-    type KeyType = Namespace;
-
-    #[inline]
-    fn to_stable_hash_key(&self, _: &CTX) -> Namespace {
-        *self
+impl IntoDiagArg for Namespace {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Borrowed(self.descr()))
     }
 }
 
 /// Just a helper ‒ separate structure for each namespace.
-#[derive(Copy, Clone, Default, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, StableHash)]
+#[derive_const(Default)]
 pub struct PerNS<T> {
     pub value_ns: T,
     pub type_ns: T,
@@ -806,6 +773,7 @@ impl<Id> Res<Id> {
             | Res::SelfTyAlias { .. }
             | Res::SelfCtor(..)
             | Res::ToolMod
+            | Res::OpenMod(..)
             | Res::NonMacroAttr(..)
             | Res::Err => None,
         }
@@ -837,6 +805,7 @@ impl<Id> Res<Id> {
             Res::Local(..) => "local variable",
             Res::SelfTyParam { .. } | Res::SelfTyAlias { .. } => "self type",
             Res::ToolMod => "tool module",
+            Res::OpenMod(..) => "namespaced crate",
             Res::NonMacroAttr(attr_kind) => attr_kind.descr(),
             Res::Err => "unresolved item",
         }
@@ -859,10 +828,11 @@ impl<Id> Res<Id> {
             Res::PrimTy(id) => Res::PrimTy(id),
             Res::Local(id) => Res::Local(map(id)),
             Res::SelfTyParam { trait_ } => Res::SelfTyParam { trait_ },
-            Res::SelfTyAlias { alias_to, forbid_generic, is_trait_impl } => {
-                Res::SelfTyAlias { alias_to, forbid_generic, is_trait_impl }
+            Res::SelfTyAlias { alias_to, is_trait_impl } => {
+                Res::SelfTyAlias { alias_to, is_trait_impl }
             }
             Res::ToolMod => Res::ToolMod,
+            Res::OpenMod(sym) => Res::OpenMod(sym),
             Res::NonMacroAttr(attr_kind) => Res::NonMacroAttr(attr_kind),
             Res::Err => Res::Err,
         }
@@ -875,10 +845,11 @@ impl<Id> Res<Id> {
             Res::PrimTy(id) => Res::PrimTy(id),
             Res::Local(id) => Res::Local(map(id)?),
             Res::SelfTyParam { trait_ } => Res::SelfTyParam { trait_ },
-            Res::SelfTyAlias { alias_to, forbid_generic, is_trait_impl } => {
-                Res::SelfTyAlias { alias_to, forbid_generic, is_trait_impl }
+            Res::SelfTyAlias { alias_to, is_trait_impl } => {
+                Res::SelfTyAlias { alias_to, is_trait_impl }
             }
             Res::ToolMod => Res::ToolMod,
+            Res::OpenMod(sym) => Res::OpenMod(sym),
             Res::NonMacroAttr(attr_kind) => Res::NonMacroAttr(attr_kind),
             Res::Err => Res::Err,
         })
@@ -904,9 +875,11 @@ impl<Id> Res<Id> {
     pub fn ns(&self) -> Option<Namespace> {
         match self {
             Res::Def(kind, ..) => kind.ns(),
-            Res::PrimTy(..) | Res::SelfTyParam { .. } | Res::SelfTyAlias { .. } | Res::ToolMod => {
-                Some(Namespace::TypeNS)
-            }
+            Res::PrimTy(..)
+            | Res::SelfTyParam { .. }
+            | Res::SelfTyAlias { .. }
+            | Res::ToolMod
+            | Res::OpenMod(..) => Some(Namespace::TypeNS),
             Res::SelfCtor(..) | Res::Local(..) => Some(Namespace::ValueNS),
             Res::NonMacroAttr(..) => Some(Namespace::MacroNS),
             Res::Err => None,
@@ -928,43 +901,3 @@ impl<Id> Res<Id> {
         matches!(self, Res::Def(DefKind::Ctor(_, CtorKind::Const), _) | Res::SelfCtor(..))
     }
 }
-
-/// Resolution for a lifetime appearing in a type.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum LifetimeRes {
-    /// Successfully linked the lifetime to a generic parameter.
-    Param {
-        /// Id of the generic parameter that introduced it.
-        param: LocalDefId,
-        /// Id of the introducing place. That can be:
-        /// - an item's id, for the item's generic parameters;
-        /// - a TraitRef's ref_id, identifying the `for<...>` binder;
-        /// - a FnPtr type's id.
-        ///
-        /// This information is used for impl-trait lifetime captures, to know when to or not to
-        /// capture any given lifetime.
-        binder: NodeId,
-    },
-    /// Created a generic parameter for an anonymous lifetime.
-    Fresh {
-        /// Id of the generic parameter that introduced it.
-        ///
-        /// Creating the associated `LocalDefId` is the responsibility of lowering.
-        param: NodeId,
-        /// Id of the introducing place. See `Param`.
-        binder: NodeId,
-        /// Kind of elided lifetime
-        kind: hir::MissingLifetimeKind,
-    },
-    /// This variant is used for anonymous lifetimes that we did not resolve during
-    /// late resolution. Those lifetimes will be inferred by typechecking.
-    Infer,
-    /// `'static` lifetime.
-    Static,
-    /// Resolution failure.
-    Error,
-    /// HACK: This is used to recover the NodeId of an elided lifetime.
-    ElidedAnchor { start: NodeId, end: NodeId },
-}
-
-pub type DocLinkResMap = UnordMap<(Symbol, Namespace), Option<Res<NodeId>>>;

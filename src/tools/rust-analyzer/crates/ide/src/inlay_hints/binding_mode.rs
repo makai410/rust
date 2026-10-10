@@ -15,7 +15,7 @@ use crate::{InlayHint, InlayHintLabel, InlayHintPosition, InlayHintsConfig, Inla
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
     FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     pat: &ast::Pat,
 ) -> Option<()> {
     if !config.binding_mode_hints {
@@ -169,13 +169,14 @@ fn __(
     }
     match &(0,) {
         (x,) | (x,) => (),
-      //^^^^^^^^^^^)
-      //^^^^^^^^^^^&(
+      //^^^^&
        //^ ref
               //^ ref
+             //^^^^&
         ((x,) | (x,)) => (),
-      //^^^^^^^^^^^^^&
+       //^^^^&
         //^ ref
+              //^^^^&
                //^ ref
     }
     match &mut (0,) {
@@ -183,7 +184,8 @@ fn __(
       //^^^^ &mut
        //^ ref mut
     }
-}"#,
+}
+"#,
         );
     }
 
@@ -217,8 +219,8 @@ fn main() {
             expect![[r#"
                 fn main() {
                     match &(0,) {
-                        &(&((ref x,) | (ref x,))) => (),
-                        &((ref x,) | (ref x,)) => (),
+                        &(ref x,) | &(ref x,) => (),
+                        (&(ref x,) | &(ref x,)) => (),
                     }
                 }
             "#]],

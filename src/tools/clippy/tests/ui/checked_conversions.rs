@@ -1,11 +1,10 @@
+#![warn(clippy::checked_conversions)]
+#![expect(clippy::legacy_numeric_constants)]
 #![allow(
-    clippy::cast_lossless,
-    clippy::legacy_numeric_constants,
-    unused,
     // Int::max_value will be deprecated in the future
     deprecated,
+    clippy::no_effect,
 )]
-#![warn(clippy::checked_conversions)]
 
 // Positive tests
 
@@ -102,6 +101,21 @@ fn msrv_1_33() {
 fn msrv_1_34() {
     let value: i64 = 34;
     let _ = value <= (u32::max_value() as i64) && value >= 0;
+    //~^ checked_conversions
+}
+
+fn issue16293() {
+    struct Outer {
+        inner: u32,
+    }
+    let outer = Outer { inner: 42 };
+    macro_rules! dot_inner {
+        ($obj:expr) => {
+            $obj.inner
+        };
+    }
+
+    dot_inner!(outer) <= i32::MAX as u32;
     //~^ checked_conversions
 }
 
